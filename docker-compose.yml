@@ -41,19 +41,6 @@ x-worker-backend: &worker-backend-base
     options: {max-size: "50m", max-file: "3"}
 
 services:
-  worker-backend-0:
-    <<: *worker-backend-base
-    container_name: minicpm-wb-0
-    volumes:
-      - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
-
   worker-backend-1:
     <<: *worker-backend-base
     container_name: minicpm-wb-1
@@ -87,15 +74,13 @@ services:
       - "--ssl-keyfile"
       - "/app/certs/key.pem"
       - "--workers"
-      - "worker-backend-0:22400,worker-backend-1:22400"
+      - "worker-backend-1:22400"
     ports:
       - "8006:8006"
     volumes:
       - ${DATA_HOST_PATH:-./data}:/app/data      # session 录制持久化到 host
       - ${CERTS_HOST_PATH:-./certs}:/app/certs:ro # TLS 证书从宿主机挂载(只读),不进镜像
     depends_on:
-      worker-backend-0:
-        condition: service_healthy
       worker-backend-1:
         condition: service_healthy
     restart: unless-stopped

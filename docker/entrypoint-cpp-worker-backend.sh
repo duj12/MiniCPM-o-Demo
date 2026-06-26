@@ -106,6 +106,17 @@ for i in $(seq 1 "$max_retries"); do
     sleep 2
 done
 
+# Preload omni models (vision, audio, TTS) into VRAM so they stay resident
+# across sessions instead of loading on first client request.
+echo "[entrypoint] preloading omni models into VRAM..."
+if curl -sf -X POST "${BACKEND_URL}/v1/stream/omni_init" \
+    -H "Content-Type: application/json" \
+    -d '{"msg_type":2,"use_tts":true}' >/dev/null 2>&1; then
+    echo "[entrypoint] omni models loaded and pinned in VRAM"
+else
+    echo "[entrypoint] omni preload failed (will load on first request)" >&2
+fi
+
 echo "[entrypoint] starting worker..."
 python worker.py \
     --host 0.0.0.0 \
