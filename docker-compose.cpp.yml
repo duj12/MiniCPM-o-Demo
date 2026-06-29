@@ -32,7 +32,7 @@ services:
       BACKEND_PORT: "22500"
       WORKER_PORT: "22400"
       GGUF_MODEL: /models/MiniCPM-o-4_5-gguf/${GGUF_MODEL_FILE:-MiniCPM-o-4_5-Q4_K_M.gguf}
-      LLAMA_SERVER_EXTRA_ARGS: "${LLAMA_SERVER_EXTRA_ARGS:--c 8192}"
+      LLAMA_SERVER_EXTRA_ARGS: "-c 8192"
     volumes:
       - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH to the host GGUF model dir}:/models/MiniCPM-o-4_5-gguf:ro
     deploy:
@@ -48,42 +48,6 @@ services:
       timeout: 5s
       retries: 40
       start_period: 120s
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options: { max-size: "50m", max-file: "3" }
-
-  cpp-worker-backend-2:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.cpp-worker-backend
-      args:
-        LLAMA_OMNI_REFSPEC: ${LLAMA_OMNI_REFSPEC:-master}
-        LLAMA_OMNI_REF: ${LLAMA_OMNI_REF:-origin/master}
-    image: minicpm-cpp-worker-backend:dev
-    container_name: minicpm-o-demo-cpp-worker-2
-    environment:
-      GPU_ID: "0"
-      BACKEND_PORT: "22600"
-      WORKER_PORT: "22401"
-      GGUF_MODEL: /models/MiniCPM-o-4_5-gguf/${GGUF_MODEL_FILE:-MiniCPM-o-4_5-Q4_K_M.gguf}
-      LLAMA_SERVER_EXTRA_ARGS: "${LLAMA_SERVER_EXTRA_ARGS:--c 8192}"
-      LLAMA_LOG_FILE: /app/logs/llama-omni-server-2.log
-    volumes:
-      - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH to the host GGUF model dir}:/models/MiniCPM-o-4_5-gguf:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: [ "${CPP_GPU_ID:-0}" ]
-              capabilities: [ gpu ]
-    healthcheck:
-      test: [ "CMD", "curl", "-sf", "http://127.0.0.1:22401/health" ]
-      interval: 15s
-      timeout: 5s
-      retries: 40
-      start_period: 180s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -105,7 +69,7 @@ services:
       - "--ssl-keyfile"
       - "/app/certs/key.pem"
       - "--workers"
-      - "cpp-worker-backend:22400,cpp-worker-backend-2:22401"
+      - "cpp-worker-backend:22400"
     ports:
       - "${GATEWAY_HOST_PORT:-8006}:8006"
     volumes:
@@ -113,8 +77,6 @@ services:
       - ${CERTS_HOST_PATH:-./certs}:/app/certs:ro
     depends_on:
       cpp-worker-backend:
-        condition: service_healthy
-      cpp-worker-backend-2:
         condition: service_healthy
     restart: unless-stopped
     logging:
