@@ -23,6 +23,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import uvicorn
+import websockets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -193,16 +194,17 @@ async def _handle_remote_backend_runtime_ws(
 
     await ws.accept()
     worker.state.status = active_status
-    runtime = BackendRuntimeSession(
-        backend_base_url=backend_url,
-        mode=mode,
-    )
-    backend_closed = False
 
     async def _send_runtime_event(event: Any) -> Dict[str, Any]:
         payload = _event_payload(event)
         await ws.send_json(payload)
         return payload
+
+    runtime = BackendRuntimeSession(
+        backend_base_url=backend_url,
+        mode=mode,
+    )
+    backend_closed = False
 
     try:
         first = json.loads(await ws.receive_text())
@@ -219,7 +221,35 @@ async def _handle_remote_backend_runtime_ws(
 
         init_params = dict(init_params)
         init_params.setdefault("mode", mode)
-        await _send_runtime_event(await runtime.init(init_params))
+
+        # Retry backend init with backoff to handle race condition where
+        # the previous session hasn't been cleaned up yet on the C++ backend.
+        MAX_INIT_RETRIES = 3
+        INIT_RETRY_DELAYS = [0.5, 1.5, 3.0]
+
+        init_event = None
+        for attempt in range(MAX_INIT_RETRIES):
+            if attempt > 0:
+                await runtime.aclose()
+                runtime = BackendRuntimeSession(
+                    backend_base_url=backend_url,
+                    mode=mode,
+                )
+            try:
+                init_event = await runtime.init(init_params)
+                break
+            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
+                if attempt < MAX_INIT_RETRIES - 1:
+                    logger.warning(
+                        "Backend init attempt %d/%d failed, retrying in %.1fs: %s",
+                        attempt + 1, MAX_INIT_RETRIES,
+                        INIT_RETRY_DELAYS[attempt], e,
+                    )
+                    await asyncio.sleep(INIT_RETRY_DELAYS[attempt])
+                    continue
+                raise  # all retries exhausted — outer except handler sends backend_error
+
+        await _send_runtime_event(init_event)
 
         if pending_input is not None:
             await runtime.push(pending_input)
