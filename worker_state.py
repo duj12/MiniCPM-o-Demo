@@ -27,16 +27,18 @@ class WorkerState(BaseModel):
     total_requests: int = 0
     total_inference_time_ms: float = 0.0
     last_activity: Optional[str] = None
+    concurrent_sessions: int = 0  # 多路并发：当前活跃 session 数
 
     @property
     def is_idle(self) -> bool:
-        return self.status == WorkerStatus.IDLE
+        return self.concurrent_sessions == 0
 
     @property
     def is_busy(self) -> bool:
-        return self.status in (
-            WorkerStatus.BUSY_CHAT,
-            WorkerStatus.BUSY_HALF_DUPLEX,
-            WorkerStatus.DUPLEX_ACTIVE,
-            WorkerStatus.DUPLEX_PAUSED,
-        )
+        return self.concurrent_sessions > 0
+
+    def inc_sessions(self) -> None:
+        self.concurrent_sessions += 1
+
+    def dec_sessions(self) -> None:
+        self.concurrent_sessions = max(0, self.concurrent_sessions - 1)

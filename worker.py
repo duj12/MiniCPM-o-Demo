@@ -157,10 +157,12 @@ async def health():
     worker_metrics = worker.metrics()
     kv_len = int(worker_metrics.get("kv_cache_length", 0) or 0)
     remote_backend_url = _backend_server_url()
-    model_loaded = bool(remote_backend_url) or worker.processor is not None or bool(getattr(worker.state, "is_idle", False))
+    model_loaded = bool(remote_backend_url) or worker.processor is not None
+    # 多路并发：有 active session 时报告 busy，否则 idle
+    reported_status = WorkerStatus.BUSY_CHAT if worker.state.concurrent_sessions > 0 else WorkerStatus.IDLE
     return WorkerHealthResponse(
         status="healthy" if model_loaded else "error",
-        worker_status=worker.state.status,
+        worker_status=reported_status,
         gpu_id=worker.gpu_id,
         model_loaded=model_loaded,
         current_ticket_id=worker.state.current_ticket_id,
@@ -188,12 +190,9 @@ async def _handle_remote_backend_runtime_ws(
     if worker is None:
         await ws.close(code=1013, reason="Worker not ready")
         return
-    if not worker.state.is_idle:
-        await ws.close(code=1013, reason=f"Worker busy: {worker.state.status.value}")
-        return
 
     await ws.accept()
-    worker.state.status = active_status
+    worker.state.inc_sessions()
 
     async def _send_runtime_event(event: Any) -> Dict[str, Any]:
         payload = _event_payload(event)
@@ -319,8 +318,7 @@ async def _handle_remote_backend_runtime_ws(
                 await runtime.unary("close", {"reason": "worker_disconnected"})
         except Exception:
             logger.exception("Remote backend runtime cleanup failed")
-        worker.state.status = idle_status
-        worker.state.current_ticket_id = None
+        worker.state.dec_sessions()
         try:
             await ws.close()
         except Exception:
