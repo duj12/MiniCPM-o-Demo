@@ -51,13 +51,20 @@ HEALTH_CHECK_INTERVAL = 10.0
 
 @dataclass
 class WorkerConnection:
-    """Worker 连接（Gateway 侧维护）"""
+    """Worker 连接（Gateway 侧维护）
+
+    支持多路并发：一个 Worker 可同时处理 max_concurrency 个 session。
+    active_tickets 跟踪当前活跃的 ticket 列表。
+    current_ticket_id 保持向后兼容（指向 active_tickets[0]）。
+    """
     worker_id: str
     host: str
     port: int
     gpu_id: int
     status: GatewayWorkerStatus = GatewayWorkerStatus.OFFLINE
+    max_concurrency: int = 4
     current_ticket_id: Optional[str] = None
+    active_tickets: List[str] = field(default_factory=list)
     total_requests: int = 0
     avg_inference_time_ms: float = 0.0
     last_heartbeat: Optional[datetime] = None
@@ -72,16 +79,16 @@ class WorkerConnection:
 
     @property
     def is_idle(self) -> bool:
-        return self.status == GatewayWorkerStatus.IDLE
+        return not self.active_tickets
 
     @property
     def is_busy(self) -> bool:
-        return self.status in (
-            GatewayWorkerStatus.BUSY_CHAT,
-            GatewayWorkerStatus.BUSY_HALF_DUPLEX,
-            GatewayWorkerStatus.DUPLEX_ACTIVE,
-            GatewayWorkerStatus.DUPLEX_PAUSED,
-        )
+        return len(self.active_tickets) >= self.max_concurrency
+
+    @property
+    def has_capacity(self) -> bool:
+        """Worker 还能接受更多并发 session"""
+        return len(self.active_tickets) < self.max_concurrency
 
     def supports(self, request_type: str) -> bool:
         required = capability_for_request(request_type)
@@ -105,23 +112,39 @@ class WorkerConnection:
 
     def mark_busy(self, status: GatewayWorkerStatus, request_type: str,
                   ticket_id: Optional[str] = None) -> None:
-        """标记 Worker 为忙碌状态（Gateway 调度决策）"""
+        """标记 Worker 的一个并发槽位为忙碌
+
+        注意：enqueue 和 caller 会各自调用一次 mark_busy（同一个 ticket_id），
+        因此需要去重防止 active_tickets 中出现重复 ticket。
+        """
         self.status = status
         self.current_request_type = request_type
-        self.task_started_at = datetime.now()
-        self.current_ticket_id = ticket_id
+        if not self.active_tickets:
+            self.task_started_at = datetime.now()
+        if ticket_id and ticket_id not in self.active_tickets:
+            self.active_tickets.append(ticket_id)
+        self.current_ticket_id = self.active_tickets[0] if self.active_tickets else None
         self._gateway_dispatched = True
+
+    def release_ticket(self, ticket_id: str) -> None:
+        """释放指定的 ticket，仅移除该 ticket 而非整个 Worker"""
+        if ticket_id in self.active_tickets:
+            self.active_tickets.remove(ticket_id)
+        self.current_ticket_id = self.active_tickets[0] if self.active_tickets else None
+        if not self.active_tickets:
+            self.mark_idle()
 
     def update_duplex_status(self, status: GatewayWorkerStatus) -> None:
         """更新 Duplex 会话的状态（pause/resume），不重置 task_started_at"""
         self.status = status
 
     def mark_idle(self) -> None:
-        """标记 Worker 为空闲状态（Gateway 释放决策）"""
+        """标记 Worker 完全空闲（所有 session 已结束）"""
         self.status = GatewayWorkerStatus.IDLE
         self.current_request_type = None
         self.task_started_at = None
         self.current_ticket_id = None
+        self.active_tickets.clear()
         self._gateway_dispatched = False
 
 
@@ -225,6 +248,7 @@ class WorkerPool:
         eta_config: Optional[EtaConfig] = None,
         ema_alpha: float = 0.3,
         ema_min_samples: int = 3,
+        worker_max_concurrency: int = 4,
     ):
         """初始化 Worker 池
 
@@ -235,10 +259,12 @@ class WorkerPool:
             eta_config: ETA 基准配置
             ema_alpha: EMA 平滑系数
             ema_min_samples: EMA 生效最少样本数
+            worker_max_concurrency: 每个 Worker 的最大并发 session 数
         """
         self.workers: Dict[str, WorkerConnection] = {}
         self.max_queue_size = max_queue_size
         self.request_timeout = request_timeout
+        self.worker_max_concurrency = worker_max_concurrency
 
         # FIFO 队列
         self._queue: OrderedDict[str, QueueEntry] = OrderedDict()
@@ -276,10 +302,12 @@ class WorkerPool:
                 host=host,
                 port=port,
                 gpu_id=gpu_id,
+                max_concurrency=worker_max_concurrency,
                 capabilities=list(DEFAULT_WORKER_CAPABILITIES),
             )
 
         logger.info(f"WorkerPool initialized with {len(self.workers)} workers, "
+                     f"max_concurrency={worker_max_concurrency}, "
                      f"max_queue_size={max_queue_size}")
 
     async def start(self) -> None:
@@ -379,23 +407,23 @@ class WorkerPool:
     # ========== 路由策略 ==========
 
     def _gpu_busy_counts(self) -> Dict[int, int]:
-        """Count busy workers per GPU for load-aware scheduling."""
+        """Count active sessions per GPU for load-aware scheduling."""
         counts: Dict[int, int] = {}
         for w in self.workers.values():
-            if w.is_busy:
-                counts[w.gpu_id] = counts.get(w.gpu_id, 0) + 1
+            if w.active_tickets:
+                counts[w.gpu_id] = counts.get(w.gpu_id, 0) + len(w.active_tickets)
         return counts
 
     def _get_idle_worker(self, request_type: Optional[str] = None) -> Optional[WorkerConnection]:
-        """获取当前负载最低 GPU 上支持该请求类型的空闲 Worker"""
+        """获取有空闲容量的 Worker（不再要求完全 IDLE，有 capacity 即可）"""
         gpu_busy = self._gpu_busy_counts()
-        idle_workers = (
+        candidates = (
             w for w in self.workers.values()
-            if w.is_idle and (request_type is None or w.supports(request_type))
+            if w.has_capacity and (request_type is None or w.supports(request_type))
         )
         return min(
-            idle_workers,
-            key=lambda w: (gpu_busy.get(w.gpu_id, 0), w.worker_id),
+            candidates,
+            key=lambda w: (gpu_busy.get(w.gpu_id, 0), len(w.active_tickets), w.worker_id),
             default=None,
         )
 
@@ -531,17 +559,22 @@ class WorkerPool:
             self._recalc_positions_and_eta()
 
     def release_worker(self, worker: WorkerConnection, request_type: Optional[str] = None,
-                       duration_s: Optional[float] = None) -> None:
-        """释放 Worker（任务完成后调用）
+                       duration_s: Optional[float] = None,
+                       ticket_id: Optional[str] = None) -> None:
+        """释放 Worker 的一个并发槽位（任务完成后调用）
 
         Args:
             worker: 要释放的 Worker
             request_type: 完成的任务类型（用于 EMA 更新）
             duration_s: 任务实际耗时（用于 EMA 更新）
+            ticket_id: 要释放的 ticket ID。为 None 时释放全部（完全空闲）。
         """
-        worker.mark_idle()
+        if ticket_id and ticket_id in worker.active_tickets:
+            worker.release_ticket(ticket_id)
+        else:
+            worker.mark_idle()
 
-        # 更新 EMA
+        # 更新 EMA（只在 Worker 完全空闲时记录）
         if request_type and duration_s is not None and duration_s > 0:
             self.eta_tracker.record_duration(request_type, duration_s)
 
@@ -587,22 +620,32 @@ class WorkerPool:
     def _recalc_positions_and_eta(self) -> None:
         """重算所有排队项的位置和预估等待时间
 
-        使用堆模拟 dispatch 链：逐个弹出最早空闲的 Worker，
-        分配给队头请求，精确计算每个排队者的等待时间。
-        复杂度 O(Q log W)，W=1~8 时约等于 O(Q)。
+        多路并发版本：每个 Worker 有 max_concurrency 个槽位，
+        已占用的槽位有剩余等待时间，空闲槽位立即可用（wait=0）。
+        复杂度 O(Q log S)，S = total_slots。
         """
         if not self._queue:
             return
 
-        # 1. 初始化 min-heap：每个 busy Worker 的预估完成时间偏移量
         now = datetime.now()
-        heap: List[Tuple[float, int]] = []  # (remaining_seconds, worker_index)
+        heap: List[Tuple[float, int, int]] = []  # (remaining_seconds, worker_index, slot_id)
+
         for i, w in enumerate(self.workers.values()):
-            if w.is_busy and w.task_started_at and w.current_request_type:
-                elapsed = (now - w.task_started_at).total_seconds()
-                eta = self.eta_tracker.get_eta(w.current_request_type)
-                remaining = (eta - elapsed) if elapsed < eta else 15.0
-                heapq.heappush(heap, (remaining, i))
+            num_active = len(w.active_tickets)
+            cap = w.max_concurrency
+            # 没有活跃 session 时，所有槽位都可用
+            if num_active == 0:
+                for slot in range(cap):
+                    heapq.heappush(heap, (0.0, i, slot))
+                continue
+
+            eta = self.eta_tracker.get_eta(w.current_request_type or "chat")
+            elapsed = (now - w.task_started_at).total_seconds() if w.task_started_at else 0.0
+            remaining = max(0.0, eta - elapsed) if elapsed < eta else 15.0
+
+            for slot in range(cap):
+                wait = remaining if slot < num_active else 0.0
+                heapq.heappush(heap, (wait, i, slot))
 
         if not heap:
             for pos_0based, entry in enumerate(self._queue.values()):
@@ -610,32 +653,31 @@ class WorkerPool:
                 entry.ticket.estimated_wait_s = 0.0
             return
 
-        # 2. 模拟 dispatch 链：每个排队请求依次获取最早空闲的 Worker
         for pos_0based, entry in enumerate(self._queue.values()):
             entry.ticket.position = pos_0based + 1
-
-            finish_time, widx = heapq.heappop(heap)
+            finish_time, widx, _ = heapq.heappop(heap)
             entry.ticket.estimated_wait_s = round(max(0.0, finish_time), 1)
-
             next_baseline = self.eta_tracker.get_eta(entry.ticket.request_type)
-            heapq.heappush(heap, (finish_time + next_baseline, widx))
+            heapq.heappush(heap, (finish_time + next_baseline, widx, pos_0based))
 
     def _get_running_tasks(self) -> List[RunningTaskInfo]:
         """获取当前正在运行的任务列表"""
         now = datetime.now()
         tasks: List[RunningTaskInfo] = []
         for w in self.workers.values():
-            if w.is_busy and w.task_started_at and w.current_request_type:
-                elapsed = (now - w.task_started_at).total_seconds()
-                eta = self.eta_tracker.get_eta(w.current_request_type)
-                remaining = max(0.0, eta - elapsed)
-                tasks.append(RunningTaskInfo(
-                    worker_id=w.worker_id,
-                    request_type=w.current_request_type,
-                    started_at=w.task_started_at,
-                    elapsed_s=round(elapsed, 1),
-                    estimated_remaining_s=round(remaining, 1),
-                ))
+            if not w.active_tickets or not w.task_started_at or not w.current_request_type:
+                continue
+            elapsed = (now - w.task_started_at).total_seconds()
+            eta = self.eta_tracker.get_eta(w.current_request_type)
+            remaining = max(0.0, eta - elapsed)
+            tasks.append(RunningTaskInfo(
+                worker_id=w.worker_id,
+                request_type=w.current_request_type,
+                started_at=w.task_started_at,
+                elapsed_s=round(elapsed, 1),
+                estimated_remaining_s=round(remaining, 1),
+                concurrent_sessions=len(w.active_tickets),
+            ))
         return tasks
 
     # ========== 队列状态查询 ==========

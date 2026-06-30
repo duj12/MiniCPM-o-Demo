@@ -158,6 +158,7 @@ async def lifespan(app: FastAPI):
         eta_config=eta_config,
         ema_alpha=GATEWAY_CONFIG.get("eta_ema_alpha", 0.3),
         ema_min_samples=GATEWAY_CONFIG.get("eta_ema_min_samples", 3),
+        worker_max_concurrency=GATEWAY_CONFIG.get("worker_max_concurrency", 4),
     )
     await worker_pool.start()
 
@@ -531,7 +532,8 @@ async def _api_worker_passthrough_ws(
             except Exception:
                 pass
         duration = (datetime.now() - task_start).total_seconds()
-        worker_pool.release_worker(worker, request_type=request_type, duration_s=duration)
+        worker_pool.release_worker(worker, request_type=request_type, duration_s=duration,
+                                   ticket_id=ticket.ticket_id)
         try:
             await ws.close()
         except Exception:

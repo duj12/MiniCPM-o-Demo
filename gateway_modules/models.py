@@ -73,6 +73,7 @@ class RunningTaskInfo(BaseModel):
     started_at: datetime
     elapsed_s: float
     estimated_remaining_s: float
+    concurrent_sessions: int = 1
 
 
 class QueueStatus(BaseModel):
