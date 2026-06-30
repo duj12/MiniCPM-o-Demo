@@ -116,6 +116,7 @@
             <div class="stat"><div class="value" id="idleWorkers">-</div><div class="label">Idle</div></div>
             <div class="stat"><div class="value" id="busyWorkers">-</div><div class="label">Busy</div></div>
             <div class="stat"><div class="value" id="queueLength">-</div><div class="label">Queue</div></div>
+            <div class="stat"><div class="value" id="capacityInfo">-</div><div class="label">Capacity</div></div>
         </div>
         <div class="refresh-note">每 5 秒自动刷新</div>
     </div>
@@ -264,6 +265,7 @@ async function loadStatus() {
         document.getElementById('idleWorkers').textContent = data.idle_workers;
         document.getElementById('busyWorkers').textContent = data.busy_workers + data.duplex_workers;
         document.getElementById('queueLength').textContent = data.queue_length;
+        document.getElementById('capacityInfo').textContent = `${data.used_capacity} / ${data.total_capacity}`;
     } catch (e) {
         console.error('Load status failed:', e);
     }

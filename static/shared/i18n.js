@@ -170,6 +170,7 @@ const zh = {
   // queue
   workers: '工作节点',
   idle: '空闲',
+  capacity: '并发',
   queue: '队列',
   queued: (pos, eta) => `排队 ${pos}，约 ${eta}s`,
   queuedOvertime: (pos, overtime) => `排队 ${pos}，超时 +${overtime}s`,

@@ -99,6 +99,11 @@ class ServiceStatus(BaseModel):
     queue_length: int = 0
     max_queue_size: int = 1000
     running_tasks: List[RunningTaskInfo] = []
+    # 多路并发信息
+    max_concurrency: int = 0       # 每个 worker 的最大并发 session 数
+    total_capacity: int = 0        # 总并发槽位数 (workers × concurrency)
+    used_capacity: int = 0         # 已使用的槽位数
+    available_capacity: int = 0    # 剩余可用槽位数
 
 
 # ============ ETA 配置（运行时可调） ============

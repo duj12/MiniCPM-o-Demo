@@ -271,6 +271,8 @@ async def status():
     if worker_pool is None:
         raise HTTPException(status_code=503, detail="Service not ready")
 
+    total_cap = sum(w.max_concurrency for w in worker_pool.workers.values())
+    used_cap = sum(len(w.active_tickets) for w in worker_pool.workers.values())
     return ServiceStatus(
         gateway_healthy=True,
         total_workers=len(worker_pool.workers),
@@ -283,6 +285,10 @@ async def status():
         queue_length=worker_pool.queue_length,
         max_queue_size=worker_pool.max_queue_size,
         running_tasks=worker_pool._get_running_tasks(),
+        max_concurrency=worker_pool.worker_max_concurrency,
+        total_capacity=total_cap,
+        used_capacity=used_cap,
+        available_capacity=total_cap - used_cap,
     )
 
 

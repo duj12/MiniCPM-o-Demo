@@ -1368,7 +1368,7 @@ async function checkServiceStatus() {
         const data = await resp.json();
         const el = document.getElementById('serviceStatus');
         const _t = window.I18n?.t || {};
-        let text = `${_t.workers || 'Workers'}: ${data.idle_workers}/${data.total_workers} ${_t.idle || 'idle'}`;
+        let text = `${_t.workers || 'Workers'}: ${data.idle_workers}/${data.total_workers} ${_t.idle || 'idle'} | ${_t.capacity || 'Slots'}: ${data.used_capacity}/${data.total_capacity}`;
         if (data.queue_length > 0) {
             text += ` | ${_t.queue || 'Queue'}: ${data.queue_length}`;
         }
