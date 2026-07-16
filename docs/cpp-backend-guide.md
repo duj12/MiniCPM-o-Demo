@@ -44,7 +44,7 @@ Backend (llama-omni-server) — 模型推理
 
 ```
 MiniCPM-o-4_5-gguf/
-├── MiniCPM-o-4_5-Q8_0.gguf         # 主模型
+├── MiniCPM-o-4_5-Q4_K_M.gguf       # 主模型（推荐 4-bit）
 ├── vision/MiniCPM-o-4_5-vision-F16.gguf
 ├── audio/MiniCPM-o-4_5-audio-F16.gguf
 ├── tts/MiniCPM-o-4_5-tts-F16.gguf
@@ -70,7 +70,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 # 将模型路径改为你的实际路径
 cat > .env << 'EOF'
 GGUF_MODEL_HOST_PATH=/data/models/MiniCPM-o-4_5-gguf
-GGUF_MODEL_FILE=MiniCPM-o-4_5-Q8_0.gguf
+GGUF_MODEL_FILE=MiniCPM-o-4_5-Q4_K_M.gguf
 CPP_GPU_ID=0
 GATEWAY_HOST_PORT=8006
 LLAMA_SERVER_EXTRA_ARGS=-c 32768
@@ -110,7 +110,7 @@ docker compose -f docker-compose.cpp.yml down
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `GGUF_MODEL_HOST_PATH` | **必填** 模型权重目录的宿主机路径 | — |
-| `GGUF_MODEL_FILE` | 主模型 GGUF 文件名 | `MiniCPM-o-4_5-Q8_0.gguf` |
+| `GGUF_MODEL_FILE` | 主模型 GGUF 文件名 | `MiniCPM-o-4_5-Q4_K_M.gguf` |
 | `CPP_GPU_ID` | 使用的 GPU 编号 | `0` |
 | `GATEWAY_HOST_PORT` | 网关对外端口（HTTPS） | `8006` |
 | `LLAMA_SERVER_EXTRA_ARGS` | 后端额外启动参数 | `-c 8192` |
@@ -631,6 +631,39 @@ A: 检查服务是否包含 2025-07-16 之后的修复。旧版本中 `force_lis
 ### Q: 单轮对话返回空文本？
 
 A: 非流式模式（`streaming: false`）的文本在 `response.done.text` 字段中，不在 `response.output.delta`。请参考上方 API 调用代码。
+
+### Q: 如何估算并发能力和显存占用？
+
+A: 与模型量化精度和 KV cache 大小密切相关。以下是在 RTX 3090（24GB）上的实测数据。
+
+**测试环境：**
+- 模型：`MiniCPM-o-4_5-Q4_K_M.gguf`（4-bit）
+- 每路 KV cache：4096（`-c 16384 --parallel 4`）
+- GPU 0 空闲显存：~7,543 MiB（含其他服务占用）
+
+**纯文本并发测试（"Say hello in 3 words"）：**
+
+| 并发路数 | 通过 | wall time | 显存峰值 |
+|:-------:|:---:|:---------:|:--------:|
+| 1 | ✅ | 1.1s | 12,981 MiB |
+| 2 | ✅ | 1.3s | 13,639 MiB |
+| 3 | ✅ | 1.5s | 12,981 MiB |
+| 4 | ✅ | **2.4s** | **11,435 MiB** |
+
+**视频推理并发测试（121.mp4, 9.6MB）：**
+
+| 并发路数 | 通过 | wall time | 显存峰值 | 说明 |
+|:-------:|:---:|:---------:|:--------:|------|
+| 1 | ✅ | 7.3s | 12,981 MiB | 单路视频基线 |
+| 2 | ✅ | 10.9s | 13,639 MiB | 2 路几乎同时完成 |
+| 3 | ✅ | 13.5s | 12,981 MiB | 全部通过 |
+| 4 | ✅ | **17.6s** | **11,435 MiB** | **4 路全通过** |
+
+**结论：**
+- `Q4_K_M` + `-c 16384 --parallel 4` 下，单卡 RTX 3090 可稳定支持 **4 路视频并发**或 **4 路文本并发**
+- 对比 `Q8_0`（8.2GB）只能跑 1-2 路，4-bit 量化显著提升并发密度
+- 关键瓶颈是 `llama_init_from_model` 创建的独立 decode 上下文，每路约额外占用 1.5-2.5GB（视 kv cache 大小）
+- 如需更高并发，可换用更大显存卡（如 A100 80GB）或缩减 `-c` 参数
 
 ### Q: 视频太大报 `WebSocket` 连接断开？
 
