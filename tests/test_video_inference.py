@@ -3,7 +3,7 @@ Test video inference through Gateway protocol.
 Usage (on remote):
   cd /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo
   /home/dujing/miniconda3/envs/py310/bin/python tests/test_video_inference.py \
-      --video /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/data/input/88.mp4
+    --video /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/data/input/88.mp4
 """
 
 import asyncio
@@ -110,7 +110,7 @@ async def main():
 
     success = await test_video(args.video, args.timeout)
     exit(0 if success else 1)
-
+ 
 
 if __name__ == "__main__":
     asyncio.run(main())
