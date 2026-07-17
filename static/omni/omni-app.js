@@ -1425,6 +1425,15 @@ async function startSession() {
     document.getElementById('videoPlaceholder').style.display = 'none';
     document.getElementById('videoOverlay').style.display = 'flex';
     _diagEvents = [];
+    // Add 20s timeout to show diagnostic on mobile
+    if (window._prepTimer) clearTimeout(window._prepTimer);
+    window._prepTimer = setTimeout(function() {
+        var _de = document.getElementById('diagErr');
+        if (!_de) { _de = document.createElement('div'); _de.id = 'diagErr'; document.body.appendChild(_de); }
+        _de.style.cssText = 'position:fixed;top:80px;left:10px;right:10px;z-index:99999;background:#c00;color:#fff;padding:12px;font-size:14px;border-radius:8px;word-break:break-all;';
+        var info = 'Preparing timeout. WS readyState: ' + (session && session.ws ? session.ws.readyState : 'no WS') + ' | sessionId: ' + (session && session.sessionId ? session.sessionId : 'none') + ' | page: ' + location.pathname;
+        _de.textContent = info;
+    }, 20000);
 
     // Create media provider
     if (currentMode === 'live') {
@@ -1459,9 +1468,10 @@ async function startSession() {
         getPlaybackDelayMs: () => parseInt(document.getElementById('playbackDelay').value, 10) || 200,
         outputSampleRate: SAMPLE_RATE_OUT,
         getWsUrl: () => {
-            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-            const url = `${proto}://${location.host}/v1/realtime?mode=video`;
-            return window.ClientIdentity ? window.ClientIdentity.appendToUrl(url) : url;
+            var p = location.protocol === "https:" ? "wss" : "ws";
+            var u = p + "://" + location.host + "/v1/realtime?mode=video";
+            try { if (window.ClientIdentity) u = window.ClientIdentity.appendToUrl(u); } catch(e) {}
+            return u;
         },
     });
     session.onMetrics = (data) => metricsPanel.update(data);
@@ -1597,7 +1607,7 @@ async function startSession() {
     const preparePayload = {
         config: { length_penalty: parseFloat(document.getElementById('omniLengthPenalty').value) || 1.0 },
         max_slice_nums: getEffectiveMaxSliceNums(),
-        use_tts: document.getElementById('ttsEnabled').checked,
+        use_tts: (document.getElementById('ttsEnabled')?.checked ?? true),
     };
     const refBase64 = refAudio.getBase64();
     if (refBase64) preparePayload.ref_audio_base64 = refBase64;
@@ -1652,6 +1662,7 @@ async function startSession() {
         );
 
         metricsPanel.update({ type: 'state', sessionState: 'Active' });
+        if (window._prepTimer) clearTimeout(window._prepTimer);
         setStatusLamp('live');
         updateFullscreenBtnVisibility(true);
 
@@ -1660,7 +1671,12 @@ async function startSession() {
         const isCancelled = err.message?.includes('cancelled');
         if (!isCancelled) {
             console.error('Session start failed:', err);
-            addSystemEntry(`Failed: ${err.message}`);
+            addSystemEntry('Failed: ' + err.message);
+            var _de = document.getElementById('diagErr');
+            if (!_de) { _de = document.createElement('div'); _de.id = 'diagErr'; document.body.appendChild(_de); }
+            _de.style.cssText = 'position:fixed;top:80px;left:10px;right:10px;z-index:99999;background:#c00;color:#fff;padding:12px;font-size:14px;border-radius:8px;';
+            _de.textContent = 'Error: ' + (err.message || err);
+            setTimeout(function(){ var _x = document.getElementById('diagErr'); if(_x)_x.remove(); }, 20000);
         }
         if (session) { try { session.cleanup(); } catch (_) {} }
         session = null;
