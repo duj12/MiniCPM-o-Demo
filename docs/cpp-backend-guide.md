@@ -256,7 +256,10 @@ async def full_duplex_example():
             "type": "session.init",
             "payload": {"mode": "full_duplex"},
         }))
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        while True:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+            if msg.get("type") == "session.created":
+                break
         print("Session:", msg.get("session_id"))
 
         # 逐帧发送音频（首帧可附带 video_frames/text）
@@ -447,7 +450,7 @@ def split_audio_frames(pcm_data, frame_ms=100):
 # 使用示例
 pcm = extract_audio_pcm("video.mp4")
 chunks = split_audio_frames(pcm)          # 音频帧列表
-frames = extract_keyframes("video.mp4")   # JPGE base64 列表
+frames = extract_keyframes("video.mp4")   # JPEG base64 列表
 
 for i, chunk in enumerate(chunks[:100]):  # 发 10 秒
     audio_b64 = base64.b64encode(chunk).decode()
@@ -479,6 +482,8 @@ Client → Server: session.close     {"type": "session.close", "reason": "done"}
 #### 消息时序（Full-duplex，每帧循环）
 
 ```
+Client → Server: session.init      {"type": "session.init", "payload": {"mode": "full_duplex"}}
+Server → Client: session.created   {"type": "session.created", "session_id": "..."}
 Client → Server: input.append      {"type": "input.append", "input": {"audio": "...", ...}}
 Server → Client: output.delta      {"type": "response.output.delta", "kind": "listen"}  ← 模型在听
                                    或 {"kind": "text", "text": "..."}                      ← 模型在说
@@ -578,7 +583,10 @@ payload = {
 | `use_tts_template` | bool | 启用 TTS 音频输出 |
 | `tts` | object | TTS 配置 `{"enabled": true, "ref_audio_data": "base64..."}` |
 | `omni_mode` | bool | 是否开启 Omni 多模态模式 |
+| `enable_thinking` | bool | 启用思考链输出 |
+| `force_listen` | bool | 全双工模式强制当前帧切到听状态 |
 | `image` | object | 图像参数，`{"max_slice_nums": 1}` |
+| `generation` | object | 生成参数，`{"max_new_tokens": 512, "length_penalty": 1.1}` |
 
 ---
 
@@ -594,6 +602,7 @@ payload = {
 | `test_video_turnbased.py` | 单轮视频理解 | 测试 `assets/video/turnbased/` 目录下视频 |
 | `test_video_fullduplex.py` | 全双工流式视频 | 模拟逐帧发送音频+视频帧 |
 | `test_multi_session_concurrency.py` | 多路并发 | `--simplex N --duplex M` 参数控制路数 |
+| `test_vram_concurrency.py` | 并发+显存测试 | 文本/视频/全双工 三种模式，自动追踪 VRAM 峰值 |
 
 **运行方式：**
 
@@ -610,7 +619,7 @@ python tests/test_video_turnbased.py
 
 ## 常见问题
 
-### Q: 启动报 `MODEL_HOST_PATH is missing`？
+### Q: 启动报 `GGUF_MODEL_HOST_PATH is missing`？
 
 A: `.env` 文件缺失或 `GGUF_MODEL_HOST_PATH` 配置不正确。确保从 `MiniCPM-o-Demo/` 目录执行命令，且 `.env` 文件存在于该目录。
 
@@ -626,7 +635,7 @@ LLAMA_SERVER_EXTRA_ARGS=-c 32768
 
 ### Q: 全双工无响应，客户端一直超时？
 
-A: 检查服务是否包含 2025-07-16 之后的修复。旧版本中 `force_listen` 产生的 `__IS_LISTEN__` 事件被 `text_done_flag` 检查提前丢弃，导致全双工模式下客户端收不到任何响应。
+A: 检查服务是否包含 2026-07-16 之后的修复。旧版本中 `force_listen` 产生的 `__IS_LISTEN__` 事件被 `text_done_flag` 检查提前丢弃，导致全双工模式下客户端收不到任何响应。
 
 ### Q: 单轮对话返回空文本？
 
@@ -634,36 +643,109 @@ A: 非流式模式（`streaming: false`）的文本在 `response.done.text` 字�
 
 ### Q: 如何估算并发能力和显存占用？
 
-A: 与模型量化精度和 KV cache 大小密切相关。以下是在 RTX 3090（24GB）上的实测数据。
+A: 与模型量化精度和 KV cache 大小密切相关。以下是在 RTX 3090（24GB）上的实测数据，测试工具为 `tests/test_vram_concurrency.py`。
 
 **测试环境：**
 - 模型：`MiniCPM-o-4_5-Q4_K_M.gguf`（4-bit）
-- 每路 KV cache：4096（`-c 16384 --parallel 4`）
-- GPU 0 空闲显存：~7,543 MiB（含其他服务占用）
+- 配置：`-c 32768 --parallel 4`（每路 LLM KV cache = 8192）
+- TTS KV cache：512（独立限制，不占 LLM 的 KV cache）
+- Token2Wav：共享模式（仅首路初始化，后续复用）
+- GPU 0 空闲显存：~9,161 MiB（含 TTS 模型 + 其他服务占用）
 
 **纯文本并发测试（"Say hello in 3 words"）：**
 
-| 并发路数 | 通过 | wall time | 显存峰值 |
-|:-------:|:---:|:---------:|:--------:|
-| 1 | ✅ | 1.1s | 12,981 MiB |
-| 2 | ✅ | 1.3s | 13,639 MiB |
-| 3 | ✅ | 1.5s | 12,981 MiB |
-| 4 | ✅ | **2.4s** | **11,435 MiB** |
+| 并发路数 | 通过 | wall time |
+|:-------:|:---:|:---------:|
+| 1 | ✅ | 1.1s |
+| 2 | ✅ | 1.3s |
+| 3 | ✅ | 1.5s |
+| 4 | ✅ | 2.4s |
 
-**视频推理并发测试（121.mp4, 9.6MB）：**
+**单轮视频并发测试（121.mp4, 9.6MB, turn_based）：**
 
-| 并发路数 | 通过 | wall time | 显存峰值 | 说明 |
-|:-------:|:---:|:---------:|:--------:|------|
-| 1 | ✅ | 7.3s | 12,981 MiB | 单路视频基线 |
-| 2 | ✅ | 10.9s | 13,639 MiB | 2 路几乎同时完成 |
-| 3 | ✅ | 13.5s | 12,981 MiB | 全部通过 |
-| 4 | ✅ | **17.6s** | **11,435 MiB** | **4 路全通过** |
+| 并发路数 | 通过 | wall time |
+|:-------:|:---:|:---------:|
+| 1 | ✅ | 7.3s |
+| 2 | ✅ | 10.9s |
+| 3 | ✅ | 13.5s |
+| 4 | ✅ | 17.6s |
+
+**全双工流式视频并发测试（121+pad.mp4, 73MB, 模拟实时采集）：**
+
+模拟真实摄像头+麦克风输入：音频按 100ms 帧发送，视频按 5fps 在对应音频帧时间点附带 JPEG 帧。每路发送 30 帧（3 秒）。
+
+| 并发路数 | 通过 | wall time | VRAM 峰值 | 说明 |
+|:-------:|:---:|:---------:|:---------:|------|
+| 1 | ✅ | 15.8s | 10,941 MiB | 含 TTS 完整加载 |
+| 2 | ✅ | 21.5s | 10,941 MiB | 显存稳定 |
+| 3 | ✅ | 29.0s | 10,941 MiB | 显存稳定 |
+| **4** | **✅** | **39.3s** | **10,945 MiB** | **4 路全通过** |
+
+**禁用 TTS 的全双工流式视频并发测试（`--no-tts` 启动）：**
+
+跳过 TTS 模型、权重和 Token2Wav 加载，节省约 2.3GB 基线显存。适用于不需要语音输出、只关注文本回复的场景。
+
+| 并发路数 | 通过 | wall time | VRAM 峰值 | 说明 |
+|:-------:|:---:|:---------:|:---------:|------|
+| 1 | ✅ | 15.4s | 8,371 MiB | 基线 6,863 MiB |
+| 2 | ✅ | 21.3s | 8,371 MiB | 含 TTS 节省 2.3GB |
+| 3 | ✅ | 28.3s | 8,371 MiB | 显存稳定 |
+| **4** | **✅** | **38.1s** | **8,373 MiB** | **4 路全通过** |
+
+**对比总结：**
+
+| 指标 | 有 TTS | 无 TTS（`--no-tts`） |
+|:----|:------:|:-------------------:|
+| 基线显存 | 9,161 MiB | **6,863 MiB** (-25%) |
+| 每路增量 | ~1.8 GB | ~1.5 GB |
+| 4 路全双工 | ✅ 稳定通过 | ✅ **4/4 通过** |
+| 适用场景 | 需要语音回复 | 仅文本回复 |
+
+**`--no-tts` 启动方式：**
+
+```bash
+# .env 中 LLAMA_SERVER_EXTRA_ARGS 添加 --no-tts
+# 或命令行启动时直接附加
+LLAMA_SERVER_EXTRA_ARGS="-c 32768 --parallel 4 --no-tts" \
+docker compose -f docker-compose.cpp.yml up -d --no-build cpp-worker-backend
+```
+
+**并发测试命令：**
+
+```bash
+# 激活 conda 环境后，在 MiniCPM-o-Demo 目录执行
+
+# 纯文本 4 路
+python tests/test_vram_concurrency.py
+
+# 单轮视频 4 路
+python tests/test_vram_concurrency.py --mode video
+
+# 全双工视频 1 路（完整 38s）
+python tests/test_vram_concurrency.py --mode duplex --video --duplex-frames 0
+
+# 全双工视频 4 路（每路 3s 音视频流，5fps 模拟摄像头）
+python tests/test_vram_concurrency.py --mode duplex --video \
+    --max-concurrency 4 --duplex-frames 30 --duplex-video-fps 5
+
+# 全双工静音+文本（不依赖视频文件）
+python tests/test_vram_concurrency.py --mode duplex --max-concurrency 2
+```
+
+**全双工流式测试参数：**
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--duplex-frames` | 每路音频帧数（0=全部） | 10 |
+| `--duplex-video-fps` | 模拟摄像头帧率 | 5 |
+| `--duplex-gap` | 帧间隔秒数 | 0.15 |
+| `--stagger` | 每路启动间隔秒数 | 2.0 |
 
 **结论：**
-- `Q4_K_M` + `-c 16384 --parallel 4` 下，单卡 RTX 3090 可稳定支持 **4 路视频并发**或 **4 路文本并发**
-- 对比 `Q8_0`（8.2GB）只能跑 1-2 路，4-bit 量化显著提升并发密度
-- 关键瓶颈是 `llama_init_from_model` 创建的独立 decode 上下文，每路约额外占用 1.5-2.5GB（视 kv cache 大小）
-- 如需更高并发，可换用更大显存卡（如 A100 80GB）或缩减 `-c` 参数
+- `Q4_K_M` + `-c 32768 --parallel 4` 下，单卡 RTX 3090 可稳定支持 **4 路全双工视频并发（含 TTS）**
+- 关键优化点：per-session KV cache 按 `n_ctx / n_parallel` 分配、TTS KV cache 限制为 512、Token2Wav GPU session 共享
+- 全双工模式和单工模式的显存增量接近（均约 1.8GB/路），因为两者共享相同的 per-session KV cache 减分配策略
+- 如需更高并发，可考虑使用 `--no-tts` 启动参数跳过 TTS 模型加载（省约 2-3GB 基线显存），或换用更大显存卡
 
 ### Q: 视频太大报 `WebSocket` 连接断开？
 
@@ -682,4 +764,4 @@ A: 修改 `.env` 中 `CPP_GPU_ID=1` 即可。服务器有多张 GPU 时，每张
 ```bash
 ssh 服务器地址 nvidia-smi
 ```
-正常运行时显存占用约 11GB（主模型） + 1.1GB（TTS）+ 其他辅助模型，总计约 15-18GB。
+正常运行时显存占用约 6.8GB（无 TTS）或 9.1GB（有 TTS），每增加一路并发额外占用约 1.5-1.8GB。
