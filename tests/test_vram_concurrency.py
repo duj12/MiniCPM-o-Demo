@@ -121,7 +121,7 @@ async def run_text_session(idx, gateway, timeout=60):
 
         await ws.send(json.dumps({"type": "input.append", "input": {
             "messages": [{"role": "user", "content": "Say hello in 3 words"}],
-            "streaming": False, "tts": {"enabled": False},
+            "streaming": True, "tts": {"enabled": False},
             "use_tts_template": False,
         }}, ensure_ascii=False))
         t_send = time.perf_counter()
@@ -177,7 +177,7 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
                 {"type": "video", "data": video_b64,
                  "name": "test.mp4", "duration": 10},
             ]}],
-            "streaming": False, "tts": {"enabled": False},
+            "streaming": True, "tts": {"enabled": False},
             "use_tts_template": False, "omni_mode": True,
             "image": {"max_slice_nums": 1},
         }}, ensure_ascii=False))
@@ -306,26 +306,26 @@ def fmt_results(results, peak_vram=None, peak_util=None, is_turn_based=False):
 
     if is_turn_based:
         lines = []
-        lines.append("  %3s  %-6s  %8s  %8s  %8s  %s" % (
-            "#", "status", "conn(ms)", "total(ms)", "chars", "chars/s"))
-        lines.append("  " + "-" * 80)
+        lines.append("  %3s  %-6s  %8s  %8s  %8s  %8s  %s" % (
+            "#", "status", "conn(ms)", "TTFT(ms)", "gen(ms)", "chars", "ch/s"))
+        lines.append("  " + "-" * 95)
         for r in results:
             idx, ok, conn, ft_ms, gen_ms, nchars, info = r
             if ok and ft_ms > 0:
                 cps = nchars / (gen_ms / 1000.0) if gen_ms > 0 else 0
-                lines.append("  %3d  %-6s  %8.0f  %8.0f  %8d  %6.0f" %
-                             (idx, "PASS", conn, gen_ms, nchars, cps))
+                lines.append("  %3d  %-6s  %8.0f  %8.0f  %8.0f  %8d  %6.0f" %
+                             (idx, "PASS", conn, ft_ms, gen_ms, nchars, cps))
             elif ok:
-                lines.append("  %3d  %-6s  %8.0f  %8s  %8d  %6s" %
-                             (idx, "PASS", conn, "-", nchars, "-"))
+                lines.append("  %3d  %-6s  %8.0f  %8s  %8s  %8d  %6s" %
+                             (idx, "PASS", conn, "-", "-", nchars, "-"))
             else:
-                lines.append("  %3d  %-6s  %8s  %8s  %8s  %8s  %s" %
-                             (idx, "FAIL", "-", "-", "-", "-", info[:30]))
+                lines.append("  %3d  %-6s  %8s  %8s  %8s  %8s  %8s  %s" %
+                             (idx, "FAIL", "-", "-", "-", "-", "-", info[:30]))
     else:
         lines = []
         lines.append("  %3s  %-6s  %8s  %8s  %s" % (
             "#", "status", "conn(ms)", "total(ms)", "info"))
-        lines.append("  " + "-" * 80)
+        lines.append("  " + "-" * 95)
         for r in results:
             idx, ok, conn, total, info = r
             if ok:
