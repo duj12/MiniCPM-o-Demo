@@ -359,6 +359,10 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         info_parts = []
         if text_output:
             info_parts.append("text=%dch" % len(text_output))
+            if len(text_output) <= 60:
+                info_parts.append("msg=%s" % text_output)
+            else:
+                info_parts.append("msg=%s..." % text_output[:60])
         if audio_chunks:
             info_parts.append("audio=%d" % audio_chunks)
         if ttft_ms:
