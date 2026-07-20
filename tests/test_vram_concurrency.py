@@ -22,8 +22,8 @@ import asyncio, json, ssl, base64, subprocess, time, argparse, os
 import websockets
 
 GATEWAY = "wss://192.168.89.106:8006/v1/realtime"
-DEFAULT_TURN_VIDEO = "assets/video/turnbased/121.mp4"
-DEFAULT_DUPLEX_VIDEO = "assets/video/turnbased/121.mp4"
+DEFAULT_TURN_VIDEO = "/data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/assets/video/turnbased/121.mp4"
+DEFAULT_DUPLEX_VIDEO = "/data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/assets/video/turnbased/121.mp4"
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
@@ -234,6 +234,9 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         text_output = ""
         audio_chunks = 0
         listen_count = 0
+        first_text_ts = None
+        first_audio_ts = None
+        t_send = time.perf_counter()
 
         for i, frame in enumerate(audio_frames):
             audio_b64 = base64.b64encode(frame).decode()
@@ -260,10 +263,16 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                 k = m.get("kind", "")
 
                 if t == "response.output.delta":
+                    now = time.perf_counter()
                     if k == "text":
-                        text_output += m.get("text", "")
+                        chunk = m.get("text", "")
+                        if chunk and first_text_ts is None:
+                            first_text_ts = now
+                        text_output += chunk
                     elif k == "audio":
                         audio_chunks += 1
+                        if first_audio_ts is None:
+                            first_audio_ts = now
                     elif k == "listen":
                         listen_count += 1
                         got_frame_done = True
@@ -271,30 +280,36 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                     text_output = m.get("text", "") or text_output
                     got_frame_done = True
                 elif t == "session.closed":
-                    return (idx, False, dt_conn, 0,
+                    return (idx, False, dt_conn, 0, 0, 0,
                             "closed: " + m.get("reason", ""))
                 elif t == "error":
-                    return (idx, False, dt_conn, 0, str(m)[:60])
+                    return (idx, False, dt_conn, 0, 0, 0, str(m)[:60])
 
             if i < len(audio_frames) - 1:
                 await asyncio.sleep(frame_gap)
 
         dt_total = (time.perf_counter() - t0) * 1000
+        ttft_ms = (first_text_ts - t_send) * 1000 if first_text_ts else 0
+        aud_first_ms = (first_audio_ts - t_send) * 1000 if first_audio_ts else 0
 
         info_parts = []
         if text_output:
-            info_parts.append(text_output[:60])
+            info_parts.append("text=%dch" % len(text_output))
         if audio_chunks:
             info_parts.append("audio=%d" % audio_chunks)
+        if ttft_ms:
+            info_parts.append("TTFT=%.0fms" % ttft_ms)
+        if aud_first_ms:
+            info_parts.append("AUDIO=%.0fms" % aud_first_ms)
         if not text_output and not audio_chunks:
             info_parts.append("listen=%d no-reply" % listen_count)
         info = " | ".join(info_parts)
 
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt_conn, dt_total, info)
+        return (idx, True, dt_conn, dt_total, ttft_ms, aud_first_ms, info)
 
     except Exception as e:
-        return (idx, False, 0, 0, str(e)[:60])
+        return (idx, False, 0, 0, 0, 0, str(e)[:60])
 
 
 # ───── 格式化 ─────
@@ -323,17 +338,18 @@ def fmt_results(results, peak_vram=None, peak_util=None, is_turn_based=False):
                              (idx, "FAIL", "-", "-", "-", "-", "-", info[:30]))
     else:
         lines = []
-        lines.append("  %3s  %-6s  %8s  %8s  %s" % (
-            "#", "status", "conn(ms)", "total(ms)", "info"))
+        lines.append("  %3s  %-6s  %8s  %8s  %8s  %s" % (
+            "#", "status", "conn(ms)", "total(ms)", "TTFT(ms)", "info"))
         lines.append("  " + "-" * 95)
         for r in results:
-            idx, ok, conn, total, info = r
+            idx, ok, conn, total, ttft, aud, info = r
             if ok:
-                lines.append("  %3d  %-6s  %8.0f  %8.0f  %s" %
-                             (idx, "PASS", conn, total, info[:60]))
+                ttft_str = ("%.0f" % ttft) if ttft > 0 else "-"
+                lines.append("  %3d  %-6s  %8.0f  %8.0f  %8s  %s" %
+                             (idx, "PASS", conn, total, ttft_str, info[:60]))
             else:
-                lines.append("  %3d  %-6s  %8s  %8s  %s" %
-                             (idx, "FAIL", "-", "-", info[:60]))
+                lines.append("  %3d  %-6s  %8s  %8s  %8s  %s" %
+                             (idx, "FAIL", "-", "-", "-", info[:60]))
 
     lines.append(extra)
     return "\n".join(lines)
@@ -471,7 +487,7 @@ async def main():
                 if is_turn_based:
                     processed.append((len(processed), False, 0, 0, 0, 0, str(r)[:60]))
                 else:
-                    processed.append((len(processed), False, 0, 0, str(r)[:60]))
+                    processed.append((len(processed), False, 0, 0, 0, 0, str(r)[:60]))
             else:
                 processed.append(r)
 
