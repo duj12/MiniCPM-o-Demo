@@ -22,8 +22,8 @@ import asyncio, json, ssl, base64, subprocess, time, argparse, os
 import websockets
 
 GATEWAY = "wss://192.168.89.106:8006/v1/realtime"
-DEFAULT_TURN_VIDEO = "/data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/assets/video/turnbased/121.mp4"
-DEFAULT_DUPLEX_VIDEO = "/data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/assets/video/turnbased/121.mp4"
+DEFAULT_TURN_VIDEO = "assets/video/turnbased/121.mp4"
+DEFAULT_DUPLEX_VIDEO = "assets/video/turnbased/121.mp4"
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
