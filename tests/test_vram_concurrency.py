@@ -29,7 +29,7 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
 SR = 16000
-FRAME_MS = 100
+FRAME_MS = 1000
 FRAME_SAMPLES = int(SR * FRAME_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * 2
 
@@ -72,6 +72,22 @@ def extract_audio_frames(video_path, max_frames=0):
     if max_frames > 0 and len(frames) > max_frames:
         frames = frames[:max_frames]
     return frames, total_s
+
+
+def extract_video_frame(video_path, offset=0.5):
+    """Extract 1 JPEG frame at time offset [0-1], matching frontend."""
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=duration", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True)
+    try:
+        dur = float(probe.stdout.strip())
+    except ValueError:
+        dur = 30
+    pos = dur * offset
+    r = subprocess.run(["ffmpeg", "-y", "-ss", str(pos), "-i", video_path,
+        "-vframes", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
+        capture_output=True, check=True)
+    return base64.b64encode(r.stdout).decode(), dur
 
 
 def extract_video_frames_stream(video_path, fps=5):
@@ -288,6 +304,54 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
             if i < len(audio_frames) - 1:
                 await asyncio.sleep(frame_gap)
 
+        # Keep sending silence+last frame after video ends, until model finishes
+        last_frame_b64 = None
+        if video_frame_map and 0 in video_frame_map:
+            last_frame_b64 = video_frame_map[0]
+        tail_idx = 0
+        model_done = False
+        while not model_done and tail_idx < 50:
+            b64 = base64.b64encode(b'\x00' * FRAME_BYTES).decode()
+            payload = {"type": "input.append", "input": {
+                "audio": b64, "max_slice_nums": 1,
+            }}
+            if last_frame_b64:
+                payload["input"]["video_frames"] = [last_frame_b64]
+                last_frame_b64 = None  # only send frame once as reference
+            await ws.send(json.dumps(payload, ensure_ascii=False))
+            tail_idx += 1
+
+            got = False
+            while not got:
+                try:
+                    m = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+                except asyncio.TimeoutError:
+                    got = True
+                    break
+                t = m.get("type"); k = m.get("kind","")
+                if t == "response.output.delta":
+                    now = time.perf_counter()
+                    if k == "text":
+                        chunk = m.get("text","")
+                        if chunk and first_text_ts is None: first_text_ts = now
+                        text_output += chunk
+                    elif k == "audio":
+                        audio_chunks += 1
+                        if first_audio_ts is None: first_audio_ts = now
+                    elif k == "listen":
+                        got = True
+                elif t == "response.done":
+                    text_output = m.get("text","") or text_output
+                    if not first_text_ts and text_output: first_text_ts = time.perf_counter()
+                    got = True
+                    model_done = True
+                    break
+                elif t in ("session.closed","error"):
+                    got = True
+                    model_done = True
+                    break
+            await asyncio.sleep(frame_gap)
+
         dt_total = (time.perf_counter() - t0) * 1000
         ttft_ms = (first_text_ts - t_send) * 1000 if first_text_ts else 0
         aud_first_ms = (first_audio_ts - t_send) * 1000 if first_audio_ts else 0
@@ -370,10 +434,10 @@ async def main():
     parser.add_argument("--timeout", type=int, default=300,
                         help="每路超时秒数 (默认 300)")
     parser.add_argument("--duplex-frames", type=int, default=10,
-                        help="全双工模式每路音频帧数 (默认 10 = 1s, 0 = 全部)")
+                        help="全双工模式每路音频帧数 (默认 10 = 10s, 0 = 全部)")
     parser.add_argument("--duplex-video-fps", type=float, default=5,
                         help="模拟摄像头帧率 (默认 5fps)")
-    parser.add_argument("--duplex-gap", type=float, default=0.15,
+    parser.add_argument("--duplex-gap", type=float, default=0.9,
                         help="全双工帧间隔秒数 (默认 0.15)")
     parser.add_argument("--duplex-text", type=str, default="请描述这个视频里发生了什么",
                         help="全双工模式首帧附带文本")
@@ -393,9 +457,8 @@ async def main():
     if args.stagger > 0:
         print("  - 交错启动: %.1fs" % args.stagger)
     if mode == "duplex":
-        print("  - 每路帧数: %d (%.1fs, 视频 %d fps)" % (
-            args.duplex_frames, args.duplex_frames * FRAME_MS / 1000,
-            args.duplex_video_fps))
+        print("  - 每路帧数: %d (%.1fs)" % (
+            args.duplex_frames, args.duplex_frames * FRAME_MS / 1000))
     print("=" * 80)
 
     video_b64 = None
@@ -420,11 +483,15 @@ async def main():
         print("\n  提取音视频: %s" % video_path)
         duplex_audio_frames, total_s = extract_audio_frames(
             video_path, max_frames=args.duplex_frames)
-        _, duplex_video_frame_map = extract_video_frames_stream(
-            video_path, fps=args.duplex_video_fps)
-        print("  音频: %d 帧 (%.1fs), 视频帧映射表: %d 个触发点 (%d fps)\n" %
-              (len(duplex_audio_frames), total_s,
-               len(duplex_video_frame_map), args.duplex_video_fps))
+        frame_b64, video_dur = extract_video_frame(video_path, offset=0.5)
+        # Frame map: only first audio chunk carries video frame (matches frontend)
+        duplex_video_frame_map = {0: frame_b64}
+        # padAfter: frontend default 2s silence after video audio
+        pad_after = 2
+        for _ in range(pad_after):
+            duplex_audio_frames.append(b'\x00' * FRAME_BYTES)
+        print("  音频: %d 帧 (%.1fs视频 + %ds静音) | 视频帧: 1 张\n" %
+              (len(duplex_audio_frames), total_s, pad_after))
 
     elif mode == "duplex" and not args.video:
         duplex_audio_frames = [b"\x00" * FRAME_BYTES for _ in range(args.duplex_frames)]
@@ -458,7 +525,7 @@ async def main():
                     video_frame_map=duplex_video_frame_map,
                     text_prompt=text_prompt,
                     frame_gap=args.duplex_gap,
-                    timeout=args.timeout)
+                    timeout=args.timeout + 120)
 
         peak_vram = 0
         peak_util = 0
