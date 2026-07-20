@@ -50,6 +50,19 @@ def get_vram(gpu_id=0):
         return 0
 
 
+def get_gpu_stats(gpu_id=0):
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
+         "--format=csv,noheader,nounits", "-i", str(gpu_id)],
+        capture_output=True, text=True
+    )
+    try:
+        parts = r.stdout.strip().split(", ")
+        return (int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return (0, 0)
+
+
 # ───── 视频/音频提取 ─────
 
 def extract_audio_frames(video_path, max_frames=0):
@@ -313,7 +326,11 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
 
 # ───── 格式化 ─────
 
-def fmt_results(results):
+def fmt_results(results, peak_vram=None, peak_util=None):
+    if peak_vram is not None:
+        extra = "  (peak VRAM: %d MiB | GPU util: %d%%)" % (peak_vram, peak_util)
+    else:
+        extra = ""
     lines = []
     lines.append("  %3s  %-6s  %8s  %8s  %s" % (
         "#", "status", "conn(ms)", "total(ms)", "info"))
@@ -326,6 +343,7 @@ def fmt_results(results):
         else:
             lines.append("  %3d  %-6s  %8s  %8s  %s" %
                          (idx, "FAIL", "-", "-", info[:60]))
+    lines.append(extra)
     return "\n".join(lines)
 
 
@@ -440,8 +458,25 @@ async def main():
                     frame_gap=args.duplex_gap,
                     timeout=args.timeout)
 
+        # GPU monitor (polls VRAM + util during inference)
+        peak_vram = 0
+        peak_util = 0
+        monitor_running = True
+
+        async def gpu_monitor():
+            nonlocal peak_vram, peak_util
+            while monitor_running:
+                v, u = get_gpu_stats(args.gpu)
+                if v > peak_vram: peak_vram = v
+                if u > peak_util: peak_util = u
+                await asyncio.sleep(0.3)
+
+        mon_task = asyncio.create_task(gpu_monitor())
         tasks = [start_one(i) for i in range(N)]
         raw = await asyncio.gather(*tasks, return_exceptions=True)
+        monitor_running = False
+        await mon_task
+
         wall = (time.perf_counter() - t_all) * 1000
         vram_after = get_vram(args.gpu)
 
@@ -460,8 +495,8 @@ async def main():
 
         print("  --- %d 路并发 ---" % N)
         print(fmt_results(processed))
-        print("  VRAM: %d -> %d MiB (+%d MiB) | %d/%d PASS in %.0fms wall" %
-              (vram_before, vram_after, vram_after - vram_before, ok, N, wall))
+        print("  VRAM baseline: %d MiB | peak VRAM: %d MiB | GPU util: %d%% | %d/%d PASS in %.0fms wall" %
+              (vram_before, peak_vram, peak_util, ok, N, wall))
         print()
 
         if ok < N:
