@@ -240,7 +240,7 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
-                      "payload": {"mode": "full_duplex"}}))
+                      "payload": {"mode": "full_duplex", "system_prompt": "Streaming Omni Conversation."}}))
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
@@ -309,24 +309,24 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         if video_frame_map and 0 in video_frame_map:
             last_frame_b64 = video_frame_map[0]
         tail_idx = 0
-        model_done = False
-        while not model_done and tail_idx < 50:
+        model_spoke = False
+        while not model_spoke and tail_idx < 100:
             b64 = base64.b64encode(b'\x00' * FRAME_BYTES).decode()
             payload = {"type": "input.append", "input": {
                 "audio": b64, "max_slice_nums": 1,
             }}
             if last_frame_b64:
                 payload["input"]["video_frames"] = [last_frame_b64]
-                last_frame_b64 = None  # only send frame once as reference
+                last_frame_b64 = None
             await ws.send(json.dumps(payload, ensure_ascii=False))
             tail_idx += 1
 
-            got = False
-            while not got:
+            done_reading = False
+            while not done_reading:
                 try:
-                    m = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+                    m = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 except asyncio.TimeoutError:
-                    got = True
+                    done_reading = True
                     break
                 t = m.get("type"); k = m.get("kind","")
                 if t == "response.output.delta":
@@ -335,22 +335,35 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                         chunk = m.get("text","")
                         if chunk and first_text_ts is None: first_text_ts = now
                         text_output += chunk
+                        model_spoke = True
                     elif k == "audio":
                         audio_chunks += 1
                         if first_audio_ts is None: first_audio_ts = now
+                        model_spoke = True
                     elif k == "listen":
-                        got = True
+                        done_reading = True
                 elif t == "response.done":
                     text_output = m.get("text","") or text_output
                     if not first_text_ts and text_output: first_text_ts = time.perf_counter()
-                    got = True
-                    model_done = True
+                    done_reading = True
                     break
                 elif t in ("session.closed","error"):
-                    got = True
-                    model_done = True
+                    done_reading = True
                     break
             await asyncio.sleep(frame_gap)
+
+        # Once model speaks, wait for response.done
+        if model_spoke:
+            try:
+                while True:
+                    m = json.loads(await asyncio.wait_for(ws.recv(), timeout=120))
+                    t = m.get("type")
+                    if t == "response.done":
+                        text_output = m.get("text","") or text_output
+                        break
+                    elif t in ("session.closed","error"): break
+            except asyncio.TimeoutError:
+                pass
 
         dt_total = (time.perf_counter() - t0) * 1000
         ttft_ms = (first_text_ts - t_send) * 1000 if first_text_ts else 0
@@ -443,7 +456,7 @@ async def main():
                         help="模拟摄像头帧率 (默认 5fps)")
     parser.add_argument("--duplex-gap", type=float, default=0.9,
                         help="全双工帧间隔秒数 (默认 0.15)")
-    parser.add_argument("--duplex-text", type=str, default="请描述这个视频里发生了什么",
+    parser.add_argument("--duplex-text", type=str, default="",
                         help="全双工模式首帧附带文本")
     parser.add_argument("--stagger", type=float, default=2.0,
                         help="每路启动间隔秒数 (默认 2.0)")
@@ -522,8 +535,7 @@ async def main():
             elif mode == "video":
                 return await run_video_session(idx, gateway, video_b64, args.timeout)
             else:
-                text_prompt = args.duplex_text if not args.video \
-                              else "请描述这个视频里发生了什么"
+                text_prompt = args.duplex_text
                 return await run_duplex_session(
                     idx, gateway, duplex_audio_frames,
                     video_frame_map=duplex_video_frame_map,
