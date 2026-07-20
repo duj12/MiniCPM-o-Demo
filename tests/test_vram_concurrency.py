@@ -1,5 +1,5 @@
 """
-并发推理测试工具 — 支持文本/视频/全双工模式 + 显存追踪。
+并发推理测试工具 — 支持文本/视频/全双工模式 + 显存追踪 + 延迟/吞吐指标。
 
 用法:
   # 纯文本并发测试（默认）
@@ -13,9 +13,6 @@
 
   # 全双工真实视频（提取视频音频帧+帧图片，模拟实时视频通话）
   python tests/test_vram_concurrency.py --mode duplex --video
-
-  # 全双工真实视频 + 指定文件
-  python tests/test_vram_concurrency.py --mode duplex --video /path/to/video.mp4
 
   # 指定并发路数和网关
   python tests/test_vram_concurrency.py --mode duplex --max-concurrency 3 \
@@ -31,19 +28,16 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# 全双工音频参数
 SR = 16000
 FRAME_MS = 100
-FRAME_SAMPLES = int(SR * FRAME_MS / 1000)  # 1600
-FRAME_BYTES = FRAME_SAMPLES * 2             # 3200 bytes
+FRAME_SAMPLES = int(SR * FRAME_MS / 1000)
+FRAME_BYTES = FRAME_SAMPLES * 2
 
 
 def get_vram(gpu_id=0):
-    r = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used",
-         "--format=csv,noheader,nounits", "-i", str(gpu_id)],
-        capture_output=True, text=True
-    )
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
+        "--format=csv,noheader,nounits", "-i", str(gpu_id)],
+        capture_output=True, text=True)
     try:
         return int(r.stdout.strip().split("\n")[0])
     except (ValueError, IndexError):
@@ -51,11 +45,9 @@ def get_vram(gpu_id=0):
 
 
 def get_gpu_stats(gpu_id=0):
-    r = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
-         "--format=csv,noheader,nounits", "-i", str(gpu_id)],
-        capture_output=True, text=True
-    )
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
+        "--format=csv,noheader,nounits", "-i", str(gpu_id)],
+        capture_output=True, text=True)
     try:
         parts = r.stdout.strip().split(", ")
         return (int(parts[0]), int(parts[1]))
@@ -66,13 +58,9 @@ def get_gpu_stats(gpu_id=0):
 # ───── 视频/音频提取 ─────
 
 def extract_audio_frames(video_path, max_frames=0):
-    """提取视频 PCM 音频并按 100ms 切帧。返回 (pcm_frames, total_seconds)"""
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn",
-         "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1",
-         "-f", "s16le", "pipe:1"],
-        capture_output=True, check=True
-    )
+    r = subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn",
+        "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1",
+        "-f", "s16le", "pipe:1"], capture_output=True, check=True)
     pcm = r.stdout
     frames = []
     for i in range(0, len(pcm), FRAME_BYTES):
@@ -86,75 +74,33 @@ def extract_audio_frames(video_path, max_frames=0):
     return frames, total_s
 
 
-def extract_video_frames_uniform(video_path, max_n=3):
-    """从视频均匀提取 N 帧 JPEG base64（用于 turn_based 单帧输入）。"""
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=duration", "-of", "csv=p=0", video_path],
-        capture_output=True, text=True
-    )
-    try:
-        dur = float(probe.stdout.strip())
-    except ValueError:
-        dur = 30
-    n = min(max_n, max(1, int(dur / 3)))
-    frames = []
-    for i in range(n):
-        pos = dur * (i + 1) / (n + 1)
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(pos), "-i", video_path,
-             "-vframes", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
-            capture_output=True, check=True
-        )
-        frames.append(base64.b64encode(r.stdout).decode())
-    return frames
-
-
 def extract_video_frames_stream(video_path, fps=5):
-    """模拟摄像头采集：按指定 fps 提取 JPEG 帧，返回 (frame_list, frame_index_map)。
-
-    frame_list: 所有 JPEG base64 帧（按时间排序）
-    frame_index_map: dict[audio_frame_index] = video_frame_base64
-      — 告诉发送方：在第 N 个音频帧时，应该附带此视频帧。
-
-    假设音频 100ms/帧，视频 fps 帧/秒：
-      - 每 audio_frames_per_video = 10/fps 个音频帧附带一帧视频
-    """
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=duration,r_frame_rate",
-         "-of", "csv=p=0", video_path],
-        capture_output=True, text=True
-    )
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=duration,r_frame_rate", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True)
     parts = probe.stdout.strip().split(",")
     try:
         dur = float(parts[0])
     except (ValueError, IndexError):
         dur = 30
-
-    # 按时间线均匀取帧，每秒取 fps 帧
     total_video_frames = int(dur * fps)
     frame_list = []
     for i in range(total_video_frames):
-        pos = (i + 0.5) / fps  # 每帧在时间线上的中间位置
+        pos = (i + 0.5) / fps
         if pos > dur:
             break
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(pos), "-i", video_path,
-             "-vframes", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
-            capture_output=True, check=True
-        )
+        r = subprocess.run(["ffmpeg", "-y", "-ss", str(pos), "-i", video_path,
+            "-vframes", "1", "-q:v", "5", "-f", "mjpeg", "pipe:1"],
+            capture_output=True, check=True)
         frame_list.append(base64.b64encode(r.stdout).decode())
 
-    # 构建映射：第 N 个音频帧 → 对应的视频帧
-    audio_frames_per_second = 10  # 100ms
-    video_frame_interval = audio_frames_per_second / fps  # 每几个音频帧发一帧视频
+    audio_frames_per_second = 10
+    video_frame_interval = audio_frames_per_second / fps
     frame_index_map = {}
     for v_idx in range(len(frame_list)):
         audio_idx = int(v_idx * video_frame_interval)
         if audio_idx not in frame_index_map:
             frame_index_map[audio_idx] = frame_list[v_idx]
-
     return frame_list, frame_index_map
 
 
@@ -171,25 +117,45 @@ async def run_text_session(idx, gateway, timeout=60):
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
                 break
+        dt_conn = (time.perf_counter() - t0) * 1000
 
         await ws.send(json.dumps({"type": "input.append", "input": {
             "messages": [{"role": "user", "content": "Say hello in 3 words"}],
             "streaming": False, "tts": {"enabled": False},
             "use_tts_template": False,
         }}, ensure_ascii=False))
+        t_send = time.perf_counter()
 
+        text = ""
+        text_done_ts = None
+        first_token_ts = None
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), timeout))
-            if m.get("type") == "response.done":
+            t = m.get("type")
+            if t == "response.output.delta" and m.get("kind") == "text":
+                chunk = m.get("text", "")
+                if chunk and first_token_ts is None:
+                    first_token_ts = time.perf_counter()
+                text += chunk
+            elif t == "response.done":
+                final_text = m.get("text", "") or text
+                if final_text and first_token_ts is None:
+                    first_token_ts = time.perf_counter()
+                text = final_text
+                text_done_ts = time.perf_counter()
                 break
-            elif m.get("type") in ("session.closed", "error"):
-                return (idx, False, time.perf_counter() - t0, str(m.get("reason", "?")))
+            elif t in ("session.closed", "error"):
+                return (idx, False, dt_conn, 0, 0, 0, m.get("reason", "?"))
 
-        dt = (time.perf_counter() - t0) * 1000
+        total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
+        ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
+        gen_ms = total_ms  # non-streaming: all text arrives at once
+        cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt, dt, "")
+        return (idx, True, dt_conn, ft_ms, gen_ms, len(text),
+                "%dchars %.0fch/s" % (len(text), cps) if text else "")
     except Exception as e:
-        return (idx, False, 0, str(e)[:60])
+        return (idx, False, 0, 0, 0, 0, str(e)[:60])
 
 
 async def run_video_session(idx, gateway, video_b64, timeout=300):
@@ -203,6 +169,7 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
                 break
+        dt_conn = (time.perf_counter() - t0) * 1000
 
         await ws.send(json.dumps({"type": "input.append", "input": {
             "messages": [{"role": "user", "content": [
@@ -214,41 +181,50 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
             "use_tts_template": False, "omni_mode": True,
             "image": {"max_slice_nums": 1},
         }}, ensure_ascii=False))
+        t_send = time.perf_counter()
 
-        prev_text = ""
+        text = ""
+        text_done_ts = None
+        first_token_ts = None
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), timeout))
-            if m.get("type") == "response.output.delta" and m.get("kind") == "text":
-                prev_text += m.get("text", "")
-            elif m.get("type") == "response.done":
-                final_text = m.get("text", "") or prev_text
+            t = m.get("type")
+            if t == "response.output.delta" and m.get("kind") == "text":
+                chunk = m.get("text", "")
+                if chunk and first_token_ts is None:
+                    first_token_ts = time.perf_counter()
+                text += chunk
+            elif t == "response.done":
+                final_text = m.get("text", "") or text
+                if final_text and first_token_ts is None:
+                    first_token_ts = time.perf_counter()
+                text = final_text
+                text_done_ts = time.perf_counter()
                 break
-            elif m.get("type") in ("session.closed", "error"):
-                return (idx, False, time.perf_counter() - t0, m.get("reason", "?"))
+            elif t in ("session.closed", "error"):
+                return (idx, False, dt_conn, 0, 0, 0, m.get("reason", "?"))
 
-        dt = (time.perf_counter() - t0) * 1000
+        total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
+        ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
+        gen_ms = total_ms  # non-streaming: all text arrives at once
+        cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt, dt, final_text[:80])
+        return (idx, True, dt_conn, ft_ms, gen_ms, len(text),
+                "%dchars %.0fch/s" % (len(text), cps) if text else "")
     except Exception as e:
-        return (idx, False, 0, str(e)[:60])
+        return (idx, False, 0, 0, 0, 0, str(e)[:60])
 
 
 # ───── full_duplex ─────
 
 async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                               text_prompt=None, frame_gap=0.1, timeout=120):
-    """
-    一路全双工流式会话。
-    逐帧发送音频，按 video_frame_map 的时间戳附带视频帧（模拟摄像头采集），
-    接收模型响应。返回 (idx, ok, conn_ms, total_ms, info)
-    """
     t0 = time.perf_counter()
     try:
         ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
                       "payload": {"mode": "full_duplex"}}))
-        # 等待 session.created（可能先收到 session.queued）
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
@@ -266,14 +242,12 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
             }}
             if i == 0 and text_prompt:
                 payload["input"]["text"] = text_prompt
-            # 模拟摄像头：在该帧的时间点附带对应的视频帧
             frameb64 = video_frame_map.get(i) if video_frame_map else None
             if frameb64:
                 payload["input"]["video_frames"] = [frameb64]
 
             await ws.send(json.dumps(payload, ensure_ascii=False))
 
-            # 接收响应（直到 LISTEN 或 response.done）
             got_frame_done = False
             while not got_frame_done:
                 try:
@@ -307,7 +281,6 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
 
         dt_total = (time.perf_counter() - t0) * 1000
 
-        # 构建信息摘要
         info_parts = []
         if text_output:
             info_parts.append(text_output[:60])
@@ -326,23 +299,42 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
 
 # ───── 格式化 ─────
 
-def fmt_results(results, peak_vram=None, peak_util=None):
+def fmt_results(results, peak_vram=None, peak_util=None, is_turn_based=False):
+    extra = ""
     if peak_vram is not None:
         extra = "  (peak VRAM: %d MiB | GPU util: %d%%)" % (peak_vram, peak_util)
+
+    if is_turn_based:
+        lines = []
+        lines.append("  %3s  %-6s  %8s  %8s  %8s  %s" % (
+            "#", "status", "conn(ms)", "total(ms)", "chars", "chars/s"))
+        lines.append("  " + "-" * 80)
+        for r in results:
+            idx, ok, conn, ft_ms, gen_ms, nchars, info = r
+            if ok and ft_ms > 0:
+                cps = nchars / (gen_ms / 1000.0) if gen_ms > 0 else 0
+                lines.append("  %3d  %-6s  %8.0f  %8.0f  %8d  %6.0f" %
+                             (idx, "PASS", conn, gen_ms, nchars, cps))
+            elif ok:
+                lines.append("  %3d  %-6s  %8.0f  %8s  %8d  %6s" %
+                             (idx, "PASS", conn, "-", nchars, "-"))
+            else:
+                lines.append("  %3d  %-6s  %8s  %8s  %8s  %8s  %s" %
+                             (idx, "FAIL", "-", "-", "-", "-", info[:30]))
     else:
-        extra = ""
-    lines = []
-    lines.append("  %3s  %-6s  %8s  %8s  %s" % (
-        "#", "status", "conn(ms)", "total(ms)", "info"))
-    lines.append("  " + "-" * 80)
-    for r in results:
-        idx, ok, conn, total, info = r
-        if ok:
-            lines.append("  %3d  %-6s  %8.0f  %8.0f  %s" %
-                         (idx, "PASS", conn, total, info[:60]))
-        else:
-            lines.append("  %3d  %-6s  %8s  %8s  %s" %
-                         (idx, "FAIL", "-", "-", info[:60]))
+        lines = []
+        lines.append("  %3s  %-6s  %8s  %8s  %s" % (
+            "#", "status", "conn(ms)", "total(ms)", "info"))
+        lines.append("  " + "-" * 80)
+        for r in results:
+            idx, ok, conn, total, info = r
+            if ok:
+                lines.append("  %3d  %-6s  %8.0f  %8.0f  %s" %
+                             (idx, "PASS", conn, total, info[:60]))
+            else:
+                lines.append("  %3d  %-6s  %8s  %8s  %s" %
+                             (idx, "FAIL", "-", "-", info[:60]))
+
     lines.append(extra)
     return "\n".join(lines)
 
@@ -355,7 +347,7 @@ async def main():
     parser.add_argument("--mode", choices=["text", "video", "duplex"],
                         default="text", help="测试模式")
     parser.add_argument("--video", nargs="?", const=True, default=None,
-                        help="视频文件路径（turn_based 或 duplex 模式使用）")
+                        help="视频文件路径")
     parser.add_argument("--gpu", type=int, default=0, help="GPU 编号")
     parser.add_argument("--max-concurrency", type=int, default=4,
                         help="最大并发路数 (默认 4)")
@@ -364,13 +356,13 @@ async def main():
     parser.add_argument("--duplex-frames", type=int, default=10,
                         help="全双工模式每路音频帧数 (默认 10 = 1s, 0 = 全部)")
     parser.add_argument("--duplex-video-fps", type=float, default=5,
-                        help="模拟摄像头帧率 (默认 5fps, 建议 3-10)")
+                        help="模拟摄像头帧率 (默认 5fps)")
     parser.add_argument("--duplex-gap", type=float, default=0.15,
                         help="全双工帧间隔秒数 (默认 0.15)")
     parser.add_argument("--duplex-text", type=str, default="请描述这个视频里发生了什么",
-                        help="全双工模式首帧附带文本 (默认通用提问)")
+                        help="全双工模式首帧附带文本")
     parser.add_argument("--stagger", type=float, default=2.0,
-                        help="每路启动间隔秒数，避免并发初始化冲突 (默认 2.0)")
+                        help="每路启动间隔秒数 (默认 2.0)")
     args = parser.parse_args()
 
     gateway = args.gateway
@@ -388,12 +380,8 @@ async def main():
         print("  - 每路帧数: %d (%.1fs, 视频 %d fps)" % (
             args.duplex_frames, args.duplex_frames * FRAME_MS / 1000,
             args.duplex_video_fps))
-        if args.video:
-            video_path = args.video if isinstance(args.video, str) else DEFAULT_DUPLEX_VIDEO
-            print("  - 视频源: %s" % video_path)
     print("=" * 80)
 
-    # 预载视频
     video_b64 = None
     duplex_audio_frames = None
     duplex_video_frame_map = None
@@ -405,11 +393,10 @@ async def main():
             return
         with open(video_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode()
-        print("\n  turn_based 视频: %s (%d MB base64)\n" %
+        print("\n  视频: %s (%d MB base64)\n" %
               (video_path, len(video_b64) // 1024 // 1024))
 
     elif mode == "duplex" and args.video:
-        # 全双工模式：从视频提取音频帧 + 视频关键帧
         video_path = args.video if isinstance(args.video, str) else DEFAULT_DUPLEX_VIDEO
         if not os.path.exists(video_path):
             print("\n  视频文件不存在: %s" % video_path)
@@ -424,7 +411,6 @@ async def main():
                len(duplex_video_frame_map), args.duplex_video_fps))
 
     elif mode == "duplex" and not args.video:
-        # 纯静音帧
         duplex_audio_frames = [b"\x00" * FRAME_BYTES for _ in range(args.duplex_frames)]
         print("\n  静音帧: %d 帧, %.1f 秒\n" %
               (len(duplex_audio_frames), len(duplex_audio_frames) * FRAME_MS / 1000))
@@ -434,12 +420,12 @@ async def main():
 
     all_ok = True
     max_ok = 0
+    is_turn_based = mode in ("text", "video")
 
     for N in range(1, args.max_concurrency + 1):
         vram_before = get_vram(args.gpu)
         t_all = time.perf_counter()
 
-        # 交错启动：每个 session 延迟 stagger 秒，避免并发初始化显存冲突
         async def start_one(idx):
             delay = idx * args.stagger
             if delay > 0:
@@ -448,7 +434,7 @@ async def main():
                 return await run_text_session(idx, gateway, args.timeout)
             elif mode == "video":
                 return await run_video_session(idx, gateway, video_b64, args.timeout)
-            else:  # duplex
+            else:
                 text_prompt = args.duplex_text if not args.video \
                               else "请描述这个视频里发生了什么"
                 return await run_duplex_session(
@@ -458,7 +444,6 @@ async def main():
                     frame_gap=args.duplex_gap,
                     timeout=args.timeout)
 
-        # GPU monitor (polls VRAM + util during inference)
         peak_vram = 0
         peak_util = 0
         monitor_running = True
@@ -483,7 +468,10 @@ async def main():
         processed = []
         for r in raw:
             if isinstance(r, Exception):
-                processed.append((len(processed), False, 0, 0, str(r)[:60]))
+                if is_turn_based:
+                    processed.append((len(processed), False, 0, 0, 0, 0, str(r)[:60]))
+                else:
+                    processed.append((len(processed), False, 0, 0, str(r)[:60]))
             else:
                 processed.append(r)
 
@@ -494,7 +482,7 @@ async def main():
             all_ok = False
 
         print("  --- %d 路并发 ---" % N)
-        print(fmt_results(processed))
+        print(fmt_results(processed, peak_vram, peak_util, is_turn_based))
         print("  VRAM baseline: %d MiB | peak VRAM: %d MiB | GPU util: %d%% | %d/%d PASS in %.0fms wall" %
               (vram_before, peak_vram, peak_util, ok, N, wall))
         print()
@@ -512,7 +500,6 @@ async def main():
     print("  GPU %d 显存: %d -> %d MiB (基线 %d MiB)" %
           (args.gpu, base_vram, vram_final, base_vram))
     print("=" * 80)
-    # 短暂等待，避免退出时 SSL 未完全释放导致 Fatal error on SSL transport
     await asyncio.sleep(0.5)
     exit(0 if all_ok else 1)
 
