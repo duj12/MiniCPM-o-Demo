@@ -133,7 +133,7 @@ async def run_text_session(idx, gateway, timeout=60):
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
                 break
-        dt_conn = (time.perf_counter() - t0) * 1000
+        dt_setup = (time.perf_counter() - t0) * 1000
 
         await ws.send(json.dumps({"type": "input.append", "input": {
             "messages": [{"role": "user", "content": "Say hello in 3 words"}],
@@ -161,14 +161,14 @@ async def run_text_session(idx, gateway, timeout=60):
                 text_done_ts = time.perf_counter()
                 break
             elif t in ("session.closed", "error"):
-                return (idx, False, dt_conn, 0, 0, 0, m.get("reason", "?"))
+                return (idx, False, dt_setup, 0, 0, 0, m.get("reason", "?"))
 
         total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
         ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
         gen_ms = total_ms  # non-streaming: all text arrives at once
         cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt_conn, ft_ms, gen_ms, len(text),
+        return (idx, True, dt_setup, ft_ms, gen_ms, len(text),
                 "%dchars %.0fch/s" % (len(text), cps) if text else "")
     except Exception as e:
         return (idx, False, 0, 0, 0, 0, str(e)[:60])
@@ -185,7 +185,7 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
                 break
-        dt_conn = (time.perf_counter() - t0) * 1000
+        dt_setup = (time.perf_counter() - t0) * 1000
 
         await ws.send(json.dumps({"type": "input.append", "input": {
             "messages": [{"role": "user", "content": [
@@ -218,14 +218,14 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
                 text_done_ts = time.perf_counter()
                 break
             elif t in ("session.closed", "error"):
-                return (idx, False, dt_conn, 0, 0, 0, m.get("reason", "?"))
+                return (idx, False, dt_setup, 0, 0, 0, m.get("reason", "?"))
 
         total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
         ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
         gen_ms = total_ms  # non-streaming: all text arrives at once
         cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt_conn, ft_ms, gen_ms, len(text),
+        return (idx, True, dt_setup, ft_ms, gen_ms, len(text),
                 "%dchars %.0fch/s" % (len(text), cps) if text else "")
     except Exception as e:
         return (idx, False, 0, 0, 0, 0, str(e)[:60])
@@ -240,12 +240,18 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
-                      "payload": {"mode": "full_duplex", "system_prompt": "Streaming Omni Conversation."}}))
+                      "payload": {
+                          "mode": "full_duplex",
+                          "system_prompt": "Streaming Omni Conversation.",
+                          "config": {"length_penalty": 1.1},
+                          "max_slice_nums": 1,
+                          "use_tts": True,
+                      }}))
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
                 break
-        dt_conn = (time.perf_counter() - t0) * 1000
+        dt_setup = (time.perf_counter() - t0) * 1000
 
         text_output = ""
         audio_chunks = 0
@@ -272,7 +278,7 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                 try:
                     m = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
                 except asyncio.TimeoutError:
-                    return (idx, False, dt_conn, 0,
+                    return (idx, False, dt_setup, 0,
                             "timeout at frame %d/%d" % (i, len(audio_frames)))
 
                 t = m.get("type")
@@ -296,10 +302,10 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                     text_output = m.get("text", "") or text_output
                     got_frame_done = True
                 elif t == "session.closed":
-                    return (idx, False, dt_conn, 0, 0, 0,
+                    return (idx, False, dt_setup, 0, 0, 0,
                             "closed: " + m.get("reason", ""))
                 elif t == "error":
-                    return (idx, False, dt_conn, 0, 0, 0, str(m)[:60])
+                    return (idx, False, dt_setup, 0, 0, 0, str(m)[:60])
 
             if i < len(audio_frames) - 1:
                 await asyncio.sleep(frame_gap)
@@ -387,7 +393,7 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         info = " | ".join(info_parts)
 
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
-        return (idx, True, dt_conn, dt_total, ttft_ms, aud_first_ms, info)
+        return (idx, True, dt_setup, dt_total, ttft_ms, aud_first_ms, info)
 
     except Exception as e:
         return (idx, False, 0, 0, 0, 0, str(e)[:60])
@@ -403,7 +409,7 @@ def fmt_results(results, peak_vram=None, peak_util=None, is_turn_based=False):
     if is_turn_based:
         lines = []
         lines.append("  %3s  %-6s  %8s  %8s  %8s  %8s  %s" % (
-            "#", "status", "conn(ms)", "TTFT(ms)", "gen(ms)", "chars", "ch/s"))
+            "#", "status", "setup(ms)", "TTFT(ms)", "gen(ms)", "chars", "ch/s"))
         lines.append("  " + "-" * 95)
         for r in results:
             idx, ok, conn, ft_ms, gen_ms, nchars, info = r
@@ -420,7 +426,7 @@ def fmt_results(results, peak_vram=None, peak_util=None, is_turn_based=False):
     else:
         lines = []
         lines.append("  %3s  %-6s  %8s  %8s  %8s  %s" % (
-            "#", "status", "conn(ms)", "total(ms)", "TTFT(ms)", "info"))
+            "#", "status", "setup(ms)", "total(ms)", "TTFT(ms)", "info"))
         lines.append("  " + "-" * 95)
         for r in results:
             idx, ok, conn, total, ttft, aud, info = r
