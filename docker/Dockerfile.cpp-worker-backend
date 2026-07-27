@@ -18,7 +18,9 @@ ARG LLAMA_OMNI_REFSPEC=master
 ARG LLAMA_OMNI_REF=origin/master
 ARG LLAMA_OMNI_SERVER_TARGET=llama-omni-server
 ARG LLAMA_OMNI_SERVER_BIN=llama-omni-server
-ARG CMAKE_CUDA_ARCHITECTURES=80;86;120 
+ARG LLAMA_QWEN3OMNI_SERVER_TARGET=llama-qwen3omni-server
+ARG LLAMA_QWEN3OMNI_SERVER_BIN=llama-qwen3omni-server
+ARG CMAKE_CUDA_ARCHITECTURES=80;86;120
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -45,8 +47,9 @@ RUN cmake -S . -B build -G Ninja \
     -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
     -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
     && cmake --build build --target "${LLAMA_OMNI_SERVER_TARGET}" -j "$(nproc)" \
+    && cmake --build build --target "${LLAMA_QWEN3OMNI_SERVER_TARGET}" -j "$(nproc)" \
     && mkdir -p /opt/llama.cpp-omni/bin \
-    && cp -a "build/bin/${LLAMA_OMNI_SERVER_BIN}" build/bin/*.so* /opt/llama.cpp-omni/bin/
+    && cp -a "build/bin/${LLAMA_OMNI_SERVER_BIN}" "build/bin/${LLAMA_QWEN3OMNI_SERVER_BIN}" build/bin/*.so* /opt/llama.cpp-omni/bin/
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 

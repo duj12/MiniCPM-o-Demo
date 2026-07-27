@@ -171,6 +171,45 @@ class DuplexSectionConfig(BaseModel):
     )
 
 
+class Qwen3OmniConfig(BaseModel):
+    """Qwen3-Omni 模型后端配置"""
+
+    model_path: str = Field(
+        default="",
+        description="Qwen3-Omni GGUF 文件路径",
+    )
+    backend_port: int = Field(
+        default=22501,
+        description="llama-qwen3omni-server 后端端口",
+    )
+    backend_host: str = Field(
+        default="127.0.0.1",
+        description="后端绑定地址",
+    )
+    n_gpu_layers: int = Field(
+        default=99,
+        description="卸载到 GPU 的层数",
+    )
+    n_ctx: int = Field(
+        default=4096,
+        description="上下文长度",
+    )
+
+
+class BackendConfig(BaseModel):
+    """后端模型选择配置"""
+
+    active_model: str = Field(
+        default="minicpm",
+        description="当前激活的模型: 'minicpm' (MiniCPM-o-4.5) 或 'qwen3omni' (Qwen3-Omni)",
+        pattern="^(minicpm|qwen3omni)$",
+    )
+    qwen3omni: Qwen3OmniConfig = Field(
+        default_factory=Qwen3OmniConfig,
+        description="Qwen3-Omni 后端配置",
+    )
+
+
 # ============ 顶层配置 ============
 
 
@@ -188,6 +227,10 @@ class ServiceConfig(BaseModel):
     audio: AudioConfig = Field(
         default_factory=AudioConfig,
         description="音频相关配置",
+    )
+    backend: BackendConfig = Field(
+        default_factory=BackendConfig,
+        description="后端模型选择配置",
     )
     service: ServiceSectionConfig = Field(
         default_factory=ServiceSectionConfig,

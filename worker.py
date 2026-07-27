@@ -13,12 +13,14 @@
 """
 
 import json
+import os
 import time
 import asyncio
 import argparse
 import logging
 import base64
 import threading
+import subprocess
 from typing import Optional, List, Dict, Any
 
 import numpy as np
@@ -110,8 +112,66 @@ async def lifespan(app: FastAPI):
     global worker
     config = WORKER_CONFIG
 
+    active_model = os.environ.get("ACTIVE_MODEL") or config.get("active_model", "minicpm")
     backend_server_url = _backend_server_url()
-    if backend_server_url:
+
+    if active_model == "qwen3omni":
+        # Auto-start llama-qwen3omni-server
+        from config import get_config as get_app_config
+        app_cfg = get_app_config()
+        qcfg = app_cfg.backend.qwen3omni
+
+        if not backend_server_url:
+            backend_server_url = f"http://{qcfg.backend_host}:{qcfg.backend_port}"
+
+        # Start the C++ server process
+        llama_server_bin = config.get("llama_server_bin", "/opt/llama.cpp-omni/bin/llama-qwen3omni-server")
+        gguf_model = config.get("model_path") or qcfg.model_path
+
+        if gguf_model and not backend_server_url:
+            logger.info("Starting llama-qwen3omni-server: %s", gguf_model)
+            gpu_id = int(config.get("gpu_id", 0) or 0)
+            server_proc = subprocess.Popen(
+                [
+                    llama_server_bin,
+                    "-m", gguf_model,
+                    "--host", qcfg.backend_host,
+                    "--port", str(qcfg.backend_port),
+                    "-ngl", str(qcfg.n_gpu_layers),
+                    "-c", str(qcfg.n_ctx),
+                    "--n-parallel", "4",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            # Store for cleanup
+            config["_qwen3_proc"] = server_proc
+
+            # Wait for server to be ready
+            import httpx
+            for i in range(600):
+                if server_proc.poll() is not None:
+                    logger.error("llama-qwen3omni-server exited prematurely")
+                    break
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(f"{backend_server_url}/health", timeout=2.0)
+                        if resp.status_code == 200:
+                            logger.info("llama-qwen3omni-server ready after ~%ds", i * 2)
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+        elif not gguf_model:
+            logger.warning("Qwen3-Omni model_path not configured, backend may fail")
+
+        worker = RemoteBackendWorker(
+            backend_server_url=backend_server_url,
+            gpu_id=int(config.get("gpu_id", 0) or 0),
+        )
+        logger.info("Worker running as Qwen3-Omni host: %s", backend_server_url)
+
+    elif backend_server_url:
         worker = RemoteBackendWorker(
             backend_server_url=backend_server_url,
             gpu_id=int(config.get("gpu_id", 0) or 0),
@@ -131,6 +191,16 @@ async def lifespan(app: FastAPI):
         logger.info("Worker shutting down")
         if worker is not None:
             await asyncio.to_thread(worker.shutdown)
+        # Cleanup Qwen3-Omni server process
+        qwen3_proc = config.get("_qwen3_proc")
+        if qwen3_proc:
+            qwen3_proc.terminate()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(qwen3_proc.wait), timeout=10)
+            except asyncio.TimeoutError:
+                qwen3_proc.kill()
+                await asyncio.to_thread(qwen3_proc.wait)
+            logger.info("llama-qwen3omni-server stopped")
 
 
 app = FastAPI(title="MiniCPMO45 Worker", lifespan=lifespan)
@@ -160,6 +230,14 @@ async def health():
     model_loaded = bool(remote_backend_url) or worker.processor is not None
     # 多路并发：有 active session 时报告 busy，否则 idle
     reported_status = WorkerStatus.BUSY_CHAT if worker.state.concurrent_sessions > 0 else WorkerStatus.IDLE
+
+    # Capabilities depend on active model (env overrides config.json)
+    active_model = os.environ.get("ACTIVE_MODEL") or WORKER_CONFIG.get("active_model", "minicpm")
+    if active_model == "qwen3omni":
+        caps = ["chat", "streaming", "half_duplex_audio"]
+    else:
+        caps = DEFAULT_WORKER_CAPABILITIES
+
     return WorkerHealthResponse(
         status="healthy" if model_loaded else "error",
         worker_status=reported_status,
@@ -169,7 +247,7 @@ async def health():
         total_requests=worker.state.total_requests,
         avg_inference_time_ms=avg_time,
         kv_cache_length=kv_len,
-        capabilities=DEFAULT_WORKER_CAPABILITIES,
+        capabilities=caps,
     )
 
 
@@ -298,10 +376,11 @@ async def _handle_remote_backend_runtime_ws(
         for task in pending:
             task.cancel()
         for task in done:
-            task.result()
+            try:
+                task.result()
+            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                backend_closed = True
 
-    except WebSocketDisconnect:
-        logger.info("Remote backend runtime WebSocket disconnected")
     except Exception as exc:
         logger.error("Remote backend runtime failed: error=%s", exc, exc_info=True)
         try:
@@ -314,7 +393,7 @@ async def _handle_remote_backend_runtime_ws(
             pass
     finally:
         try:
-            if not backend_closed:
+            if not backend_closed and runtime.session_id:
                 await runtime.unary("close", {"reason": "worker_disconnected"})
         except Exception:
             logger.exception("Remote backend runtime cleanup failed")
@@ -408,6 +487,7 @@ def main():
         "compile": cfg.compile,
         "chat_vocoder": cfg.chat_vocoder,
         "attn_implementation": cfg.attn_implementation,
+        "active_model": cfg.backend.active_model,
     })
 
     logger.info(f"Starting Worker on port {port}, GPU {gpu_id}")

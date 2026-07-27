@@ -3,19 +3,30 @@
 # Topology:
 #   gateway            x1   host :${GATEWAY_HOST_PORT:-8006} -> container :8006
 #   cpp-worker-backend x1   one container with:
-#       - llama-omni-server backend on 127.0.0.1:22500
+#       - llama-omni-server (MiniCPM-o) or llama-qwen3omni-server (Qwen3-Omni)
+#         backend on 127.0.0.1:22500
 #       - Python worker on 0.0.0.0:22400, forwarding to the local backend
+#
+# Model directory layout:
+#   GGUF_MODEL_HOST_PATH/
+#     MiniCPM-o-4_5-gguf/           # MiniCPM-o-4.5 (default)
+#       MiniCPM-o-4_5-Q4_K_M.gguf
+#       vision/
+#       audio/
+#       tts/
+#       token2wav-gguf/
+#     qwen3omni-gguf/                # Qwen3-Omni (ACTIVE_MODEL=qwen3omni)
+#       Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf
+#       mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf
 #
 # Usage:
 #   mkdir -p certs data
 #   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 #     -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
-#   GGUF_MODEL_HOST_PATH=/path/to/MiniCPM-o-4_5-gguf \
+#   GGUF_MODEL_HOST_PATH=/path/to/models_dir \
 #   GATEWAY_HOST_PORT=8006 \
 #   CPP_GPU_ID=0 \
 #   docker compose -f docker-compose.cpp.yml up -d --build
-#   docker compose -f docker-compose.cpp.yml logs -f gateway
-#   docker compose -f docker-compose.cpp.yml logs -f cpp-worker-backend
 
 services:
   cpp-worker-backend:
@@ -28,14 +39,19 @@ services:
     image: minicpm-cpp-worker-backend:dev
     container_name: minicpm-o-demo-cpp-worker-1
     environment:
+      ACTIVE_MODEL: "${ACTIVE_MODEL:-minicpm}"
       GPU_ID: "0"
       BACKEND_PORT: "22500"
       WORKER_PORT: "22400"
-      GGUF_MODEL: /models/MiniCPM-o-4_5-gguf/${GGUF_MODEL_FILE:-MiniCPM-o-4_5-Q4_K_M.gguf}
       LLAMA_SERVER_EXTRA_ARGS: "${LLAMA_SERVER_EXTRA_ARGS:--c 16384 --parallel 4}"
       GGML_CUDA_DISABLE_GRAPHS: "1"
     volumes:
-      - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH to the host GGUF model dir}:/models/MiniCPM-o-4_5-gguf:ro
+      # Mount the parent directory containing both MiniCPM and Qwen3-Omni model dirs.
+      # Expected layout on host:
+      #   <GGUF_MODEL_HOST_PATH>/
+      #     MiniCPM-o-4_5-gguf/    (for ACTIVE_MODEL=minicpm)
+      #     qwen3omni-gguf/        (for ACTIVE_MODEL=qwen3omni)
+      - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH (parent of MiniCPM-o-4_5-gguf/ and qwen3omni-gguf/)}:/models:ro
     deploy:
       resources:
         reservations:
