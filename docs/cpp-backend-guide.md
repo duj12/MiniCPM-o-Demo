@@ -31,9 +31,11 @@ Client (浏览器/Python/curl)
     │  WSS (:8006)
 Gateway — HTTPS 入口、路由、排队
     │  WS (internal)
-Worker — 协议转发、状态管理
+Worker — 协议转发、状态管理（ACTIVE_MODEL=minicpm|qwen3omni）
     │  WS (internal)
-Backend (llama-omni-server) — 模型推理
+Backend — 模型推理
+  ├─ minicpm:  llama-omni-server (MiniCPM-o-4.5, 全双工)
+  └─ qwen3omni: llama-qwen3omni-server (Qwen3-Omni-30B, turn-based)
 ```
 
 ## 前置条件
@@ -43,13 +45,16 @@ Backend (llama-omni-server) — 模型推理
 - 模型权重（GGUF 格式），目录结构如下：
 
 ```
-MiniCPM-o-4_5-gguf/
+MiniCPM-o-4_5-gguf/                    # MiniCPM-o-4.5（ACTIVE_MODEL=minicpm）
 ├── MiniCPM-o-4_5-Q4_K_M.gguf       # 主模型（推荐 4-bit）
 ├── vision/MiniCPM-o-4_5-vision-F16.gguf
 ├── audio/MiniCPM-o-4_5-audio-F16.gguf
 ├── tts/MiniCPM-o-4_5-tts-F16.gguf
 ├── tts/MiniCPM-o-4_5-projector-F16.gguf
 └── token2wav-gguf/
+qwen3omni-gguf/                        # Qwen3-Omni（ACTIVE_MODEL=qwen3omni）
+├── Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf
+└── mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf
 ```
 
 ## 快速启动
@@ -69,11 +74,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 ```bash
 # 将模型路径改为你的实际路径
 cat > .env << 'EOF'
-GGUF_MODEL_HOST_PATH=/data/models/MiniCPM-o-4_5-gguf
-GGUF_MODEL_FILE=MiniCPM-o-4_5-Q4_K_M.gguf
+ACTIVE_MODEL=minicpm
+GGUF_MODEL_HOST_PATH=/data/models
 CPP_GPU_ID=0
 GATEWAY_HOST_PORT=8006
-LLAMA_SERVER_EXTRA_ARGS=-c 32768
+LLAMA_SERVER_EXTRA_ARGS=-c 16384 --parallel 2
 EOF
 ```
 
@@ -109,13 +114,29 @@ docker compose -f docker-compose.cpp.yml down
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `GGUF_MODEL_HOST_PATH` | **必填** 模型权重目录的宿主机路径 | — |
-| `GGUF_MODEL_FILE` | 主模型 GGUF 文件名 | `MiniCPM-o-4_5-Q4_K_M.gguf` |
+| `ACTIVE_MODEL` | 激活的模型：`minicpm` 或 `qwen3omni` | `minicpm` |
+| `GGUF_MODEL_HOST_PATH` | **必填** 模型权重目录的宿主机**父目录**（含 `MiniCPM-o-4_5-gguf/` 和 `qwen3omni-gguf/`） | — |
 | `CPP_GPU_ID` | 使用的 GPU 编号 | `0` |
 | `GATEWAY_HOST_PORT` | 网关对外端口（HTTPS） | `8006` |
-| `LLAMA_SERVER_EXTRA_ARGS` | 后端额外启动参数 | `-c 8192` |
+| `LLAMA_SERVER_EXTRA_ARGS` | 后端额外启动参数 | `-c 16384 --parallel 4` |
 
-> **`LLAMA_SERVER_EXTRA_ARGS` 建议**：`-c 32768`。增大 KV cache 可避免 `failed to find a memory slot` 错误，尤其多路并发时更稳定。也支持其他 llama-server 参数（如 `--no-cache-prompt`）。
+> **`-c` 建议**：
+> - MiniCPM（含 TTS）：`-c 32768 --parallel 4`（每路分配 8192 tokens）
+> - Qwen3-Omni（含 4 帧视频）：`-c 16384 --parallel 2`（每路分配 8192 tokens）
+> - 纯文本场景：`-c 8192 --parallel 4` 即可
+
+**切换模型示例：**
+
+```bash
+# MiniCPM-o-4.5（默认）
+ACTIVE_MODEL=minicpm \
+docker compose -f docker-compose.cpp.yml up -d
+
+# Qwen3-Omni
+ACTIVE_MODEL=qwen3omni \
+GGUF_MODEL_HOST_PATH=/data/megastore/Projects/DuJing/models \
+docker compose -f docker-compose.cpp.yml up -d
+```
 
 ---
 
@@ -602,7 +623,8 @@ payload = {
 | `test_video_turnbased.py` | 单轮视频理解 | 测试 `assets/video/turnbased/` 目录下视频 |
 | `test_video_fullduplex.py` | 全双工流式视频 | 模拟逐帧发送音频+视频帧 |
 | `test_multi_session_concurrency.py` | 多路并发 | `--simplex N --duplex M` 参数控制路数 |
-| `test_vram_concurrency.py` | 并发+显存测试 | 文本/视频/全双工 三种模式，自动追踪 VRAM 峰值 |
+| `test_vram_concurrency.py` | 并发+显存测试 | 文本/视频/全双工 + `--direct-backend`/`--no-tts` 参数 |
+| `benchmark_qwen3omni.py` | Qwen3-Omni 基准 | 直接连接后端，测量 TTFT/生成速度/显存 |
 
 **运行方式：**
 
@@ -613,6 +635,17 @@ payload = {
 # 或激活环境后运行
 export PATH=/home/dujing/miniconda3/envs/py310/bin:$PATH
 python tests/test_video_turnbased.py
+
+# Qwen3-Omni 基准测试（通过直连后端）
+python tests/benchmark_qwen3omni.py --runs 3 --text "hi" --video assets/samples/compile.mp4
+
+# Qwen3-Omni 并发视频测试
+python tests/test_vram_concurrency.py --direct-backend ws://127.0.0.1:22500/backend \
+    --mode video --no-tts
+
+# Qwen3-Omni 纯文本并发测试
+python tests/test_vram_concurrency.py --direct-backend ws://127.0.0.1:22500/backend \
+    --mode text --no-tts
 ```
 
 ---
@@ -755,13 +788,58 @@ python tests/test_vram_concurrency.py --mode duplex --max-concurrency 2
 | `--duplex-gap` | 帧间隔秒数 | 0.15 |
 | `--stagger` | 每路启动间隔秒数 | 2.0 |
 
-**结论：**
+**结论（MiniCPM-o-4.5, Q4_K_M）：**
 - `Q4_K_M` + `-c 32768 --parallel 4` 下，单卡 RTX 3090 可稳定支持 **4 路全双工视频并发（含 TTS）**
 - 关键优化点：per-session KV cache 按 `n_ctx / n_parallel` 分配、TTS KV cache 限制为 512、Token2Wav GPU session 共享
 - 全双工模式和单工模式的显存增量接近（均约 1.8GB/路），因为两者共享相同的 per-session KV cache 减分配策略
 - 如需更高并发，可考虑使用 `--no-tts` 启动参数跳过 TTS 模型加载（省约 2-3GB 基线显存），或换用更大显存卡
 
-### Q: 视频太大报 `WebSocket` 连接断开？
+### Q: Qwen3-Omni 的并发能力怎么样？
+
+A: Qwen3-Omni-30B 模型本身较大（Q4_K_S 约 17GB），在 RTX 3090（24GB）上的实测数据如下。
+
+**测试环境：**
+- 模型：`Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf`（4-bit, 17GB）
+- mmproj：`mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf`
+- 配置：`-c 16384 --parallel 2`（每路 = 8192 tokens，4 路视频需 2GB/路显存增量）
+- 帧率：自适应 fps，上限 4 帧，~540 tokens/帧（1440p 缩放至 768x576）
+- 测试工具：`tests/benchmark_qwen3omni.py` 或 `tests/test_vram_concurrency.py --direct-backend ... --no-tts`
+
+**纯文本并发：**
+
+| 并发路数 | 通过 | TTFT | Peak VRAM |
+|:-------:|:---:|:----:|:---------:|
+| 1 | ✅ | 0.09s | 18,849 MiB |
+| 2 | ✅ | 0.09s | 18,849 MiB |
+| 3 | ✅ | 0.08s | 18,849 MiB |
+| **4** | **✅** | **0.08s** | **20,835 MiB** |
+
+**单轮视频并发（121.mp4, 1440p, 17s, 4帧均匀采样, 流式模式）：**
+
+| 并发路数 | 通过 | TTFT | 生成速度 | Peak VRAM |
+|:-------:|:---:|:----:|:--------:|:---------:|
+| 1 | ✅ | 4.6-5.0s | 59-188 ch/s | 20,965 MiB |
+| **2** | **✅** | **4.6-6.5s** | 31-67 ch/s | **22,975 MiB** |
+
+> 2 路视频并发时峰值 22,975 MiB 已接近 24GB 上限，3 路将触发 CUDA 碎片化导致的分配失败。这是 30B 参数模型的物理限制，非配置问题。
+
+**并发测试命令：**
+
+```bash
+# Qwen3-Omni 纯文本 4 路
+python tests/test_vram_concurrency.py \
+    --direct-backend ws://127.0.0.1:22500/backend \
+    --mode text --no-tts
+
+# Qwen3-Omni 视频 2 路
+python tests/test_vram_concurrency.py \
+    --direct-backend ws://127.0.0.1:22500/backend \
+    --mode video --no-tts --max-concurrency 2
+
+# Qwen3-Omni 多模态基准
+python tests/benchmark_qwen3omni.py --runs 3 --image assets/images/feishu-group.png \
+    --video assets/samples/compile.mp4
+```
 
 A: httplib 默认 WS 最大消息体为 16MB，base64 编码后约 12MB 视频会超出。已在 `ws_handler.cpp` 和 `server-omni.cpp` 开头设置：
 ```cpp
