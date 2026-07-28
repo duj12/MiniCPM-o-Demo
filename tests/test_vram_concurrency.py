@@ -312,7 +312,7 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
         if video_frame_map and 0 in video_frame_map:
             last_frame_b64 = video_frame_map[0]
         tail_idx = 0
-        model_spoke = False
+        model_spoke = bool(text_output) or bool(audio_chunks)
         while not model_spoke and tail_idx < 100:
             b64 = base64.b64encode(b'\x00' * FRAME_BYTES).decode()
             payload = {"type": "input.append", "input": {
