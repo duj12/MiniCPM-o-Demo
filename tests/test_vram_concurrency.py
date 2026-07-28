@@ -2,21 +2,17 @@
 并发推理测试工具 — 支持文本/视频/全双工模式 + 显存追踪 + 延迟/吞吐指标。
 
 用法:
-  # 纯文本并发测试（默认）
+  # MiniCPM-o 纯文本并发测试（通过 Gateway）
   python tests/test_vram_concurrency.py
 
-  # 视频并发测试 (turn_based)
+  # Qwen3-Omni 纯文本并发测试（直连后端）
+  python tests/test_vram_concurrency.py --direct-backend ws://127.0.0.1:22500/backend --no-tts
+
+  # MiniCPM-o 视频并发测试
   python tests/test_vram_concurrency.py --mode video
 
-  # 全双工静音+文本（模拟麦克风）
-  python tests/test_vram_concurrency.py --mode duplex
-
-  # 全双工真实视频（提取视频音频帧+帧图片，模拟实时视频通话）
-  python tests/test_vram_concurrency.py --mode duplex --video
-
-  # 指定并发路数和网关
-  python tests/test_vram_concurrency.py --mode duplex --max-concurrency 3 \
-      --gateway wss://host:8006/v1/realtime
+  # Qwen3-Omni 视频并发测试
+  python tests/test_vram_concurrency.py --mode video --direct-backend ws://127.0.0.1:22500/backend --no-tts
 """
 import asyncio, json, ssl, base64, subprocess, time, argparse, os
 import websockets
@@ -75,7 +71,6 @@ def extract_audio_frames(video_path, max_frames=0):
 
 
 def extract_video_frame(video_path, offset=0.5):
-    """Extract 1 JPEG frame at time offset [0-1], matching frontend."""
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=duration", "-of", "csv=p=0", video_path],
         capture_output=True, text=True)
@@ -122,13 +117,14 @@ def extract_video_frames_stream(video_path, fps=5):
 
 # ───── turn_based（纯文本 / 视频） ─────
 
-async def run_text_session(idx, gateway, timeout=60):
+async def run_text_session(idx, gateway, timeout=60, no_tts=False, ssl_ctx=SSL_CTX):
     t0 = time.perf_counter()
     try:
-        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
+        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=ssl_ctx)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
-                      "payload": {"mode": "turn_based"}}))
+                      "payload": {"mode": "turn_based",
+                                  "use_tts": not no_tts}}))
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
@@ -165,7 +161,7 @@ async def run_text_session(idx, gateway, timeout=60):
 
         total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
         ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
-        gen_ms = total_ms  # non-streaming: all text arrives at once
+        gen_ms = total_ms
         cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
         return (idx, True, dt_setup, ft_ms, gen_ms, len(text),
@@ -174,13 +170,14 @@ async def run_text_session(idx, gateway, timeout=60):
         return (idx, False, 0, 0, 0, 0, str(e)[:60])
 
 
-async def run_video_session(idx, gateway, video_b64, timeout=300):
+async def run_video_session(idx, gateway, video_b64, timeout=300, no_tts=False, ssl_ctx=SSL_CTX):
     t0 = time.perf_counter()
     try:
-        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
+        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=ssl_ctx)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
-                      "payload": {"mode": "turn_based"}}))
+                      "payload": {"mode": "turn_based",
+                                  "use_tts": not no_tts}}))
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
             if m.get("type") == "session.created":
@@ -222,7 +219,7 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
 
         total_ms = (text_done_ts - t_send) * 1000 if text_done_ts else 0
         ft_ms = (first_token_ts - t_send) * 1000 if first_token_ts else 0
-        gen_ms = total_ms  # non-streaming: all text arrives at once
+        gen_ms = total_ms
         cps = len(text) / (gen_ms / 1000.0) if gen_ms > 50 else 0
         await ws.send(json.dumps({"type": "session.close", "reason": "done"}))
         return (idx, True, dt_setup, ft_ms, gen_ms, len(text),
@@ -234,10 +231,11 @@ async def run_video_session(idx, gateway, video_b64, timeout=300):
 # ───── full_duplex ─────
 
 async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
-                              text_prompt=None, frame_gap=0.1, timeout=120):
+                              text_prompt=None, frame_gap=0.1, timeout=120,
+                              no_tts=False, ssl_ctx=SSL_CTX):
     t0 = time.perf_counter()
     try:
-        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=SSL_CTX)
+        ws = await websockets.connect(gateway, max_size=128*1024*1024, ssl=ssl_ctx)
         await asyncio.wait_for(ws.recv(), 10)
         await ws.send(json.dumps({"type": "session.init",
                       "payload": {
@@ -245,7 +243,7 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                           "system_prompt": "Streaming Omni Conversation.",
                           "config": {"length_penalty": 1.1},
                           "max_slice_nums": 1,
-                          "use_tts": True,
+                          "use_tts": not no_tts,
                       }}))
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), 30))
@@ -310,7 +308,6 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
             if i < len(audio_frames) - 1:
                 await asyncio.sleep(frame_gap)
 
-        # Keep sending silence+last frame after video ends, until model finishes
         last_frame_b64 = None
         if video_frame_map and 0 in video_frame_map:
             last_frame_b64 = video_frame_map[0]
@@ -358,7 +355,6 @@ async def run_duplex_session(idx, gateway, audio_frames, video_frame_map=None,
                     break
             await asyncio.sleep(frame_gap)
 
-        # Once model speaks, wait for response.done
         if model_spoke:
             try:
                 while True:
@@ -466,13 +462,29 @@ async def main():
                         help="全双工模式首帧附带文本")
     parser.add_argument("--stagger", type=float, default=2.0,
                         help="每路启动间隔秒数 (默认 2.0)")
+    parser.add_argument("--direct-backend", default=None,
+                        help="直连后端 WS (ws://host:port/backend)，跳过 Gateway")
+    parser.add_argument("--no-tts", action="store_true", default=False,
+                        help="禁用 TTS (Qwen3-Omni 模式)")
     args = parser.parse_args()
 
     gateway = args.gateway
     mode = args.mode
 
+    if args.direct_backend:
+        gateway = args.direct_backend
+        model_title = "Qwen3-Omni C++ 后端 (直连)"
+        ssl_ctx = None
+    else:
+        model_title = "MiniCPM-o"
+        ssl_ctx = SSL_CTX
+        # Qwen3-Omni 只有 turn_based chat 能力，通过 Gateway 时需指定 mode=chat
+        if args.no_tts and args.mode in ("text", "video"):
+            sep = "&" if "?" in gateway else "?"
+            gateway = gateway.rstrip("/") + sep + "mode=chat"
+
     print("=" * 80)
-    print("  MiniCPM-o 并发推理测试")
+    print("  %s 并发推理测试" % model_title)
     print("  - 模式: %s" % mode)
     print("  - 网关: %s" % gateway)
     print("  - GPU:  %d" % args.gpu)
@@ -482,6 +494,8 @@ async def main():
     if mode == "duplex":
         print("  - 每路帧数: %d (%.1fs)" % (
             args.duplex_frames, args.duplex_frames * FRAME_MS / 1000))
+    if args.no_tts:
+        print("  - TTS: 已禁用")
     print("=" * 80)
 
     video_b64 = None
@@ -507,9 +521,7 @@ async def main():
         duplex_audio_frames, total_s = extract_audio_frames(
             video_path, max_frames=args.duplex_frames)
         frame_b64, video_dur = extract_video_frame(video_path, offset=0.5)
-        # Frame map: only first audio chunk carries video frame (matches frontend)
         duplex_video_frame_map = {0: frame_b64}
-        # padAfter: frontend default 2s silence after video audio
         pad_after = 2
         for _ in range(pad_after):
             duplex_audio_frames.append(b'\x00' * FRAME_BYTES)
@@ -522,7 +534,7 @@ async def main():
               (len(duplex_audio_frames), len(duplex_audio_frames) * FRAME_MS / 1000))
 
     base_vram = get_vram(args.gpu)
-    print("  GPU %d 空闲显存: %d MiB\n" % (args.gpu, base_vram))
+    print("  GPU %d 当前显存: %d MiB\n" % (args.gpu, base_vram))
 
     all_ok = True
     max_ok = 0
@@ -537,9 +549,9 @@ async def main():
             if delay > 0:
                 await asyncio.sleep(delay)
             if mode == "text":
-                return await run_text_session(idx, gateway, args.timeout)
+                return await run_text_session(idx, gateway, args.timeout, args.no_tts, ssl_ctx)
             elif mode == "video":
-                return await run_video_session(idx, gateway, video_b64, args.timeout)
+                return await run_video_session(idx, gateway, video_b64, args.timeout, args.no_tts, ssl_ctx)
             else:
                 text_prompt = args.duplex_text
                 return await run_duplex_session(
@@ -547,7 +559,9 @@ async def main():
                     video_frame_map=duplex_video_frame_map,
                     text_prompt=text_prompt,
                     frame_gap=args.duplex_gap,
-                    timeout=args.timeout + 120)
+                    timeout=args.timeout + 120,
+                    no_tts=args.no_tts,
+                    ssl_ctx=ssl_ctx)
 
         peak_vram = 0
         peak_util = 0
