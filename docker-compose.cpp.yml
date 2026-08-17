@@ -52,6 +52,12 @@ services:
       #     MiniCPM-o-4_5-gguf/    (for ACTIVE_MODEL=minicpm)
       #     qwen3omni-gguf/        (for ACTIVE_MODEL=qwen3omni)
       - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH (parent of MiniCPM-o-4_5-gguf/ and qwen3omni-gguf/)}:/models:ro
+      # TurnSense (semantic completeness judge for VAD+TurnSense turn decision):
+      #   - python modules: turnsense_module.py / turnsense_config.py / audio_frontend.py
+      #   - model weights:  checkpoints/TurnSense/pretrained_models/v1.0/model_fp32.onnx
+      # Mounted so runtime/half_duplex.py's auto-detect finds both the module
+      # (sys.path /Fun-ASR-deploy) and the model (v1.0/v1.1).
+      - ${FUNASR_DEPLOY_HOST_PATH:-../Fun-ASR-deploy}:/Fun-ASR-deploy:ro
     deploy:
       resources:
         reservations:

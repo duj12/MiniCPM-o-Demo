@@ -101,11 +101,25 @@ class RemoteBackendSession:
         return event
 
     async def unary(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Generic one-shot RPC to the backend. The only method today is "close"."""
+        """Generic one-shot RPC to the backend."""
         payload = payload or {}
         if method in {"close", "backend.close", "session.close"}:
             return await self.close(reason=str(payload.get("reason") or "client_closed"))
+        if method in {"interrupt", "backend.interrupt"}:
+            return await self.interrupt()
         raise ValueError(f"unsupported backend unary method: {method}")
+
+    async def interrupt(self) -> Dict[str, Any]:
+        """Barge-in: stop current generation, keep the session alive."""
+        if self.session_id is None:
+            return {"ok": True, "interrupted": True}
+        async with httpx.AsyncClient(timeout=self.close_timeout_s) as client:
+            response = await client.post(
+                _join_url(self.base_url, f"/sessions/{self.session_id}/interrupt"),
+                json={"reason": "barge_in"},
+            )
+            response.raise_for_status()
+            return response.json()
 
     async def close(self, *, reason: str = "client_closed") -> Dict[str, Any]:
         if self._closed:

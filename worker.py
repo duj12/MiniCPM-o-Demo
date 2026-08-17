@@ -282,6 +282,7 @@ async def _handle_remote_backend_runtime_ws(
         mode=mode,
     )
     backend_closed = False
+    hd_session: Optional[Any] = None  # half-duplex (VAD+TurnSense) state machine, if enabled
 
     try:
         first = json.loads(await ws.receive_text())
@@ -331,6 +332,24 @@ async def _handle_remote_backend_runtime_ws(
         if pending_input is not None:
             await runtime.push(pending_input)
 
+        # ── Half-duplex (VAD+TurnSense) turn-decision setup ──────────────
+        # If the frontend requested turn_decision="vad_turnsense" in session.init,
+        # wrap the stream with a VAD+TurnSense state machine that decides when to
+        # trigger the model reply (reusing full_duplex transport).
+        from runtime.half_duplex import HalfDuplexConfig, HalfDuplexSession, TurnSenseCfg
+
+        hd_cfg_payload = {}
+        if init_params.get("config") and isinstance(init_params["config"], dict):
+            hd_cfg_payload = init_params["config"].get("turn_decision") or {}
+        if hd_cfg_payload == "vad_turnsense":
+            hd_session = HalfDuplexSession(
+                config=HalfDuplexConfig(turnsense=TurnSenseCfg()),
+                push=lambda payload: runtime.push(payload),
+                interrupt=lambda: runtime.interrupt(),
+                send_event=lambda payload: ws.send_json(payload),
+            )
+            logger.info("half-duplex VAD+TurnSense enabled for session %s", runtime.session_id)
+
         async def client_to_backend() -> None:
             nonlocal backend_closed
             async for raw in ws.iter_text():
@@ -338,7 +357,14 @@ async def _handle_remote_backend_runtime_ws(
                 msg_type = str(msg.get("type") or "")
 
                 if msg_type == "input.append":
-                    await runtime.push(_input_payload(msg))
+                    input_payload = _input_payload(msg)
+                    if hd_session is not None:
+                        await hd_session.feed(
+                            audio_b64=input_payload.get("audio", ""),
+                            video_frames=input_payload.get("video_frames"),
+                        )
+                    else:
+                        await runtime.push(input_payload)
                     continue
 
                 if msg_type == "session.close":
@@ -362,6 +388,8 @@ async def _handle_remote_backend_runtime_ws(
             while not backend_closed:
                 event = await runtime.pull()
                 payload = await _send_runtime_event(event)
+                if hd_session is not None:
+                    await hd_session.on_backend_event(payload)
                 if payload.get("type") == "session.closed":
                     backend_closed = True
                     return
@@ -392,6 +420,11 @@ async def _handle_remote_backend_runtime_ws(
         except Exception:
             pass
     finally:
+        if hd_session is not None:
+            try:
+                hd_session.shutdown()
+            except Exception:
+                pass
         try:
             if not backend_closed and runtime.session_id:
                 await runtime.unary("close", {"reason": "worker_disconnected"})

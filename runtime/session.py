@@ -72,5 +72,10 @@ class BackendRuntimeSession:
         event = await self.backend.unary(method, payload)
         return RuntimeEvent(channel="session", payload={"event": event, **event})
 
+    async def interrupt(self) -> RuntimeEvent:
+        """Barge-in: stop current generation, keep session alive."""
+        event = await self.backend.interrupt()
+        return RuntimeEvent(channel="session", payload={"event": event, **event})
+
     async def aclose(self) -> None:
         await self.backend.aclose()

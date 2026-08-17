@@ -210,6 +210,60 @@ class BackendConfig(BaseModel):
     )
 
 
+class TurnSenseModelConfig(BaseModel):
+    """TurnSense 语义完整性判断模型配置"""
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用 TurnSense（语义完整判断）。false 时退化为仅 VAD 触发",
+    )
+    model_path: str = Field(
+        default="",
+        description="model_fp32.onnx 路径（为空则自动探测 FullDuplexDemo/TurnSense）",
+    )
+    cmvn_path: str = Field(
+        default="",
+        description="am.mvn 路径（为空则自动探测）",
+    )
+    incomplete_wait_ms: int = Field(
+        default=900,
+        description="TurnSense incomplete 等待超时（ms），超时后强制触发回复",
+    )
+    invalid_confidence_threshold: float = Field(
+        default=0.9,
+        description="TurnSense invalid 丢弃的置信度阈值（低于则回退到触发）",
+    )
+
+
+class TurnDecisionConfig(BaseModel):
+    """Half-duplex（VAD+TurnSense）轮次判决配置"""
+
+    vad_threshold: float = Field(
+        default=0.8,
+        description="VAD 语音检测阈值（Silero）",
+    )
+    min_speech_duration_ms: int = Field(
+        default=128,
+        description="最小语音段时长（ms），短于此视为噪音",
+    )
+    min_silence_duration_ms: int = Field(
+        default=800,
+        description="静音持续多少 ms 判定一句话说完",
+    )
+    barge_in_enabled: bool = Field(
+        default=True,
+        description="模型回复时用户抢话是否打断",
+    )
+    barge_in_min_speech_ms: int = Field(
+        default=300,
+        description="抢话触发打断所需的最短语音时长（ms）",
+    )
+    turnsense: TurnSenseModelConfig = Field(
+        default_factory=TurnSenseModelConfig,
+        description="TurnSense 模型配置",
+    )
+
+
 # ============ 顶层配置 ============
 
 
@@ -243,6 +297,10 @@ class ServiceConfig(BaseModel):
     recording: RecordingConfig = Field(
         default_factory=RecordingConfig,
         description="Session 录制配置",
+    )
+    turn_decision: TurnDecisionConfig = Field(
+        default_factory=TurnDecisionConfig,
+        description="Half-duplex（VAD+TurnSense）轮次判决配置",
     )
 
     # ========== 便捷属性（兼容旧代码） ==========
