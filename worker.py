@@ -300,6 +300,13 @@ async def _handle_remote_backend_runtime_ws(
         init_params = dict(init_params)
         init_params.setdefault("mode", mode)
 
+        # VAD+TurnSense 判决：压低 <|listen|> 采样概率，让模型在 TurnSense
+        # 触发后倾向 Speak（否则模型自主决策常选 listen 不回复）。
+        if (init_params.get("config") or {}).get("turn_decision") == "vad_turnsense":
+            cfg = dict(init_params.get("config") or {})
+            cfg.setdefault("listen_prob_scale", 0.4)
+            init_params["config"] = cfg
+
         # Retry backend init with backoff to handle race condition where
         # the previous session hasn't been cleaned up yet on the C++ backend.
         MAX_INIT_RETRIES = 3

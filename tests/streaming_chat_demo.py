@@ -335,6 +335,17 @@ class StreamingChatClient:
         return m
 
     async def close(self, reason: str = "demo_done"):
+        # 直连后端：用 HTTP POST /sessions/{id}/close 可靠释放 session
+        # （后端 WS 不处理 session.close 消息，发 WS close 可能导致 session 泄漏）。
+        if self.direct and self.session_id:
+            try:
+                import httpx
+                base = self.url.split("/backend")[0]
+                async with httpx.AsyncClient() as c:
+                    await c.post(f"{base}/sessions/{self.session_id}/close",
+                                 json={"reason": reason})
+            except Exception:
+                pass
         try:
             await self.ws.send(json.dumps({"type": "session.close", "reason": reason}))
         except Exception:
