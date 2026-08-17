@@ -1605,7 +1605,10 @@ async function startSession() {
 
     // Build prepare payload
     const preparePayload = {
-        config: { length_penalty: parseFloat(document.getElementById('omniLengthPenalty').value) || 1.0 },
+        config: {
+            length_penalty: parseFloat(document.getElementById('omniLengthPenalty').value) || 1.0,
+            turn_decision: (document.getElementById('turnDecision')?.checked ?? false) ? 'vad_turnsense' : 'model',
+        },
         max_slice_nums: getEffectiveMaxSliceNums(),
         use_tts: (document.getElementById('ttsEnabled')?.checked ?? true),
     };

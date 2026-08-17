@@ -966,7 +966,10 @@ async function startSession() {
 
     // Build prepare payload
     const preparePayload = {
-        config: { length_penalty: parseFloat(document.getElementById('duplexLengthPenalty').value) || 1.05 },
+        config: {
+            length_penalty: parseFloat(document.getElementById('duplexLengthPenalty').value) || 1.05,
+            turn_decision: (document.getElementById('turnDecision')?.checked ?? false) ? 'vad_turnsense' : 'model',
+        },
         use_tts: document.getElementById('ttsEnabled').checked,
     };
     const refBase64 = refAudio.getBase64();

@@ -310,3 +310,18 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
     }
     .rt-col-left { flex-direction: row; flex-wrap: wrap; }
 }
+
+/* ── Turn-decision switch ─────────────────────────── */
+.switch-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    cursor: pointer;
+    color: #cbd5e1;
+}
+.switch-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: #6366f1;
+}

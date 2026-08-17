@@ -334,9 +334,13 @@ btnStart.onclick = async () => {
     session = createSession();
 
     const prompt = $('cfgPrompt').value;
+    const turnDecision = $('cfgTurnDecision').checked ? 'vad_turnsense' : 'model';
     const preparePayload = {
         deferred_finalize: true,
         max_slice_nums: parseInt($('cfgSlices').value) || 1,
+        config: {
+            turn_decision: turnDecision,
+        },
     };
 
     try {
