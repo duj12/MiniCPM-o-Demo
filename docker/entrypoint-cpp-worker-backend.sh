@@ -70,7 +70,10 @@ echo "  n-gpu-layers = ${N_GPU_LAYERS}"
 echo "=================================================="
 
 : > "$LLAMA_LOG_FILE"
-tail -n +1 -F "$LLAMA_LOG_FILE" &
+# 转发 backend 日志到 stdout，过滤调试噪声，突出关键事件。
+# 丢弃: preprocess/[prof]/tensor 等；保留: session/duplex/decode/error/omni。
+tail -n +1 -F "$LLAMA_LOG_FILE" | \
+    grep -vE "audition_audio_preprocess|vision_|clip_model_loader|load_tensors|\[prof\]|KV cache iter|Before incrementing|Final output|mel spectrogram|build_whisper|conv2d|tensor\[|audio slice|audio decoded" &
 tail_pid=$!
 
 llama_args=(
@@ -144,7 +147,10 @@ echo "  n-gpu-layers = ${N_GPU_LAYERS}"
 echo "=================================================="
 
 : > "$LLAMA_LOG_FILE"
-tail -n +1 -F "$LLAMA_LOG_FILE" &
+# 转发 backend 日志到 stdout，过滤调试噪声，突出关键事件。
+# 丢弃: preprocess/[prof]/tensor 等；保留: session/duplex/decode/error/omni。
+tail -n +1 -F "$LLAMA_LOG_FILE" | \
+    grep -vE "audition_audio_preprocess|vision_|clip_model_loader|load_tensors|\[prof\]|KV cache iter|Before incrementing|Final output|mel spectrogram|build_whisper|conv2d|tensor\[|audio slice|audio decoded" &
 tail_pid=$!
 
 llama_args=(

@@ -317,6 +317,7 @@ class HalfDuplexSession:
         segment = self.vad.feed(audio_np)
         if not was_speaking and self.vad.is_speaking:
             self._vad_speech_started_at = time.monotonic()
+            logger.info("[HD] 🎤 检测到语音开始")
 
         if self.state == HalfDuplexState.GENERATING:
             await self._on_chunk_while_generating()
@@ -330,6 +331,8 @@ class HalfDuplexSession:
         })
 
         if segment is not None:
+            seg_s = len(segment) / 16000.0
+            logger.info("[HD] ⏸ VAD 检测到停顿, 语音段 %.1fs", seg_s)
             await self._on_speech_segment(segment)
 
     async def _on_chunk_while_generating(self) -> None:
@@ -351,11 +354,14 @@ class HalfDuplexSession:
         )
 
         if decision == TurnDecision.TRIGGER:
+            logger.info("[HD] 🧠 TurnSense=complete → 触发回复")
             self.accumulated = []
             self.pending = False
             self.accum_gen += 1
             await self._trigger_reply()
         elif decision == TurnDecision.DEFERRED:
+            logger.info("[HD] ⏳ TurnSense=incomplete → 等待用户继续 (watchdog %.0fms)",
+                        self.cfg.turnsense.incomplete_wait_ms)
             self.accumulated.append(segment)
             if len(self.accumulated) > self.cfg.max_accumulate_segments:
                 self.accumulated = self.accumulated[-self.cfg.max_accumulate_segments:]
@@ -365,13 +371,14 @@ class HalfDuplexSession:
             await self.send_event({"type": "turn.turnsense", "label": "incomplete"})
             asyncio.create_task(self._watchdog(gen))
         else:  # DISCARD
+            logger.info("[HD] 🚫 TurnSense=invalid → 丢弃(噪音/过短)")
             await self.send_event({"type": "turn.turnsense", "label": "invalid"})
-            logger.info("TurnSense discard (noise/short)")
 
     async def _trigger_reply(self) -> None:
         """User finished — send a decode trigger (chunk WITHOUT force_listen)."""
         self.state = HalfDuplexState.GENERATING
         self._barge_in_detected = False
+        logger.info("[HD] ▶ 触发模型回复")
         await self.send_event({"type": "turn.turnsense", "label": "complete"})
 
         # Trigger decode: short silence chunk, no force_listen → backend decodes.
@@ -406,8 +413,20 @@ class HalfDuplexSession:
         if etype == "response.output.delta":
             kind = str(event.get("kind") or "")
             if kind == "listen":
+                logger.info("[HD] 👂 模型 → Listen")
                 self._reset_to_listening()
+            elif kind == "text":
+                txt = str(event.get("text") or "")
+                if txt:
+                    logger.info("[HD] 💬 模型回复: %s", txt.strip())
+            elif kind == "audio":
+                logger.info("[HD] 🔊 模型 → 说话 (audio chunk)")
         elif etype == "response.done":
+            full = str(event.get("text") or "")
+            if full:
+                logger.info("[HD] ✅ 回复完成: %s", full.strip())
+            else:
+                logger.info("[HD] ✅ 回复完成 (无文本)")
             self._reset_to_listening()
         return True
 

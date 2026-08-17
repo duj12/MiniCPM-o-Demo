@@ -72,6 +72,7 @@ class TurnMetrics:
     reply_chars: int = 0                  # 回复字符数
     speed_cps: float = 0.0                # 生成速度
     model_state: str = ""                 # listening / speaking
+    reply_text: str = ""                  # 完整回复文本
 
     @property
     def summary(self) -> str:
@@ -88,20 +89,28 @@ class TurnMetrics:
 # 音视频文件提取（离线回放）
 # ============================================================================
 
-def extract_audio_pcm(video_path: str, max_s: float = 60.0) -> np.ndarray:
-    """用 ffmpeg 提取视频音轨为 16kHz float32 mono PCM。无音轨返回全零。"""
+def extract_audio_pcm(video_path: str, max_s: Optional[float] = None) -> np.ndarray:
+    """用 ffmpeg 提取视频音轨为 16kHz float32 mono PCM。无音轨返回全零。
+
+    max_s: 限制提取的音频时长（秒）。None=提取完整音轨。
+    注意：完整音轨 token 数与时长成正比（MiniCPM 约 25 tok/s 音频），
+    长视频音频可能超出 KV 预算，需配合 --kv-budget 或增大后端 -c。
+    """
     cmd = [
         "ffmpeg", "-y", "-i", video_path, "-vn",
         "-acodec", "pcm_f32le", "-ar", str(SAMPLE_RATE), "-ac", "1",
-        "-t", str(max_s), "-f", "f32le", "pipe:1",
     ]
+    if max_s is not None:
+        cmd += ["-t", str(max_s)]
+    cmd += ["-f", "f32le", "pipe:1"]
     try:
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
         return np.frombuffer(out, dtype=np.float32)
     except subprocess.CalledProcessError:
         # 无音轨 → 返回对应时长静音
         dur = probe_duration(video_path)
-        return np.zeros(int(min(dur, max_s) * SAMPLE_RATE), dtype=np.float32)
+        cap = min(dur, max_s) if max_s is not None else dur
+        return np.zeros(int(cap * SAMPLE_RATE), dtype=np.float32)
 
 
 def probe_duration(video_path: str) -> float:
@@ -295,11 +304,14 @@ class StreamingChatClient:
                             reply_started = first_delta_at
                             m.ttft_s = first_delta_at - t_start
                         text += chunk
+                        # 实时打印模型回复文本（流式）
+                        print(f"  [模型] {chunk}", end="", flush=True)
                 elif kind == "listen":
                     m.model_state = "listening"
                     # 模型选择聆听（无回复）——记录时间，若持续过久则放弃等待
                     if first_delta_at is None:
                         last_listen_at = time.monotonic()
+                        print("  [模型] Listen（选择聆听，未回复）", flush=True)
                     else:
                         last_listen_at = None  # 已开始回复，listen 是回复结束标志
                 elif kind == "audio":
@@ -319,6 +331,7 @@ class StreamingChatClient:
             m.speed_cps = m.reply_chars / m.reply_s
         elif m.reply_chars > 0:
             m.speed_cps = 0.0
+        m.reply_text = text
         return m
 
     async def close(self, reason: str = "demo_done"):
@@ -340,7 +353,9 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           prompt: str, turn_decision: str, n_turns: int = 1,
                           fps: float = 1.0, max_frames: int = 0,
                           kv_budget_tokens: int = 6000,
-                          audio_path: str = ""):
+                          audio_path: str = "",
+                          max_audio_s: Optional[float] = None,
+                          replay_speed: float = 1.0):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
     帧策略：按 fps 持续抽帧（max_frames=0 不限制总数），但用 KV 预算保护
@@ -349,8 +364,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
     audio_path: 指定人声音频 wav（替代视频音轨）。视频音轨常为非人声背景音，
       TurnSense 会判 invalid；用清晰人声可验证 VAD+TurnSense 完整链路。
+    max_audio_s: 限制音频提取时长（秒）。None=完整音轨。注意长音频 token
+      量巨大（约 25 tok/s），可能超出 KV，需配合 --kv-budget / 后端 -c。
     """
-    audio = extract_audio_pcm(video_path)
+    audio = extract_audio_pcm(video_path, max_s=max_audio_s)
     if audio_path and os.path.exists(audio_path):
         if sf is None:
             print("  [warn] soundfile 不可用，忽略 --audio")
@@ -409,7 +426,9 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 pass
 
             if i < n_chunks:
-                await asyncio.sleep(0.05)
+                # 按真实音频时长节奏发送（发 1s 音频 ≈ 等 1s/replay_speed），
+                # 让 worker 的 VAD 有真实处理节奏。replay_speed>1 加速（更快触发）。
+                await asyncio.sleep(CHUNK_MS / 1000.0 / replay_speed)
 
         m.in_video_s = min(video_s, sent_frames / max(fps, 0.1))
         if not reply_done:
@@ -431,8 +450,11 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
         m.reply_chars = rm.reply_chars
         m.speed_cps = rm.speed_cps
         m.model_state = rm.model_state
+        m.reply_text = rm.reply_text
         all_metrics.append(m)
         print(f"  {m.summary}")
+        if m.reply_text:
+            print(f"  ── 完整回复 ──\n  {m.reply_text}\n  ──────────────")
 
     return all_metrics
 
@@ -560,6 +582,10 @@ async def main():
                         help="最大抽帧数，0=不限(用 KV 预算保护)")
     parser.add_argument("--kv-budget", type=int, default=6000,
                         help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频")
+    parser.add_argument("--max-audio-s", type=float, default=None,
+                        help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
+    parser.add_argument("--replay-speed", type=float, default=1.0,
+                        help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
     parser.add_argument("--direct-backend", default="",
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
@@ -599,7 +625,9 @@ async def main():
                                             args.turn_decision, args.turns,
                                             fps=args.fps, max_frames=args.max_frames,
                                             kv_budget_tokens=args.kv_budget,
-                                            audio_path=args.audio)
+                                            audio_path=args.audio,
+                                            max_audio_s=args.max_audio_s,
+                                            replay_speed=args.replay_speed)
         else:
             metrics = await run_realtime(client, args.system_prompt,
                                          args.turn_decision, args.duration,
