@@ -232,9 +232,12 @@ async def health():
     reported_status = WorkerStatus.BUSY_CHAT if worker.state.concurrent_sessions > 0 else WorkerStatus.IDLE
 
     # Capabilities depend on active model (env overrides config.json)
+    # Qwen3-Omni supports streaming video/audio via VAD+TurnSense too, so it
+    # advertises the duplex capabilities the gateway routes on (omni_duplex /
+    # audio_duplex for mode=video / mode=audio in /v1/realtime).
     active_model = os.environ.get("ACTIVE_MODEL") or WORKER_CONFIG.get("active_model", "minicpm")
     if active_model == "qwen3omni":
-        caps = ["chat", "streaming", "half_duplex_audio"]
+        caps = ["chat", "streaming", "half_duplex_audio", "audio_duplex", "omni_duplex"]
     else:
         caps = DEFAULT_WORKER_CAPABILITIES
 
