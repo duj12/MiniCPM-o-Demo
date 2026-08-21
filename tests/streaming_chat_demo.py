@@ -448,24 +448,11 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
         # 回复进行中：继续接收直到完成
         if in_reply:
-            # 后台 keep-alive：回复期间定期发静音 force_listen，避免后端
-            # 把此会话判为 idle 而回收（reaper 60s 无 input 即回收）。
-            async def _keepalive():
-                for _ in range(60):  # 最多 60×5s=300s
-                    await asyncio.sleep(5.0)
-                    if not in_reply:
-                        return
-                    try:
-                        await client.send_input(
-                            audio_b64=b64(np.zeros(CHUNK_SAMPLES, dtype=np.float32)),
-                            force_listen=True,
-                        )
-                    except Exception:
-                        return
-            ka_task = asyncio.create_task(_keepalive())
-            rm_done = await client.collect_reply(timeout=10.0, listen_giveup_s=10.0)
-            if not ka_task.done():
-                ka_task.cancel()
+            # 等待回复完成。不在这里发 keep-alive：静音 prefill 会让模型
+            # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
+            # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
+            # 被回收。
+            rm_done = await client.collect_reply(timeout=30.0, listen_giveup_s=15.0)
             if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
                 rm = rm_done
                 rm.turn_idx = turn_no
