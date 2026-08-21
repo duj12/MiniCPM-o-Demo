@@ -346,19 +346,36 @@ async def _handle_remote_backend_runtime_ws(
         # If the frontend requested turn_decision="vad_turnsense" in session.init,
         # wrap the stream with a VAD+TurnSense state machine that decides when to
         # trigger the model reply (reusing full_duplex transport).
-        from runtime.half_duplex import HalfDuplexConfig, HalfDuplexSession, TurnSenseCfg
+        # VAD 参数可从 session.init payload.config.vad 设置：
+        #   { vad_model: "fsmn"|"silero", vad_tail_sil: 600, vad_max_len: 60000,
+        #     fsmn_model_dir: "..." }
+        from runtime.half_duplex import HalfDuplexConfig, HalfDuplexSession, TurnSenseCfg, VadCfg
 
         hd_cfg_payload = {}
+        vad_cfg_payload = {}
         if init_params.get("config") and isinstance(init_params["config"], dict):
             hd_cfg_payload = init_params["config"].get("turn_decision") or {}
+            vad_p = init_params["config"].get("vad") or {}
+            if isinstance(vad_p, dict):
+                vad_cfg_payload = vad_p
         if hd_cfg_payload == "vad_turnsense":
+            vad_cfg = VadCfg(
+                vad_model=str(vad_cfg_payload.get("vad_model", "fsmn")),
+                fsmn_model_dir=str(vad_cfg_payload.get("fsmn_model_dir", "")),
+                vad_tail_sil=int(vad_cfg_payload.get("vad_tail_sil", 600)),
+                vad_max_len=int(vad_cfg_payload.get("vad_max_len", 60000)),
+                vad_chunk_size=int(vad_cfg_payload.get("vad_chunk_size", 1000)),
+            )
             hd_session = HalfDuplexSession(
-                config=HalfDuplexConfig(turnsense=TurnSenseCfg()),
+                config=HalfDuplexConfig(vad=vad_cfg, turnsense=TurnSenseCfg()),
                 push=lambda payload: runtime.push(payload),
                 interrupt=lambda: runtime.interrupt(),
                 send_event=lambda payload: ws.send_json(payload),
             )
-            logger.info("half-duplex VAD+TurnSense enabled for session %s", runtime.session_id)
+            logger.info("half-duplex VAD+TurnSense enabled for session %s "
+                        "(vad=%s tail_sil=%dms max_len=%dms)",
+                        runtime.session_id, vad_cfg.vad_model,
+                        vad_cfg.vad_tail_sil, vad_cfg.vad_max_len)
 
         async def client_to_backend() -> None:
             nonlocal backend_closed

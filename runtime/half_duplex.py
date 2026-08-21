@@ -59,17 +59,184 @@ class TurnSenseCfg:
 
 
 @dataclass
-class HalfDuplexConfig:
-    """Half-duplex (VAD+TurnSense) turn-decision configuration."""
+class VadCfg:
+    """VAD 配置：支持 Silero（默认）或 FunASR fsmn-vad。
 
+    vad_model: "silero" | "fsmn"（fsmn 为 FunASR fsmn-vad，默认）
+    fsmn_model_dir: fsmn-vad 模型目录（含 config.yaml 等）
+    vad_tail_sil: 尾静音（ms），fsmn 的 max_end_silence_time，默认 600
+    vad_max_len: 最大段长（ms），fsmn 的 max_single_segment_time，默认 60000
+    vad_threshold: Silero 阈值（仅 silero 用）
+    min_speech_duration_ms / min_silence_duration_ms: Silero 参数
+    """
+
+    vad_model: str = "fsmn"                 # "silero" | "fsmn"
+    fsmn_model_dir: str = ""                # FunASR fsmn-vad 模型目录
+    vad_tail_sil: int = 600                 # 尾静音 ms -> max_end_silence_time
+    vad_max_len: int = 60000                # 最大段长 ms -> max_single_segment_time
+    vad_chunk_size: int = 1000              # fsmn 内部处理窗口 ms（1s 可流式分句）
+    # Silero 参数（vad_model=silero 时用）
     vad_threshold: float = 0.8
     min_speech_duration_ms: int = 128
     min_silence_duration_ms: int = 800
+
+
+@dataclass
+class HalfDuplexConfig:
+    """Half-duplex (VAD+TurnSense) turn-decision configuration."""
+
+    vad: VadCfg = field(default_factory=VadCfg)   # VAD 选择与参数
     barge_in_enabled: bool = True
     barge_in_min_speech_ms: int = 300       # min user speech before barge-in fires
     max_accumulate_segments: int = 8        # cap on accumulated incomplete segments
     silence_trigger_ms: int = 100           # silence payload sent to trigger decode
     turnsense: TurnSenseCfg = field(default_factory=TurnSenseCfg)
+
+
+class FSMNVADManager:
+    """惰性加载 fsmn-vad ONNX 模型（单例，跨 session 共享）。
+
+    用 onnxruntime（容器已有），无需 funasr 包。模型目录需含：
+      model.onnx + config.yaml + am.mvn
+    参考 FunASR onnx 流式实现：Fsmn_vad_online。
+    """
+
+    _instance = None
+
+    @classmethod
+    def get(cls, model_dir: str) -> "FSMNVADManager":
+        if cls._instance is None or cls._instance.model_dir != model_dir:
+            cls._instance = cls(model_dir)
+        return cls._instance
+
+    def __init__(self, model_dir: str):
+        self.model_dir = model_dir
+        self.model = None
+        self._load()
+
+    def _load(self):
+        if not self.model_dir:
+            # 自动探测：vad-runtime/model、FunASR onnx、或本包内置 model 目录
+            root = root_for_deploy()
+            here = os.path.dirname(os.path.abspath(__file__))
+            cands = [
+                os.path.join(root, "vad-runtime", "model"),
+                os.path.join(here, "fsmn_vad_onnx", "model"),   # 容器内/本包内置
+                os.path.join(root, "FunASR", "runtime", "python", "onnxruntime", "models", "vad"),
+            ]
+            found = next((c for c in cands if os.path.exists(os.path.join(c, "model.onnx"))), None)
+            if found is None:
+                raise RuntimeError(f"fsmn-vad onnx 模型未找到，请设置 fsmn_model_dir 或放模型到 {cands[0]}")
+            self.model_dir = found
+
+        # 导入 FunASR onnx 流式 VAD（本仓库 runtime/fsmn_vad_onnx/）
+        try:
+            from runtime.fsmn_vad_onnx.vad_bin import Fsmn_vad_online
+        except ImportError:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from fsmn_vad_onnx.vad_bin import Fsmn_vad_online
+        self._Fsmn_vad_online = Fsmn_vad_online
+        self.max_end_sil = None  # 在 make_vad 时按参数创建
+        logger.info("fsmn-vad onnx model dir: %s", self.model_dir)
+
+    def make_vad(self, max_end_silence_time: int, max_single_segment_time: int,
+                 chunk_size: int = 1000) -> "FSMNVAD":
+        vad = self._Fsmn_vad_online(
+            model_dir=self.model_dir,
+            max_end_sil=max_end_silence_time,
+            intra_op_num_threads=1,
+        )
+        return FSMNVAD(vad, max_single_segment_time)
+
+
+class FSMNVAD:
+    """fsmn-vad ONNX 流式适配器，接口对齐 StreamingVAD。
+
+    基于 FunASR onnx 的 Fsmn_vad_online（runtime/fsmn_vad_onnx/vad_bin.py），
+    用 onnxruntime 逐块推理。feed 返回完整语音段（VAD 检测到段结束时）。
+
+    feed(audio_np) -> Optional[np.ndarray]
+    is_speaking 属性
+    reset()
+    """
+
+    SAMPLE_RATE = 16000
+
+    def __init__(self, vad_online, max_single_segment_time: int = 60000):
+        self.vad = vad_online                      # Fsmn_vad_online 实例
+        self.max_single_segment_time = max_single_segment_time
+        self.param_dict: Dict[str, Any] = {}       # 流式状态（in_cache/frontend/vad_scorer）
+        self._speech_buffer: List[np.ndarray] = []
+        self._abs_pos_ms = 0                       # 已处理的绝对位置 (ms)
+        self._seg_start_ms = -1                    # 当前语音段开始位置 (ms)
+        self._is_speaking = False
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._is_speaking
+
+    def reset(self) -> None:
+        self.param_dict = {}
+        self._speech_buffer = []
+        self._abs_pos_ms = 0
+        self._seg_start_ms = -1
+        self._is_speaking = False
+
+    def feed(self, audio_np: np.ndarray) -> Optional[np.ndarray]:
+        """喂入 float32 16kHz 音频，VAD 段结束时返回完整语音段。"""
+        if len(audio_np) == 0:
+            return None
+
+        # 调 FunASR onnx 流式 VAD（param_dict 维护 frontend/in_cache/vad_scorer 状态）
+        self.param_dict["is_final"] = False
+        segments = self.vad(audio_np, param_dict=self.param_dict)
+        # segments: [[start_ms, end_ms], ...]，start/end 为 -1 表示只有边界
+
+        chunk_dur_ms = int(len(audio_np) / self.SAMPLE_RATE * 1000)
+
+        if segments and isinstance(segments, list):
+            # segments 形如 [[[start,-1]], ...]：外层是 batch，取 batch0 的段列表
+            seg_list = segments[0] if segments and isinstance(segments[0], list) else segments
+            if isinstance(seg_list, list) and seg_list and isinstance(seg_list[0], (list, tuple)):
+                for seg in seg_list:
+                    if len(seg) < 2:
+                        continue
+                    start_ms, end_ms = seg[0], seg[-1]
+                    if start_ms != -1 and self._seg_start_ms < 0:
+                        # 语音开始：开始累积
+                        self._seg_start_ms = start_ms
+                        self._speech_buffer = []
+                        self._is_speaking = True
+                    if end_ms != -1 and self._seg_start_ms >= 0:
+                        # 语音结束：返回累积的语音段
+                        segment = np.concatenate(self._speech_buffer) if self._speech_buffer else audio_np
+                        self._is_speaking = False
+                        self._seg_start_ms = -1
+                        self._speech_buffer = []
+                        return segment
+
+        # 语音进行中：累积当前块
+        if self._is_speaking:
+            self._speech_buffer.append(audio_np)
+
+        self._abs_pos_ms += chunk_dur_ms
+        return None
+
+    def flush(self) -> Optional[np.ndarray]:
+        """强制结束当前语音段（is_final=True 触发 VAD 输出最后段）。"""
+        if self._is_speaking:
+            self.param_dict["is_final"] = True
+            try:
+                self.vad(np.zeros(160, dtype=np.float32), param_dict=self.param_dict)
+            except Exception:
+                pass
+            segment = np.concatenate(self._speech_buffer) if self._speech_buffer else None
+            self._is_speaking = False
+            self._seg_start_ms = -1
+            self._speech_buffer = []
+            return segment
+        return None
 
 
 def _default_turnsense_paths() -> Dict[str, str]:
@@ -291,11 +458,23 @@ class HalfDuplexSession:
         self.send_event = send_event
 
         self.state = HalfDuplexState.LISTENING
-        self.vad = StreamingVAD(StreamingVadOptions(
-            threshold=self.cfg.vad_threshold,
-            min_speech_duration_ms=self.cfg.min_speech_duration_ms,
-            min_silence_duration_ms=self.cfg.min_silence_duration_ms,
-        ))
+        # 选择 VAD：fsmn（FunASR，默认）或 silero（StreamingVAD）
+        vad_cfg = self.cfg.vad
+        if vad_cfg.vad_model == "fsmn":
+            mgr = FSMNVADManager.get(vad_cfg.fsmn_model_dir)
+            self.vad = mgr.make_vad(
+                max_end_silence_time=vad_cfg.vad_tail_sil,        # 尾静音 ms
+                max_single_segment_time=vad_cfg.vad_max_len,      # 最大段长 ms
+                chunk_size=vad_cfg.vad_chunk_size,                # 处理窗口 ms
+            )
+            logger.info("[HD] 使用 fsmn-vad (tail_sil=%dms, max_len=%dms, chunk=%dms)",
+                        vad_cfg.vad_tail_sil, vad_cfg.vad_max_len, vad_cfg.vad_chunk_size)
+        else:
+            self.vad = StreamingVAD(StreamingVadOptions(
+                threshold=vad_cfg.vad_threshold,
+                min_speech_duration_ms=vad_cfg.min_speech_duration_ms,
+                min_silence_duration_ms=vad_cfg.min_silence_duration_ms,
+            ))
         self.ts_mgr = TurnSenseManager(self.cfg.turnsense)
 
         self.accumulated: List[np.ndarray] = []

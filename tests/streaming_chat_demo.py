@@ -603,6 +603,17 @@ async def main():
                         default=True,
                         help="VAD+TurnSense 触发回复后是否暂停发送音频，等模型回复完成再继续(默认开)。"
                              "--wait-reply=false 关闭则持续发送不等回复")
+    parser.add_argument("--vad-model", choices=["fsmn", "silero"], default="fsmn",
+                        help="VAD 模型: fsmn(FunASR,默认) 或 silero")
+    parser.add_argument("--vad-tail-sil", type=int, default=600,
+                        help="VAD 尾静音(ms)，fsmn 的 max_end_silence_time，默认600")
+    parser.add_argument("--vad-max-len", type=int, default=60000,
+                        help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
+    parser.add_argument("--vad-chunk-size", type=int, default=1000,
+                        help="VAD 处理窗口(ms)，fsmn 内部窗口，默认1000(1s可流式分句)")
+    parser.add_argument("--audio-chunk-ms", type=int, default=1000,
+                        help="demo 发送音频的 chunk 大小(ms)，默认1000。"
+                             "建议与 --vad-chunk-size 一致，流式分句最及时")
     parser.add_argument("--direct-backend", default="",
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
@@ -613,6 +624,11 @@ async def main():
 
     if not args.video and not args.realtime:
         parser.error("需要 --video 或 --realtime 之一")
+
+    # 按 --audio-chunk-ms 重算发送 chunk（与 VAD 窗口统一，流式分句最及时）
+    global CHUNK_MS, CHUNK_SAMPLES
+    CHUNK_MS = max(100, args.audio_chunk_ms)
+    CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
     # 连接目标：直连后端 或 gateway
     ssl_ctx = None
@@ -633,6 +649,12 @@ async def main():
             mode="full_duplex",
             system_prompt=args.system_prompt,
             turn_decision=args.turn_decision,
+            config={"vad": {
+                "vad_model": args.vad_model,
+                "vad_tail_sil": args.vad_tail_sil,
+                "vad_max_len": args.vad_max_len,
+                "vad_chunk_size": args.vad_chunk_size,
+            }},
         )
         print(f"会话已建立: session={client.session_id[:8] if client.session_id else '?'} "
               f"url={url}")
