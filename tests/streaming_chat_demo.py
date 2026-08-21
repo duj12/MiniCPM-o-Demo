@@ -370,7 +370,6 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           audio_path: str = "",
                           max_audio_s: Optional[float] = None,
                           replay_speed: float = 1.0,
-                          segment_s: Optional[float] = None,
                           wait_reply: bool = True):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
@@ -402,65 +401,73 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
     TOKENS_PER_FRAME = 540  # 1440p 缩放后每帧约 540 token
 
-    # ── 分段：长音频切多段，每段触发一次回复，避免 KV 溢出 ──
-    seg_samples = int((segment_s or (audio_s + 1)) * SAMPLE_RATE)
-    segments = [audio[i:i + seg_samples] for i in range(0, len(audio), seg_samples)]
-    segments = [s for s in segments if len(s) > 0]
-    if len(segments) > 1:
-        print(f"  分段: {len(segments)} 段 (每段 {segment_s}s)")
-
+    # ── VAD 驱动 + wait_reply ──
+    # 不硬切段：持续流式发送音频，worker 的 VAD 检测到静音停顿即视为一个语音段，
+    # 触发 TurnSense → 回复。demo 每发一块就检查是否已触发回复；若 wait_reply 开启，
+    # 触发后暂停发送，等模型回复完成再继续（避免后续音频淹没回复内容）。
     all_metrics = []
-    for seg_idx, seg in enumerate(segments):
-        m = TurnMetrics(turn_idx=seg_idx + 1, in_audio_s=len(seg) / SAMPLE_RATE)
-        sent_frames = 0
-        seg_audio_s = len(seg) / SAMPLE_RATE
-        print(f"\n  [段{seg_idx + 1}/{len(segments)}] 音频 {seg_audio_s:.1f}s")
+    turn_no = 0
+    sent_frames = 0
+    n_chunks = max(1, int(np.ceil(len(audio) / CHUNK_SAMPLES)))
+    i = 0
+    in_reply = False
+    rm = TurnMetrics(turn_idx=0)
 
-        # 流式发送本段音频（force_listen 累积；首块带 prompt）
-        n_chunks = max(1, int(np.ceil(len(seg) / CHUNK_SAMPLES)))
-        for i in range(n_chunks):
-            chunk = seg[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
+    while i < n_chunks:
+        if not in_reply:
+            chunk = audio[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
             if len(chunk) < CHUNK_SAMPLES:
                 chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
 
             frame_b64 = []
             if sent_frames * TOKENS_PER_FRAME < kv_budget_tokens and frames:
-                frame_b64 = [b64(frames[seg_idx % len(frames)])]
+                frame_b64 = [b64(frames[sent_frames % len(frames)])]
                 sent_frames += 1
 
-            text = prompt if (seg_idx == 0 and i == 0) else ""
+            text = prompt if i == 0 else ""
             await client.send_input(
                 audio_b64=b64(chunk), video_frames=frame_b64, text=text,
                 force_listen=True,
             )
+            i += 1
             await asyncio.sleep(CHUNK_MS / 1000.0 / replay_speed)
 
-        # 段尾补静音，让 worker 的 VAD 检测到停顿 → TurnSense → 触发回复
-        for _ in range(2):  # 2s 静音，确保超过 VAD 静音阈值
-            await client.send_input(audio_b64=b64(np.zeros(CHUNK_SAMPLES, dtype=np.float32)),
-                                    force_listen=True)
-            await asyncio.sleep(0.1)
+        # 非阻塞检查：VAD 是否已触发回复（出现 text delta 或 listen）
+        if wait_reply and not in_reply:
+            try:
+                rm = await asyncio.wait_for(
+                    client.collect_reply(timeout=0.4, listen_giveup_s=0.4),
+                    timeout=0.5,
+                )
+                if rm.reply_chars > 0 or rm.model_state == "speaking":
+                    in_reply = True
+                    turn_no += 1
+                    rm.turn_idx = turn_no
+                    print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
 
-        # 等待模型回复（wait_reply 开启）：
-        #   worker 的 VAD+TurnSense 已自动触发回复，collect_reply 收到 text/response.done。
-        #   回复完成后再继续下一段（避免持续发送时回复被淹没/内容丢失）。
-        if wait_reply:
-            print(f"  [段{seg_idx + 1}] 等待模型回复...")
-            rm = await client.collect_reply(listen_giveup_s=20.0)
-        else:
-            rm = TurnMetrics(turn_idx=seg_idx + 1)
-
-        m.in_video_s = min(video_s, sent_frames / max(fps, 0.1))
-        m.ttft_s = rm.ttft_s
-        m.reply_s = rm.reply_s
-        m.reply_chars = rm.reply_chars
-        m.speed_cps = rm.speed_cps
-        m.model_state = rm.model_state
-        m.reply_text = rm.reply_text
-        all_metrics.append(m)
-        print(f"  {m.summary}")
-        if m.reply_text:
-            print(f"  ── 完整回复 ──\n  {m.reply_text}\n  ──────────────")
+        # 回复进行中：继续接收直到完成
+        if in_reply:
+            rm_done = await client.collect_reply(timeout=5.0, listen_giveup_s=5.0)
+            if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
+                rm = rm_done
+                rm.turn_idx = turn_no
+            # 回复完成（response.done 或 listen 超时）→ 记录，恢复发送
+            m = TurnMetrics(turn_idx=turn_no, in_audio_s=audio_s)
+            m.in_video_s = min(video_s, sent_frames / max(fps, 0.1))
+            m.ttft_s = rm.ttft_s
+            m.reply_s = rm.reply_s
+            m.reply_chars = rm.reply_chars
+            m.speed_cps = rm.speed_cps
+            m.model_state = rm.model_state
+            m.reply_text = rm.reply_text
+            all_metrics.append(m)
+            print(f"\n  {m.summary}")
+            if m.reply_text:
+                print(f"  ── 回复{turn_no} ──\n  {m.reply_text}\n  ──────────────")
+            in_reply = False
+            await asyncio.sleep(0.5)  # 短暂停顿后继续发下一段
 
     return all_metrics
 
@@ -590,8 +597,6 @@ async def main():
                         help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频")
     parser.add_argument("--max-audio-s", type=float, default=None,
                         help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
-    parser.add_argument("--segment-s", type=float, default=None,
-                        help="分段长度(秒)，默认=整段。长音频建议分段(如50s)，每段触发一次回复，避免KV溢出")
     parser.add_argument("--replay-speed", type=float, default=1.0,
                         help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
     parser.add_argument("--wait-reply", type=lambda v: v.lower() in ("1","true","yes","on"),
@@ -640,7 +645,6 @@ async def main():
                                             audio_path=args.audio,
                                             max_audio_s=args.max_audio_s,
                                             replay_speed=args.replay_speed,
-                                            segment_s=args.segment_s,
                                             wait_reply=args.wait_reply)
         else:
             metrics = await run_realtime(client, args.system_prompt,
