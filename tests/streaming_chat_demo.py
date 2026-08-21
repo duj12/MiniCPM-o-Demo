@@ -304,14 +304,13 @@ class StreamingChatClient:
                             reply_started = first_delta_at
                             m.ttft_s = first_delta_at - t_start
                         text += chunk
-                        # 实时打印模型回复文本（流式）
-                        print(f"  [模型] {chunk}", end="", flush=True)
+                        # 不在此逐 token 打印（碎片化难看）；回复完成后统一显示
                 elif kind == "listen":
                     m.model_state = "listening"
                     # 模型选择聆听（无回复）——记录时间，若持续过久则放弃等待
                     if first_delta_at is None:
                         last_listen_at = time.monotonic()
-                        print("  [模型] Listen（选择聆听，未回复）", flush=True)
+                        m.model_state = "listening"
                     else:
                         last_listen_at = None  # 已开始回复，listen 是回复结束标志
                 elif kind == "audio":
@@ -449,7 +448,24 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
         # 回复进行中：继续接收直到完成
         if in_reply:
-            rm_done = await client.collect_reply(timeout=5.0, listen_giveup_s=5.0)
+            # 后台 keep-alive：回复期间定期发静音 force_listen，避免后端
+            # 把此会话判为 idle 而回收（reaper 60s 无 input 即回收）。
+            async def _keepalive():
+                for _ in range(60):  # 最多 60×5s=300s
+                    await asyncio.sleep(5.0)
+                    if not in_reply:
+                        return
+                    try:
+                        await client.send_input(
+                            audio_b64=b64(np.zeros(CHUNK_SAMPLES, dtype=np.float32)),
+                            force_listen=True,
+                        )
+                    except Exception:
+                        return
+            ka_task = asyncio.create_task(_keepalive())
+            rm_done = await client.collect_reply(timeout=10.0, listen_giveup_s=10.0)
+            if not ka_task.done():
+                ka_task.cancel()
             if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
                 rm = rm_done
                 rm.turn_idx = turn_no
