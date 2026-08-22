@@ -32,6 +32,33 @@ function getErrorMessage(error: unknown): string {
   return 'Unknown error'
 }
 
+/** 后端 active_model 缓存（fetch 一次后复用）。 */
+let _cachedActiveModel: string | null = null
+
+/**
+ * 获取当前后端模型类型（qwen3omni | minicpm），用于决定 turn_decision 默认值：
+ *   qwen3omni → 'vad_turnsense'（VAD+TurnSense 触发才回复）
+ *   minicpm   → 'model'（模型自主听/说）
+ * 与桌面端 loadFrontendDefaults() 逻辑保持一致。
+ */
+async function getActiveModel(): Promise<string> {
+  if (_cachedActiveModel) {
+    return _cachedActiveModel
+  }
+  try {
+    const resp = await fetch('/api/frontend_defaults')
+    if (resp.ok) {
+      const data = (await resp.json()) as { active_model?: string }
+      if (data.active_model) {
+        _cachedActiveModel = data.active_model
+      }
+    }
+  } catch {
+    // 忽略，回退默认 minicpm
+  }
+  return _cachedActiveModel ?? 'minicpm'
+}
+
 export type UseDuplexSessionInput = {
   /** App-level current screen, used to derive screenOpen flags. */
   screen: string
@@ -403,6 +430,11 @@ export function useDuplexSession(
           length_penalty: withVideo
             ? settings.videoDuplexLengthPenalty
             : settings.audioDuplexLengthPenalty,
+          // 按后端模型自动决定 turn_decision：
+          //   qwen3omni → VAD+TurnSense（检测到分句语义完整后回复）
+          //   minicpm   → model（模型自主听/说）
+          // 与桌面端 loadFrontendDefaults() / omni-app.js 逻辑一致。
+          turn_decision: (await getActiveModel()) === 'qwen3omni' ? 'vad_turnsense' : 'model',
         },
       }
 

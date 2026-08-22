@@ -118,6 +118,8 @@ services:
       - ./static/half-duplex/half-duplex-app.js:/app/static/half-duplex/half-duplex-app.js:ro
       - ./static/mobile-omni/index.html:/app/static/mobile-omni/index.html:ro
       - ./static/duplex/ui/duplex-ui.js:/app/static/duplex/ui/duplex-ui.js:ro
+      # React 移动端构建产物（/mobile 页面），宿主机构建后即时生效。
+      - ./static/mobile:/app/static/mobile:ro
     depends_on:
       cpp-worker-backend:
         condition: service_healthy
