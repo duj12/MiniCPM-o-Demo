@@ -164,7 +164,7 @@ const deviceSelector = new AudioDeviceSelector({
 let _systemContentList = [
     { type: 'text', text: '模仿音频样本的音色并生成新的内容。' },
     { type: 'audio', data: null, name: '', duration: 0 },
-    { type: 'text', text: '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。' },
+    { type: 'text', text: '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由魔珐科技开发的人工智能助手：XmovOmni。' },
 ];
 
 let _sceHdx = null;

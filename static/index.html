@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MiniCPMO45 — Multimodal Inference Service</title>
+    <title>XmovOmni — Multimodal Inference Service</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -293,7 +293,7 @@
 <body>
     <div class="header">
         <div class="header-left">
-            <h1>MiniCPM-o 4.5</h1>
+            <h1>XmovOmni</h1>
             <div class="nav-links">
                 <a href="/" class="active">Home</a>
             </div>
@@ -314,33 +314,6 @@
 
         <div class="mode-cards" id="mode-cards"></div>
 
-        <section class="resource-section" aria-labelledby="resource-heading">
-            <div class="resource-title" id="resource-heading">Resources</div>
-            <div class="resource-buttons">
-                <a class="resource-btn" href="https://github.com/OpenBMB/MiniCPM-o" target="_blank" rel="noopener">
-                    <span class="platform-icon" aria-hidden="true">📦</span><span id="resource-model">Model Repo</span>
-                </a>
-                <a class="resource-btn" href="https://github.com/OpenBMB/MiniCPM-o-Demo" target="_blank" rel="noopener">
-                    <span class="platform-icon" aria-hidden="true">💻</span><span id="resource-demo">Demo Repo</span>
-                </a>
-                <a class="resource-btn" href="/docs/">
-                    <span class="platform-icon" aria-hidden="true">📘</span><span id="resource-docs">Docs</span>
-                </a>
-                <a class="resource-btn" href="/docs/zh/realtime-api/overview/">
-                    <span class="platform-icon" aria-hidden="true">⚡</span><span id="resource-api">API Docs</span>
-                </a>
-                <a class="resource-btn" href="https://huggingface.co/openbmb/MiniCPM-o-4_5" target="_blank" rel="noopener">
-                    <span class="platform-icon" aria-hidden="true">🤗</span><span id="resource-model-hf">HF Model</span>
-                </a>
-                <a class="resource-btn" href="https://huggingface.co/papers/2604.27393" target="_blank" rel="noopener">
-                    <span class="platform-icon" aria-hidden="true">📄</span><span id="resource-paper">Paper</span>
-                </a>
-                <a class="resource-btn" href="https://github.com/tc-mb/llama.cpp-omni/releases/" target="_blank" rel="noopener">
-                    <span class="platform-icon" aria-hidden="true">🖥️</span><span id="resource-comni">llama.cpp Desktop</span>
-                </a>
-            </div>
-        </section>
-
         <div class="recent-section" id="recent-section" style="display:none;">
             <div class="recent-header">
                 <span class="recent-title" id="recent-title">Recent Sessions (Only visible to you)</span>
@@ -348,96 +321,6 @@
             </div>
             <div class="recent-list" id="recent-list"></div>
         </div>
-
-        <div class="intro-section">
-            <div class="intro-header">About MiniCPM-o 4.5</div>
-            <div class="intro-lead">
-                MiniCPM-o 4.5 is the latest and most capable model in the MiniCPM-o series. The model is built in an end-to-end fashion based on SigLip2, Whisper-medium, CosyVoice2, and Qwen3-8B with a total of 9B parameters. It exhibits a significant performance improvement, and introduces new features for full-duplex multimodal live streaming.
-            </div>
-            <div class="feature-grid">
-                <div class="feature-card">
-                    <div class="feat-icon">🔥</div>
-                    <div class="feat-title">Leading Visual Capability</div>
-                    <div class="feat-desc">MiniCPM-o 4.5 achieves an average score of 77.6 on OpenCompass, a comprehensive evaluation of 8 popular benchmarks. With only 9B parameters, it surpasses widely used proprietary models like GPT-4o, Gemini 2.0 Pro, and approaches Gemini 2.5 Flash for vision-language capabilities.</div>
-                </div>
-                <div class="feature-card">
-                    <div class="feat-icon">🎙</div>
-                    <div class="feat-title">Strong Speech Capability</div>
-                    <div class="feat-desc">MiniCPM-o 4.5 supports bilingual real-time speech conversation with configurable voices in English and Chinese. It features more natural, expressive and stable speech conversation. The model also allows for fun features such as voice cloning and role play via a simple reference audio clip.</div>
-                </div>
-                <div class="feature-card">
-                    <div class="feat-icon">🎬</div>
-                    <div class="feat-title">Full-Duplex Multimodal Live Streaming</div>
-                    <div class="feat-desc">MiniCPM-o 4.5 can process real-time, continuous video and audio input streams simultaneously while generating concurrent text and speech output streams in an end-to-end fashion, without mutual blocking. This allows MiniCPM-o 4.5 to see, listen, and speak simultaneously.</div>
-                </div>
-                <div class="feature-card">
-                    <div class="feat-icon">💪</div>
-                    <div class="feat-title">Strong OCR Capability &amp; Efficiency</div>
-                    <div class="feat-desc">MiniCPM-o 4.5 can process high-resolution images (up to 1.8 million pixels) and high-FPS videos (up to 10fps) in any aspect ratio efficiently. It achieves state-of-the-art performance for end-to-end English document parsing on OmniDocBench.</div>
-                </div>
-                <div class="feature-card" style="grid-column: 1 / -1;">
-                    <div class="feat-icon">💫</div>
-                    <div class="feat-title">Easy Usage</div>
-                    <div class="feat-desc">MiniCPM-o 4.5 can be easily used in various ways: PyTorch inference with Nvidia GPU, llama.cpp and Ollama for efficient CPU inference on local devices, int4 and GGUF quantized models in 16 sizes, vLLM and SGLang for high-throughput inference, and more.</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="arch-section">
-            <div class="arch-title">Model Architecture</div>
-            <div class="arch-figure">
-                <img src="/static/assets/minicpm-o-45-framework.png" alt="MiniCPM-o 4.5 Model Architecture" />
-            </div>
-            <div class="arch-list">
-                <div class="arch-item">
-                    <div class="arch-item-title">End-to-end Omni-modal Architecture</div>
-                    <div class="arch-item-desc">The modality encoders/decoders and LLM are densely connected via hidden states in an end-to-end fashion. This enables better information flow and control, and also facilitates full exploitation of rich multimodal knowledge during training.</div>
-                </div>
-                <div class="arch-item">
-                    <div class="arch-item-title">Full-Duplex Omni-modal Live Streaming Mechanism</div>
-                    <div class="arch-item-desc">We turn the offline modality encoder/decoders into online and full-duplex ones for streaming inputs/outputs. The speech token decoder models text and speech tokens in an interleaved fashion to support full-duplex speech generation. We sync all the input and output streams on timeline in milliseconds via a time-division multiplexing (TDM) mechanism.</div>
-                </div>
-                <div class="arch-item">
-                    <div class="arch-item-title">Proactive Interaction Mechanism</div>
-                    <div class="arch-item-desc">The LLM continuously monitors the input video and audio streams, and decides at a frequency of 1Hz to speak or not. This high decision-making frequency together with full-duplex nature are crucial to enable the proactive interaction capability.</div>
-                </div>
-                <div class="arch-item">
-                    <div class="arch-item-title">Configurable Speech Modeling Design</div>
-                    <div class="arch-item-desc">We inherit the multimodal system prompt design of MiniCPM-o 2.6, which includes a traditional text system prompt, and a new audio system prompt to determine the assistant voice. This enables cloning new voices and role play in inference time for speech conversation.</div>
-                </div>
-            </div>
-        </div>
-
-        <section class="comparison-section" aria-labelledby="comparison-heading">
-            <h2 class="comparison-title" id="comparison-heading">Model Capability Comparison</h2>
-            <div class="comparison-wrap">
-                <div class="comparison-scroll">
-                    <table class="comparison-table">
-                        <thead><tr>
-                            <th scope="col">Model</th>
-                            <th scope="col">Speech<br>Duplex</th>
-                            <th scope="col">Omni<br>Duplex</th>
-                            <th scope="col">Live Video<br>Captioning</th>
-                            <th scope="col">Omni<br>Q&amp;A</th>
-                            <th scope="col">Proactive<br>Reminders</th>
-                            <th scope="col">Half-Duplex<br>Call</th>
-                            <th scope="col">Custom<br>Voice</th>
-                            <th scope="col">Speech<br>Synthesis</th>
-                            <th scope="col">OCR</th>
-                        </tr></thead>
-                        <tbody>
-                            <tr><td>Moshi</td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td></tr>
-                            <tr><td>Qwen3-Omni</td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td></tr>
-                            <tr><td>StreamingVLM</td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td></tr>
-                            <tr><td>LiveCC</td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td></tr>
-                            <tr><td>GPT-4o</td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td></tr>
-                            <tr><td>Gemini 2.5</td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-no">✗</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td></tr>
-                            <tr class="highlight-row"><td>MiniCPM-o 4.5</td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td><td><span class="cmp-yes">✓</span></td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </section>
 
     </main>
 
@@ -462,14 +345,6 @@
     document.getElementById('home-title').textContent = t.chooseMode;
     document.getElementById('recent-title').textContent = t.recentSessions;
     document.getElementById('recent-clear-btn').textContent = t.clearRecent;
-    document.getElementById('resource-heading').textContent = t.resources;
-    document.getElementById('resource-model').textContent = t.modelRepo;
-    document.getElementById('resource-demo').textContent = t.demoRepo;
-    document.getElementById('resource-docs').textContent = t.docs;
-    document.getElementById('resource-api').textContent = t.apiDocs;
-    document.getElementById('resource-model-hf').textContent = t.hfModel;
-    document.getElementById('resource-paper').textContent = t.techReport;
-    document.getElementById('resource-comni').textContent = t.comniApp;
 
     // Language toggle in header (FAQ-style)
     const _hlEl = document.getElementById('headerLang');

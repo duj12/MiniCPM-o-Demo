@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MiniCPMO45 Turn-based Chat</title>
+    <title>XmovOmni Turn-based Chat</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         [data-tooltip] { position: relative; cursor: help; }
@@ -881,7 +881,7 @@
     <!-- ========== Header ========== -->
     <div class="header">
         <div style="display:flex;align-items:center;gap:16px;">
-            <h1>MiniCPM-o 4.5</h1>
+            <h1>XmovOmni</h1>
             <div class="nav-links">
                 <a href="/" >Home</a>
                 <a href="/turnbased" class="active">Turn-based Chat</a>
@@ -892,7 +892,7 @@
 
     <!-- ========== 初始视图（ChatGPT 风格） ========== -->
     <div class="initial-view" id="initialView">
-        <div class="initial-title">MiniCPM-o 4.5</div>
+        <div class="initial-title">XmovOmni</div>
         <div class="initial-subtitle" id="initialSubtitle">Turn-based Chat</div>
 
         <!-- Preset + System 配置 -->
@@ -1070,7 +1070,7 @@
 const DEFAULT_SYSTEM_CONTENT = [
     { type: 'text', text: '模仿音频样本的音色并生成新的内容。' },
     { type: 'audio', data: null, name: '', duration: 0 },
-    { type: 'text', text: '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。' },
+    { type: 'text', text: '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由魔珐科技开发的人工智能助手：XmovOmni。' },
 ];
 
 const state = {
@@ -3216,7 +3216,7 @@ import { t } from '/static/shared/i18n-module.js';
 initNav('turnbased');
 
 // ── Page title ──
-document.title = t.turnbasedChat + ' – MiniCPM-o 4.5';
+document.title = t.turnbasedChat + ' – XmovOmni';
 
 // ── Header status & subtitle ──
 document.getElementById('serviceStatus').textContent = t.connecting;

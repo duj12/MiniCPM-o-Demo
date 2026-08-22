@@ -214,7 +214,7 @@ const EMPTY_REF_AUDIO: RefAudioState = {
 
 const TURN_SYSTEM_PREFIX = '模仿音频样本的音色并生成新的内容。'
 const TURN_SYSTEM_SUFFIX =
-  '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。'
+  '你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由魔珐科技开发的人工智能助手：XmovOmni。'
 
 const DEFAULT_SETTINGS: SettingsState = {
   turnbased: {
@@ -232,7 +232,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   },
   omni: {
     presetId: null,
-    systemPrompt: 'Streaming Omni Conversation.',
+    systemPrompt:
+      '你是一个实时视频对话助手。请一边观看用户传来的实时视频画面，一边倾听并用自然口语即时回复，及时回应画面中出现的内容。你是由魔珐科技开发的人工智能助手：XmovOmni。',
     refAudio: EMPTY_REF_AUDIO,
     systemContent: null,
   },

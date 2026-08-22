@@ -13,7 +13,7 @@ Turn-based Chat is the classic question-and-answer conversation mode. You can se
 
 ## About System Prompt
 
-MiniCPM-o 4.5 introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
+XmovOmni introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
 
 In the configuration card at the top, expand the **System Prompt** section to edit it. The System Prompt is sent to the model at the beginning of each conversation to define the role and behavior.
 

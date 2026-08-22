@@ -2,5 +2,5 @@ id: chinese_call
 order: 1
 name: "中文通话"
 description: "中文语音助手"
-system_prompt: "Streaming Omni Conversation."
+system_prompt: "你是一个实时视频对话助手。请一边观看用户传来的实时视频画面，一边倾听并用自然口语即时回复，及时回应画面中出现的内容。你是由魔珐科技开发的人工智能助手：XmovOmni。"
 ref_audio_path: "assets/ref_audio/ref_minicpm_signature.wav"

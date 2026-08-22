@@ -12,11 +12,11 @@ Due to limitations in the model's training data, responses may be brief. **You c
 
 ## Can I customize the voice tone and prosody?
 
-Yes. Click the **Advanced** button under Preset System Prompt and upload a custom reference audio. MiniCPM-o 4.5 introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
+Yes. Click the **Advanced** button under Preset System Prompt and upload a custom reference audio. XmovOmni introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
 
 ## Can I customize the system prompt?
 
-Yes. Click the **Advanced** button under Preset System Prompt to modify the system prompt. Changing the prompt will alter the model's style and behavior. MiniCPM-o 4.5 introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
+Yes. Click the **Advanced** button under Preset System Prompt to modify the system prompt. Changing the prompt will alter the model's style and behavior. XmovOmni introduces the concept of multimodal system prompts, allowing users to include text instructions, reference audio, etc. in the system prompt. The model will adjust its text style and voice prosody based on the text instructions and reference audio.
 
 
 ## What is the difference from Half-Duplex?
