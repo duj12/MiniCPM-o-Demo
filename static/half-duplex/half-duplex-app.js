@@ -66,7 +66,7 @@ const DEFAULTS = {
     genMaxTokens: 256,
     genLengthPenalty: 1.1,
     genTemperature: 0.7,
-    ttsEnabled: true,
+    ttsEnabled: false,
     sessionTimeout: 300,
 };
 

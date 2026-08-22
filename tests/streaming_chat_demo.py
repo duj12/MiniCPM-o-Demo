@@ -186,11 +186,14 @@ class StreamingChatClient:
     """封装 /v1/realtime（或直连后端 /backend）的流式对话会话。"""
 
     def __init__(self, url: str, ssl_ctx=None, max_size: int = 128 * 1024 * 1024,
-                 direct: bool = False):
+                 direct: bool = False, backend: str = "minicpm"):
         self.url = url
         self.ssl_ctx = ssl_ctx
         self.max_size = max_size
         self.direct = direct
+        # 后端类型：minicpm（free-duplex，回复以 listen 结束，response.done 只是 chunk
+        # 边界）或 qwen3omni（turn-based，response.done 即完整回复结束）。
+        self.backend = backend
         self.ws = None
         self.session_id = None
 
@@ -307,17 +310,24 @@ class StreamingChatClient:
                         # 不在此逐 token 打印（碎片化难看）；回复完成后统一显示
                 elif kind == "listen":
                     m.model_state = "listening"
-                    # 模型选择聆听（无回复）——记录时间，若持续过久则放弃等待
                     if first_delta_at is None:
+                        # 还没收到任何文本就 listen：模型选择聆听（无回复）
                         last_listen_at = time.monotonic()
                         m.model_state = "listening"
                     else:
-                        last_listen_at = None  # 已开始回复，listen 是回复结束标志
+                        # 已收到文本后 listen = 本轮回复结束。
+                        # MiniCPM free-duplex 多 chunk 回复以 listen 结束（而非
+                        # response.done，后者只是 chunk 边界）。
+                        done = True
                 elif kind == "audio":
                     m.model_state = "speaking"
             elif t == "response.done":
-                text = ev.get("text", "") or text
-                done = True
+                # Qwen3-Omni turn-based：response.done = 完整回复结束。
+                # MiniCPM free-duplex：response.done 只是 chunk 边界（其 text 已通过
+                # text delta 累积），listen 才是 turn 结束。
+                if self.backend != "minicpm":
+                    text = ev.get("text", "") or text
+                    done = True
             elif t == "session.closed":
                 break
             elif t == "session.error":
@@ -424,15 +434,20 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 sent_frames += 1
 
             text = prompt if i == 0 else ""
+            # force_listen 只用于 VAD+TurnSense 判决（worker 累积音频，VAD 触发才回复）。
+            # 自由全双工（turn_decision=model）下必须让模型自主 listen/speak，
+            # 不能 force_listen，否则模型永远只累积不回复。
             await client.send_input(
                 audio_b64=b64(chunk), video_frames=frame_b64, text=text,
-                force_listen=True,
+                force_listen=(turn_decision == "vad_turnsense"),
             )
             i += 1
             await asyncio.sleep(CHUNK_MS / 1000.0 / replay_speed)
 
-        # 非阻塞检查：VAD 是否已触发回复（出现 text delta 或 listen）
-        if wait_reply and not in_reply:
+        # 非阻塞检查：仅 VAD+TurnSense 模式触发回复后暂停发送。
+        # 自由全双工（turn_decision=model）靠持续输入驱动，模型可随时回复，
+        # 不能暂停发送（否则模型收不到后续输入，回复会中断）。
+        if turn_decision == "vad_turnsense" and wait_reply and not in_reply:
             try:
                 rm = await asyncio.wait_for(
                     client.collect_reply(timeout=0.4, listen_giveup_s=0.4),
@@ -446,8 +461,9 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             except (asyncio.TimeoutError, TimeoutError):
                 pass
 
-        # 回复进行中：继续接收直到完成
-        if in_reply:
+        # 回复进行中：仅 VAD+TurnSense 模式等待回复完成再继续发送。
+        # model 模式持续发送，回复由模型自主穿插（靠 listen_giveup_s 分段）。
+        if turn_decision == "vad_turnsense" and in_reply:
             # 等待回复完成。不在这里发 keep-alive：静音 prefill 会让模型
             # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
             # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
@@ -538,7 +554,7 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
                             frame_tokens += TOKENS_PER_FRAME
                             cur_frames += 1
                 await client.send_input(audio_b64=b64(chunk), video_frames=frame_b64,
-                                        force_listen=True)
+                                        force_listen=(turn_decision == "vad_turnsense"))
                 cur_audio += 1.0
 
             # 读取模型回复（非阻塞）
@@ -621,6 +637,8 @@ async def main():
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
                         help="gateway WS 地址")
+    parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
+                        help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
     parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
                         help="系统提示词")
     args = parser.parse_args()
@@ -645,7 +663,7 @@ async def main():
     elif args.direct_backend.startswith("wss"):
         ssl_ctx = _ssl_ctx_noverify()
 
-    client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct)
+    client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, backend=args.backend)
     try:
         await client.connect()
         await client.init(

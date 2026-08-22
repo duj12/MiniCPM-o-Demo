@@ -371,6 +371,7 @@ async def _handle_remote_backend_runtime_ws(
                 push=lambda payload: runtime.push(payload),
                 interrupt=lambda: runtime.interrupt(),
                 send_event=lambda payload: ws.send_json(payload),
+                active_model=str(WORKER_CONFIG.get("active_model", "minicpm")),
             )
             logger.info("half-duplex VAD+TurnSense enabled for session %s "
                         "(vad=%s tail_sil=%dms max_len=%dms)",
@@ -547,7 +548,10 @@ def main():
         "compile": cfg.compile,
         "chat_vocoder": cfg.chat_vocoder,
         "attn_implementation": cfg.attn_implementation,
-        "active_model": cfg.backend.active_model,
+        # active_model 以环境变量 ACTIVE_MODEL 为准（entrypoint 用它启动对应后端），
+        # 回退到 config.json 的 backend.active_model。避免 .env 与 config.json 不一致时
+        # worker 误判模型类型（例如环境变量 qwen3omni 但 config.json 里是 minicpm）。
+        "active_model": os.environ.get("ACTIVE_MODEL") or cfg.backend.active_model,
     })
 
     logger.info(f"Starting Worker on port {port}, GPU {gpu_id}")

@@ -58,6 +58,10 @@ services:
       # Mounted so runtime/half_duplex.py's auto-detect finds both the module
       # (sys.path /Fun-ASR-deploy) and the model (v1.0/v1.1).
       - ${FUNASR_DEPLOY_HOST_PATH:-../Fun-ASR-deploy}:/Fun-ASR-deploy:ro
+      # FSMN-VAD onnx 模型（VAD+TurnSense 用）：
+      #   model.onnx + config.yaml + am.mvn，挂载到 half_duplex.py 的候选路径
+      #   <root>/vad-runtime/model（root_for_deploy() 在容器内解析为 /）。
+      - ${VAD_RUNTIME_MODEL_HOST_PATH:-../vad-runtime/model}:/vad-runtime/model:ro
     deploy:
       resources:
         reservations:
@@ -81,6 +85,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile.gateway
     image: minicpm-gateway:dev
+    environment:
+      # 与 cpp-worker-backend 保持一致，让 gateway 的 /api/frontend_defaults
+      # 能正确报告当前后端模型（config.py 里优先读 ACTIVE_MODEL 环境变量）。
+      ACTIVE_MODEL: "${ACTIVE_MODEL:-minicpm}"
     command:
       - "--host"
       - "0.0.0.0"
@@ -98,6 +106,18 @@ services:
     volumes:
       - ${DATA_HOST_PATH:-./data}:/app/data
       - ${CERTS_HOST_PATH:-./certs}:/app/certs:ro
+      # 开发期挂载 config.py + 改动的静态前端文件，宿主机改动即时生效，
+      # 无需重建镜像。不整体挂载 static/（会盖掉镜像内 bun 构建的 mobile/docs）。
+      - ./config.py:/app/config.py:ro
+      - ./static/omni/omni.html:/app/static/omni/omni.html:ro
+      - ./static/omni/omni-app.js:/app/static/omni/omni-app.js:ro
+      - ./static/audio-duplex/audio_duplex.html:/app/static/audio-duplex/audio_duplex.html:ro
+      - ./static/audio-duplex/audio-duplex-app.js:/app/static/audio-duplex/audio-duplex-app.js:ro
+      - ./static/realtime/realtime-app.js:/app/static/realtime/realtime-app.js:ro
+      - ./static/half-duplex/half_duplex.html:/app/static/half-duplex/half_duplex.html:ro
+      - ./static/half-duplex/half-duplex-app.js:/app/static/half-duplex/half-duplex-app.js:ro
+      - ./static/mobile-omni/index.html:/app/static/mobile-omni/index.html:ro
+      - ./static/duplex/ui/duplex-ui.js:/app/static/duplex/ui/duplex-ui.js:ro
     depends_on:
       cpp-worker-backend:
         condition: service_healthy

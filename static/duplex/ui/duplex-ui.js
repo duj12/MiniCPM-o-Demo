@@ -416,6 +416,14 @@ export async function loadFrontendDefaults() {
             const el = document.getElementById('playbackDelay');
             if (el) el.value = defaults.playback_delay_ms;
         }
+        // 按后端模型类型设置 turn_decision 默认值：
+        //   qwen3omni → 默认勾选 VAD+TurnSense（其 turn-based 后端靠 VAD 触发才回复）
+        //   minicpm   → 默认不勾选（free-duplex，模型自主听/说）
+        // 该复选框不持久化到 localStorage，每次页面加载按当前后端应用默认。
+        if (defaults.active_model) {
+            const el = document.getElementById('turnDecision');
+            if (el) el.checked = (defaults.active_model === 'qwen3omni');
+        }
     } catch (e) {
         console.warn('[frontend_defaults] fetch failed, using HTML defaults:', e.message);
     }

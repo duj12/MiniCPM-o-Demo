@@ -451,11 +451,15 @@ class HalfDuplexSession:
         push: Callable[[Dict[str, Any]], Any],
         interrupt: Callable[[], Any],
         send_event: Callable[[Dict[str, Any]], Any],
+        active_model: str = "minicpm",
     ) -> None:
         self.cfg = config or HalfDuplexConfig()
         self.push = push
         self.interrupt = interrupt
         self.send_event = send_event
+        # 后端模型类型：minicpm（free-duplex 采样，需要 1s 静音驱动循环）
+        # 或 qwen3omni（turn-based，触发 chunk 即完整回复，保持一次性触发）。
+        self.active_model = active_model
 
         self.state = HalfDuplexState.LISTENING
         # 选择 VAD：fsmn（FunASR，默认）或 silero（StreamingVAD）
@@ -482,6 +486,12 @@ class HalfDuplexSession:
         self.pending = False              # TurnSense incomplete, watchdog armed
         self._barge_in_detected = False
         self._vad_speech_started_at = 0.0
+
+        # 回复驱动状态（仅 MiniCPM free-duplex 使用）
+        self._reply_ended = False         # 模型已输出 <|listen|>，回复结束
+        self._last_reply_activity = 0.0   # 最近一次 text/audio delta 时间
+        self._drive_task = None           # 1s 静音驱动任务
+        self._reply_stall_task = None     # 回复停滞看门狗
 
     # ------------------------------------------------------------------
     # Feed a frontend chunk (audio base64 float32 16kHz + optional frames)
@@ -554,19 +564,82 @@ class HalfDuplexSession:
             await self.send_event({"type": "turn.turnsense", "label": "invalid"})
 
     async def _trigger_reply(self) -> None:
-        """User finished — send a decode trigger (chunk WITHOUT force_listen)."""
+        """User finished — trigger the model to reply.
+
+        - Qwen3-Omni（turn-based）：一个触发 chunk 即产生完整回复，保持一次性触发。
+        - MiniCPM-o（free-duplex）：首 chunk 带 force_reply（C++ 一次性，保证模型开口），
+          然后 1s 静音驱动循环，让模型基于累积的音频 KV 自然多 chunk 回复，直到它
+          自己输出 <|listen|> 结束 turn。
+        """
         self.state = HalfDuplexState.GENERATING
         self._barge_in_detected = False
+        self._reply_ended = False
+        self._last_reply_activity = time.monotonic()
         logger.info("[HD] ▶ 触发模型回复")
         await self.send_event({"type": "turn.turnsense", "label": "complete"})
 
-        # Trigger decode: short silence chunk, no force_listen → backend decodes.
-        silence = np.zeros(int(16000 * self.cfg.silence_trigger_ms / 1000), dtype=np.float32)
+        if self.active_model != "minicpm":
+            # Qwen3-Omni: turn-based，触发 chunk 即完整回复，无静音循环。
+            silence = np.zeros(int(16000 * self.cfg.silence_trigger_ms / 1000), dtype=np.float32)
+            await self.push({
+                "audio": _np_float32_to_b64(silence),
+                "video_frames": [],
+                # force_listen intentionally omitted → decode
+                "force_reply": True,
+            })
+            return
+
+        # MiniCPM-o: 首 chunk 带 force_reply（C++ 一次性 → 首 token 非 listen，确保开口）。
+        silence = np.zeros(16000, dtype=np.float32)  # 1 秒
         await self.push({
             "audio": _np_float32_to_b64(silence),
             "video_frames": [],
-            # force_listen intentionally omitted → decode
+            "force_reply": True,
         })
+        # 启动 1s 静音驱动循环 + 停滞看门狗。
+        self._drive_task = asyncio.create_task(self._drive_reply_loop())
+        self._reply_stall_task = asyncio.create_task(self._reply_stall_watchdog())
+
+    async def _drive_reply_loop(self) -> None:
+        """每 1s 发一个静音 chunk（无 force_reply / force_listen），自然驱动模型继续说话。
+
+        模型每 chunk 输出 <|chunk_eos|>（本轮 chunk 结束），下一个静音 chunk 触发下一次
+        decode → 下一个自然 chunk。直到模型输出 <|listen|>（on_backend_event 置
+        _reply_ended）或收到 barge-in / 超时。
+        """
+        try:
+            while self.state == HalfDuplexState.GENERATING and not self._reply_ended:
+                await asyncio.sleep(1.0)
+                if self.state != HalfDuplexState.GENERATING or self._reply_ended:
+                    break
+                try:
+                    await self.push({
+                        "audio": _np_float32_to_b64(np.zeros(16000, dtype=np.float32)),
+                        "video_frames": [],
+                        # force_listen/force_reply 均不设 → 自然 decode
+                    })
+                except Exception as exc:
+                    # session 已关闭 / 后端不可用 → 停止驱动，避免异常泄漏
+                    logger.info("[HD] 静音驱动停止 (push failed: %s)", exc)
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _reply_stall_watchdog(self) -> None:
+        """若模型长时间无 text/audio delta（回复停滞），强制回到 listening，防止卡死。"""
+        stall_s = self.cfg.turnsense.incomplete_wait_ms / 1000.0 * 4  # 默认 3.6s，够多 chunk
+        stall_s = max(stall_s, 6.0)  # 至少 6s
+        try:
+            while not self._reply_ended and self.state == HalfDuplexState.GENERATING:
+                await asyncio.sleep(stall_s)
+                if self._reply_ended or self.state != HalfDuplexState.GENERATING:
+                    break
+                if time.monotonic() - self._last_reply_activity >= stall_s:
+                    logger.warning("[HD] reply stall timeout — forcing back to listening")
+                    self._reply_ended = True
+                    self._reset_to_listening()
+        except asyncio.CancelledError:
+            pass
 
     async def _watchdog(self, gen: int) -> None:
         """Port of funasr_wss_server._turnsense_watchdog."""
@@ -592,13 +665,18 @@ class HalfDuplexSession:
         if etype == "response.output.delta":
             kind = str(event.get("kind") or "")
             if kind == "listen":
-                logger.info("[HD] 👂 模型 → Listen")
+                logger.info("[HD] 👂 模型 → Listen（本轮回复结束）")
+                # MiniCPM: 只有 <|listen|> 表示模型真正让出话轮 → 复位。
+                # Qwen3-Omni 走 response.done 复位（下面）。
+                self._reply_ended = True
                 self._reset_to_listening()
             elif kind == "text":
                 txt = str(event.get("text") or "")
                 if txt:
+                    self._last_reply_activity = time.monotonic()
                     logger.info("[HD] 💬 模型回复: %s", txt.strip())
             elif kind == "audio":
+                self._last_reply_activity = time.monotonic()
                 logger.info("[HD] 🔊 模型 → 说话 (audio chunk)")
         elif etype == "response.done":
             full = str(event.get("text") or "")
@@ -606,7 +684,12 @@ class HalfDuplexSession:
                 logger.info("[HD] ✅ 回复完成: %s", full.strip())
             else:
                 logger.info("[HD] ✅ 回复完成 (无文本)")
-            self._reset_to_listening()
+            # MiniCPM free-duplex: 每个静音 chunk 都产生一个 response.done（该 chunk 的
+            # 文本），这是"chunk 边界"而非"turn 结束"。只有 listen 才复位。
+            # Qwen3-Omni turn-based: response.done 即完整回复结束。
+            if self.active_model != "minicpm":
+                self._reply_ended = True
+                self._reset_to_listening()
         return True
 
     def _reset_to_listening(self) -> None:
@@ -614,6 +697,13 @@ class HalfDuplexSession:
             self.state = HalfDuplexState.LISTENING
             self.vad.reset()  # drop VAD state from the reply period
             self._barge_in_detected = False
+            # 清理回复驱动任务，防止旧循环泄漏到下次触发。
+            if self._drive_task is not None and not self._drive_task.done():
+                self._drive_task.cancel()
+            if self._reply_stall_task is not None and not self._reply_stall_task.done():
+                self._reply_stall_task.cancel()
+            self._drive_task = None
+            self._reply_stall_task = None
             logger.info("Back to listening")
 
     def shutdown(self) -> None:

@@ -392,3 +392,19 @@ async function checkHealth() {
 
 checkHealth();
 setInterval(checkHealth, 30000);
+
+// ── Frontend defaults (active_model → turn_decision default) ────────────────
+
+async function applyFrontendDefaults() {
+    try {
+        const resp = await fetch('/api/frontend_defaults');
+        if (!resp.ok) return;
+        const defaults = await resp.json();
+        if (defaults.active_model) {
+            // qwen3omni → 默认 VAD+TurnSense；minicpm → 默认模型自主。
+            const el = $('cfgTurnDecision');
+            if (el) el.checked = (defaults.active_model === 'qwen3omni');
+        }
+    } catch { /* 忽略，用 HTML 默认 */ }
+}
+applyFrontendDefaults();

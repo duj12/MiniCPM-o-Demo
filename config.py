@@ -385,9 +385,15 @@ class ServiceConfig(BaseModel):
 
     def frontend_defaults(self) -> dict:
         """返回前端页面需要的默认配置（供 /api/frontend_defaults 使用）"""
-        return {
+        defaults = {
             "playback_delay_ms": self.playback_delay_ms,
         }
+        # 暴露当前后端模型类型，前端据此设置 turn_decision 默认值：
+        #   qwen3omni → 默认 VAD+TurnSense；minicpm → 默认模型自主（free-duplex）。
+        # 以环境变量 ACTIVE_MODEL 为准（与 entrypoint / worker 一致），回退 config.json。
+        active_model = os.environ.get("ACTIVE_MODEL") or getattr(self.backend, "active_model", "minicpm")
+        defaults["active_model"] = active_model
+        return defaults
 
 
 # ============ 加载逻辑 ============

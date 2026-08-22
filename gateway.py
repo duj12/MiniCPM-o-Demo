@@ -1355,7 +1355,10 @@ async def realtime_ws(ws: WebSocket):
         await ws.close(code=1008, reason=f"Unsupported realtime mode: {mode}")
         return
 
-    max_duration_s = 300 if mode == "video" else 600
+    # 长会话（如 VAD+TurnSense 多段转写）可能运行 10+ 分钟。默认 30min，
+    # 可用环境变量 REALTIME_MAX_DURATION_S 覆盖。
+    _max_dur_env = os.environ.get("REALTIME_MAX_DURATION_S")
+    max_duration_s = int(_max_dur_env) if _max_dur_env else (1800 if mode == "video" else 3600)
     request_type = "omni_duplex" if mode == "video" else "audio_duplex"
 
     await _api_worker_passthrough_ws(

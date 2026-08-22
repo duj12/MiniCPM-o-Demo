@@ -1610,7 +1610,7 @@ async function startSession() {
             turn_decision: (document.getElementById('turnDecision')?.checked ?? false) ? 'vad_turnsense' : 'model',
         },
         max_slice_nums: getEffectiveMaxSliceNums(),
-        use_tts: (document.getElementById('ttsEnabled')?.checked ?? true),
+        use_tts: (document.getElementById('ttsEnabled')?.checked ?? false),
     };
     const refBase64 = refAudio.getBase64();
     if (refBase64) preparePayload.ref_audio_base64 = refBase64;
