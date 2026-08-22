@@ -454,9 +454,33 @@ class HalfDuplexSession:
         active_model: str = "minicpm",
     ) -> None:
         self.cfg = config or HalfDuplexConfig()
-        self.push = push
+        # 包装 send_event / push：客户端断开时 WebSocketDisconnect / ClientDisconnected /
+        # RuntimeError("send after close") 会向上抛，后台任务（watchdog / 静音驱动循环）
+        # 会变成 "Task exception was never retrieved"。这里捕获断开异常，标记
+        # _disconnected 并静默，避免任务异常泄漏，也避免后续重复发送。
+        self._disconnected = False
+
+        async def _safe_send_event(payload: Dict[str, Any]) -> None:
+            if self._disconnected:
+                return
+            try:
+                await send_event(payload)
+            except Exception:
+                self._disconnected = True
+                logger.debug("[HD] send_event failed — client disconnected")
+
+        async def _safe_push(payload: Dict[str, Any]) -> None:
+            if self._disconnected:
+                return
+            try:
+                await push(payload)
+            except Exception:
+                self._disconnected = True
+                logger.debug("[HD] push failed — backend/session disconnected")
+
+        self.push = _safe_push
         self.interrupt = interrupt
-        self.send_event = send_event
+        self.send_event = _safe_send_event
         # 后端模型类型：minicpm（free-duplex 采样，需要 1s 静音驱动循环）
         # 或 qwen3omni（turn-based，触发 chunk 即完整回复，保持一次性触发）。
         self.active_model = active_model
@@ -655,6 +679,10 @@ class HalfDuplexSession:
             await self._trigger_reply()
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # 客户端断开 / 后端不可用时，_trigger_reply 内部的 send_event/push
+            # 已由 _safe_* 包装静默；这里兜底捕获，避免 "Task exception was never retrieved"。
+            logger.debug("[HD] watchdog aborted", exc_info=True)
 
     # ------------------------------------------------------------------
     # Backend event feed (from worker's backend_to_client loop)

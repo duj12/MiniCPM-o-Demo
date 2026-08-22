@@ -633,6 +633,10 @@ async def main():
     parser.add_argument("--audio-chunk-ms", type=int, default=1000,
                         help="demo 发送音频的 chunk 大小(ms)，默认1000。"
                              "建议与 --vad-chunk-size 一致，流式分句最及时")
+    parser.add_argument("--ts-wait-ms", type=int, default=900,
+                        help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
+    parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
+                        help="TurnSense invalid 丢弃阈值(0~1)：invalid 概率≥此值则丢弃该句不回复，默认0.9")
     parser.add_argument("--direct-backend", default="",
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
@@ -670,12 +674,18 @@ async def main():
             mode="full_duplex",
             system_prompt=args.system_prompt,
             turn_decision=args.turn_decision,
-            config={"vad": {
-                "vad_model": args.vad_model,
-                "vad_tail_sil": args.vad_tail_sil,
-                "vad_max_len": args.vad_max_len,
-                "vad_chunk_size": args.vad_chunk_size,
-            }},
+            config={
+                "vad": {
+                    "vad_model": args.vad_model,
+                    "vad_tail_sil": args.vad_tail_sil,
+                    "vad_max_len": args.vad_max_len,
+                    "vad_chunk_size": args.vad_chunk_size,
+                },
+                "turnsense": {
+                    "incomplete_wait_ms": args.ts_wait_ms,
+                    "invalid_confidence_threshold": args.ts_invalid_threshold,
+                },
+            },
         )
         print(f"会话已建立: session={client.session_id[:8] if client.session_id else '?'} "
               f"url={url}")

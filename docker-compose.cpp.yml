@@ -45,6 +45,12 @@ services:
       WORKER_PORT: "22400"
       LLAMA_SERVER_EXTRA_ARGS: "${LLAMA_SERVER_EXTRA_ARGS:--c 16384 --parallel 4}"
       GGML_CUDA_DISABLE_GRAPHS: "1"
+      # VAD + TurnSense 半双工参数（worker 读 env 作默认值，请求 config 可覆盖）
+      VAD_TAIL_SIL: "${VAD_TAIL_SIL:-600}"
+      VAD_MAX_LEN: "${VAD_MAX_LEN:-60000}"
+      VAD_CHUNK_SIZE: "${VAD_CHUNK_SIZE:-1000}"
+      TS_INCOMPLETE_WAIT_MS: "${TS_INCOMPLETE_WAIT_MS:-900}"
+      TS_INVALID_THRESHOLD: "${TS_INVALID_THRESHOLD:-0.9}"
     volumes:
       # Mount the parent directory containing both MiniCPM and Qwen3-Omni model dirs.
       # Expected layout on host:
@@ -62,6 +68,8 @@ services:
       #   model.onnx + config.yaml + am.mvn，挂载到 half_duplex.py 的候选路径
       #   <root>/vad-runtime/model（root_for_deploy() 在容器内解析为 /）。
       - ${VAD_RUNTIME_MODEL_HOST_PATH:-../vad-runtime/model}:/vad-runtime/model:ro
+      # 预设（presets）挂载，宿主机改动即时生效，避免镜像内残留旧品牌文案。
+      - ./assets/presets:/app/assets/presets:ro
     deploy:
       resources:
         reservations:
@@ -118,6 +126,16 @@ services:
       - ./static/half-duplex/half-duplex-app.js:/app/static/half-duplex/half-duplex-app.js:ro
       - ./static/mobile-omni/index.html:/app/static/mobile-omni/index.html:ro
       - ./static/duplex/ui/duplex-ui.js:/app/static/duplex/ui/duplex-ui.js:ro
+      - ./static/index.html:/app/static/index.html:ro
+      - ./static/admin.html:/app/static/admin.html:ro
+      - ./static/session-viewer.html:/app/static/session-viewer.html:ro
+      - ./static/mobile-flow-mock.html:/app/static/mobile-flow-mock.html:ro
+      - ./static/turnbased.html:/app/static/turnbased.html:ro
+      - ./static/prototype-content-editor.html:/app/static/prototype-content-editor.html:ro
+      - ./static/realtime/realtime.html:/app/static/realtime/realtime.html:ro
+      - ./static/faq:/app/static/faq:ro
+      # 预设（presets）挂载，宿主机改动即时生效，避免镜像内残留旧品牌文案。
+      - ./assets/presets:/app/assets/presets:ro
       # React 移动端构建产物（/mobile 页面），宿主机构建后即时生效。
       - ./static/mobile:/app/static/mobile:ro
     depends_on:

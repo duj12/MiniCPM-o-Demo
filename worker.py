@@ -359,24 +359,54 @@ async def _handle_remote_backend_runtime_ws(
             if isinstance(vad_p, dict):
                 vad_cfg_payload = vad_p
         if hd_cfg_payload == "vad_turnsense":
+            # 优先级：请求 config > 环境变量(.env) > 代码默认值
+            def _env_int(name: str, default: int) -> int:
+                try:
+                    return int(os.environ.get(name, default))
+                except (TypeError, ValueError):
+                    return default
+
+            def _env_float(name: str, default: float) -> float:
+                try:
+                    return float(os.environ.get(name, default))
+                except (TypeError, ValueError):
+                    return default
+
             vad_cfg = VadCfg(
                 vad_model=str(vad_cfg_payload.get("vad_model", "fsmn")),
                 fsmn_model_dir=str(vad_cfg_payload.get("fsmn_model_dir", "")),
-                vad_tail_sil=int(vad_cfg_payload.get("vad_tail_sil", 600)),
-                vad_max_len=int(vad_cfg_payload.get("vad_max_len", 60000)),
-                vad_chunk_size=int(vad_cfg_payload.get("vad_chunk_size", 1000)),
+                vad_tail_sil=int(vad_cfg_payload.get(
+                    "vad_tail_sil", _env_int("VAD_TAIL_SIL", 600))),
+                vad_max_len=int(vad_cfg_payload.get(
+                    "vad_max_len", _env_int("VAD_MAX_LEN", 60000))),
+                vad_chunk_size=int(vad_cfg_payload.get(
+                    "vad_chunk_size", _env_int("VAD_CHUNK_SIZE", 1000))),
+            )
+            # TurnSense 配置：请求 config.turnsense 可覆盖 env 默认值
+            ts_payload = {}
+            if init_params.get("config") and isinstance(init_params["config"], dict):
+                _ts = init_params["config"].get("turnsense")
+                if isinstance(_ts, dict):
+                    ts_payload = _ts
+            ts_cfg = TurnSenseCfg(
+                enabled=bool(ts_payload.get("enabled", True)),
+                incomplete_wait_ms=int(ts_payload.get(
+                    "incomplete_wait_ms", _env_int("TS_INCOMPLETE_WAIT_MS", 900))),
+                invalid_confidence_threshold=float(ts_payload.get(
+                    "invalid_confidence_threshold", _env_float("TS_INVALID_THRESHOLD", 0.9))),
             )
             hd_session = HalfDuplexSession(
-                config=HalfDuplexConfig(vad=vad_cfg, turnsense=TurnSenseCfg()),
+                config=HalfDuplexConfig(vad=vad_cfg, turnsense=ts_cfg),
                 push=lambda payload: runtime.push(payload),
                 interrupt=lambda: runtime.interrupt(),
                 send_event=lambda payload: ws.send_json(payload),
                 active_model=str(WORKER_CONFIG.get("active_model", "minicpm")),
             )
             logger.info("half-duplex VAD+TurnSense enabled for session %s "
-                        "(vad=%s tail_sil=%dms max_len=%dms)",
+                        "(vad=%s tail_sil=%dms max_len=%dms, ts_wait=%dms invalid_thr=%.2f)",
                         runtime.session_id, vad_cfg.vad_model,
-                        vad_cfg.vad_tail_sil, vad_cfg.vad_max_len)
+                        vad_cfg.vad_tail_sil, vad_cfg.vad_max_len,
+                        ts_cfg.incomplete_wait_ms, ts_cfg.invalid_confidence_threshold)
 
         async def client_to_backend() -> None:
             nonlocal backend_closed
@@ -405,8 +435,16 @@ async def _handle_remote_backend_runtime_ws(
                             "session_id": runtime.session_id,
                             "reason": msg.get("reason", "client_closed"),
                         }
-                    await ws.send_json(close_payload)
-                    await ws.close(code=1000, reason="client_closed")
+                    # 客户端可能已断开（1006），send_json 会抛 WebSocketDisconnect /
+                    # RuntimeError("send after close")。这里容错，避免清理阶段二次报错。
+                    try:
+                        await ws.send_json(close_payload)
+                    except Exception:
+                        pass
+                    try:
+                        await ws.close(code=1000, reason="client_closed")
+                    except Exception:
+                        pass
                     return
 
                 raise RuntimeError(f"unsupported runtime message type: {msg_type}")
