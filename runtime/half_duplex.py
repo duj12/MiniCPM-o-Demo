@@ -463,11 +463,12 @@ class HalfDuplexSession:
         async def _safe_send_event(payload: Dict[str, Any]) -> None:
             if self._disconnected:
                 return
+            logger.info("[HD] send_event: %s", payload)
             try:
                 await send_event(payload)
-            except Exception:
+            except Exception as e:
                 self._disconnected = True
-                logger.debug("[HD] send_event failed — client disconnected")
+                logger.error("[HD] send_event failed — %s", e)
 
         async def _safe_push(payload: Dict[str, Any]) -> None:
             if self._disconnected:

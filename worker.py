@@ -275,10 +275,21 @@ async def _handle_remote_backend_runtime_ws(
     await ws.accept()
     worker.state.inc_sessions()
 
+    # 串行化向客户端 WS 的发送：backend_to_client 转发与 hd_session 的 send_event
+    # 并发 send 同一 FastAPI WebSocket 时，uvicorn 可能丢弃事件（如 turn.turnsense）。
+    # 用锁保证 send 原子性，事件不丢失。
+    _ws_send_lock = asyncio.Lock()
+
     async def _send_runtime_event(event: Any) -> Dict[str, Any]:
         payload = _event_payload(event)
-        await ws.send_json(payload)
+        async with _ws_send_lock:
+            await ws.send_json(payload)
         return payload
+
+    async def _send_json_locked(payload: Dict[str, Any]) -> None:
+        """直发事件（如 hd_session 的 turn.turnsense），带锁串行发送。"""
+        async with _ws_send_lock:
+            await ws.send_json(payload)
 
     runtime = BackendRuntimeSession(
         backend_base_url=backend_url,
@@ -399,7 +410,7 @@ async def _handle_remote_backend_runtime_ws(
                 config=HalfDuplexConfig(vad=vad_cfg, turnsense=ts_cfg),
                 push=lambda payload: runtime.push(payload),
                 interrupt=lambda: runtime.interrupt(),
-                send_event=lambda payload: ws.send_json(payload),
+                send_event=lambda payload: _send_json_locked(payload),
                 active_model=str(WORKER_CONFIG.get("active_model", "minicpm")),
             )
             logger.info("half-duplex VAD+TurnSense enabled for session %s "
