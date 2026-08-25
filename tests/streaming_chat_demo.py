@@ -647,30 +647,77 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
             config={"vad": vad_cfg, "turnsense": ts_cfg},
         )
         setup_ms = (time.perf_counter() - t0) * 1000
-        t_send = time.perf_counter()
 
         text = ""
         first_ts = None
-        # 逐帧发短音频
+        trigger_ts = None   # VAD+TurnSense 分句决定（收到 turn.turnsense complete）时刻
+        t_send = time.perf_counter()  # 发送第一块音频前
+        send_end = None
+
+        # 流式发送 + 非阻塞收：每发一块（1s 音频），用短超时 _recv 收中间事件，
+        # 再发下一块。不并发 send/recv（websockets 同连接不能同时 send+recv），
+        # 而是交替进行，模拟真实流式（VAD 边收边检测停顿分句）。
+        # 参考 run_file_replay 的节奏。
+        done = False
+        had_text = False
+        recv_deadline = time.perf_counter() + 45  # 单路总等待上限
+
         for i, frame in enumerate(audio_frames[:n_frames]):
+            if done:
+                break
             await client.send_input(
                 audio_b64=b64(frame),
                 text=prompt if i == 0 else "",
                 force_listen=(turn_decision == "vad_turnsense"),
             )
-        # 读回复直到 listen 或 done。vad_turnsense 下 VAD 检测停顿 + TurnSense
-        # 判定后才触发回复，延迟可能较长；收到 text 后继续等到 listen 才算一轮结束。
-        done = False
-        had_text = False
-        recv_deadline = time.monotonic() + 45  # 单路总等待上限
-        while not done and time.monotonic() < recv_deadline:
-            remaining = recv_deadline - time.monotonic()
+            # 发送间隙非阻塞收事件（每次最多等 0.3s，随后继续发下一块）
+            try:
+                while True:
+                    ev = await asyncio.wait_for(client._recv(timeout=1.0), timeout=1.0)
+                    t = ev.get("type")
+                    # VAD+TurnSense 分句决定：worker 在 _trigger_reply 时发 complete
+                    if t == "turn.turnsense" and ev.get("label") == "complete":
+                        if trigger_ts is None:
+                            trigger_ts = time.perf_counter()
+                    elif t == "response.output.delta":
+                        k = ev.get("kind")
+                        if k == "text":
+                            chunk = ev.get("text", "")
+                            if chunk:
+                                if first_ts is None:
+                                    first_ts = time.perf_counter()
+                                text += chunk
+                                had_text = True
+                        elif k == "listen":
+                            if had_text:
+                                done = True
+                    elif t == "response.done":
+                        text = ev.get("text", "") or text
+                        if text and first_ts is None:
+                            first_ts = time.perf_counter()
+                        if text:
+                            had_text = True
+                        done = True
+                    elif t in ("session.closed", "error"):
+                        done = True
+            except (asyncio.TimeoutError, TimeoutError):
+                pass  # 无新事件，继续发下一块
+
+        send_end = time.perf_counter()  # 全部音频发完的时刻
+
+        # 发完后继续收直到 listen（有 text 后）或 done
+        while not done and time.perf_counter() < recv_deadline:
+            remaining = recv_deadline - time.perf_counter()
             try:
                 ev = await client._recv(timeout=min(15.0, max(1.0, remaining)))
             except (TimeoutError, websockets.exceptions.ConnectionClosed):
                 break
             t = ev.get("type")
-            if t == "response.output.delta":
+            # VAD+TurnSense 分句决定
+            if t == "turn.turnsense" and ev.get("label") == "complete":
+                if trigger_ts is None:
+                    trigger_ts = time.perf_counter()
+            elif t == "response.output.delta":
                 k = ev.get("kind")
                 if k == "text":
                     chunk = ev.get("text", "")
@@ -680,7 +727,6 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
                         text += chunk
                         had_text = True
                 elif k == "listen":
-                    # MiniCPM: listen = 本轮回复结束；Qwen3-Omni 走 response.done
                     if had_text:
                         done = True
             elif t == "response.done":
@@ -693,8 +739,11 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
             elif t in ("session.closed", "error"):
                 done = True
 
-        ttft_ms = (first_ts - t_send) * 1000 if first_ts else 0
-        total_ms = (time.perf_counter() - t_send) * 1000
+        # TTFT：VAD+TurnSense 分句决定（收到 turn.turnsense complete）→ 首字。
+        # 用户说完一句话、worker 判定句尾触发回复的时刻开始计时，到模型首字。
+        start_ts = trigger_ts or t_send  # 若未收到分句事件，回退到发送开始
+        ttft_ms = (first_ts - start_ts) * 1000 if first_ts else 0
+        total_ms = (time.perf_counter() - t0) * 1000
         return {
             "ok": bool(text),
             "setup_ms": setup_ms,
@@ -739,59 +788,52 @@ async def run_concurrency(url, ssl_ctx, direct, backend,
     baseline = _gpu_baseline(gpu_ids)
     print(f"  显存基线: " + ", ".join(f"GPU{g}={v}MiB" for g, v in baseline.items()))
 
-    max_ok = 0
-    for N in range(1, concurrency + 1):
-        monitor_running = True
-        peak = {g: (0, 0) for g in gpu_ids}  # gpu_id -> (vram, util)
+    N = concurrency
+    monitor_running = True
+    peak = {g: (0, 0) for g in gpu_ids}  # gpu_id -> (vram, util)
 
-        async def monitor():
-            nonlocal peak
-            while monitor_running:
-                stats = _gpu_stats(gpu_ids)
-                for g in gpu_ids:
-                    v, u = stats.get(g, (0, 0))
-                    if v > peak[g][0]:
-                        peak[g] = (v, max(peak[g][1], u))
-                    if u > peak[g][1]:
-                        peak[g] = (v, u)
-                await asyncio.sleep(0.3)
+    async def monitor():
+        nonlocal peak
+        while monitor_running:
+            stats = _gpu_stats(gpu_ids)
+            for g in gpu_ids:
+                v, u = stats.get(g, (0, 0))
+                if v > peak[g][0]:
+                    peak[g] = (v, max(peak[g][1], u))
+                if u > peak[g][1]:
+                    peak[g] = (v, u)
+            await asyncio.sleep(0.3)
 
-        mon_task = asyncio.create_task(monitor())
-        t_all = time.perf_counter()
+    mon_task = asyncio.create_task(monitor())
+    t_all = time.perf_counter()
 
-        tasks = [_run_one_concurrent(
-            url, ssl_ctx, direct, backend, turn_decision, system_prompt,
-            vad_cfg, ts_cfg, audio_frames, prompt,
-            n_frames=len(audio_frames),
-        ) for _ in range(N)]
-        results = await asyncio.gather(*tasks)
+    tasks = [_run_one_concurrent(
+        url, ssl_ctx, direct, backend, turn_decision, system_prompt,
+        vad_cfg, ts_cfg, audio_frames, prompt,
+        n_frames=len(audio_frames),
+    ) for _ in range(N)]
+    results = await asyncio.gather(*tasks)
 
-        monitor_running = False
-        await mon_task
-        wall_ms = (time.perf_counter() - t_all) * 1000
+    monitor_running = False
+    await mon_task
+    wall_ms = (time.perf_counter() - t_all) * 1000
 
-        ok = sum(1 for r in results if r["ok"])
-        max_ok = max(max_ok, ok)
+    ok = sum(1 for r in results if r["ok"])
 
-        print(f"\n  --- {N} 路并发 ---")
-        for i, r in enumerate(results):
-            st = "PASS" if r["ok"] else "FAIL"
-            print(f"    #{i+1:<2} {st:<4} setup={r['setup_ms']:.0f}ms "
-                  f"total={r['total_ms']:.0f}ms TTFT={r['ttft_ms']:.0f}ms "
-                  f"chars={r['chars']} {r['info'][:30]}")
-        peak_str = ", ".join(
-            f"GPU{g}: {v}MiB/{u}% (基线{baseline.get(g,0)}MiB)" for g, v, u in
-            [(g, p[0], p[1]) for g, p in peak.items()])
-        print(f"  峰值显存/利用率: {peak_str}")
-        print(f"  {ok}/{N} PASS | wall={wall_ms:.0f}ms")
+    print(f"\n  --- {N} 路并发 ---")
+    for i, r in enumerate(results):
+        st = "PASS" if r["ok"] else "FAIL"
+        print(f"    #{i+1:<2} {st:<4} setup={r['setup_ms']:.0f}ms "
+              f"total={r['total_ms']:.0f}ms TTFT={r['ttft_ms']:.0f}ms "
+              f"chars={r['chars']} {r['info'][:30]}")
+    peak_str = ", ".join(
+        f"GPU{g}: {v}MiB/{u}% (基线{baseline.get(g,0)}MiB)" for g, v, u in
+        [(g, p[0], p[1]) for g, p in peak.items()])
+    print(f"  峰值显存/利用率: {peak_str}")
+    print(f"  {ok}/{N} PASS | wall={wall_ms:.0f}ms")
 
-        if ok < N:
-            print(f"\n  ⚠️  {N} 路出现失败，停止递增（最大成功 {max_ok} 路）")
-            break
-        await asyncio.sleep(3)
-
-    print(f"\n=== 并发测试完成: 最大成功 {max_ok} 路 ===")
-    return max_ok
+    print(f"\n=== 并发测试完成: {ok}/{N} 路成功 ===")
+    return ok
 
 
 async def main():
