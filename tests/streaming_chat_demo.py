@@ -186,7 +186,7 @@ class StreamingChatClient:
     """封装 /v1/realtime（或直连后端 /backend）的流式对话会话。"""
 
     def __init__(self, url: str, ssl_ctx=None, max_size: int = 128 * 1024 * 1024,
-                 direct: bool = False, backend: str = "minicpm"):
+                 direct: bool = False, backend: str = "qwen3omni"):
         self.url = url
         self.ssl_ctx = ssl_ctx
         self.max_size = max_size
@@ -595,6 +595,205 @@ def _ssl_ctx_noverify():
     return ctx
 
 
+# ============================================================================
+# 并发测试（--concurrency N）
+# ============================================================================
+
+def _gpu_stats(gpu_ids=(0, 1)):
+    """查询多张 GPU 的显存(used)/利用率。返回 {gpu_id: (used_MiB, util%)}。"""
+    ids = ",".join(str(g) for g in gpu_ids)
+    try:
+        # nvidia-smi 在子进程里 NVML 初始化可能较慢（~7s），timeout 给足；
+        # 失败时静默返回 0，不影响主流程。
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
+             "--format=csv,noheader,nounits", "-i", ids],
+            capture_output=True, text=True, timeout=15,
+        )
+        out = {}
+        for i, line in enumerate(r.stdout.strip().splitlines()):
+            if gpu_ids[i] is not None and line:
+                parts = line.split(", ")
+                try:
+                    out[gpu_ids[i]] = (int(parts[0]), int(parts[1]))
+                except (ValueError, IndexError):
+                    out[gpu_ids[i]] = (0, 0)
+        return out
+    except Exception:
+        return {g: (0, 0) for g in gpu_ids}
+
+
+def _gpu_baseline(gpu_ids=(0, 1)):
+    """测试前记录显存基线（模型已加载后）。"""
+    stats = _gpu_stats(gpu_ids)
+    return {g: stats.get(g, (0, 0))[0] for g in gpu_ids}
+
+
+async def _run_one_concurrent(url, ssl_ctx, direct, backend,
+                              turn_decision, system_prompt,
+                              vad_cfg, ts_cfg, audio_frames, prompt,
+                              n_frames=5):
+    """单路并发会话：独立连接，发短音频触发一轮回复，返回结果 dict。"""
+    import websockets
+    t0 = time.perf_counter()
+    client = None
+    try:
+        client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, backend=backend)
+        await client.connect()
+        await client.init(
+            mode="full_duplex",
+            system_prompt=system_prompt,
+            turn_decision=turn_decision,
+            config={"vad": vad_cfg, "turnsense": ts_cfg},
+        )
+        setup_ms = (time.perf_counter() - t0) * 1000
+        t_send = time.perf_counter()
+
+        text = ""
+        first_ts = None
+        # 逐帧发短音频
+        for i, frame in enumerate(audio_frames[:n_frames]):
+            await client.send_input(
+                audio_b64=b64(frame),
+                text=prompt if i == 0 else "",
+                force_listen=(turn_decision == "vad_turnsense"),
+            )
+        # 读回复直到 listen 或 done。vad_turnsense 下 VAD 检测停顿 + TurnSense
+        # 判定后才触发回复，延迟可能较长；收到 text 后继续等到 listen 才算一轮结束。
+        done = False
+        had_text = False
+        recv_deadline = time.monotonic() + 45  # 单路总等待上限
+        while not done and time.monotonic() < recv_deadline:
+            remaining = recv_deadline - time.monotonic()
+            try:
+                ev = await client._recv(timeout=min(15.0, max(1.0, remaining)))
+            except (TimeoutError, websockets.exceptions.ConnectionClosed):
+                break
+            t = ev.get("type")
+            if t == "response.output.delta":
+                k = ev.get("kind")
+                if k == "text":
+                    chunk = ev.get("text", "")
+                    if chunk:
+                        if first_ts is None:
+                            first_ts = time.perf_counter()
+                        text += chunk
+                        had_text = True
+                elif k == "listen":
+                    # MiniCPM: listen = 本轮回复结束；Qwen3-Omni 走 response.done
+                    if had_text:
+                        done = True
+            elif t == "response.done":
+                text = ev.get("text", "") or text
+                if text and first_ts is None:
+                    first_ts = time.perf_counter()
+                if text:
+                    had_text = True
+                done = True
+            elif t in ("session.closed", "error"):
+                done = True
+
+        ttft_ms = (first_ts - t_send) * 1000 if first_ts else 0
+        total_ms = (time.perf_counter() - t_send) * 1000
+        return {
+            "ok": bool(text),
+            "setup_ms": setup_ms,
+            "total_ms": total_ms,
+            "ttft_ms": ttft_ms,
+            "chars": len(text),
+            "info": text[:40] if text else "",
+        }
+    except Exception as e:
+        return {"ok": False, "setup_ms": 0, "total_ms": 0, "ttft_ms": 0,
+                "chars": 0, "info": str(e)[:60]}
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+
+async def run_concurrency(url, ssl_ctx, direct, backend,
+                          turn_decision, system_prompt,
+                          vad_cfg, ts_cfg, video_path, prompt,
+                          concurrency, frames_per_route, gpu_ids=(0, 1)):
+    """并发 N 路测试：递增并发数，同时监控多张 GPU 显存/利用率。"""
+    import numpy as _np
+
+    # 提取音频：frames_per_route>0 截断到 N 秒，0=完整音轨（每路用同一段）
+    max_s = float(frames_per_route) if frames_per_route > 0 else None
+    audio = extract_audio_pcm(video_path, max_s=max_s)
+    if len(audio) == 0:
+        audio = _np.zeros(int(SAMPLE_RATE * (frames_per_route or 3)), dtype=_np.float32)
+    # 切成 1s 帧
+    audio_frames = [audio[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
+                    for i in range(max(1, len(audio) // CHUNK_SAMPLES))]
+    audio_frames = [f if len(f) == CHUNK_SAMPLES
+                    else _np.pad(f, (0, CHUNK_SAMPLES - len(f))) for f in audio_frames]
+
+    print(f"\n=== 并发测试 ===")
+    print(f"  视频: {video_path} | 每路音频 {len(audio_frames)}s | 目标并发: {concurrency} 路")
+    print(f"  GPU 监控: {list(gpu_ids)}")
+
+    baseline = _gpu_baseline(gpu_ids)
+    print(f"  显存基线: " + ", ".join(f"GPU{g}={v}MiB" for g, v in baseline.items()))
+
+    max_ok = 0
+    for N in range(1, concurrency + 1):
+        monitor_running = True
+        peak = {g: (0, 0) for g in gpu_ids}  # gpu_id -> (vram, util)
+
+        async def monitor():
+            nonlocal peak
+            while monitor_running:
+                stats = _gpu_stats(gpu_ids)
+                for g in gpu_ids:
+                    v, u = stats.get(g, (0, 0))
+                    if v > peak[g][0]:
+                        peak[g] = (v, max(peak[g][1], u))
+                    if u > peak[g][1]:
+                        peak[g] = (v, u)
+                await asyncio.sleep(0.3)
+
+        mon_task = asyncio.create_task(monitor())
+        t_all = time.perf_counter()
+
+        tasks = [_run_one_concurrent(
+            url, ssl_ctx, direct, backend, turn_decision, system_prompt,
+            vad_cfg, ts_cfg, audio_frames, prompt,
+            n_frames=len(audio_frames),
+        ) for _ in range(N)]
+        results = await asyncio.gather(*tasks)
+
+        monitor_running = False
+        await mon_task
+        wall_ms = (time.perf_counter() - t_all) * 1000
+
+        ok = sum(1 for r in results if r["ok"])
+        max_ok = max(max_ok, ok)
+
+        print(f"\n  --- {N} 路并发 ---")
+        for i, r in enumerate(results):
+            st = "PASS" if r["ok"] else "FAIL"
+            print(f"    #{i+1:<2} {st:<4} setup={r['setup_ms']:.0f}ms "
+                  f"total={r['total_ms']:.0f}ms TTFT={r['ttft_ms']:.0f}ms "
+                  f"chars={r['chars']} {r['info'][:30]}")
+        peak_str = ", ".join(
+            f"GPU{g}: {v}MiB/{u}% (基线{baseline.get(g,0)}MiB)" for g, v, u in
+            [(g, p[0], p[1]) for g, p in peak.items()])
+        print(f"  峰值显存/利用率: {peak_str}")
+        print(f"  {ok}/{N} PASS | wall={wall_ms:.0f}ms")
+
+        if ok < N:
+            print(f"\n  ⚠️  {N} 路出现失败，停止递增（最大成功 {max_ok} 路）")
+            break
+        await asyncio.sleep(3)
+
+    print(f"\n=== 并发测试完成: 最大成功 {max_ok} 路 ===")
+    return max_ok
+
+
 async def main():
     parser = argparse.ArgumentParser(description="流式视频对话 Demo")
     parser.add_argument("--video", help="视频文件路径（回放模式）")
@@ -645,10 +844,19 @@ async def main():
                         help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
     parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
                         help="系统提示词")
+    parser.add_argument("--concurrency", type=int, default=0,
+                        help="并发路数(默认0=单路)。>0 时进入并发测试：从1递增到N，同时监控 GPU 显存/利用率")
+    parser.add_argument("--gpu-ids", default="0,1",
+                        help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
+    parser.add_argument("--duplex-frames", type=int, default=5,
+                        help="并发模式下每路的音频时长(秒)，默认5")
     args = parser.parse_args()
 
-    if not args.video and not args.realtime:
+    if not args.video and not args.realtime and args.concurrency <= 0:
         parser.error("需要 --video 或 --realtime 之一")
+
+    if args.concurrency > 0 and not args.video:
+        parser.error("并发测试需要 --video 提供测试音视频")
 
     # 按 --audio-chunk-ms 重算发送 chunk（与 VAD 窗口统一，流式分句最及时）
     global CHUNK_MS, CHUNK_SAMPLES
@@ -666,6 +874,30 @@ async def main():
         url = f"{url}{sep}mode=video"
     elif args.direct_backend.startswith("wss"):
         ssl_ctx = _ssl_ctx_noverify()
+
+    # 并发测试模式：不建单路 client，直接并发 N 路
+    if args.concurrency > 0:
+        gpu_ids = tuple(int(x.strip()) for x in args.gpu_ids.split(",") if x.strip())
+        await run_concurrency(
+            url, ssl_ctx, direct, args.backend,
+            args.turn_decision, args.system_prompt,
+            vad_cfg={
+                "vad_model": args.vad_model,
+                "vad_tail_sil": args.vad_tail_sil,
+                "vad_max_len": args.vad_max_len,
+                "vad_chunk_size": args.vad_chunk_size,
+            },
+            ts_cfg={
+                "incomplete_wait_ms": args.ts_wait_ms,
+                "invalid_confidence_threshold": args.ts_invalid_threshold,
+            },
+            video_path=args.video,
+            prompt=args.prompt,
+            concurrency=args.concurrency,
+            frames_per_route=args.duplex_frames,
+            gpu_ids=gpu_ids,
+        )
+        return
 
     client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, backend=args.backend)
     try:
