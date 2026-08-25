@@ -1478,6 +1478,9 @@ def main():
 
     GATEWAY_CONFIG.update({
         "workers": worker_list,
+        # 每个 worker 的最大并发 session 数（前端显示为 Slots 上限）。
+        # 优先环境变量 WORKER_MAX_CONCURRENCY，回退默认 4。
+        "worker_max_concurrency": int(os.environ.get("WORKER_MAX_CONCURRENCY", 4)),
         "max_queue_size": args.max_queue_size or cfg.max_queue_size,
         "timeout": args.timeout or cfg.request_timeout,
         "eta_config": {

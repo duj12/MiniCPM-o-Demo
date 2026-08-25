@@ -75,6 +75,8 @@ services:
         reservations:
           devices:
             - driver: nvidia
+              # GPU 绑定由 .env 的 CPP_GPU_ID 控制（逗号分隔，如 0,1 = 双卡张量并行）。
+              # docker NVIDIA runtime 会把它解析为多张 GPU；单卡设 CPP_GPU_ID=0。
               device_ids: [ "${CPP_GPU_ID:-0}" ]
               capabilities: [ gpu ]
     healthcheck:
@@ -97,6 +99,8 @@ services:
       # 与 cpp-worker-backend 保持一致，让 gateway 的 /api/frontend_defaults
       # 能正确报告当前后端模型（config.py 里优先读 ACTIVE_MODEL 环境变量）。
       ACTIVE_MODEL: "${ACTIVE_MODEL:-minicpm}"
+      # 前端 Slots 上限（每 worker 最大并发 session），与 C++ --parallel 匹配。
+      WORKER_MAX_CONCURRENCY: "${WORKER_MAX_CONCURRENCY:-4}"
     command:
       - "--host"
       - "0.0.0.0"
