@@ -57,7 +57,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -293,8 +293,12 @@ class StreamingChatClient:
 
     async def collect_reply(self, timeout: float = 300.0,
                             listen_giveup_s: float = 8.0,
-                            initial: Optional[TurnMetrics] = None) -> TurnMetrics:
+                            initial: Optional[TurnMetrics] = None,
+                            on_text: Optional[Callable[[str], None]] = None) -> TurnMetrics:
         """收集一回合的回复（text/audio/listen deltas + response.done）。
+
+        on_text: 收到每个文本 delta 时回调（用于流式显示回复）。
+
 
         返回指标：TTFT（首个文本 delta）、回复耗时、字符数、模型状态。
 
@@ -321,10 +325,11 @@ class StreamingChatClient:
                 ev = await self._recv(min(timeout, listen_giveup_s))
             except (TimeoutError, websockets.ConnectionClosed):
                 # 无新事件。若已收到文本（回复进行中），说明可能是长回复生成中
-                # （_recv 超时但 response.done 未到）——不应 break，否则会丢弃
+                # （_recv 超时但 response.done 未到）——不应立即 break，否则会丢弃
                 # 还没收到的 response.done，回复只留超时前的部分（截断）。
-                # 只有从未收到文本时才 break（判定本轮无回复）。
-                if text:
+                # 但必须有总超时上限：超过 timeout（自开始累计）仍未收到 response.done，
+                # 说明该轮已结束（response.done 可能被前置消费/转发缺失），否则会死循环卡住。
+                if text and (time.monotonic() - t_start) < timeout:
                     continue
                 break
 
@@ -339,12 +344,18 @@ class StreamingChatClient:
                             reply_started = first_delta_at
                             m.ttft_s = first_delta_at - t_start
                         text += chunk
-                        # 不在此逐 token 打印（碎片化难看）；回复完成后统一显示
+                        # 流式显示：on_text 回调（demo 里实时打印回复）
+                        if on_text is not None:
+                            on_text(chunk)
                 elif kind == "listen":
                     m.model_state = "listening"
                     if first_delta_at is None:
-                        # 还没收到任何文本就 listen：模型选择聆听（无回复）
-                        last_listen_at = time.monotonic()
+                        if self.backend == "minicpm":
+                            # 还没收到任何文本就 listen：模型选择聆听（无回复）。
+                            # 仅 MiniCPM free-duplex 用 listen 判定无回复；
+                            # Qwen3 的 listen 是 prefill 完成信号（PREFILL_DONE），
+                            # 后面必有文本回复，绝不能据此 break（会收不到文本卡住）。
+                            last_listen_at = time.monotonic()
                         m.model_state = "listening"
                     else:
                         # 已收到文本后 listen = 本轮回复结束。
@@ -541,7 +552,13 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             # 过小会在 response.done 前超时。且 collect_reply 在收到文本后超时不再 break
             # （见 collect_reply 内部），所以这里只需足够大的总等待上限。
             # initial=rm：续接触发检测已消费的 delta，避免重复 collect 丢开头。
-            rm_done = await client.collect_reply(timeout=120.0, listen_giveup_s=60.0, initial=rm)
+            # on_text：流式打印每个文本 delta，回复边生成边显示。
+            print("\n  ── 回复流 ──", flush=True)
+            rm_done = await client.collect_reply(
+                timeout=120.0, listen_giveup_s=60.0, initial=rm,
+                on_text=lambda chunk: print(chunk, end="", flush=True),
+            )
+            print("", flush=True)
             if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
                 rm = rm_done
                 rm.turn_idx = turn_no
@@ -921,9 +938,9 @@ async def main():
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
                         help="gateway WS 地址")
-    parser.add_argument("--host", default="",
+    parser.add_argument("--host", default="192.168.89.106",
                         help="服务主机地址（内网机器连生产用，如 192.168.89.106）")
-    parser.add_argument("--port", type=int, default=0,
+    parser.add_argument("--port", type=int, default=8006,
                         help="服务端口：8006=gateway(wss，生产外网入口，默认)；"
                              "22500=直连后端(ws，需后端端口映射到宿主机)。"
                              "未指定时走 --direct-backend / --gateway 默认地址")
@@ -940,7 +957,7 @@ async def main():
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     
-    parser.add_argument("--video", help="视频文件路径（回放模式）")
+    parser.add_argument("--video", default="assets/video/turnbased/121.mp4", help="视频文件路径（回放模式）")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="视频抽帧率(帧/秒)，0=不抽帧只发音频") 
     parser.add_argument("--max-frames", type=int, default=0,
