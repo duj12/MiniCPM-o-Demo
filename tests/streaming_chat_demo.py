@@ -327,6 +327,10 @@ class StreamingChatClient:
                 # text delta 累积），listen 才是 turn 结束。
                 if self.backend != "minicpm":
                     text = ev.get("text", "") or text
+                    # Qwen3 收到 response.done 即本轮有完整文本回复 → speaking。
+                    # 此前若从未收到 listen/audio，model_state 会留空，这里补齐。
+                    if not m.model_state:
+                        m.model_state = "speaking"
                     done = True
             elif t == "session.closed":
                 break
@@ -421,6 +425,8 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     i = 0
     in_reply = False
     rm = TurnMetrics(turn_idx=0)
+    turn_start_i = 0       # 本轮分句开始时的 chunk 索引（用于计算当前分句音频时长）
+    cur_turn_audio_s = 0.0 # 当前分句的音频时长（触发时计算，回复完成后用于指标）
 
     while i < n_chunks:
         if not in_reply:
@@ -457,6 +463,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                     in_reply = True
                     turn_no += 1
                     rm.turn_idx = turn_no
+                    # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
+                    # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
+                    cur_turn_audio_s = (i - turn_start_i) * CHUNK_MS / 1000.0
+                    turn_start_i = i
                     print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
             except (asyncio.TimeoutError, TimeoutError):
                 pass
@@ -473,7 +483,8 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 rm = rm_done
                 rm.turn_idx = turn_no
             # 回复完成（response.done 或 listen 超时）→ 记录，恢复发送
-            m = TurnMetrics(turn_idx=turn_no, in_audio_s=audio_s)
+            # in_audio_s 用当前分句的音频时长（VAD 触发的那一段），不是整段音轨。
+            m = TurnMetrics(turn_idx=turn_no, in_audio_s=cur_turn_audio_s)
             m.in_video_s = min(video_s, sent_frames / max(fps, 0.1))
             m.ttft_s = rm.ttft_s
             m.reply_s = rm.reply_s
