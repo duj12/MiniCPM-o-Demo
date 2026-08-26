@@ -27,11 +27,17 @@
   # 走 gateway（生产路径，wss + mode=video；需可访问 :8006）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
 
+  # 内网其他机器连生产服务（--host/--port 拼接地址）：
+  #   --port 22500 = 直连后端(ws://HOST:22500/backend)；--port 8006 = gateway(wss://HOST:8006/v1/realtime)
+  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
+      --backend qwen3omni --host 192.168.89.106 --port 22500
+
 常用参数：
   --audio-chunk-ms  音频发送块大小(ms)，默认 100（VAD 需 ≥25ms；100ms 兼顾实时性）
   --kv-budget       单分句视频帧预算(token)，默认 20000（≈每路 KV 25600 的 78%）
   --max-audio-s     限制回放/并发使用的音频时长(秒)，默认全部
   --concurrency N   并发路数，>0 进入并发测试
+  --host / --port   生产服务地址（内网机器连用；22500=后端，8006=gateway）
   --direct-backend  直连后端 WS（绕过 gateway），如 ws://127.0.0.1:22500/backend
 
 输出指标（每轮）：
@@ -933,6 +939,11 @@ async def main():
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
                         help="gateway WS 地址")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="服务主机地址（内网机器连生产用，如 192.168.89.106）")
+    parser.add_argument("--port", type=int, default=0,
+                        help="服务端口：22500=直连后端(ws)，8006=gateway(wss)。"
+                             "默认 0=未指定，用 --direct-backend / --gateway 显式地址")
     parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
                         help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
     parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
@@ -959,17 +970,32 @@ async def main():
     CHUNK_MS = max(25, args.audio_chunk_ms)
     CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
-    # 连接目标：直连后端 或 gateway
+    # 连接目标：直连后端 或 gateway。
+    # 优先级：--direct-backend / --gateway 显式地址 > --host+--port 拼接 > 默认。
     ssl_ctx = None
     direct = bool(args.direct_backend)
-    url = args.direct_backend or args.gateway
+    if args.port > 0:
+        # --host/--port 拼接生产服务地址：内网其他机器可连
+        if args.port == 22500:
+            # 后端直连（容器内 WS，需后端 host 可达）
+            url = f"ws://{args.host}:{args.port}/backend"
+            direct = True
+        else:
+            # gateway（HTTPS/WSS）
+            url = f"wss://{args.host}:{args.port}/v1/realtime"
+            direct = False
+    else:
+        url = args.direct_backend or args.gateway
+        direct = bool(args.direct_backend)
     if not direct:
         # gateway 是 HTTPS/WSS，需要 no-verify + mode 参数
         ssl_ctx = _ssl_ctx_noverify()
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}mode=video"
-    elif args.direct_backend.startswith("wss"):
+    elif url.startswith("wss"):
         ssl_ctx = _ssl_ctx_noverify()
+
+    print(f"连接目标: {url} (direct={direct})")
 
     # 并发测试模式：不建单路 client，直接并发 N 路
     if args.concurrency > 0:
