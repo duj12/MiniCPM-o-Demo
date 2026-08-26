@@ -437,7 +437,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
 
             frame_b64 = []
-            if sent_frames * TOKENS_PER_FRAME < kv_budget_tokens and frames:
+            # kv_budget 限制的是"当前分句"发送的视频帧数（单次持续处理的帧预算），
+            # 不是累计发送帧数——否则多轮对话后预算被跨分句耗尽，视频帧提前停发。
+            # 每分句独立预算：一次 VAD 说话内最多发 kv_budget/540 帧。
+            if (sent_frames - turn_start_frames) * TOKENS_PER_FRAME < kv_budget_tokens and frames:
                 frame_b64 = [b64(frames[sent_frames % len(frames)])]
                 sent_frames += 1
 
