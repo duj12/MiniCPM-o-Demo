@@ -24,11 +24,13 @@
   # qwen3omni 实时采集用 VAD+TurnSense：
   python streaming_chat_demo.py --realtime --turn-decision vad_turnsense --backend qwen3omni
 
-  # 走 gateway（生产路径，wss + mode=video；需可访问 :8006）
+  # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
 
-  # 内网其他机器连生产服务（--host/--port 拼接地址）：
-  #   --port 22500 = 直连后端(ws://HOST:22500/backend)；--port 8006 = gateway(wss://HOST:8006/v1/realtime)
+  # 内网其他机器连生产服务：--host 指定机器 IP（默认走 gateway :8006，生产外网入口）
+  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
+      --backend qwen3omni --host 192.168.89.106
+  # 若要直连后端调试：--port 22500（需后端端口映射到宿主机）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
       --backend qwen3omni --host 192.168.89.106 --port 22500
 
@@ -37,7 +39,7 @@
   --kv-budget       单分句视频帧预算(token)，默认 20000（≈每路 KV 25600 的 78%）
   --max-audio-s     限制回放/并发使用的音频时长(秒)，默认全部
   --concurrency N   并发路数，>0 进入并发测试
-  --host / --port   生产服务地址（内网机器连用；22500=后端，8006=gateway）
+  --host / --port   生产服务地址（默认 gateway 8006；22500=直连后端需端口映射）
   --direct-backend  直连后端 WS（绕过 gateway），如 ws://127.0.0.1:22500/backend
 
 输出指标（每轮）：
@@ -939,11 +941,12 @@ async def main():
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
                         help="gateway WS 地址")
-    parser.add_argument("--host", default="127.0.0.1",
+    parser.add_argument("--host", default="",
                         help="服务主机地址（内网机器连生产用，如 192.168.89.106）")
     parser.add_argument("--port", type=int, default=0,
-                        help="服务端口：22500=直连后端(ws)，8006=gateway(wss)。"
-                             "默认 0=未指定，用 --direct-backend / --gateway 显式地址")
+                        help="服务端口：8006=gateway(wss，生产外网入口，默认)；"
+                             "22500=直连后端(ws，需后端端口映射到宿主机)。"
+                             "未指定时走 --direct-backend / --gateway 默认地址")
     parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
                         help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
     parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
@@ -971,18 +974,19 @@ async def main():
     CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
     # 连接目标：直连后端 或 gateway。
-    # 优先级：--direct-backend / --gateway 显式地址 > --host+--port 拼接 > 默认。
+    # 优先级：--host+--port 拼接（显式指定时）> --direct-backend/--gateway 显式地址 > 默认。
+    # 默认走 gateway（--gateway 默认 wss://127.0.0.1:8006），与生产外网入口一致。
     ssl_ctx = None
     direct = bool(args.direct_backend)
-    if args.port > 0:
+    if args.port > 0 or args.host:
         # --host/--port 拼接生产服务地址：内网其他机器可连
         if args.port == 22500:
-            # 后端直连（容器内 WS，需后端 host 可达）
-            url = f"ws://{args.host}:{args.port}/backend"
+            # 后端直连（容器内 WS，需后端端口映射到宿主机）
+            url = f"ws://{args.host or '127.0.0.1'}:{args.port}/backend"
             direct = True
         else:
-            # gateway（HTTPS/WSS）
-            url = f"wss://{args.host}:{args.port}/v1/realtime"
+            # gateway（HTTPS/WSS）；默认端口 8006
+            url = f"wss://{args.host or '127.0.0.1'}:{args.port or 8006}/v1/realtime"
             direct = False
     else:
         url = args.direct_backend or args.gateway
