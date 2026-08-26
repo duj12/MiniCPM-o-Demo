@@ -379,7 +379,7 @@ class StreamingChatClient:
 async def run_file_replay(client: StreamingChatClient, video_path: str,
                           prompt: str, turn_decision: str, n_turns: int = 1,
                           fps: float = 1.0, max_frames: int = 0,
-                          kv_budget_tokens: int = 6000,
+                          kv_budget_tokens: int = 20000,
                           audio_path: str = "",
                           max_audio_s: Optional[float] = None,
                           replay_speed: float = 1.0,
@@ -515,7 +515,7 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
 async def run_realtime(client: StreamingChatClient, system_prompt: str,
                        turn_decision: str, duration_s: float = 30.0,
-                       fps: float = 1.0, kv_budget_tokens: int = 6000):
+                       fps: float = 1.0, kv_budget_tokens: int = 20000):
     """在线：麦克风 + 摄像头实时采集。需要 sounddevice + opencv。
 
     视频按 fps 抽帧（KV 预算保护：接近上限后只发音频，保留最新画面）。
@@ -871,8 +871,9 @@ async def main():
                         help="视频抽帧率(帧/秒)，0=不抽帧只发音频")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="最大抽帧数，0=不限(用 KV 预算保护)")
-    parser.add_argument("--kv-budget", type=int, default=6000,
-                        help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频")
+    parser.add_argument("--kv-budget", type=int, default=20000,
+                        help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频。"
+                             "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
     parser.add_argument("--max-audio-s", type=float, default=None,
                         help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
     parser.add_argument("--replay-speed", type=float, default=1.0,
