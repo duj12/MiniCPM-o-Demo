@@ -8,35 +8,28 @@
     （worker 端用 force_listen 累积，说完才触发 decode —— 首字延迟更低）
 
 用法：
+  # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
+  python streaming_chat_demo.py --video xxx.mp4
+
+  # 纯音频交互模式（只有 --audio，无视频）：语音对话
+  python streaming_chat_demo.py --audio assets/audio/xxx.wav 
+
   # 单路回放（视频理解，VAD+TurnSense 判决；音频块默认 1s，可 --audio-chunk-ms 100 调细粒度）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
       --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
-      --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend
+      --backend qwen3omni --host "192.168.89.106"  --port 8006
 
   # 并发压力测试（10 路，用完整音轨驱动真实多轮；GPU 显存/利用率监控）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
       --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
-      --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend \
-      --concurrency 10 --gpu-ids 0,1
+      --backend qwen3omni --host "192.168.89.106"  --port 8006 \
+      --concurrency 10 --gpu-ids 0,1 
 
-  # 实时采集（麦克风 + 摄像头）。模型自主判决仅 MiniCPM 支持：
+  # 实时采集（麦克风 + 摄像头）。模型自主判决仅 MiniCPM 支持。目前默认后端qwen3omni：
   python streaming_chat_demo.py --realtime --turn-decision model --backend minicpm
   # qwen3omni 实时采集用 VAD+TurnSense：
   python streaming_chat_demo.py --realtime --turn-decision vad_turnsense --backend qwen3omni
 
-  # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
-  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
-
-  # 纯音频交互模式（只有 --audio，无视频）：语音对话
-  python streaming_chat_demo.py --audio assets/audio/xxx.wav \
-      --turn-decision vad_turnsense --backend qwen3omni --host 192.168.89.106
-
-  # 内网其他机器连生产服务：--host 指定机器 IP（默认走 gateway :8006，生产外网入口）
-  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
-      --backend qwen3omni --host 192.168.89.106
-  # 若要直连后端调试：--port 22500（需后端端口映射到宿主机）
-  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
-      --backend qwen3omni --host 192.168.89.106 --port 22500
 
 常用参数：
   --audio-chunk-ms  音频发送块大小(ms)，默认 1000（VAD 需 ≥25ms；100 更实时但更频繁）
@@ -282,7 +275,8 @@ class StreamingChatClient:
         return json.loads(raw)
 
     async def send_input(self, *, audio_b64: str = "", video_frames: Optional[List[str]] = None,
-                         text: str = "", force_listen: bool = False) -> None:
+                         text: str = "", force_listen: bool = False,
+                         max_new_tokens: Optional[int] = None) -> None:
         """发送一帧输入（音频 base64 + 视频帧）。force_listen=true 时只累积不触发回复。"""
         inp: dict = {}
         if audio_b64:
@@ -293,6 +287,8 @@ class StreamingChatClient:
             inp["text"] = text
         if force_listen:
             inp["force_listen"] = True
+        if max_new_tokens:
+            inp["max_new_tokens"] = max_new_tokens
         await self.ws.send(json.dumps({"type": "input.append", "input": inp}, ensure_ascii=False))
 
     async def collect_reply(self, timeout: float = 300.0,
@@ -934,6 +930,9 @@ async def main():
     parser.add_argument("--kv-budget", type=int, default=20000,
                         help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频。"
                              "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
+    parser.add_argument("--max-new-tokens", type=int, default=1024,
+                        help="单次回复最大生成 token 数(默认1024)。长回复(视频理解/总结)易超 512，"
+                             "默认后端 1024；过大则回复慢、KV 消耗大")
     parser.add_argument("--max-audio-s", type=float, default=None,
                         help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
     parser.add_argument("--replay-speed", type=float, default=1.0,
