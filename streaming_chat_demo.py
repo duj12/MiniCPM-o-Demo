@@ -19,8 +19,10 @@
       --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend \
       --concurrency 10 --gpu-ids 0,1
 
-  # 实时采集（麦克风 + 摄像头，模型自主判决）
-  python streaming_chat_demo.py --realtime --turn-decision model
+  # 实时采集（麦克风 + 摄像头）。模型自主判决仅 MiniCPM 支持：
+  python streaming_chat_demo.py --realtime --turn-decision model --backend minicpm
+  # qwen3omni 实时采集用 VAD+TurnSense：
+  python streaming_chat_demo.py --realtime --turn-decision vad_turnsense --backend qwen3omni
 
   # 走 gateway（生产路径，wss + mode=video；需可访问 :8006）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
@@ -946,6 +948,11 @@ async def main():
 
     if args.concurrency > 0 and not args.video:
         parser.error("并发测试需要 --video 提供测试音视频")
+
+    # Qwen3-Omni 是 turn-based（VAD+TurnSense 分句触发解码），不支持模型自主
+    # speak/listen（model 判决）。只有 MiniCPM 全双工才有 <|listen|> 概念。
+    if args.backend == "qwen3omni" and args.turn_decision == "model":
+        parser.error("qwen3omni 后端必须用 --turn-decision vad_turnsense（模型自主判决仅 MiniCPM 支持）")
 
     # 按 --audio-chunk-ms 重算全局发送 chunk（并发/实时模式用；回放模式直接传参）
     global CHUNK_MS, CHUNK_SAMPLES
