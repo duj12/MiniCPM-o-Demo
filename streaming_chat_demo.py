@@ -274,6 +274,21 @@ class StreamingChatClient:
             raw = raw.decode("utf-8")
         return json.loads(raw)
 
+    async def _peek(self) -> Optional[dict]:
+        """非阻塞检查是否有待接收事件，不消费（事件留给后续 recv）。
+
+        用 wait_for(ws.recv(), timeout=0)：立即超时且 ws.recv 被取消，
+        事件保留在底层缓冲，后续 _recv 仍能收到。
+        """
+        import websockets
+        try:
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=0)
+        except asyncio.TimeoutError:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
+
     async def send_input(self, *, audio_b64: str = "", video_frames: Optional[List[str]] = None,
                          text: str = "", force_listen: bool = False,
                          max_new_tokens: Optional[int] = None) -> None:
@@ -519,16 +534,16 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
         # 非阻塞检查：仅 VAD+TurnSense 模式触发回复后暂停发送。
         # 自由全双工（turn_decision=model）靠持续输入驱动，模型可随时回复，
         # 不能暂停发送（否则模型收不到后续输入，回复会中断）。
+        # 用 _peek 非阻塞检查是否有回复事件（delta/done），**不消费**——
+        # 事件留给下面的等待 collect_reply 从头收，避免"触发检测消费了
+        # response.done 导致等待 collect_reply 等满超时"（reply 虚高 120s）。
         if turn_decision == "vad_turnsense" and wait_reply and not in_reply:
             try:
-                rm = await asyncio.wait_for(
-                    client.collect_reply(timeout=0.4, listen_giveup_s=0.4),
-                    timeout=0.5,
-                )
-                if rm.reply_chars > 0 or rm.model_state == "speaking":
+                ev = await client._peek()
+                if ev is not None:
                     in_reply = True
                     turn_no += 1
-                    rm.turn_idx = turn_no
+                    rm = TurnMetrics(turn_idx=turn_no)
                     # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
                     # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
                     cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
@@ -548,11 +563,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
             # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
             # 被回收。
-            # 长回复可能生成较久（视频理解多轮可达 30s+）。_recv 超时=listen_giveup_s，
-            # 过小会在 response.done 前超时。且 collect_reply 在收到文本后超时不再 break
-            # （见 collect_reply 内部），所以这里只需足够大的总等待上限。
-            # initial=rm：续接触发检测已消费的 delta，避免重复 collect 丢开头。
-            # on_text：流式打印每个文本 delta，回复边生成边显示。
+            # 触发检测用 _peek 不消费事件，回复 delta 仍在 WS 流里。这里从空 rm 从头
+            # collect 完整回复：collect_reply 在收到 response.done 时立即返回（不靠超时），
+            # 回复流式显示（on_text）。不会再出现"response.done 被触发检测消费导致
+            # 等待 120s 超时"的问题。
             print("\n  ── 回复流 ──", flush=True)
             rm_done = await client.collect_reply(
                 timeout=120.0, listen_giveup_s=60.0, initial=rm,
