@@ -120,6 +120,9 @@ services:
       - ${CERTS_HOST_PATH:-./certs}:/app/certs:ro
       # 开发期挂载 config.py + 改动的静态前端文件，宿主机改动即时生效，
       # 无需重建镜像。不整体挂载 static/（会盖掉镜像内 bun 构建的 mobile/docs）。
+      # gateway.py 也挂载：旧镜像内 gateway.py 不含 WORKER_MAX_CONCURRENCY
+      # 的 env 读取逻辑，前端并发显示会落到默认 4；挂载宿主机新版即时修复。
+      - ./gateway.py:/app/gateway.py:ro
       - ./config.py:/app/config.py:ro
       - ./static/omni/omni.html:/app/static/omni/omni.html:ro
       - ./static/omni/omni-app.js:/app/static/omni/omni-app.js:ro

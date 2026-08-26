@@ -6,7 +6,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
-build/
+build*/
 
 node_modules/
 
