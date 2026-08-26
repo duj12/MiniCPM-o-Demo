@@ -8,7 +8,7 @@
     （worker 端用 force_listen 累积，说完才触发 decode —— 首字延迟更低）
 
 用法：
-  # 单路回放（视频理解，VAD+TurnSense 判决；音频 100ms 细粒度流式）
+  # 单路回放（视频理解，VAD+TurnSense 判决；音频块默认 1s，可 --audio-chunk-ms 100 调细粒度）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
       --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
       --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend
@@ -39,7 +39,7 @@
       --backend qwen3omni --host 192.168.89.106 --port 22500
 
 常用参数：
-  --audio-chunk-ms  音频发送块大小(ms)，默认 100（VAD 需 ≥25ms；100ms 兼顾实时性）
+  --audio-chunk-ms  音频发送块大小(ms)，默认 1000（VAD 需 ≥25ms；100 更实时但更频繁）
   --kv-budget       单分句视频帧预算(token)，默认 20000（≈每路 KV 25600 的 78%）
   --max-audio-s     限制回放/并发使用的音频时长(秒)，默认全部
   --concurrency N   并发路数，>0 进入并发测试
@@ -412,7 +412,7 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           max_audio_s: Optional[float] = None,
                           replay_speed: float = 1.0,
                           wait_reply: bool = True,
-                          audio_chunk_ms: int = 100):
+                          audio_chunk_ms: int = 1000):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
     帧策略：按 fps 持续抽帧（max_frames=0 不限制总数），但用 KV 预算保护
@@ -424,10 +424,9 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     max_audio_s: 限制音频提取时长（秒）。None=完整音轨。注意长音频 token
       量巨大（约 25 tok/s），可能超出 KV，需配合 --kv-budget / 后端 -c。
     """
-    # 回放模式音频块节奏：默认 100ms（VAD 需 ≥25ms chunk，100ms 兼顾实时性与网络
-    # 开销），可由 --audio-chunk-ms 覆盖。视频帧节奏与音频解耦：每
-    # _frames_per_audio_chunk 个音频块（1s）发 1 帧，保持视频 1s 一帧不爆 KV。
-    # 并发/实时模式仍用全局 CHUNK_MS（由 --audio-chunk-ms 控制）。
+    # 回放模式音频块节奏：默认 1000ms（由 --audio-chunk-ms 控制，可调 100ms 更实时）。
+    # 视频帧节奏与音频解耦：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧，
+    # 保持视频 1s 一帧不爆 KV。并发/实时模式仍用全局 CHUNK_MS。
     _chunk_ms = max(25, audio_chunk_ms)
     _chunk_samples = SAMPLE_RATE * _chunk_ms // 1000
     _frames_per_audio_chunk = max(1, 1000 // _chunk_ms)  # 默认 10 → 每 1s 发 1 帧
@@ -622,7 +621,7 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
                             cur_frames += 1
                 await client.send_input(audio_b64=b64(chunk), video_frames=frame_b64,
                                         force_listen=(turn_decision == "vad_turnsense"))
-                cur_audio += CHUNK_MS / 1000.0   # 块时长（100ms→0.1s）
+                cur_audio += CHUNK_MS / 1000.0   # 块时长（秒）
 
             # 读取模型回复（非阻塞）
             try:
@@ -699,7 +698,7 @@ def _gpu_baseline(gpu_ids=(0, 1)):
 async def _run_one_concurrent(url, ssl_ctx, direct, backend,
                               turn_decision, system_prompt,
                               vad_cfg, ts_cfg, audio_frames, prompt,
-                              n_frames=5):
+                              n_frames=5, accumulate_context=False):
     """单路并发会话：独立连接，发短音频触发一轮回复，返回结果 dict。"""
     import websockets
     t0 = time.perf_counter()
@@ -711,7 +710,7 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
             mode="full_duplex",
             system_prompt=system_prompt,
             turn_decision=turn_decision,
-            config={"vad": vad_cfg, "turnsense": ts_cfg},
+            config={"accumulate_context": accumulate_context, "vad": vad_cfg, "turnsense": ts_cfg},
         )
         setup_ms = (time.perf_counter() - t0) * 1000
 
@@ -721,7 +720,7 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
         t_send = time.perf_counter()  # 发送第一块音频前
         send_end = None
 
-        # 流式发送 + 非阻塞收：每发一块（CHUNK_MS，默认 100ms），用短超时 _recv
+        # 流式发送 + 非阻塞收：每发一块（CHUNK_MS，默认 1000ms），用短超时 _recv
         # 收中间事件，再发下一块。不并发 send/recv（websockets 同连接不能同时
         # send+recv），而是交替进行，模拟真实流式（VAD 边收边检测停顿分句）。
         done = False
@@ -832,7 +831,8 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
 async def run_concurrency(url, ssl_ctx, direct, backend,
                           turn_decision, system_prompt,
                           vad_cfg, ts_cfg, video_path, prompt,
-                          concurrency, max_audio_s, gpu_ids=(0, 1)):
+                          concurrency, max_audio_s, gpu_ids=(0, 1),
+                          accumulate_context=False):
     """并发 N 路测试：递增并发数，同时监控多张 GPU 显存/利用率。
 
     每路发同一段音频（完整音轨，或 --max-audio-s 截断），驱动真实多轮。
@@ -844,7 +844,7 @@ async def run_concurrency(url, ssl_ctx, direct, backend,
     audio = extract_audio_pcm(video_path, max_s=max_s)
     if len(audio) == 0:
         audio = _np.zeros(int(SAMPLE_RATE * (max_audio_s or 3)), dtype=_np.float32)
-    # 切成 CHUNK_MS 音频块（默认 100ms；由 --audio-chunk-ms 控制）
+    # 切成 CHUNK_MS 音频块（默认 1000ms；由 --audio-chunk-ms 控制）
     audio_frames = [audio[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
                     for i in range(max(1, len(audio) // CHUNK_SAMPLES))]
     audio_frames = [f if len(f) == CHUNK_SAMPLES
@@ -880,6 +880,7 @@ async def run_concurrency(url, ssl_ctx, direct, backend,
         url, ssl_ctx, direct, backend, turn_decision, system_prompt,
         vad_cfg, ts_cfg, audio_frames, prompt,
         n_frames=len(audio_frames),
+        accumulate_context=accumulate_context,
     ) for _ in range(N)]
     results = await asyncio.gather(*tasks)
 
@@ -916,6 +917,9 @@ async def main():
     parser.add_argument("--turn-decision", choices=["model", "vad_turnsense"],
                         default="vad_turnsense",
                         help="轮次判决: model=模型自主 speak/listen, vad_turnsense=VAD+TurnSense")
+    parser.add_argument("--accumulate-context", action="store_true",
+                        help="跨分句累积历史上下文（默认关）。开启后每轮保留之前的音频/回复，"
+                             "模型有跨轮记忆，但 prompt 变长、输出变慢；关闭则每轮只推理当前分句，输出更快")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="视频抽帧率(帧/秒)，0=不抽帧只发音频")
@@ -938,11 +942,9 @@ async def main():
                         help="VAD 尾静音(ms)，fsmn 的 max_end_silence_time，默认600")
     parser.add_argument("--vad-max-len", type=int, default=60000,
                         help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
-    parser.add_argument("--vad-chunk-size", type=int, default=1000,
-                        help="VAD 处理窗口(ms)，fsmn 内部窗口，默认1000(1s可流式分句)")
-    parser.add_argument("--audio-chunk-ms", type=int, default=100,
-                        help="demo 发送音频的 chunk 大小(ms)，默认100（VAD 需 ≥25ms，"
-                             "100ms 兼顾实时性与网络开销）。回放模式即用此值")
+    parser.add_argument("--audio-chunk-ms", type=int, default=1000,
+                        help="demo 发送音频的 chunk 大小(ms)，默认1000（VAD 需 ≥25ms，"
+                             "100 更实时但更频繁）。回放模式即用此值")
     parser.add_argument("--ts-wait-ms", type=int, default=900,
                         help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
     parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
@@ -1021,7 +1023,6 @@ async def main():
                 "vad_model": args.vad_model,
                 "vad_tail_sil": args.vad_tail_sil,
                 "vad_max_len": args.vad_max_len,
-                "vad_chunk_size": args.vad_chunk_size,
             },
             ts_cfg={
                 "incomplete_wait_ms": args.ts_wait_ms,
@@ -1032,6 +1033,7 @@ async def main():
             concurrency=args.concurrency,
             max_audio_s=args.max_audio_s,
             gpu_ids=gpu_ids,
+            accumulate_context=args.accumulate_context,
         )
         return
 
@@ -1043,11 +1045,11 @@ async def main():
             system_prompt=args.system_prompt,
             turn_decision=args.turn_decision,
             config={
+                "accumulate_context": args.accumulate_context,   # 跨分句累积历史上下文
                 "vad": {
                     "vad_model": args.vad_model,
                     "vad_tail_sil": args.vad_tail_sil,
                     "vad_max_len": args.vad_max_len,
-                    "vad_chunk_size": args.vad_chunk_size,
                 },
                 "turnsense": {
                     "incomplete_wait_ms": args.ts_wait_ms,
