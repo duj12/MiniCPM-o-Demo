@@ -35,15 +35,17 @@
   --audio-chunk-ms  音频发送块大小(ms)，默认 1000（VAD 需 ≥25ms；100 更实时但更频繁）
   --kv-budget       单分句视频帧预算(token)，默认 20000（≈每路 KV 25600 的 78%）
   --max-audio-s     限制回放/并发使用的音频时长(秒)，默认全部
+  --tail-silence-s  音频放完后补发的静音时长(秒)，默认 2.0（VAD 靠尾静音闭合最后一段）
+  --drain-idle-s    收尾等待：连续多久无事件判定结束，默认 10.0
   --concurrency N   并发路数，>0 进入并发测试
   --host / --port   生产服务地址（默认 gateway 8006；22500=直连后端需端口映射）
   --direct-backend  直连后端 WS（绕过 gateway），如 ws://127.0.0.1:22500/backend
 
-输出指标（每轮）：
-  - TTFT      : 首字延迟（发送完触发帧 → 第一个文本 token）
+输出指标（每轮，文件回放与实时采集口径一致，见 TurnTracker）：
+  - TTFT      : 首字延迟（服务端 turn.turnsense=complete 判定句尾 → 第一个文本 token）
   - in_audio_s: 本轮输入音频长度（秒）
   - in_video_s: 本轮输入视频长度（秒）
-  - reply_s   : 回复总耗时
+  - reply_s   : 纯生成耗时（首字 → 本轮结束）
   - speed_cps : 生成速度（字符/秒）
 """
 
@@ -275,21 +277,6 @@ class StreamingChatClient:
             raw = raw.decode("utf-8")
         return json.loads(raw)
 
-    async def _peek(self) -> Optional[dict]:
-        """非阻塞检查是否有待接收事件，不消费（事件留给后续 recv）。
-
-        用 wait_for(ws.recv(), timeout=0)：立即超时且 ws.recv 被取消，
-        事件保留在底层缓冲，后续 _recv 仍能收到。
-        """
-        import websockets
-        try:
-            raw = await asyncio.wait_for(self.ws.recv(), timeout=0)
-        except asyncio.TimeoutError:
-            return None
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        return json.loads(raw)
-
     async def send_input(self, *, audio_b64: str = "", video_frames: Optional[List[str]] = None,
                          text: str = "", force_listen: bool = False,
                          max_new_tokens: Optional[int] = None) -> None:
@@ -306,113 +293,6 @@ class StreamingChatClient:
         if max_new_tokens:
             inp["max_new_tokens"] = max_new_tokens
         await self.ws.send(json.dumps({"type": "input.append", "input": inp}, ensure_ascii=False))
-
-    async def collect_reply(self, timeout: float = 300.0,
-                            listen_giveup_s: float = 8.0,
-                            initial: Optional[TurnMetrics] = None,
-                            on_text: Optional[Callable[[str], None]] = None) -> TurnMetrics:
-        """收集一回合的回复（text/audio/listen deltas + response.done）。
-
-        on_text: 收到每个文本 delta 时回调（用于流式显示回复）。
-
-
-        返回指标：TTFT（首个文本 delta）、回复耗时、字符数、模型状态。
-
-        - timeout: 单次 recv 超时（总体等待上限）
-        - listen_giveup_s: 若模型持续 listen（选择聆听）超过该秒数，判定本轮无回复
-          （避免对静音/短音频时 collect_reply 无限等待 response.done）
-        - initial: 若提供，在此基础上继续累积（用于触发检测已消费部分 delta 的场景，
-          避免重复 collect 丢开头）
-        """
-        import websockets
-        m = initial or TurnMetrics()
-        # 若 initial 已收到 response.done（触发检测已完整收集），直接返回，
-        # 避免"再等一轮 collect_reply 收不到 done 而等满超时"（reply 虚高）。
-        if m.is_done:
-            return m
-        t_start = time.monotonic()
-        first_delta_at = None
-        reply_started = None
-        last_listen_at = None
-        text = m.reply_text  # initial 提供时续接已累积的文本（触发检测消费的 delta）
-        done = False
-
-        while not done:
-            # 若收到过 listen（模型选择聆听）且之后一段时间无任何新事件，判定无回复
-            if last_listen_at is not None and (time.monotonic() - last_listen_at) > listen_giveup_s:
-                break
-            try:
-                ev = await self._recv(min(timeout, listen_giveup_s))
-            except (TimeoutError, websockets.ConnectionClosed):
-                # 无新事件。若已收到文本（回复进行中），说明可能是长回复生成中
-                # （_recv 超时但 response.done 未到）——不应立即 break，否则会丢弃
-                # 还没收到的 response.done，回复只留超时前的部分（截断）。
-                # 但必须有总超时上限：超过 timeout（自开始累计）仍未收到 response.done，
-                # 说明该轮已结束（response.done 可能被前置消费/转发缺失），否则会死循环卡住。
-                if text and (time.monotonic() - t_start) < timeout:
-                    continue
-                break
-
-            t = ev.get("type")
-            if t == "response.output.delta":
-                kind = ev.get("kind")
-                if kind == "text":
-                    chunk = ev.get("text", "")
-                    if chunk:
-                        if first_delta_at is None:
-                            first_delta_at = time.monotonic()
-                            reply_started = first_delta_at
-                            m.ttft_s = first_delta_at - t_start
-                        text += chunk
-                        # 流式显示：on_text 回调（demo 里实时打印回复）
-                        if on_text is not None:
-                            on_text(chunk)
-                elif kind == "listen":
-                    m.model_state = "listening"
-                    if first_delta_at is None:
-                        if self.backend == "minicpm":
-                            # 还没收到任何文本就 listen：模型选择聆听（无回复）。
-                            # 仅 MiniCPM free-duplex 用 listen 判定无回复；
-                            # Qwen3 的 listen 是 prefill 完成信号（PREFILL_DONE），
-                            # 后面必有文本回复，绝不能据此 break（会收不到文本卡住）。
-                            last_listen_at = time.monotonic()
-                        m.model_state = "listening"
-                    else:
-                        # 已收到文本后 listen = 本轮回复结束。
-                        # MiniCPM free-duplex 多 chunk 回复以 listen 结束（而非
-                        # response.done，后者只是 chunk 边界）。
-                        done = True
-                elif kind == "audio":
-                    m.model_state = "speaking"
-            elif t == "response.done":
-                # Qwen3-Omni turn-based：response.done = 完整回复结束。
-                # MiniCPM free-duplex：response.done 只是 chunk 边界（其 text 已通过
-                # text delta 累积），listen 才是 turn 结束。
-                if self.backend != "minicpm":
-                    text = ev.get("text", "") or text
-                    # Qwen3 收到 response.done 即本轮有完整文本回复 → speaking。
-                    # 此前若从未收到 listen/audio，model_state 会留空，这里补齐。
-                    if not m.model_state:
-                        m.model_state = "speaking"
-                    m.is_done = True
-                    done = True
-            elif t == "session.closed":
-                break
-            elif t == "session.error":
-                print(f"  [error] {ev}")
-                break
-
-        m.reply_chars = len(text)
-        # reply_s: 从首个文本 delta 到结束（纯生成时间），避免把触发前的
-        # 等待算进去导致 speed 虚高。
-        if reply_started is not None:
-            m.reply_s = (time.monotonic() - reply_started)
-            m.speed_cps = m.reply_chars / m.reply_s if m.reply_s > 0 else 0.0
-        else:
-            m.reply_s = (time.monotonic() - t_start)
-            m.speed_cps = 0.0
-        m.reply_text = text
-        return m
 
     async def close(self, reason: str = "demo_done"):
         # 直连后端：用 HTTP POST /sessions/{id}/close 可靠释放 session
@@ -437,6 +317,227 @@ class StreamingChatClient:
 
 
 # ============================================================================
+# 回复事件处理（文件回放 / 实时采集共用）
+# ============================================================================
+
+class TurnTracker:
+    """独立 receiver task 收事件，到达即处理即打印，并按轮统计指标。
+
+    为什么要独立 task：发送侧要按真实节奏 sleep（1s 一块音频），若在同一个
+    循环里收事件，就变成 ~1 事件/秒——服务端连续推的几十个 text delta 会全部
+    积压在 socket 缓冲里，等某次循环才被批量取出。表现为"回复不流式、整段
+    蹦出来"，且首字时间戳失真（reply_s≈0 → speed 虚高）。收发分离后每个
+    delta 的时间戳都是真实到达时刻。
+
+    指标口径（两种模式一致）：
+      - TTFT       = 首个 text delta − turn.turnsense{label:"complete"}
+                     （服务端判定句尾、开始生成的时刻）。model 判决无该事件时为 None。
+      - reply_s    = 本轮结束 − 首个 text delta（纯生成时间，不含触发前等待）
+      - in_audio_s / in_video_s = 本轮相对上轮新发送的音视频量，由调用方注入的
+                     audio_sent_s / video_sent_s 回调取累计值作差得到。
+    """
+
+    def __init__(self, client: StreamingChatClient, *,
+                 audio_sent_s: Callable[[], float],
+                 video_sent_s: Callable[[], float],
+                 reply_stall_s: float = 20.0,
+                 echo: bool = True):
+        self.client = client
+        self._audio_sent_s = audio_sent_s
+        self._video_sent_s = video_sent_s
+        self.reply_stall_s = reply_stall_s
+        self.echo = echo
+
+        self.metrics: List[TurnMetrics] = []
+        self.in_reply = False              # 服务端正在生成本轮回复
+        self.closed = False                # 会话结束（session.closed / 连接断开）
+        self.last_event_at = time.monotonic()
+        self.turn_no = 0
+
+        self._trigger_at: Optional[float] = None
+        self._first_delta_at: Optional[float] = None
+        self._text = ""
+        self._printing = False             # 已打印"回复流"表头
+        self._mark_audio = 0.0             # 上轮开始时的累计发送量
+        self._mark_video = 0.0
+        self._cur_audio_s = 0.0
+        self._cur_video_s = 0.0
+        self._task: Optional[asyncio.Task] = None
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._receiver())
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._task = None
+
+    async def _receiver(self) -> None:
+        """长驻收包循环：不设短超时，事件一到就处理（真流式）。"""
+        import websockets
+        while True:
+            try:
+                ev = await self.client._recv(timeout=3600.0)
+            except (TimeoutError, websockets.ConnectionClosed, ConnectionError):
+                break
+            except Exception as exc:
+                if self.echo:
+                    print(f"\n  [recv error] {exc}", flush=True)
+                break
+            if not self.handle_event(ev):
+                break
+        self.closed = True
+
+    # ------------------------------------------------------------------
+    # 发送侧协作
+    # ------------------------------------------------------------------
+    async def wait_while_replying(self) -> None:
+        """阻塞到本轮回复结束（--wait-reply 用）。停滞超时则强制收尾，不死等。"""
+        while self.in_reply and not self.closed:
+            if (time.monotonic() - self.last_event_at) > self.reply_stall_s:
+                if self.echo:
+                    print(f"\n  [warn] 回复停滞 >{self.reply_stall_s:.0f}s，强制收尾",
+                          flush=True)
+                self._finish_turn()
+                break
+            await asyncio.sleep(0.05)
+
+    async def drain(self, idle_s: float = 10.0, max_s: float = 300.0) -> None:
+        """收尾：只收不发，把还在路上的回复收完。
+
+        协议里没有"再无输出"的信号，只能用空闲时长判定：连续 idle_s 无任何
+        事件且不在回复中 → 结束。已进入回复（in_reply）则改由 reply_stall_s
+        兜底，生成本身多慢都不会被 idle_s 掐断。
+        空闲从 drain 开始算起——发送阶段 force_listen 不回包，last_event_at
+        可能很旧，否则会立刻误判结束。
+        """
+        t0 = time.monotonic()
+        while not self.closed and (time.monotonic() - t0) < max_s:
+            idle = time.monotonic() - max(t0, self.last_event_at)
+            if self.in_reply:
+                if idle > self.reply_stall_s:
+                    if self.echo:
+                        print(f"\n  [warn] 回复停滞 >{self.reply_stall_s:.0f}s，强制收尾",
+                              flush=True)
+                    self._finish_turn()
+            elif idle > idle_s:
+                return
+            await asyncio.sleep(0.1)
+
+    # ------------------------------------------------------------------
+    # 轮次记账
+    # ------------------------------------------------------------------
+    def _begin_turn(self) -> None:
+        if self.in_reply:
+            return
+        self.in_reply = True
+        self.turn_no += 1
+        a, v = self._audio_sent_s(), self._video_sent_s()
+        self._cur_audio_s = max(0.0, a - self._mark_audio)
+        self._cur_video_s = max(0.0, v - self._mark_video)
+        self._mark_audio, self._mark_video = a, v
+
+    def _finish_turn(self, final_text: str = "") -> None:
+        if not self.in_reply:
+            return
+        text = final_text or self._text
+        m = TurnMetrics(turn_idx=self.turn_no,
+                        in_audio_s=self._cur_audio_s,
+                        in_video_s=self._cur_video_s)
+        m.reply_text = text
+        m.reply_chars = len(text)
+        m.model_state = "speaking" if text else "listening"
+        m.is_done = True
+        if self._first_delta_at is not None:
+            if self._trigger_at is not None:
+                m.ttft_s = self._first_delta_at - self._trigger_at
+            m.reply_s = time.monotonic() - self._first_delta_at
+            if m.reply_s > 0:
+                m.speed_cps = m.reply_chars / m.reply_s
+        self.metrics.append(m)
+        if self.echo:
+            if self._printing:
+                print()          # 收束"回复流"那一行
+            print(f"  {m.summary}", flush=True)
+
+        self.in_reply = False
+        self._trigger_at = None
+        self._first_delta_at = None
+        self._text = ""
+        self._printing = False
+
+    # ------------------------------------------------------------------
+    # 事件分发
+    # ------------------------------------------------------------------
+    def handle_event(self, ev: dict) -> bool:
+        """处理单个事件。返回 False 表示会话结束、receiver 应退出。"""
+        self.last_event_at = time.monotonic()
+        t = ev.get("type")
+
+        if t == "turn.turnsense":
+            label = ev.get("label")
+            if label == "complete":
+                # 服务端判定句尾并触发生成 —— TTFT 的计时起点。
+                # 在这里（而非首个 delta）置 in_reply：让发送侧在 prefill 阶段
+                # 就暂停，避免后续音频被 VAD 当成 barge-in 打断当前回复。
+                self._begin_turn()
+                self._trigger_at = time.monotonic()
+                if self.echo:
+                    print(f"\n  [VAD段{self.turn_no}] 判定句尾 → 模型开始回复", flush=True)
+            elif self.echo:
+                # incomplete = 语义不完整，等用户续说；invalid = 噪音/过短，丢弃
+                print(f"\n  [turnsense] {label}", flush=True)
+
+        elif t == "response.output.delta":
+            kind = ev.get("kind")
+            if kind == "text":
+                txt = ev.get("text", "")
+                if txt:
+                    self._begin_turn()   # model 判决无 turnsense 事件，在此开轮
+                    if self._first_delta_at is None:
+                        self._first_delta_at = time.monotonic()
+                    self._text += txt
+                    if self.echo:
+                        if not self._printing:
+                            self._printing = True
+                            print("  ── 回复流 ── ", end="", flush=True)
+                        print(txt, end="", flush=True)
+            elif kind == "listen":
+                # MiniCPM free-duplex: <|listen|> = 模型让出话轮，本轮结束。
+                # Qwen3-Omni: prefill 完成信号（PREFILL_DONE），后面必有文本，
+                # 不能据此收尾（会把回复截断在开头）。
+                if self.client.backend == "minicpm":
+                    self._finish_turn()
+            elif kind == "audio":
+                pass
+
+        elif t == "response.done":
+            # Qwen3-Omni turn-based: done = 完整回复结束。
+            # MiniCPM free-duplex: done 只是 chunk 边界（文本已由 delta 累积），
+            # listen 才是 turn 结束——按 done 收尾会把一轮拆成多轮。
+            if self.client.backend != "minicpm":
+                self._begin_turn()
+                self._finish_turn(ev.get("text", "") or "")
+
+        elif t == "session.closed":
+            self._finish_turn()
+            return False
+
+        elif t == "session.error":
+            print(f"\n  [error] {ev}", flush=True)
+
+        return True
+
+
+# ============================================================================
 # 文件回放模式
 # ============================================================================
 
@@ -449,7 +550,9 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           replay_speed: float = 1.0,
                           wait_reply: bool = True,
                           audio_chunk_ms: int = 1000,
-                          max_new_tokens: int = 1024):
+                          max_new_tokens: int = 1024,
+                          tail_silence_s: float = 2.0,
+                          drain_idle_s: float = 10.0):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
     帧策略：按 fps 持续抽帧（max_frames=0 不限制总数），但用 KV 预算保护
@@ -460,6 +563,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
       TurnSense 会判 invalid；用清晰人声可验证 VAD+TurnSense 完整链路。
     max_audio_s: 限制音频提取时长（秒）。None=完整音轨。注意长音频 token
       量巨大（约 25 tok/s），可能超出 KV，需配合 --kv-budget / 后端 -c。
+    tail_silence_s: 音频放完后补发的静音时长。FSMN VAD 靠尾静音闭合语音段，
+      音频一放完就停发，最后一句可能永远不触发回复。
+    drain_idle_s: 收尾等待。发完后只收不发，连续这么久无事件才判定结束——
+      否则最后一段回复还在生成中就被 close() 掐断（收不到结果）。
     """
     # 回放模式音频块节奏：默认 1000ms（由 --audio-chunk-ms 控制，可调 100ms 更实时）。
     # 视频帧节奏与音频解耦：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧，
@@ -494,130 +601,79 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
     TOKENS_PER_FRAME = 540  # 1440p 缩放后每帧约 540 token
 
-    # ── VAD 驱动 + wait_reply ──
-    # 不硬切段：持续流式发送音频，worker 的 VAD 检测到静音停顿即视为一个语音段，
-    # 触发 TurnSense → 回复。demo 每发一块就检查是否已触发回复；若 wait_reply 开启，
-    # 触发后暂停发送，等模型回复完成再继续（避免后续音频淹没回复内容）。
-    all_metrics = []
-    turn_no = 0
-    sent_frames = 0
     n_chunks = max(1, int(np.ceil(len(audio) / _chunk_samples)))
-    i = 0
-    in_reply = False
-    rm = TurnMetrics(turn_idx=0)
-    turn_start_i = 0         # 本轮分句开始时的 chunk 索引（用于计算当前分句音频时长）
-    cur_turn_audio_s = 0.0   # 当前分句的音频时长（触发时计算，回复完成后用于指标）
-    turn_start_frames = 0    # 本轮分句开始时的累计发送帧数（用于计算当前分句视频时长）
-    cur_turn_video_s = 0.0   # 当前分句的视频时长（触发时计算，回复完成后用于指标）
-    reply_started_at = None  # 本轮首个文本 delta 时间（TTFT / reply_s 计算）
+    # 尾静音块：音频放完后继续喂静音，让 VAD 能闭合最后一个语音段。
+    n_tail = max(0, int(round(tail_silence_s * 1000 / _chunk_ms)))
+    silence = np.zeros(_chunk_samples, dtype=np.float32)
+    print(f"  尾静音 {tail_silence_s:.1f}s ({n_tail} 块), 收尾空闲判据 {drain_idle_s:.0f}s")
 
-    while i < n_chunks:
-        # 是否暂停发音频：VAD+TurnSense 且 wait_reply 时，回复中暂停发送，
-        # 避免新音频打断当前回复（VAD 检测到新语音会 barge-in）。
-        pause_send = turn_decision == "vad_turnsense" and wait_reply and in_reply
+    sent_chunks = 0     # 已发送音频块数（含尾静音）
+    sent_frames = 0     # 已发送视频帧数
+    turn_frames_0 = 0   # 本轮分句起始的帧计数（KV 预算按分句算，不跨轮累计）
+    last_turn_no = 0
 
-        if not pause_send:
-            chunk = audio[i * _chunk_samples:(i + 1) * _chunk_samples]
-            if len(chunk) < _chunk_samples:
-                chunk = np.pad(chunk, (0, _chunk_samples - len(chunk)))
+    # ── 收发分离 ──
+    # receiver task 独立收事件（到达即打印，真流式）；本协程只管按节奏发送，
+    # 通过 tracker.in_reply 决定是否暂停。
+    tracker = TurnTracker(
+        client,
+        audio_sent_s=lambda: sent_chunks * _chunk_ms / 1000.0,
+        video_sent_s=lambda: sent_frames / max(fps, 0.1),
+    )
+    tracker.start()
+
+    try:
+        for idx in range(n_chunks + n_tail):
+            if tracker.closed:
+                break
+            # VAD+TurnSense + wait_reply：回复期间暂停发送，避免新音频被 VAD
+            # 当成 barge-in 打断当前回复。
+            if wait_reply and turn_decision == "vad_turnsense":
+                await tracker.wait_while_replying()
+                if tracker.closed:
+                    break
+            # 新一轮开始 → 重置本分句的视频帧预算
+            if tracker.turn_no != last_turn_no:
+                last_turn_no = tracker.turn_no
+                turn_frames_0 = sent_frames
+
+            if idx < n_chunks:
+                chunk = audio[idx * _chunk_samples:(idx + 1) * _chunk_samples]
+                if len(chunk) < _chunk_samples:
+                    chunk = np.pad(chunk, (0, _chunk_samples - len(chunk)))
+            else:
+                chunk = silence   # 尾静音，只为触发 VAD 尾判定
 
             frame_b64 = []
             # 视频帧节奏独立于音频：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧。
             # 这样音频可 100ms 细粒度流式（VAD 更实时），而视频保持 1s 一帧不爆 KV。
             # kv_budget 限制的是"当前分句"发送的视频帧数（单次持续处理的帧预算），
             # 不是累计发送帧数——否则多轮对话后预算被跨分句耗尽，视频帧提前停发。
-            if i % _frames_per_audio_chunk == 0 and \
-               (sent_frames - turn_start_frames) * TOKENS_PER_FRAME < kv_budget_tokens and frames:
+            if idx < n_chunks and frames and idx % _frames_per_audio_chunk == 0 and \
+               (sent_frames - turn_frames_0) * TOKENS_PER_FRAME < kv_budget_tokens:
                 frame_b64 = [b64(frames[sent_frames % len(frames)])]
                 sent_frames += 1
 
-            text = prompt if i == 0 else ""
             # force_listen 只用于 VAD+TurnSense 判决（worker 累积音频，VAD 触发才回复）。
             # 自由全双工（turn_decision=model）下必须让模型自主 listen/speak，
             # 不能 force_listen，否则模型永远只累积不回复。
             await client.send_input(
-                audio_b64=b64(chunk), video_frames=frame_b64, text=text,
+                audio_b64=b64(chunk), video_frames=frame_b64,
+                text=prompt if idx == 0 else "",
                 force_listen=(turn_decision == "vad_turnsense"),
             )
-            i += 1
+            sent_chunks += 1
             await asyncio.sleep(_chunk_ms / 1000.0 / replay_speed)
 
-        # 收事件（短超时非阻塞）：与网页前端一致，收到什么处理什么——
-        # delta/text → 流式显示；response.done → 本轮结束；listen → Qwen3 prefill 信号。
-        try:
-            ev = await client._recv(timeout=0.3)
-        except TimeoutError:
-            continue
-        except Exception:
-            break
+        # 收尾：最后一段回复往往还在生成中，必须等，否则 close() 会掐断它。
+        if not tracker.closed:
+            print(f"\n  [收尾] 音频发送完毕，等待剩余回复"
+                  f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
+            await tracker.drain(idle_s=drain_idle_s)
+    finally:
+        await tracker.stop()
 
-        t = ev.get("type")
-        if t == "response.output.delta":
-            kind = ev.get("kind")
-            if kind == "text":
-                txt = ev.get("text", "")
-                if txt:
-                    if not in_reply:
-                        in_reply = True
-                        turn_no += 1
-                        # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
-                        # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
-                        cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
-                        turn_start_i = i
-                        # 当前分句视频时长 = 触发后到本次触发之间发送的帧数 / fps。
-                        cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
-                        turn_start_frames = sent_frames
-                        reply_started_at = time.monotonic()  # 首个 delta 时间（TTFT）
-                        print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
-                        print("\n  ── 回复流 ──", flush=True)
-                    rm.reply_text += txt
-                    print(txt, end="", flush=True)
-            elif kind == "listen":
-                # Qwen3: prefill 完成信号（PREFILL_DONE），非让出话轮，忽略。
-                # MiniCPM free-duplex: <|listen|> = 本轮回复结束。
-                if client.backend == "minicpm" and in_reply:
-                    in_reply = False
-                    print("", flush=True)
-            elif kind == "audio":
-                pass
-        elif t == "response.done":
-            if not in_reply:
-                # 直接收到 done（短回复，无前置 delta）：也视为一轮
-                in_reply = True
-                turn_no += 1
-                cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
-                turn_start_i = i
-                cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
-                turn_start_frames = sent_frames
-                print(f"\n  [VAD段{turn_no}] 模型回复（无流式 delta）")
-                print("\n  ── 回复流 ──", flush=True)
-            rm.reply_text = ev.get("text", "") or rm.reply_text
-            print("", flush=True)
-            # 记录本轮指标
-            m = TurnMetrics(turn_idx=turn_no, in_audio_s=cur_turn_audio_s)
-            m.in_video_s = cur_turn_video_s
-            m.reply_chars = len(rm.reply_text)
-            m.model_state = "speaking" if rm.reply_text else ""
-            m.reply_text = rm.reply_text
-            if reply_started_at is not None:
-                # TTFT: 首个 delta 到 done 的生成耗时（近似）；reply_s: 纯生成时间
-                now = time.monotonic()
-                m.ttft_s = 0.01  # 事件驱动下首个 delta 即收到，TTFT 近似为即时
-                m.reply_s = now - reply_started_at
-                if m.reply_s > 0:
-                    m.speed_cps = m.reply_chars / m.reply_s
-            reply_started_at = None
-            all_metrics.append(m)
-            print(f"\n  {m.summary}")
-            if m.reply_text:
-                print(f"  ── 回复{turn_no} ──\n  {m.reply_text}\n  ──────────────")
-            in_reply = False
-            rm = TurnMetrics(turn_idx=turn_no + 1)
-            await asyncio.sleep(0.5)  # 短暂停顿后继续发下一段
-        elif t == "session.closed":
-            break
-
-    return all_metrics
+    return tracker.metrics
 
 
 # ============================================================================
@@ -626,10 +682,16 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
 async def run_realtime(client: StreamingChatClient, system_prompt: str,
                        turn_decision: str, duration_s: float = 30.0,
-                       fps: float = 1.0, kv_budget_tokens: int = 20000):
+                       fps: float = 1.0, kv_budget_tokens: int = 20000,
+                       tail_silence_s: float = 2.0,
+                       drain_idle_s: float = 10.0):
     """在线：麦克风 + 摄像头实时采集。需要 sounddevice + opencv。
 
+    与文件回放共用 TurnTracker（独立 receiver task 收事件），指标口径一致。
     视频按 fps 抽帧（KV 预算保护：接近上限后只发音频，保留最新画面）。
+
+    与回放的区别：麦克风在模型回复期间**不暂停**——真实双工场景下用户随时可
+    插话（barge-in 由服务端 VAD 处理），暂停会让采集与时间轴脱节。
     """
     try:
         import sounddevice as sd
@@ -642,75 +704,87 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
     print("  按 Enter 开始...")
     input()
 
-    frame = None
     cap = cv2.VideoCapture(0) if cv2 else None
     if cap and not cap.isOpened():
         cap = None
-
-    loop = asyncio.get_event_loop()
-    all_metrics = []
-    m = TurnMetrics(turn_idx=1)
-    t_session_start = time.monotonic()
-    cur_audio = 0.0
-    cur_frames = 0
-
-    audio_buf = np.zeros(0, dtype=np.float32)
-    stop = False
-
-    def audio_cb(indata, frames, t, status):
-        nonlocal audio_buf
-        audio_buf = np.concatenate([audio_buf, indata[:, 0].astype(np.float32)])
+    if cap is None:
+        print("  [warn] 摄像头不可用，仅发送音频")
 
     TOKENS_PER_FRAME = 540
-    frame_tokens = 0
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, blocksize=FRAME_SAMPLES,
-                        callback=audio_cb):
-        while time.monotonic() - t_session_start < duration_s and not stop:
-            # 攒够 1s 音频 → 发送（附当前摄像头帧）
-            if len(audio_buf) >= CHUNK_SAMPLES:
-                chunk = audio_buf[:CHUNK_SAMPLES]
-                audio_buf = audio_buf[CHUNK_SAMPLES:]
+    sent_chunks = 0     # 已发送音频块数（含尾静音）
+    sent_frames = 0     # 已发送视频帧数
+    turn_frames_0 = 0   # 本轮分句起始的帧计数
+    last_turn_no = 0
+    last_frame_at = 0.0
+
+    tracker = TurnTracker(
+        client,
+        audio_sent_s=lambda: sent_chunks * CHUNK_MS / 1000.0,
+        video_sent_s=lambda: sent_frames / max(fps, 0.1),
+    )
+    tracker.start()
+
+    # sounddevice 回调在音频线程里跑：只做 deque.append（GIL 下原子），
+    # 不碰 numpy 拼接，避免与主协程的切片竞争。
+    from collections import deque
+    audio_q: deque = deque()
+    audio_buf = np.zeros(0, dtype=np.float32)
+
+    def audio_cb(indata, n_frames, t, status):
+        audio_q.append(indata[:, 0].copy().astype(np.float32))
+
+    t0 = time.monotonic()
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            blocksize=FRAME_SAMPLES, callback=audio_cb):
+            while (time.monotonic() - t0) < duration_s and not tracker.closed:
+                while audio_q and len(audio_buf) < CHUNK_SAMPLES:
+                    audio_buf = np.concatenate([audio_buf, audio_q.popleft()])
+                if len(audio_buf) < CHUNK_SAMPLES:
+                    await asyncio.sleep(0.02)
+                    continue
+                chunk, audio_buf = audio_buf[:CHUNK_SAMPLES], audio_buf[CHUNK_SAMPLES:]
+
+                # 新一轮开始 → 重置本分句的视频帧预算（同回放：预算按分句算）
+                if tracker.turn_no != last_turn_no:
+                    last_turn_no = tracker.turn_no
+                    turn_frames_0 = sent_frames
+
                 frame_b64 = []
-                if cap and fps > 0:
-                    # fps 控制：每 (1/fps) 秒抽一帧；KV 预算保护：超限后只发音频
-                    now = time.monotonic()
-                    if (now - t_session_start) % max(1.0 / fps, 0.1) < 0.15 \
-                            and frame_tokens + TOKENS_PER_FRAME < kv_budget_tokens:
-                        ret, frame = cap.read()
-                        if ret:
-                            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                            frame_b64 = [base64.b64encode(jpeg.tobytes()).decode()]
-                            frame_tokens += TOKENS_PER_FRAME
-                            cur_frames += 1
+                now = time.monotonic()
+                if cap and fps > 0 and (now - last_frame_at) >= max(1.0 / fps, 0.1) and \
+                   (sent_frames - turn_frames_0) * TOKENS_PER_FRAME < kv_budget_tokens:
+                    ret, frame = cap.read()
+                    if ret:
+                        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        frame_b64 = [base64.b64encode(jpeg.tobytes()).decode()]
+                        sent_frames += 1
+                        last_frame_at = now
+
                 await client.send_input(audio_b64=b64(chunk), video_frames=frame_b64,
                                         force_listen=(turn_decision == "vad_turnsense"))
-                cur_audio += CHUNK_MS / 1000.0   # 块时长（秒）
+                sent_chunks += 1
 
-            # 读取模型回复（非阻塞）
-            try:
-                rm = await asyncio.wait_for(client.collect_reply(timeout=0.5), timeout=0.6)
-            except (asyncio.TimeoutError, TimeoutError):
-                continue
+            # 尾静音 + 收尾：同回放，让 VAD 闭合最后一句并收完还在路上的回复。
+            if not tracker.closed:
+                silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+                for _ in range(max(0, int(round(tail_silence_s * 1000 / CHUNK_MS)))):
+                    if tracker.closed:
+                        break
+                    await client.send_input(
+                        audio_b64=b64(silence),
+                        force_listen=(turn_decision == "vad_turnsense"))
+                    sent_chunks += 1
+                    await asyncio.sleep(CHUNK_MS / 1000.0)
+                print(f"\n  [收尾] 采集结束，等待剩余回复"
+                      f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
+                await tracker.drain(idle_s=drain_idle_s)
+    finally:
+        await tracker.stop()
+        if cap:
+            cap.release()
 
-            if rm.ttft_s is not None or rm.reply_chars > 0 or rm.model_state:
-                m.ttft_s = rm.ttft_s
-                m.reply_chars = rm.reply_chars
-                m.reply_s = rm.reply_s
-                m.speed_cps = rm.speed_cps
-                m.model_state = rm.model_state
-                m.in_audio_s = cur_audio
-                m.in_video_s = cur_frames  # 帧数近似
-                all_metrics.append(m)
-                print(f"  {m.summary}")
-                m = TurnMetrics(turn_idx=len(all_metrics) + 1)
-                cur_audio = 0.0
-                cur_frames = 0
-
-            await asyncio.sleep(0.05)
-
-    if cap:
-        cap.release()
-    return all_metrics
+    return tracker.metrics
 
 
 # ============================================================================
@@ -1011,6 +1085,12 @@ async def main():
                              "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
     parser.add_argument("--replay-speed", type=float, default=1.0,
                         help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
+    parser.add_argument("--tail-silence-s", type=float, default=2.0,
+                        help="音频发完后补发的静音时长(秒)，默认2.0。FSMN VAD 靠尾静音"
+                             "闭合语音段，不补则最后一句可能永远不触发回复")
+    parser.add_argument("--drain-idle-s", type=float, default=10.0,
+                        help="收尾等待(秒)，默认10。发完后只收不发，连续这么久无事件才"
+                             "判定结束——否则最后一段回复还在生成就被断开，收不到结果")
     parser.add_argument("--wait-reply", type=lambda v: v.lower() in ("1","true","yes","on"),
                         default=True,
                         help="VAD+TurnSense 触发回复后是否暂停发送音频，等模型回复完成再继续(默认开)。"
@@ -1141,11 +1221,15 @@ async def main():
                                             max_audio_s=args.max_audio_s,
                                             replay_speed=args.replay_speed,
                                             wait_reply=args.wait_reply,
-                                            audio_chunk_ms=args.audio_chunk_ms)
+                                            audio_chunk_ms=args.audio_chunk_ms,
+                                            tail_silence_s=args.tail_silence_s,
+                                            drain_idle_s=args.drain_idle_s)
         else:
             metrics = await run_realtime(client, args.system_prompt,
                                          args.turn_decision, args.duration,
-                                         fps=args.fps, kv_budget_tokens=args.kv_budget)
+                                         fps=args.fps, kv_budget_tokens=args.kv_budget,
+                                         tail_silence_s=args.tail_silence_s,
+                                         drain_idle_s=args.drain_idle_s)
 
         # 汇总
         if metrics:
