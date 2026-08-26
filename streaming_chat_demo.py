@@ -320,7 +320,12 @@ class StreamingChatClient:
             try:
                 ev = await self._recv(min(timeout, listen_giveup_s))
             except (TimeoutError, websockets.ConnectionClosed):
-                # 无新事件：若已进入聆听或等待过久，结束本轮
+                # 无新事件。若已收到文本（回复进行中），说明可能是长回复生成中
+                # （_recv 超时但 response.done 未到）——不应 break，否则会丢弃
+                # 还没收到的 response.done，回复只留超时前的部分（截断）。
+                # 只有从未收到文本时才 break（判定本轮无回复）。
+                if text:
+                    continue
                 break
 
             t = ev.get("type")
@@ -411,7 +416,8 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           max_audio_s: Optional[float] = None,
                           replay_speed: float = 1.0,
                           wait_reply: bool = True,
-                          audio_chunk_ms: int = 1000):
+                          audio_chunk_ms: int = 1000,
+                          max_new_tokens: int = 1024):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
     帧策略：按 fps 持续抽帧（max_frames=0 不限制总数），但用 KV 预算保护
@@ -531,10 +537,11 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
             # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
             # 被回收。
-            # 长回复可能生成较久（视频理解多轮可达 20s+）。_recv 超时=listen_giveup_s，
-            # 过小会在 response.done 前超时 → 回复被截断。用 30s 覆盖长回复。
+            # 长回复可能生成较久（视频理解多轮可达 30s+）。_recv 超时=listen_giveup_s，
+            # 过小会在 response.done 前超时。且 collect_reply 在收到文本后超时不再 break
+            # （见 collect_reply 内部），所以这里只需足够大的总等待上限。
             # initial=rm：续接触发检测已消费的 delta，避免重复 collect 丢开头。
-            rm_done = await client.collect_reply(timeout=60.0, listen_giveup_s=30.0, initial=rm)
+            rm_done = await client.collect_reply(timeout=120.0, listen_giveup_s=60.0, initial=rm)
             if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
                 rm = rm_done
                 rm.turn_idx = turn_no
@@ -910,50 +917,6 @@ async def run_concurrency(url, ssl_ctx, direct, backend,
 
 async def main():
     parser = argparse.ArgumentParser(description="流式视频对话 Demo")
-    parser.add_argument("--video", help="视频文件路径（回放模式）")
-    parser.add_argument("--audio", default="",
-                        help="音频文件：与 --video 同时用=替换视频音轨；单独用=纯音频交互模式")
-    parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
-    parser.add_argument("--prompt", default="你是一个多模态AI助手，请理解音频和视频内容，简洁准确地回复用户。",
-                        help="对话提示词")
-    parser.add_argument("--turn-decision", choices=["model", "vad_turnsense"],
-                        default="vad_turnsense",
-                        help="轮次判决: model=模型自主 speak/listen, vad_turnsense=VAD+TurnSense")
-    parser.add_argument("--accumulate-context", action="store_true",
-                        help="跨分句累积历史上下文（默认关）。开启后每轮保留之前的音频/回复，"
-                             "模型有跨轮记忆，但 prompt 变长、输出变慢；关闭则每轮只推理当前分句，输出更快")
-    parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
-    parser.add_argument("--fps", type=float, default=1.0,
-                        help="视频抽帧率(帧/秒)，0=不抽帧只发音频")
-    parser.add_argument("--max-frames", type=int, default=0,
-                        help="最大抽帧数，0=不限(用 KV 预算保护)")
-    parser.add_argument("--kv-budget", type=int, default=20000,
-                        help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频。"
-                             "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
-    parser.add_argument("--max-new-tokens", type=int, default=1024,
-                        help="单次回复最大生成 token 数(默认1024)。长回复(视频理解/总结)易超 512，"
-                             "默认后端 1024；过大则回复慢、KV 消耗大")
-    parser.add_argument("--max-audio-s", type=float, default=None,
-                        help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
-    parser.add_argument("--replay-speed", type=float, default=1.0,
-                        help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
-    parser.add_argument("--wait-reply", type=lambda v: v.lower() in ("1","true","yes","on"),
-                        default=True,
-                        help="VAD+TurnSense 触发回复后是否暂停发送音频，等模型回复完成再继续(默认开)。"
-                             "--wait-reply=false 关闭则持续发送不等回复")
-    parser.add_argument("--vad-model", choices=["fsmn", "silero"], default="fsmn",
-                        help="VAD 模型: fsmn(FunASR,默认) 或 silero")
-    parser.add_argument("--vad-tail-sil", type=int, default=600,
-                        help="VAD 尾静音(ms)，fsmn 的 max_end_silence_time，默认600")
-    parser.add_argument("--vad-max-len", type=int, default=60000,
-                        help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
-    parser.add_argument("--audio-chunk-ms", type=int, default=1000,
-                        help="demo 发送音频的 chunk 大小(ms)，默认1000（VAD 需 ≥25ms，"
-                             "100 更实时但更频繁）。回放模式即用此值")
-    parser.add_argument("--ts-wait-ms", type=int, default=900,
-                        help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
-    parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
-                        help="TurnSense invalid 丢弃阈值(0~1)：invalid 概率≥此值则丢弃该句不回复，默认0.9")
     parser.add_argument("--direct-backend", default="",
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
     parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
@@ -964,14 +927,64 @@ async def main():
                         help="服务端口：8006=gateway(wss，生产外网入口，默认)；"
                              "22500=直连后端(ws，需后端端口映射到宿主机)。"
                              "未指定时走 --direct-backend / --gateway 默认地址")
-    parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
-                        help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
-    parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
-                        help="系统提示词")
+    
     parser.add_argument("--concurrency", type=int, default=0,
                         help="并发路数(默认0=单路)。>0 时进入并发测试：从1递增到N，同时监控 GPU 显存/利用率")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
+    parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
+                        help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
+    parser.add_argument("--turn-decision", choices=["model", "vad_turnsense"],
+                        default="vad_turnsense",
+                        help="轮次判决: model=模型自主 speak/listen, vad_turnsense=VAD+TurnSense")
+    parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
+    parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
+    
+    parser.add_argument("--video", help="视频文件路径（回放模式）")
+    parser.add_argument("--fps", type=float, default=1.0,
+                        help="视频抽帧率(帧/秒)，0=不抽帧只发音频") 
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="最大抽帧数，0=不限(用 KV 预算保护)")
+    parser.add_argument("--audio", default="",
+                        help="音频文件：与 --video 同时用=替换视频音轨；单独用=纯音频交互模式")
+    parser.add_argument("--audio-chunk-ms", type=int, default=1000,
+                        help="demo 发送音频的 chunk 大小(ms)，默认1000（VAD 需 ≥25ms，"
+                             "100 更实时但更频繁）。回放模式即用此值")   
+    parser.add_argument("--max-audio-s", type=float, default=None,
+                        help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
+    parser.add_argument("--kv-budget", type=int, default=20000,
+                        help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频。"
+                             "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
+    parser.add_argument("--replay-speed", type=float, default=1.0,
+                        help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
+    parser.add_argument("--wait-reply", type=lambda v: v.lower() in ("1","true","yes","on"),
+                        default=True,
+                        help="VAD+TurnSense 触发回复后是否暂停发送音频，等模型回复完成再继续(默认开)。"
+                             "--wait-reply=false 关闭则持续发送不等回复")
+    
+    parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
+                        help="系统提示词")
+    parser.add_argument("--prompt", default="你是一个多模态AI助手，请理解音频和视频内容，简洁准确地回复用户。",
+                        help="对话提示词")
+    parser.add_argument("--accumulate-context", action="store_true",
+                        help="跨分句累积历史上下文（默认关）。开启后每轮保留之前的音频/回复，"
+                             "模型有跨轮记忆，但 prompt 变长、输出变慢；关闭则每轮只推理当前分句，输出更快")
+    parser.add_argument("--max-new-tokens", type=int, default=1024,
+                        help="单次回复最大生成 token 数(默认1024)。长回复(视频理解/总结)易超 512，"
+                             "默认后端 1024；过大则回复慢、KV 消耗大")
+    
+    parser.add_argument("--vad-model", choices=["fsmn", "silero"], default="fsmn",
+                        help="VAD 模型: fsmn(FunASR,默认) 或 silero")
+    parser.add_argument("--vad-tail-sil", type=int, default=600,
+                        help="VAD 尾静音(ms)，fsmn 的 max_end_silence_time，默认600")
+    parser.add_argument("--vad-max-len", type=int, default=60000,
+                        help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
+    parser.add_argument("--ts-wait-ms", type=int, default=900,
+                        help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
+    parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
+                        help="TurnSense invalid 丢弃阈值(0~1)：invalid 概率≥此值则丢弃该句不回复，默认0.9")
+
+
     args = parser.parse_args()
 
     if not args.video and not args.audio and not args.realtime and args.concurrency <= 0:
