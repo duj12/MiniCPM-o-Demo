@@ -296,7 +296,8 @@ class StreamingChatClient:
         await self.ws.send(json.dumps({"type": "input.append", "input": inp}, ensure_ascii=False))
 
     async def collect_reply(self, timeout: float = 300.0,
-                            listen_giveup_s: float = 8.0) -> TurnMetrics:
+                            listen_giveup_s: float = 8.0,
+                            initial: Optional[TurnMetrics] = None) -> TurnMetrics:
         """收集一回合的回复（text/audio/listen deltas + response.done）。
 
         返回指标：TTFT（首个文本 delta）、回复耗时、字符数、模型状态。
@@ -304,14 +305,16 @@ class StreamingChatClient:
         - timeout: 单次 recv 超时（总体等待上限）
         - listen_giveup_s: 若模型持续 listen（选择聆听）超过该秒数，判定本轮无回复
           （避免对静音/短音频时 collect_reply 无限等待 response.done）
+        - initial: 若提供，在此基础上继续累积（用于触发检测已消费部分 delta 的场景，
+          避免重复 collect 丢开头）
         """
         import websockets
-        m = TurnMetrics()
+        m = initial or TurnMetrics()
         t_start = time.monotonic()
         first_delta_at = None
         reply_started = None
         last_listen_at = None
-        text = ""
+        text = m.reply_text  # initial 提供时续接已累积的文本（触发检测消费的 delta）
         done = False
 
         while not done:
@@ -532,7 +535,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
             # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
             # 被回收。
-            rm_done = await client.collect_reply(timeout=30.0, listen_giveup_s=15.0)
+            # 长回复可能生成较久（视频理解多轮可达 20s+）。_recv 超时=listen_giveup_s，
+            # 过小会在 response.done 前超时 → 回复被截断。用 30s 覆盖长回复。
+            # initial=rm：续接触发检测已消费的 delta，避免重复 collect 丢开头。
+            rm_done = await client.collect_reply(timeout=60.0, listen_giveup_s=30.0, initial=rm)
             if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
                 rm = rm_done
                 rm.turn_idx = turn_no
