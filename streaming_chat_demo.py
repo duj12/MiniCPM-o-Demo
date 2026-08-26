@@ -425,8 +425,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     i = 0
     in_reply = False
     rm = TurnMetrics(turn_idx=0)
-    turn_start_i = 0       # 本轮分句开始时的 chunk 索引（用于计算当前分句音频时长）
-    cur_turn_audio_s = 0.0 # 当前分句的音频时长（触发时计算，回复完成后用于指标）
+    turn_start_i = 0         # 本轮分句开始时的 chunk 索引（用于计算当前分句音频时长）
+    cur_turn_audio_s = 0.0   # 当前分句的音频时长（触发时计算，回复完成后用于指标）
+    turn_start_frames = 0    # 本轮分句开始时的累计发送帧数（用于计算当前分句视频时长）
+    cur_turn_video_s = 0.0   # 当前分句的视频时长（触发时计算，回复完成后用于指标）
 
     while i < n_chunks:
         if not in_reply:
@@ -467,6 +469,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                     # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
                     cur_turn_audio_s = (i - turn_start_i) * CHUNK_MS / 1000.0
                     turn_start_i = i
+                    # 当前分句视频时长 = 从上一轮触发后到本次触发之间发送的帧数 / fps。
+                    # 帧发送受 kv_budget_tokens 限制，可能比音频稀疏，但秒数估算仍准确。
+                    cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
+                    turn_start_frames = sent_frames
                     print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
             except (asyncio.TimeoutError, TimeoutError):
                 pass
@@ -483,9 +489,10 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 rm = rm_done
                 rm.turn_idx = turn_no
             # 回复完成（response.done 或 listen 超时）→ 记录，恢复发送
-            # in_audio_s 用当前分句的音频时长（VAD 触发的那一段），不是整段音轨。
+            # in_audio_s / in_video_s 用当前分句的时长（VAD 触发的那一段），
+            # 不是整段音轨/视频的累计值。
             m = TurnMetrics(turn_idx=turn_no, in_audio_s=cur_turn_audio_s)
-            m.in_video_s = min(video_s, sent_frames / max(fps, 0.1))
+            m.in_video_s = cur_turn_video_s
             m.ttft_s = rm.ttft_s
             m.reply_s = rm.reply_s
             m.reply_chars = rm.reply_chars

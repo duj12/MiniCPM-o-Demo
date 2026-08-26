@@ -608,6 +608,10 @@ class HalfDuplexSession:
 
         if self.active_model != "minicpm":
             # Qwen3-Omni: turn-based，触发 chunk 即完整回复，无静音循环。
+            # 发一次静音块作为触发信号（每次 VAD 触发只发一次）。后端已识别
+            # force_reply 不把触发静音块累积进 context——所以多轮对话静音不会
+            # 堆积、回复不会趋同。静音块不能省略为"空 audio"因为部分客户端/链路
+            # 依赖 audio 字段存在；一次触发块本身无害。
             silence = np.zeros(int(16000 * self.cfg.silence_trigger_ms / 1000), dtype=np.float32)
             await self.push({
                 "audio": _np_float32_to_b64(silence),
