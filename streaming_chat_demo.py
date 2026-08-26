@@ -8,15 +8,29 @@
     （worker 端用 force_listen 累积，说完才触发 decode —— 首字延迟更低）
 
 用法：
-  # 文件回放（视频理解，VAD+TurnSense 判决）
+  # 单路回放（视频理解，VAD+TurnSense 判决；音频 100ms 细粒度流式）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
-      --turn-decision vad_turnsense --prompt "描述这个视频"
+      --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
+      --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend
+
+  # 并发压力测试（10 路，用完整音轨驱动真实多轮；GPU 显存/利用率监控）
+  python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
+      --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
+      --backend qwen3omni --direct-backend ws://127.0.0.1:22500/backend \
+      --concurrency 10 --gpu-ids 0,1
 
   # 实时采集（麦克风 + 摄像头，模型自主判决）
   python streaming_chat_demo.py --realtime --turn-decision model
 
-  # 直连后端（绕过 gateway，调试用）
-  python streaming_chat_demo.py --video xxx.mp4 --direct-backend ws://127.0.0.1:22500/backend
+  # 走 gateway（生产路径，wss + mode=video；需可访问 :8006）
+  python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
+
+常用参数：
+  --audio-chunk-ms  音频发送块大小(ms)，默认 100（VAD 需 ≥25ms；100ms 兼顾实时性）
+  --kv-budget       单分句视频帧预算(token)，默认 20000（≈每路 KV 25600 的 78%）
+  --max-audio-s     限制回放/并发使用的音频时长(秒)，默认全部
+  --concurrency N   并发路数，>0 进入并发测试
+  --direct-backend  直连后端 WS（绕过 gateway），如 ws://127.0.0.1:22500/backend
 
 输出指标（每轮）：
   - TTFT      : 首字延迟（发送完触发帧 → 第一个文本 token）
@@ -383,7 +397,8 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                           audio_path: str = "",
                           max_audio_s: Optional[float] = None,
                           replay_speed: float = 1.0,
-                          wait_reply: bool = True):
+                          wait_reply: bool = True,
+                          audio_chunk_ms: int = 100):
     """离线：按 fps 流式抽帧 + 音频切块发送，模拟实时流。
 
     帧策略：按 fps 持续抽帧（max_frames=0 不限制总数），但用 KV 预算保护
@@ -395,12 +410,13 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     max_audio_s: 限制音频提取时长（秒）。None=完整音轨。注意长音频 token
       量巨大（约 25 tok/s），可能超出 KV，需配合 --kv-budget / 后端 -c。
     """
-    # 回放模式音频块节奏：100ms（VAD 需 ≥25ms chunk，100ms 兼顾实时性与网络开销）。
-    # 视频帧节奏与音频解耦：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧，
-    # 保持视频 1s 一帧不爆 KV。并发/实时模式仍用全局 CHUNK_MS=1000。
-    _chunk_ms = 100
-    _chunk_samples = SAMPLE_RATE * _chunk_ms // 1000     # 1600
-    _frames_per_audio_chunk = max(1, 1000 // _chunk_ms)  # 10 → 每 1s 发 1 帧
+    # 回放模式音频块节奏：默认 100ms（VAD 需 ≥25ms chunk，100ms 兼顾实时性与网络
+    # 开销），可由 --audio-chunk-ms 覆盖。视频帧节奏与音频解耦：每
+    # _frames_per_audio_chunk 个音频块（1s）发 1 帧，保持视频 1s 一帧不爆 KV。
+    # 并发/实时模式仍用全局 CHUNK_MS（由 --audio-chunk-ms 控制）。
+    _chunk_ms = max(25, audio_chunk_ms)
+    _chunk_samples = SAMPLE_RATE * _chunk_ms // 1000
+    _frames_per_audio_chunk = max(1, 1000 // _chunk_ms)  # 默认 10 → 每 1s 发 1 帧
 
     audio = extract_audio_pcm(video_path, max_s=max_audio_s)
     if audio_path and os.path.exists(audio_path):
@@ -684,10 +700,9 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
         t_send = time.perf_counter()  # 发送第一块音频前
         send_end = None
 
-        # 流式发送 + 非阻塞收：每发一块（1s 音频），用短超时 _recv 收中间事件，
-        # 再发下一块。不并发 send/recv（websockets 同连接不能同时 send+recv），
-        # 而是交替进行，模拟真实流式（VAD 边收边检测停顿分句）。
-        # 参考 run_file_replay 的节奏。
+        # 流式发送 + 非阻塞收：每发一块（CHUNK_MS，默认 100ms），用短超时 _recv
+        # 收中间事件，再发下一块。不并发 send/recv（websockets 同连接不能同时
+        # send+recv），而是交替进行，模拟真实流式（VAD 边收边检测停顿分句）。
         done = False
         had_text = False
         recv_deadline = time.perf_counter() + 45  # 单路总等待上限
@@ -796,16 +811,19 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
 async def run_concurrency(url, ssl_ctx, direct, backend,
                           turn_decision, system_prompt,
                           vad_cfg, ts_cfg, video_path, prompt,
-                          concurrency, frames_per_route, gpu_ids=(0, 1)):
-    """并发 N 路测试：递增并发数，同时监控多张 GPU 显存/利用率。"""
+                          concurrency, max_audio_s, gpu_ids=(0, 1)):
+    """并发 N 路测试：递增并发数，同时监控多张 GPU 显存/利用率。
+
+    每路发同一段音频（完整音轨，或 --max-audio-s 截断），驱动真实多轮。
+    """
     import numpy as _np
 
-    # 提取音频：frames_per_route>0 截断到 N 秒，0=完整音轨（每路用同一段）
-    max_s = float(frames_per_route) if frames_per_route > 0 else None
+    # 提取音频：max_audio_s>0 截断到 N 秒，None/0=完整音轨（每路用同一段）
+    max_s = float(max_audio_s) if max_audio_s and max_audio_s > 0 else None
     audio = extract_audio_pcm(video_path, max_s=max_s)
     if len(audio) == 0:
-        audio = _np.zeros(int(SAMPLE_RATE * (frames_per_route or 3)), dtype=_np.float32)
-    # 切成 1s 帧
+        audio = _np.zeros(int(SAMPLE_RATE * (max_audio_s or 3)), dtype=_np.float32)
+    # 切成 CHUNK_MS 音频块（默认 100ms；由 --audio-chunk-ms 控制）
     audio_frames = [audio[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
                     for i in range(max(1, len(audio) // CHUNK_SAMPLES))]
     audio_frames = [f if len(f) == CHUNK_SAMPLES
@@ -902,9 +920,9 @@ async def main():
                         help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
     parser.add_argument("--vad-chunk-size", type=int, default=1000,
                         help="VAD 处理窗口(ms)，fsmn 内部窗口，默认1000(1s可流式分句)")
-    parser.add_argument("--audio-chunk-ms", type=int, default=1000,
-                        help="demo 发送音频的 chunk 大小(ms)，默认1000。"
-                             "建议与 --vad-chunk-size 一致，流式分句最及时")
+    parser.add_argument("--audio-chunk-ms", type=int, default=100,
+                        help="demo 发送音频的 chunk 大小(ms)，默认100（VAD 需 ≥25ms，"
+                             "100ms 兼顾实时性与网络开销）。回放模式即用此值")
     parser.add_argument("--ts-wait-ms", type=int, default=900,
                         help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
     parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
@@ -921,8 +939,6 @@ async def main():
                         help="并发路数(默认0=单路)。>0 时进入并发测试：从1递增到N，同时监控 GPU 显存/利用率")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
-    parser.add_argument("--duplex-frames", type=int, default=5,
-                        help="并发模式下每路的音频时长(秒)，默认5")
     args = parser.parse_args()
 
     if not args.video and not args.realtime and args.concurrency <= 0:
@@ -931,9 +947,9 @@ async def main():
     if args.concurrency > 0 and not args.video:
         parser.error("并发测试需要 --video 提供测试音视频")
 
-    # 按 --audio-chunk-ms 重算发送 chunk（与 VAD 窗口统一，流式分句最及时）
+    # 按 --audio-chunk-ms 重算全局发送 chunk（并发/实时模式用；回放模式直接传参）
     global CHUNK_MS, CHUNK_SAMPLES
-    CHUNK_MS = max(100, args.audio_chunk_ms)
+    CHUNK_MS = max(25, args.audio_chunk_ms)
     CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
     # 连接目标：直连后端 或 gateway
@@ -967,7 +983,7 @@ async def main():
             video_path=args.video,
             prompt=args.prompt,
             concurrency=args.concurrency,
-            frames_per_route=args.duplex_frames,
+            max_audio_s=args.max_audio_s,
             gpu_ids=gpu_ids,
         )
         return
@@ -1003,7 +1019,8 @@ async def main():
                                             audio_path=args.audio,
                                             max_audio_s=args.max_audio_s,
                                             replay_speed=args.replay_speed,
-                                            wait_reply=args.wait_reply)
+                                            wait_reply=args.wait_reply,
+                                            audio_chunk_ms=args.audio_chunk_ms)
         else:
             metrics = await run_realtime(client, args.system_prompt,
                                          args.turn_decision, args.duration,
