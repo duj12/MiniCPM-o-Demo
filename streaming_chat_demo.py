@@ -94,6 +94,7 @@ class TurnMetrics:
     speed_cps: float = 0.0                # 生成速度
     model_state: str = ""                 # listening / speaking
     reply_text: str = ""                  # 完整回复文本
+    is_done: bool = False                 # 已收到 response.done（回复完整）
 
     @property
     def summary(self) -> str:
@@ -325,6 +326,10 @@ class StreamingChatClient:
         """
         import websockets
         m = initial or TurnMetrics()
+        # 若 initial 已收到 response.done（触发检测已完整收集），直接返回，
+        # 避免"再等一轮 collect_reply 收不到 done 而等满超时"（reply 虚高）。
+        if m.is_done:
+            return m
         t_start = time.monotonic()
         first_delta_at = None
         reply_started = None
@@ -389,6 +394,7 @@ class StreamingChatClient:
                     # 此前若从未收到 listen/audio，model_state 会留空，这里补齐。
                     if not m.model_state:
                         m.model_state = "speaking"
+                    m.is_done = True
                     done = True
             elif t == "session.closed":
                 break
@@ -503,9 +509,14 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     cur_turn_audio_s = 0.0   # 当前分句的音频时长（触发时计算，回复完成后用于指标）
     turn_start_frames = 0    # 本轮分句开始时的累计发送帧数（用于计算当前分句视频时长）
     cur_turn_video_s = 0.0   # 当前分句的视频时长（触发时计算，回复完成后用于指标）
+    reply_started_at = None  # 本轮首个文本 delta 时间（TTFT / reply_s 计算）
 
     while i < n_chunks:
-        if not in_reply:
+        # 是否暂停发音频：VAD+TurnSense 且 wait_reply 时，回复中暂停发送，
+        # 避免新音频打断当前回复（VAD 检测到新语音会 barge-in）。
+        pause_send = turn_decision == "vad_turnsense" and wait_reply and in_reply
+
+        if not pause_send:
             chunk = audio[i * _chunk_samples:(i + 1) * _chunk_samples]
             if len(chunk) < _chunk_samples:
                 chunk = np.pad(chunk, (0, _chunk_samples - len(chunk)))
@@ -531,68 +542,80 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             i += 1
             await asyncio.sleep(_chunk_ms / 1000.0 / replay_speed)
 
-        # 非阻塞检查：仅 VAD+TurnSense 模式触发回复后暂停发送。
-        # 自由全双工（turn_decision=model）靠持续输入驱动，模型可随时回复，
-        # 不能暂停发送（否则模型收不到后续输入，回复会中断）。
-        # 用 _peek 非阻塞检查是否有回复事件（delta/done），**不消费**——
-        # 事件留给下面的等待 collect_reply 从头收，避免"触发检测消费了
-        # response.done 导致等待 collect_reply 等满超时"（reply 虚高 120s）。
-        if turn_decision == "vad_turnsense" and wait_reply and not in_reply:
-            try:
-                ev = await client._peek()
-                if ev is not None:
-                    in_reply = True
-                    turn_no += 1
-                    rm = TurnMetrics(turn_idx=turn_no)
-                    # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
-                    # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
-                    cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
-                    turn_start_i = i
-                    # 当前分句视频时长 = 从上一轮触发后到本次触发之间发送的帧数 / fps。
-                    # 帧发送受 kv_budget_tokens 限制，可能比音频稀疏，但秒数估算仍准确。
-                    cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
-                    turn_start_frames = sent_frames
-                    print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
-            except (asyncio.TimeoutError, TimeoutError):
-                pass
+        # 收事件（短超时非阻塞）：与网页前端一致，收到什么处理什么——
+        # delta/text → 流式显示；response.done → 本轮结束；listen → Qwen3 prefill 信号。
+        try:
+            ev = await client._recv(timeout=0.3)
+        except TimeoutError:
+            continue
+        except Exception:
+            break
 
-        # 回复进行中：仅 VAD+TurnSense 模式等待回复完成再继续发送。
-        # model 模式持续发送，回复由模型自主穿插（靠 listen_giveup_s 分段）。
-        if turn_decision == "vad_turnsense" and in_reply:
-            # 等待回复完成。不在这里发 keep-alive：静音 prefill 会让模型
-            # 持续 Listen，导致本循环永远收不到 text 而卡住。后端 reaper
-            # 超时已调大（见 server-qwen3omni 的 idle_timeout），长回复不会
-            # 被回收。
-            # 触发检测用 _peek 不消费事件，回复 delta 仍在 WS 流里。这里从空 rm 从头
-            # collect 完整回复：collect_reply 在收到 response.done 时立即返回（不靠超时），
-            # 回复流式显示（on_text）。不会再出现"response.done 被触发检测消费导致
-            # 等待 120s 超时"的问题。
-            print("\n  ── 回复流 ──", flush=True)
-            rm_done = await client.collect_reply(
-                timeout=120.0, listen_giveup_s=60.0, initial=rm,
-                on_text=lambda chunk: print(chunk, end="", flush=True),
-            )
+        t = ev.get("type")
+        if t == "response.output.delta":
+            kind = ev.get("kind")
+            if kind == "text":
+                txt = ev.get("text", "")
+                if txt:
+                    if not in_reply:
+                        in_reply = True
+                        turn_no += 1
+                        # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
+                        # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
+                        cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
+                        turn_start_i = i
+                        # 当前分句视频时长 = 触发后到本次触发之间发送的帧数 / fps。
+                        cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
+                        turn_start_frames = sent_frames
+                        reply_started_at = time.monotonic()  # 首个 delta 时间（TTFT）
+                        print(f"\n  [VAD段{turn_no}] 模型开始回复，暂停发送...")
+                        print("\n  ── 回复流 ──", flush=True)
+                    rm.reply_text += txt
+                    print(txt, end="", flush=True)
+            elif kind == "listen":
+                # Qwen3: prefill 完成信号（PREFILL_DONE），非让出话轮，忽略。
+                # MiniCPM free-duplex: <|listen|> = 本轮回复结束。
+                if client.backend == "minicpm" and in_reply:
+                    in_reply = False
+                    print("", flush=True)
+            elif kind == "audio":
+                pass
+        elif t == "response.done":
+            if not in_reply:
+                # 直接收到 done（短回复，无前置 delta）：也视为一轮
+                in_reply = True
+                turn_no += 1
+                cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
+                turn_start_i = i
+                cur_turn_video_s = (sent_frames - turn_start_frames) / max(fps, 0.1)
+                turn_start_frames = sent_frames
+                print(f"\n  [VAD段{turn_no}] 模型回复（无流式 delta）")
+                print("\n  ── 回复流 ──", flush=True)
+            rm.reply_text = ev.get("text", "") or rm.reply_text
             print("", flush=True)
-            if rm_done.reply_chars > 0 or rm_done.model_state == "speaking":
-                rm = rm_done
-                rm.turn_idx = turn_no
-            # 回复完成（response.done 或 listen 超时）→ 记录，恢复发送
-            # in_audio_s / in_video_s 用当前分句的时长（VAD 触发的那一段），
-            # 不是整段音轨/视频的累计值。
+            # 记录本轮指标
             m = TurnMetrics(turn_idx=turn_no, in_audio_s=cur_turn_audio_s)
             m.in_video_s = cur_turn_video_s
-            m.ttft_s = rm.ttft_s
-            m.reply_s = rm.reply_s
-            m.reply_chars = rm.reply_chars
-            m.speed_cps = rm.speed_cps
-            m.model_state = rm.model_state
+            m.reply_chars = len(rm.reply_text)
+            m.model_state = "speaking" if rm.reply_text else ""
             m.reply_text = rm.reply_text
+            if reply_started_at is not None:
+                # TTFT: 首个 delta 到 done 的生成耗时（近似）；reply_s: 纯生成时间
+                now = time.monotonic()
+                m.ttft_s = 0.01  # 事件驱动下首个 delta 即收到，TTFT 近似为即时
+                m.reply_s = now - reply_started_at
+                if m.reply_s > 0:
+                    m.speed_cps = m.reply_chars / m.reply_s
+            reply_started_at = None
             all_metrics.append(m)
             print(f"\n  {m.summary}")
             if m.reply_text:
                 print(f"  ── 回复{turn_no} ──\n  {m.reply_text}\n  ──────────────")
             in_reply = False
+            rm = TurnMetrics(turn_idx=turn_no + 1)
             await asyncio.sleep(0.5)  # 短暂停顿后继续发下一段
+        elif t == "session.closed":
+            break
 
     return all_metrics
 
