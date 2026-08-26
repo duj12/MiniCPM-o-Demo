@@ -27,6 +27,10 @@
   # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense --backend qwen3omni
 
+  # 纯音频交互模式（只有 --audio，无视频）：语音对话
+  python streaming_chat_demo.py --audio assets/audio/xxx.wav \
+      --turn-decision vad_turnsense --backend qwen3omni --host 192.168.89.106
+
   # 内网其他机器连生产服务：--host 指定机器 IP（默认走 gateway :8006，生产外网入口）
   python streaming_chat_demo.py --video xxx.mp4 --turn-decision vad_turnsense \
       --backend qwen3omni --host 192.168.89.106
@@ -401,7 +405,7 @@ class StreamingChatClient:
 # ============================================================================
 
 async def run_file_replay(client: StreamingChatClient, video_path: str,
-                          prompt: str, turn_decision: str, n_turns: int = 1,
+                          prompt: str, turn_decision: str,
                           fps: float = 1.0, max_frames: int = 0,
                           kv_budget_tokens: int = 20000,
                           audio_path: str = "",
@@ -428,7 +432,8 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     _chunk_samples = SAMPLE_RATE * _chunk_ms // 1000
     _frames_per_audio_chunk = max(1, 1000 // _chunk_ms)  # 默认 10 → 每 1s 发 1 帧
 
-    audio = extract_audio_pcm(video_path, max_s=max_audio_s)
+    # 音频来源：优先 --audio（人声 wav），否则从视频提取音轨。纯音频模式
+    # （video_path 为空）必须有 --audio。
     if audio_path and os.path.exists(audio_path):
         if sf is None:
             print("  [warn] soundfile 不可用，忽略 --audio")
@@ -437,12 +442,18 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             if sr != SAMPLE_RATE:
                 print(f"  [warn] --audio 采样率 {sr}≠16000，将按原采样率处理（可能不准）")
             audio = np.asarray(a, dtype=np.float32)
-    frames = extract_frames_evenly(video_path, fps=fps, max_frames=max_frames)
-    video_s = probe_duration(video_path)
+    else:
+        audio = extract_audio_pcm(video_path, max_s=max_audio_s)
+
+    # 纯音频模式：无视频帧
+    frames = extract_frames_evenly(video_path, fps=fps, max_frames=max_frames) if video_path else []
+    video_s = probe_duration(video_path) if video_path else 0.0
     audio_s = len(audio) / SAMPLE_RATE
 
-    print(f"\n=== 文件回放: {os.path.basename(video_path)} ===")
-    print(f"  音频 {audio_s:.1f}s, 视频 {video_s:.1f}s, 抽帧 {len(frames)} 帧 @{fps}fps")
+    src_name = os.path.basename(audio_path or video_path) or "(audio)"
+    print(f"\n=== 文件回放: {src_name} ===")
+    print(f"  音频 {audio_s:.1f}s, 视频 {video_s:.1f}s, 抽帧 {len(frames)} 帧 @{fps}fps"
+          + (" [纯音频模式]" if not video_path else ""))
     print(f"  turn_decision = {turn_decision}, KV预算 ≈{kv_budget_tokens} tok")
 
     TOKENS_PER_FRAME = 540  # 1440p 缩放后每帧约 540 token
@@ -898,14 +909,13 @@ async def main():
     parser = argparse.ArgumentParser(description="流式视频对话 Demo")
     parser.add_argument("--video", help="视频文件路径（回放模式）")
     parser.add_argument("--audio", default="",
-                        help="人声音频 wav（替代视频音轨；视频音轨常非人声导致 TurnSense 判 invalid）")
+                        help="音频文件：与 --video 同时用=替换视频音轨；单独用=纯音频交互模式")
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
-    parser.add_argument("--prompt", default="请描述这个视频里发生了什么，尽量详细。",
+    parser.add_argument("--prompt", default="你是一个多模态AI助手，请理解音频和视频内容，简洁准确地回复用户。",
                         help="对话提示词")
     parser.add_argument("--turn-decision", choices=["model", "vad_turnsense"],
                         default="vad_turnsense",
                         help="轮次判决: model=模型自主 speak/listen, vad_turnsense=VAD+TurnSense")
-    parser.add_argument("--turns", type=int, default=1, help="回放模式的对话轮数")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="视频抽帧率(帧/秒)，0=不抽帧只发音频")
@@ -957,8 +967,8 @@ async def main():
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
     args = parser.parse_args()
 
-    if not args.video and not args.realtime and args.concurrency <= 0:
-        parser.error("需要 --video 或 --realtime 之一")
+    if not args.video and not args.audio and not args.realtime and args.concurrency <= 0:
+        parser.error("需要 --video / --audio 或 --realtime 之一（纯音频模式用 --audio）")
 
     if args.concurrency > 0 and not args.video:
         parser.error("并发测试需要 --video 提供测试音视频")
@@ -1048,9 +1058,9 @@ async def main():
         print(f"会话已建立: session={client.session_id[:8] if client.session_id else '?'} "
               f"url={url}")
 
-        if args.video:
+        if args.video or args.audio:
             metrics = await run_file_replay(client, args.video, args.prompt,
-                                            args.turn_decision, args.turns,
+                                            args.turn_decision,
                                             fps=args.fps, max_frames=args.max_frames,
                                             kv_budget_tokens=args.kv_budget,
                                             audio_path=args.audio,
