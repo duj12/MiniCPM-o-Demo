@@ -321,8 +321,11 @@ class TurnSenseManager:
                 frontend_conf=frontend_conf,
             )
             self.module = TurnSenseModule(ts_config)
-            self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="turnsense")
-            logger.info("TurnSense ready (model=%s)", model_path)
+            # TurnSense 推理线程池大小 = WORKER_MAX_CONCURRENCY（与后端并发数一致，
+            # 由环境变量控制，回退默认 4）。多路并发时允许更多路并行做分句决策。
+            _ts_workers = int(os.environ.get("WORKER_MAX_CONCURRENCY", 4))
+            self.executor = ThreadPoolExecutor(max_workers=max(1, _ts_workers), thread_name_prefix="turnsense")
+            logger.info("TurnSense ready (model=%s, max_workers=%d)", model_path, max(1, _ts_workers))
             return True
         except Exception as exc:
             logger.error("TurnSense init failed: %s", exc)
