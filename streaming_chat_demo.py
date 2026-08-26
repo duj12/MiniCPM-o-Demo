@@ -53,7 +53,7 @@ except ImportError:
 SAMPLE_RATE = 16000
 FRAME_MS = 100
 FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 1600
-CHUNK_MS = 1000                                       # 视频帧/音频块节奏
+CHUNK_MS = 1000                                       # 默认音频块节奏（1s，并发/实时模式用）
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000        # 16000
 
 
@@ -395,6 +395,13 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     max_audio_s: 限制音频提取时长（秒）。None=完整音轨。注意长音频 token
       量巨大（约 25 tok/s），可能超出 KV，需配合 --kv-budget / 后端 -c。
     """
+    # 回放模式音频块节奏：100ms（VAD 需 ≥25ms chunk，100ms 兼顾实时性与网络开销）。
+    # 视频帧节奏与音频解耦：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧，
+    # 保持视频 1s 一帧不爆 KV。并发/实时模式仍用全局 CHUNK_MS=1000。
+    _chunk_ms = 100
+    _chunk_samples = SAMPLE_RATE * _chunk_ms // 1000     # 1600
+    _frames_per_audio_chunk = max(1, 1000 // _chunk_ms)  # 10 → 每 1s 发 1 帧
+
     audio = extract_audio_pcm(video_path, max_s=max_audio_s)
     if audio_path and os.path.exists(audio_path):
         if sf is None:
@@ -421,7 +428,7 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     all_metrics = []
     turn_no = 0
     sent_frames = 0
-    n_chunks = max(1, int(np.ceil(len(audio) / CHUNK_SAMPLES)))
+    n_chunks = max(1, int(np.ceil(len(audio) / _chunk_samples)))
     i = 0
     in_reply = False
     rm = TurnMetrics(turn_idx=0)
@@ -432,15 +439,17 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
 
     while i < n_chunks:
         if not in_reply:
-            chunk = audio[i * CHUNK_SAMPLES:(i + 1) * CHUNK_SAMPLES]
-            if len(chunk) < CHUNK_SAMPLES:
-                chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
+            chunk = audio[i * _chunk_samples:(i + 1) * _chunk_samples]
+            if len(chunk) < _chunk_samples:
+                chunk = np.pad(chunk, (0, _chunk_samples - len(chunk)))
 
             frame_b64 = []
+            # 视频帧节奏独立于音频：每 _frames_per_audio_chunk 个音频块（1s）发 1 帧。
+            # 这样音频可 100ms 细粒度流式（VAD 更实时），而视频保持 1s 一帧不爆 KV。
             # kv_budget 限制的是"当前分句"发送的视频帧数（单次持续处理的帧预算），
             # 不是累计发送帧数——否则多轮对话后预算被跨分句耗尽，视频帧提前停发。
-            # 每分句独立预算：一次 VAD 说话内最多发 kv_budget/540 帧。
-            if (sent_frames - turn_start_frames) * TOKENS_PER_FRAME < kv_budget_tokens and frames:
+            if i % _frames_per_audio_chunk == 0 and \
+               (sent_frames - turn_start_frames) * TOKENS_PER_FRAME < kv_budget_tokens and frames:
                 frame_b64 = [b64(frames[sent_frames % len(frames)])]
                 sent_frames += 1
 
@@ -453,7 +462,7 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 force_listen=(turn_decision == "vad_turnsense"),
             )
             i += 1
-            await asyncio.sleep(CHUNK_MS / 1000.0 / replay_speed)
+            await asyncio.sleep(_chunk_ms / 1000.0 / replay_speed)
 
         # 非阻塞检查：仅 VAD+TurnSense 模式触发回复后暂停发送。
         # 自由全双工（turn_decision=model）靠持续输入驱动，模型可随时回复，
@@ -470,7 +479,7 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                     rm.turn_idx = turn_no
                     # 当前分句音频时长 = 从上一轮触发后（turn_start_i）到本次触发（i）
                     # 之间发送的音频块数 × 每块秒数。触发后记录下一分句起点。
-                    cur_turn_audio_s = (i - turn_start_i) * CHUNK_MS / 1000.0
+                    cur_turn_audio_s = (i - turn_start_i) * _chunk_ms / 1000.0
                     turn_start_i = i
                     # 当前分句视频时长 = 从上一轮触发后到本次触发之间发送的帧数 / fps。
                     # 帧发送受 kv_budget_tokens 限制，可能比音频稀疏，但秒数估算仍准确。
@@ -576,7 +585,7 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
                             cur_frames += 1
                 await client.send_input(audio_b64=b64(chunk), video_frames=frame_b64,
                                         force_listen=(turn_decision == "vad_turnsense"))
-                cur_audio += 1.0
+                cur_audio += CHUNK_MS / 1000.0   # 块时长（100ms→0.1s）
 
             # 读取模型回复（非阻塞）
             try:
