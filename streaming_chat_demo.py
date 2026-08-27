@@ -213,6 +213,7 @@ class StreamingChatClient:
     def __init__(self, url: str, ssl_ctx=None, max_size: int = 128 * 1024 * 1024,
                  direct: bool = False, backend: Optional[str] = None,
                  echo: bool = True,
+                 on_turn: Optional[Callable[[TurnMetrics], None]] = None,
                  audio_sent_s: Optional[Callable[[], float]] = None,
                  video_sent_s: Optional[Callable[[], float]] = None,
                  sent_pushes: Optional[Callable[[], int]] = None):
@@ -233,6 +234,9 @@ class StreamingChatClient:
         # （指标按轮差值计）；sent_pushes 返回已发音频块数（收尾判据）。
         # 不提供时回退到内部计数器（send_input 每次自增）。
         self.echo = echo
+        # on_turn: 每轮回复结束（_finish_turn）时回调，参数是当轮的 TurnMetrics。
+        # 并发下用它即时打印"#N turn#k ..."，不等音频发完/全部轮次结束。
+        self.on_turn = on_turn
         self._audio_sent_s = audio_sent_s or (lambda: self._sent_chunks * CHUNK_MS / 1000.0)
         self._video_sent_s = video_sent_s or (lambda: 0.0)
         self._sent_pushes = 0           # 内部计数：已发音频块
@@ -505,7 +509,9 @@ class StreamingChatClient:
             if self._n_deltas >= 2 and m.reply_s >= 0.05:
                 m.speed_cps = m.reply_chars / m.reply_s
         self.metrics.append(m)
-        if self.echo:
+        if self.on_turn is not None:
+            self.on_turn(m)      # 每轮即时回调（并发下打印带路前缀的 summary）
+        elif self.echo:
             if self._printing:
                 print()          # 收束"回复流"那一行
             print(f"  {m.summary}", flush=True)
@@ -952,6 +958,13 @@ def _turn_stats(metrics: List[TurnMetrics]) -> dict:
     }
 
 
+def _print_concurrent_turn(label, m: TurnMetrics, show_reply_text: bool) -> None:
+    """并发下每轮回复结束即打印当轮 summary（带路前缀 #N）。"""
+    print(f"      #{label} {m.summary}", flush=True)
+    if show_reply_text and m.reply_text:
+        print(f"        #{label} {m.reply_text}", flush=True)
+
+
 async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
                               vad_cfg, ts_cfg, video_path, prompt,
                               audio_chunk_ms=1000, kv_budget=20000,
@@ -961,12 +974,16 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
     """单路并发会话：独立连接，与单路 run_file_replay 完全相同的发送/收尾/统计。
 
     echo=False：并发下不逐字流式（多路交错会错乱）。
-    完成后即时打印本路结果（含每轮 summary），不等 gather 全部结束。
+    每轮回复结束（response.done 到达）即通过 on_turn 打印当轮 summary，
+    不等音频发完/全部轮次结束。
     """
     t0 = time.perf_counter()
     client = None
     try:
-        client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, echo=echo)
+        client = StreamingChatClient(
+            url, ssl_ctx=ssl_ctx, direct=direct, echo=echo,
+            on_turn=lambda m: _print_concurrent_turn(label, m, show_reply_text),
+        )
         await client.connect()
         await client.init(
             mode="full_duplex",
@@ -986,14 +1003,10 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
         )
         st = _turn_stats(metrics)
         ok = bool(metrics) and any(m.reply_chars for m in metrics)
-        # 即时打印本路结果（每路完成即打，不等全部）
-        print(f"\n  #{label} {'PASS' if ok else 'FAIL'} setup={setup_ms:.0f}ms "
+        # 本路完成：打汇总行（每轮 summary 已在 on_turn 即时打印过）
+        print(f"  #{label} {'PASS' if ok else 'FAIL'} setup={setup_ms:.0f}ms "
               f"{st['n_turns']}轮 平均TTFT={st['avg_ttft_s']:.2f}s "
               f"平均speed={st['avg_speed']:.0f}ch/s 总{st['chars']}ch", flush=True)
-        for m in metrics:
-            print(f"      {m.summary}")
-            if show_reply_text and m.reply_text:
-                print(f"        {m.reply_text}")
         return {
             "ok": ok,
             "setup_ms": setup_ms,
