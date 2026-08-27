@@ -1047,29 +1047,14 @@ def _percentile(vals: List[float], pct: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-async def run_concurrency(url, ssl_ctx, direct, system_prompt,
-                          vad_cfg, ts_cfg, video_path, prompt,
-                          concurrency, max_audio_s, gpu_ids=None,
-                          accumulate_context=False,
-                          audio_chunk_ms=1000, kv_budget=20000,
-                          tail_silence_s=2.0, drain_idle_s=5.0,
-                          show_reply_text=False, audio_path=""):
-    """视频/音频回放的统一入口：N 路各自独立连接，与单路同口径统计。
-
-    concurrency==1 即单路（--concurrency 默认 1）：每路 echo=True 流式输出，
-    结束后打单路汇总；N>1 加 GPU 监控 + 全体 P50/P90/P99。
-    每路结果由 _run_one_concurrent 完成即打印（不逐字流式，避免交错）。
-    gpu_ids=None 或 N==1 时不启 GPU 监控。
-    audio_path: 指定人声音频（替代 video_path 音轨）。video_path 为空且 audio_path
-      给定时为纯音频交互（无视频帧）。
-    """
-    N = concurrency
-    gpu_ids = gpu_ids or ()
+async def _run_round(url, ssl_ctx, direct, system_prompt,
+                     vad_cfg, ts_cfg, video_path, prompt,
+                     round_n, max_audio_s, gpu_ids, accumulate_context,
+                     audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
+                     show_reply_text, audio_path):
+    """跑一轮 N 路并发（单档），返回 (results, ok, wall_ms, peak, baseline)。"""
+    N = round_n
     multi = N > 1
-    src = os.path.basename(audio_path or video_path)
-    print(f"\n=== 回放测试（{N} 路）===")
-    print(f"  音频来源: {src} | 每路音频完整音轨（或 --max-audio-s 截断）")
-
     monitor_running = multi and bool(gpu_ids)
     peak = {g: (0, 0) for g in gpu_ids}
     baseline = {}
@@ -1109,16 +1094,77 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
         monitor_running = False
         await mon_task
     wall_ms = (time.perf_counter() - t_all) * 1000
-
     ok = sum(1 for r in results if r["ok"])
+    return results, ok, wall_ms, peak, baseline
 
-    if not multi:
+
+async def run_concurrency(url, ssl_ctx, direct, system_prompt,
+                          vad_cfg, ts_cfg, video_path, prompt,
+                          concurrency, max_audio_s, gpu_ids=None,
+                          accumulate_context=False,
+                          audio_chunk_ms=1000, kv_budget=20000,
+                          tail_silence_s=2.0, drain_idle_s=5.0,
+                          show_reply_text=False, audio_path="",
+                          ramp=False):
+    """视频/音频回放的统一入口：N 路各自独立连接，与单路同口径统计。
+
+    concurrency==1 即单路（--concurrency 默认 1）：每路 echo=True 流式输出，
+    结束后打单路汇总；N>1 加 GPU 监控 + 全体 P50/P90/P99。
+    每路结果由 _run_one_concurrent 完成即打印（不逐字流式，避免交错）。
+    gpu_ids=None 或 N==1 时不启 GPU 监控。
+    audio_path: 指定人声音频（替代 video_path 音轨）。video_path 为空且 audio_path
+      给定时为纯音频交互（无视频帧）。
+    ramp=True: 递增压力测试 —— 1→2→…→N 每档完整跑一遍，输出每档的
+      TTFT/speed/每路延迟 + 对比表，观察随并发增加的延迟变化。
+    """
+    N = concurrency
+    gpu_ids = gpu_ids or ()
+    src = os.path.basename(audio_path or video_path)
+    print(f"\n=== 回放测试（{'递增 1→' + str(N) if ramp else str(N) + ' 路'}）===")
+    print(f"  音频来源: {src} | 每路音频完整音轨（或 --max-audio-s 截断）")
+
+    if ramp:
+        # ── 递增压力测试：1→2→…→N ──
+        rows = []   # (并发数, 平均TTFT, P50TTFT, 平均speed, ok/N, wall)
+        for k in range(1, N + 1):
+            print(f"\n--- 并发 {k} 路 ---")
+            results, ok, wall_ms, _, _ = await _run_round(
+                url, ssl_ctx, direct, system_prompt,
+                vad_cfg, ts_cfg, video_path, prompt,
+                k, max_audio_s, gpu_ids, accumulate_context,
+                audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
+                show_reply_text, audio_path,
+            )
+            all_ttfts = [m.ttft_s for r in results for m in r["metrics"] if m.ttft_s is not None]
+            all_speeds = [m.speed_cps for r in results for m in r["metrics"] if m.speed_cps > 0]
+            avg_ttft = sum(all_ttfts) / len(all_ttfts) if all_ttfts else 0.0
+            avg_speed = sum(all_speeds) / len(all_speeds) if all_speeds else 0.0
+            rows.append((k, avg_ttft, _percentile(all_ttfts, 0.5), avg_speed, ok, wall_ms))
+
+        print(f"\n=== 递增压测对比 ===")
+        print(f"  {'并发':>4} {'平均TTFT':>9} {'P50':>7} {'平均speed':>10} {'OK':>6} {'wall(s)':>8}")
+        for k, at, p50, asp, ok, wall in rows:
+            print(f"  {k:>4} {at:>7.2f}s {p50:>7.2f}s {asp:>8.0f}ch/s {ok:>3}/{k:<3} {wall/1000:>7.1f}s")
+        print("\n  观察：并发增加时 TTFT/speed 的变化趋势（TTFT 上升、speed 下降 = 正常瓶颈）")
+        return sum(ok for _, _, _, _, ok, _ in rows)
+
+
+    # ── 非 ramp：单轮 N 路并发 ──
+    results, ok, wall_ms, peak, baseline = await _run_round(
+        url, ssl_ctx, direct, system_prompt,
+        vad_cfg, ts_cfg, video_path, prompt,
+        N, max_audio_s, gpu_ids, accumulate_context,
+        audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
+        show_reply_text, audio_path,
+    )
+
+    if N == 1:
         # 单路：echo 已流式打印每轮 summary，这里只打汇总
         _print_summary(results[0]["metrics"])
         print(f"  wall={wall_ms:.0f}ms")
         return ok
 
-    if monitor_running:
+    if gpu_ids:
         peak_str = ", ".join(
             f"GPU{g}: {v}MiB/{u}% (基线{baseline.get(g,0)}MiB)" for g, v, u in
             [(g, p[0], p[1]) for g, p in peak.items()])
@@ -1154,6 +1200,9 @@ async def main():
     
     parser.add_argument("--concurrency", type=int, default=1,
                         help="并发路数(默认1=单路)。>1 时进入并发测试，同时监控 GPU 显存/利用率")
+    parser.add_argument("--ramp", action="store_true",
+                        help="递增压力测试：1→2→…→N 每档完整跑一遍，输出每档 TTFT/speed"
+                             "延迟 + 对比表，观察随并发增加的延迟变化（N 由 --concurrency 定）")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
     parser.add_argument("--show-reply-text", action="store_true",
@@ -1315,6 +1364,7 @@ async def main():
         tail_silence_s=args.tail_silence_s,
         drain_idle_s=args.drain_idle_s,
         show_reply_text=args.show_reply_text,
+        ramp=args.ramp,
     )
 
 
