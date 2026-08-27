@@ -293,6 +293,12 @@ async def _handle_remote_backend_runtime_ws(
 
     async def _send_json_locked(payload: Dict[str, Any]) -> None:
         """直发事件（如 hd_session 的 turn.turnsense），带锁串行发送。"""
+        # 附加 server_send_ts：与服务端后端事件同一时钟。客户端（demo）用
+        # turn.turnsense 的该时间戳作为 TTFT 计时起点——否则并发下该事件走
+        # worker 直发（无 server_send_ts），与后端 delta 的 server_send_ts 混用
+        # 两种时间线，TTFT 会变成负值。
+        payload = dict(payload)
+        payload["server_send_ts"] = time.time()
         async with _ws_send_lock:
             await ws.send_json(payload)
 
