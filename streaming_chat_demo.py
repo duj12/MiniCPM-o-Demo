@@ -982,7 +982,10 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
     try:
         client = StreamingChatClient(
             url, ssl_ctx=ssl_ctx, direct=direct, echo=echo,
-            on_turn=lambda m: _print_concurrent_turn(label, m, show_reply_text),
+            # on_turn 只在并发（echo=False）时用：单路 echo 分支负责打印 summary
+            # 并收束流式行（print() 换行），不能被 on_turn 劫持。
+            on_turn=(None if echo
+                     else (lambda m: _print_concurrent_turn(label, m, show_reply_text))),
         )
         await client.connect()
         await client.init(
