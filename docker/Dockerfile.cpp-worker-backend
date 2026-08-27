@@ -13,9 +13,9 @@ ARG UBUNTU_VERSION=22.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS cpp-build
 
-ARG LLAMA_OMNI_REPO=https://github.com/tc-mb/llama.cpp-omni.git
-ARG LLAMA_OMNI_REFSPEC=master
-ARG LLAMA_OMNI_REF=origin/master
+ARG LLAMA_OMNI_REPO=https://github.com/duj12/llama.cpp-omni.git
+ARG LLAMA_OMNI_REFSPEC=dev
+ARG LLAMA_OMNI_REF=origin/dev
 ARG LLAMA_OMNI_SERVER_TARGET=llama-omni-server
 ARG LLAMA_OMNI_SERVER_BIN=llama-omni-server
 ARG LLAMA_QWEN3OMNI_SERVER_TARGET=llama-qwen3omni-server
@@ -32,7 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker/llama.cpp-omni /src/llama.cpp-omni
+# 构建时从 git 拉取 llama.cpp-omni 源码（不再依赖本地 docker/llama.cpp-omni 同步目录）。
+# 默认 duj12/dev 分支，可用 --build-arg LLAMA_OMNI_REPO / LLAMA_OMNI_REFSPEC 覆盖。
+RUN git clone --depth 1 -b ${LLAMA_OMNI_REFSPEC} ${LLAMA_OMNI_REPO} /src/llama.cpp-omni
 
 WORKDIR /src/llama.cpp-omni
 
@@ -89,6 +91,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY --from=cpp-build /opt/llama.cpp-omni /opt/llama.cpp-omni
 COPY . .
+
+# 说明：`COPY . .` 会把构建上下文的 checkpoints/ 一起拷进镜像 /app/checkpoints
+# （若存在），满足"模型进镜像"（CI 里 svn export 到 checkpoints 后构建）。
+# 本地/挂载部署时镜像内可能无模型，half_duplex 会从 /models（compose 挂载点）探测。
 
 RUN chmod +x docker/entrypoint-cpp-worker-backend.sh \
     && mkdir -p /app/logs

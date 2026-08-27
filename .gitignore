@@ -58,3 +58,8 @@ benchmark.json
 .run-logs/
 *.log
 tools/
+
+# 模型权重目录（CI 构建时由 svn export 生成，不进 git）
+checkpoints/
+# llama.cpp-omni 源码构建时 git clone，不进 git
+docker/llama.cpp-omni/

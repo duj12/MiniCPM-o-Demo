@@ -7,17 +7,16 @@
 #         backend on 127.0.0.1:22500
 #       - Python worker on 0.0.0.0:22400, forwarding to the local backend
 #
-# Model directory layout:
-#   GGUF_MODEL_HOST_PATH/
-#     MiniCPM-o-4_5-gguf/           # MiniCPM-o-4.5 (default)
-#       MiniCPM-o-4_5-Q4_K_M.gguf
-#       vision/
-#       audio/
-#       tts/
-#       token2wav-gguf/
+# Model directory layout (default ./checkpoints, overridable via MODEL_HOST_PATH):
+#   MODEL_HOST_PATH/
 #     qwen3omni-gguf/                # Qwen3-Omni (ACTIVE_MODEL=qwen3omni)
 #       Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf
 #       mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf
+#     MiniCPM-o-4_5-gguf/            # MiniCPM-o-4.5 (ACTIVE_MODEL=minicpm)
+#       MiniCPM-o-4_5-Q4_K_M.gguf
+#       vision/ audio/ tts/ token2wav-gguf/
+#     fsmn-vad-onnx/                 # FSMN-VAD (model_quant.onnx)
+#     TurnSense/                     # TurnSense (pretrained_models/v1.0/model_int8.onnx)
 #
 # Usage:
 #   mkdir -p certs data
@@ -34,8 +33,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.cpp-worker-backend
       args:
-        LLAMA_OMNI_REFSPEC: ${LLAMA_OMNI_REFSPEC:-master}
-        LLAMA_OMNI_REF: ${LLAMA_OMNI_REF:-origin/master}
+        LLAMA_OMNI_REPO: ${LLAMA_OMNI_REPO:-https://github.com/duj12/llama.cpp-omni.git}
+        LLAMA_OMNI_REFSPEC: ${LLAMA_OMNI_REFSPEC:-dev}
+        LLAMA_OMNI_REF: ${LLAMA_OMNI_REF:-origin/dev}
     image: minicpm-cpp-worker-backend:dev
     container_name: minicpm-o-demo-cpp-worker-1
     environment:
@@ -52,22 +52,14 @@ services:
       TS_INCOMPLETE_WAIT_MS: "${TS_INCOMPLETE_WAIT_MS:-900}"
       TS_INVALID_THRESHOLD: "${TS_INVALID_THRESHOLD:-0.9}"
     volumes:
-      # Mount the parent directory containing both MiniCPM and Qwen3-Omni model dirs.
-      # Expected layout on host:
-      #   <GGUF_MODEL_HOST_PATH>/
-      #     MiniCPM-o-4_5-gguf/    (for ACTIVE_MODEL=minicpm)
-      #     qwen3omni-gguf/        (for ACTIVE_MODEL=qwen3omni)
-      - ${GGUF_MODEL_HOST_PATH:?set GGUF_MODEL_HOST_PATH (parent of MiniCPM-o-4_5-gguf/ and qwen3omni-gguf/)}:/models:ro
-      # TurnSense (semantic completeness judge for VAD+TurnSense turn decision):
-      #   - python modules: turnsense_module.py / turnsense_config.py / audio_frontend.py
-      #   - model weights:  checkpoints/TurnSense/pretrained_models/v1.0/model_fp32.onnx
-      # Mounted so runtime/half_duplex.py's auto-detect finds both the module
-      # (sys.path /Fun-ASR-deploy) and the model (v1.0/v1.1).
-      - ${FUNASR_DEPLOY_HOST_PATH:-../Fun-ASR-deploy}:/Fun-ASR-deploy:ro
-      # FSMN-VAD onnx 模型（VAD+TurnSense 用）：
-      #   model.onnx + config.yaml + am.mvn，挂载到 half_duplex.py 的候选路径
-      #   <root>/vad-runtime/model（root_for_deploy() 在容器内解析为 /）。
-      - ${VAD_RUNTIME_MODEL_HOST_PATH:-../vad-runtime/model}:/vad-runtime/model:ro
+      # 统一模型目录：项目内 checkpoints/（含 qwen3omni-gguf/、fsmn-vad-onnx/、TurnSense/）
+      # 默认挂 ./checkpoints，可用 MODEL_HOST_PATH 覆盖为别处（如 SVN 下载目录）。
+      #   <MODEL_HOST_PATH>/
+      #     qwen3omni-gguf/    (for ACTIVE_MODEL=qwen3omni)
+      #     MiniCPM-o-4_5-gguf/(for ACTIVE_MODEL=minicpm)
+      #     fsmn-vad-onnx/     (VAD, model_quant.onnx)
+      #     TurnSense/         (pretrained_models/v1.0/model_int8.onnx)
+      - ${MODEL_HOST_PATH:-./checkpoints}:/models:ro
       # 预设（presets）挂载，宿主机改动即时生效，避免镜像内残留旧品牌文案。
       - ./assets/presets:/app/assets/presets:ro
     deploy:

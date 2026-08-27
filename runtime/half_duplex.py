@@ -116,15 +116,24 @@ class FSMNVADManager:
 
     def _load(self):
         if not self.model_dir:
-            # 自动探测：vad-runtime/model、FunASR onnx、或本包内置 model 目录
+            # 自动探测：项目内 checkpoints/fsmn-vad-onnx（quant 模型）、vad-runtime/model、
+            # FunASR onnx、或本包内置 model 目录
             root = root_for_deploy()
             here = os.path.dirname(os.path.abspath(__file__))
             cands = [
+                os.path.join(root, "checkpoints", "fsmn-vad-onnx"),   # 项目内统一模型目录
+                os.path.join("/models", "fsmn-vad-onnx"),   # 容器内 compose 挂载点
                 os.path.join(root, "vad-runtime", "model"),
                 os.path.join(here, "fsmn_vad_onnx", "model"),   # 容器内/本包内置
                 os.path.join(root, "FunASR", "runtime", "python", "onnxruntime", "models", "vad"),
             ]
-            found = next((c for c in cands if os.path.exists(os.path.join(c, "model.onnx"))), None)
+            # checkpoints 下只有 model_quant.onnx（无 model.onnx），两种都认
+            found = next(
+                (c for c in cands
+                 if os.path.exists(os.path.join(c, "model.onnx"))
+                 or os.path.exists(os.path.join(c, "model_quant.onnx"))),
+                None,
+            )
             if found is None:
                 raise RuntimeError(f"fsmn-vad onnx 模型未找到，请设置 fsmn_model_dir 或放模型到 {cands[0]}")
             self.model_dir = found
@@ -142,10 +151,15 @@ class FSMNVADManager:
 
     def make_vad(self, max_end_silence_time: int, max_single_segment_time: int,
                  chunk_size: int = 1000) -> "FSMNVAD":
+        # 目录里只有 model_quant.onnx（量化模型，checkpoints/fsmn-vad-onnx 下没有 model.onnx）
+        # 时，必须传 quantize=True，否则 vad_bin 会因 model.onnx 不存在走"导出 onnx"分支。
+        has_quant = os.path.exists(os.path.join(self.model_dir, "model_quant.onnx"))
+        has_fp32 = os.path.exists(os.path.join(self.model_dir, "model.onnx"))
         vad = self._Fsmn_vad_online(
             model_dir=self.model_dir,
             max_end_sil=max_end_silence_time,
             intra_op_num_threads=1,
+            quantize=(has_quant and not has_fp32),   # 只有 quant 时显式用 quant
         )
         return FSMNVAD(vad, max_single_segment_time)
 
@@ -240,18 +254,22 @@ class FSMNVAD:
 
 
 def _default_turnsense_paths() -> Dict[str, str]:
-    """Auto-locate TurnSense model under common project roots.
+    """Auto-locate TurnSense model under project root.
 
-    支持的布局（任一命中即用，v1.0 优先因体积小、适合实时）：
-      <code>/Fun-ASR-deploy/checkpoints/TurnSense/pretrained_models/
-          model_fp32.onnx + am.mvn            （直接放根下）
-          v1.0/model_fp32.onnx + am.mvn
-          v1.1/model_fp32.onnx + am.mvn
-      <code>/FullDuplexDemo/TurnSense/pretrained_models/
-          model_fp32.onnx + am.mvn
+    模型统一放项目根 checkpoints/ 下：
+      <root>/checkpoints/TurnSense/pretrained_models/
+          model_fp32.onnx / model_int8.onnx   （直接放根下）
+          v1.0/model_fp32.onnx + v1.0/model_int8.onnx   ← 优先 v1.0
+          v1.1/model_fp32.onnx + v1.1/model_int8.onnx
+    优先 8bit int8（体积小、适合实时），fallback 到 fp32。旧布局（Fun-ASR-deploy /
+    FullDuplexDemo）保留作兼容。
     """
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = root_for_deploy()
     rels = [
+        os.path.join("checkpoints", "TurnSense", "pretrained_models"),
+        # 容器内 compose 挂载点（checkpoints 挂到 /models）
+        os.path.join("/models", "TurnSense", "pretrained_models"),
+        # 兼容旧布局
         os.path.join("Fun-ASR-deploy", "checkpoints", "TurnSense", "pretrained_models"),
         os.path.join("FullDuplexDemo", "TurnSense", "pretrained_models"),
         os.path.join("..", "Fun-ASR-deploy", "checkpoints", "TurnSense", "pretrained_models"),
@@ -262,19 +280,21 @@ def _default_turnsense_paths() -> Dict[str, str]:
         if not os.path.isdir(d):
             continue
         # 直接放根下
-        if os.path.exists(os.path.join(d, "model_fp32.onnx")):
-            return {
-                "model_path": os.path.join(d, "model_fp32.onnx"),
-                "cmvn_path": os.path.join(d, "am.mvn"),
-            }
-        # v1.0 / v1.1 子目录（优先 v1.0，体积小、实时延迟低）
-        for ver in ("v1.0", "v1.1"):
-            vd = os.path.join(d, ver)
-            if os.path.exists(os.path.join(vd, "model_fp32.onnx")):
+        for name in ("model_int8.onnx", "model_fp32.onnx"):
+            if os.path.exists(os.path.join(d, name)):
                 return {
-                    "model_path": os.path.join(vd, "model_fp32.onnx"),
-                    "cmvn_path": os.path.join(vd, "am.mvn"),
+                    "model_path": os.path.join(d, name),
+                    "cmvn_path": os.path.join(d, "am.mvn"),
                 }
+        # v1.0 / v1.1 子目录（优先 v1.0，且 int8 优先）
+        for ver in ("v1.0", "v1.1"):
+            for name in ("model_int8.onnx", "model_fp32.onnx"):
+                vd = os.path.join(d, ver)
+                if os.path.exists(os.path.join(vd, name)):
+                    return {
+                        "model_path": os.path.join(vd, name),
+                        "cmvn_path": os.path.join(vd, "am.mvn"),
+                    }
     return {"model_path": "", "cmvn_path": ""}
 
 
@@ -303,12 +323,9 @@ class TurnSenseManager:
             logger.warning("TurnSense model not found (%s); VAD-only trigger", model_path)
             return False
         try:
-            import sys
-            deploy_dir = os.path.join(root_for_deploy(), "Fun-ASR-deploy")
-            if deploy_dir not in sys.path:
-                sys.path.insert(0, deploy_dir)
-            from turnsense_module import TurnSenseModule  # noqa: E402
-            from turnsense_config import TurnSenseConfig  # noqa: E402
+            # TurnSense 运行代码已 vendor 到项目内 runtime/turnsense/，不再依赖 Fun-ASR-deploy
+            from runtime.turnsense.turnsense_module import TurnSenseModule  # noqa: E402
+            from runtime.turnsense.turnsense_config import TurnSenseConfig  # noqa: E402
 
             frontend_conf = dict(self.cfg.frontend_conf)
             frontend_conf.setdefault("cmvn_file", cmvn_path)
@@ -344,12 +361,11 @@ class TurnSenseManager:
 
 
 def root_for_deploy() -> str:
-    """Workspace root — parent of MiniCPM-o-Demo and Fun-ASR-deploy.
+    """Project root — MiniCPM-o-Demo/（模型统一放 <root>/checkpoints/ 下）。
 
-    __file__ = <root>/MiniCPM-o-Demo/runtime/half_duplex.py
-    → dirname x3 = <root>
+    __file__ = <root>/runtime/half_duplex.py → dirname x2 = <root>
     """
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ---------------------------------------------------------------------------
