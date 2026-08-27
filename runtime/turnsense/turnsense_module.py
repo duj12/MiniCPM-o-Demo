@@ -85,8 +85,8 @@ _add_cudnn_to_path()
 
 import onnxruntime as ort
 
-from turnsense_config import TurnSenseConfig
-from audio_frontend import AudioFrontend
+from .turnsense_config import TurnSenseConfig
+from .audio_frontend import AudioFrontend
 
 logger = logging.getLogger(__name__)
 
