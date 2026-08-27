@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-"""流式视频对话 Demo — 支持音视频文件回放 / 实时采集，两种 turn_decision 判决。
+"""流式视频对话 Demo — 支持音视频文件回放 / 实时采集。
 
 复用 MiniCPM-o-Demo 的全双工流式协议（/v1/realtime?mode=video）：
   - 音视频持续逐帧发送（"边听边看"，累积进 KV cache）
-  - turn_decision="model"        : 模型自主决定 speak/listen（现有全双工）
-  - turn_decision="vad_turnsense": VAD 检测语音停顿 + TurnSense 语义完整后才回复
-    （worker 端用 force_listen 累积，说完才触发 decode —— 首字延迟更低）
+  - 后端类型（qwen3omni / minicpm）由服务端 session.created 的 active_model
+    自动判定，turn_decision 按后端推导：qwen3omni→VAD+TurnSense 判决，
+    minicpm→模型自主 speak/listen。无需、也没有 --backend / --turn-decision 参数。
 
 用法：
   # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
   python streaming_chat_demo.py --video xxx.mp4
 
   # 纯音频交互模式（只有 --audio，无视频）：语音对话
-  python streaming_chat_demo.py --audio assets/audio/xxx.wav 
+  python streaming_chat_demo.py --audio assets/audio/xxx.wav
 
-  # 单路回放（视频理解，VAD+TurnSense 判决；音频块默认 1s，可 --audio-chunk-ms 100 调细粒度）
+  # 单路回放（视频理解，后端自动判定；音频块默认 1s，可 --audio-chunk-ms 100 调细粒度）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
-      --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
-      --backend qwen3omni --host "192.168.89.106"  --port 8006
+      --prompt "你是一个多模态助手，请简练回复用户的问题。" \
+      --host "192.168.89.106"  --port 8006
 
   # 并发压力测试（10 路，用完整音轨驱动真实多轮；GPU 显存/利用率监控）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
-      --turn-decision vad_turnsense --prompt "你是一个多模态助手，请简练回复用户的问题。" \
-      --backend qwen3omni --host "192.168.89.106"  --port 8006 \
-      --concurrency 10 --gpu-ids 0,1 
+      --prompt "你是一个多模态助手，请简练回复用户的问题。" \
+      --host "192.168.89.106"  --port 8006 \
+      --concurrency 10 --gpu-ids 0,1
 
-  # 实时采集（麦克风 + 摄像头）。模型自主判决仅 MiniCPM 支持。目前默认后端qwen3omni：
-  python streaming_chat_demo.py --realtime --turn-decision model --backend minicpm
-  # qwen3omni 实时采集用 VAD+TurnSense：
-  python streaming_chat_demo.py --realtime --turn-decision vad_turnsense --backend qwen3omni
+  # 实时采集（麦克风 + 摄像头），后端自动判定
+  python streaming_chat_demo.py --realtime
 
 
 常用参数：
@@ -213,13 +211,15 @@ class StreamingChatClient:
     """封装 /v1/realtime（或直连后端 /backend）的流式对话会话。"""
 
     def __init__(self, url: str, ssl_ctx=None, max_size: int = 128 * 1024 * 1024,
-                 direct: bool = False, backend: str = "qwen3omni"):
+                 direct: bool = False, backend: Optional[str] = None):
         self.url = url
         self.ssl_ctx = ssl_ctx
         self.max_size = max_size
         self.direct = direct
         # 后端类型：minicpm（free-duplex，回复以 listen 结束，response.done 只是 chunk
         # 边界）或 qwen3omni（turn-based，response.done 即完整回复结束）。
+        # None=未知：由 init() 从服务端 session.created 的 active_model 自动判定
+        # （worker 转发事件时带上，见 worker._send_runtime_event）。
         self.backend = backend
         self.ws = None
         self.session_id = None
@@ -248,9 +248,14 @@ class StreamingChatClient:
             raise RuntimeError("no queue_done within timeout")
 
     async def init(self, mode: str = "full_duplex", system_prompt: str = "",
-                   turn_decision: str = "model", use_tts: bool = False,
+                   turn_decision: Optional[str] = None, use_tts: bool = False,
                    config: Optional[dict] = None) -> dict:
-        """发送 session.init。turn_decision 决定用模型自主 还是 VAD+TurnSense 判决。"""
+        """发送 session.init。
+
+        turn_decision 不传（None）：由服务端按 active_model 推导默认判决
+        （qwen3omni→vad_turnsense，minicpm→model），worker 是权威。客户端在
+        session.created 拿到 active_model 后再推导本地使用的判决（force_listen）。
+        """
         payload = {
             "mode": mode,
             "use_tts": use_tts,
@@ -258,7 +263,8 @@ class StreamingChatClient:
         if system_prompt:
             payload["system_prompt"] = system_prompt
         cfg = dict(config or {})
-        cfg["turn_decision"] = turn_decision
+        if turn_decision is not None:
+            cfg["turn_decision"] = turn_decision
         cfg.setdefault("force_listen_count", 0)  # 供 MiniCPM 后端；VAD 判决必须为 0
         payload["config"] = cfg
         await self.ws.send(json.dumps({"type": "session.init", "payload": payload}))
@@ -268,6 +274,14 @@ class StreamingChatClient:
                 raise RuntimeError(f"init error: {ev}")
             ev = await self._recv()
         self.session_id = ev.get("session_id")
+        # 服务端在 session.created 里回传权威的 active_model（worker 转发时附加，
+        # 见 worker._send_runtime_event）。以此判定后端类型。
+        server_model = ev.get("active_model")
+        if server_model in ("minicpm", "qwen3omni"):
+            self.backend = server_model
+        elif self.backend is None:
+            raise RuntimeError(
+                "无法判定后端类型：session.created 未带 active_model")
         return ev
 
     async def _recv(self, timeout: float = 300.0) -> dict:
@@ -1140,11 +1154,6 @@ async def main():
                         help="并发路数(默认0=单路)。>0 时进入并发测试：从1递增到N，同时监控 GPU 显存/利用率")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
-    parser.add_argument("--backend", choices=["minicpm", "qwen3omni"], default="minicpm",
-                        help="后端类型：minicpm（回复以 listen 结束）或 qwen3omni（response.done 结束）")
-    parser.add_argument("--turn-decision", choices=["model", "vad_turnsense"],
-                        default="vad_turnsense",
-                        help="轮次判决: model=模型自主 speak/listen, vad_turnsense=VAD+TurnSense")
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     
@@ -1208,11 +1217,6 @@ async def main():
     if args.concurrency > 0 and not args.video:
         parser.error("并发测试需要 --video 提供测试音视频")
 
-    # Qwen3-Omni 是 turn-based（VAD+TurnSense 分句触发解码），不支持模型自主
-    # speak/listen（model 判决）。只有 MiniCPM 全双工才有 <|listen|> 概念。
-    if args.backend == "qwen3omni" and args.turn_decision == "model":
-        parser.error("qwen3omni 后端必须用 --turn-decision vad_turnsense（模型自主判决仅 MiniCPM 支持）")
-
     # 按 --audio-chunk-ms 重算全局发送 chunk（并发/实时模式用；回放模式直接传参）
     global CHUNK_MS, CHUNK_SAMPLES
     CHUNK_MS = max(25, args.audio_chunk_ms)
@@ -1246,12 +1250,14 @@ async def main():
 
     print(f"连接目标: {url} (direct={direct})")
 
-    # 并发测试模式：不建单路 client，直接并发 N 路
+    # 并发测试模式：不建单路 client，直接并发 N 路。
+    # 后端类型与判决无法预知（active_model 在连上才知道），并发分支统一走
+    # VAD+TurnSense 判决——与生产 VAD 判决路径一致，qwen3omni/minicpm 都支持。
     if args.concurrency > 0:
         gpu_ids = tuple(int(x.strip()) for x in args.gpu_ids.split(",") if x.strip())
         await run_concurrency(
-            url, ssl_ctx, direct, args.backend,
-            args.turn_decision, args.system_prompt,
+            url, ssl_ctx, direct, "qwen3omni",
+            "vad_turnsense", args.system_prompt,
             vad_cfg={
                 "vad_model": args.vad_model,
                 "vad_tail_sil": args.vad_tail_sil,
@@ -1270,13 +1276,14 @@ async def main():
         )
         return
 
-    client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, backend=args.backend)
+    client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct)
     try:
         await client.connect()
+        # turn_decision 不传给服务端：worker 按 active_model 推导（服务端权威）。
+        # 这里拿到后端后再推导本地用的判决（决定是否 force_listen）。
         await client.init(
             mode="full_duplex",
             system_prompt=args.system_prompt,
-            turn_decision=args.turn_decision,
             config={
                 "accumulate_context": args.accumulate_context,   # 跨分句累积历史上下文
                 "vad": {
@@ -1290,12 +1297,18 @@ async def main():
                 },
             },
         )
+        # 后端类型由服务端 session.created 的 active_model 判定（init 里赋值）。
+        if client.backend == "qwen3omni":
+            turn_decision = "vad_turnsense"   # turn-based：VAD+TurnSense 分句触发解码
+        else:
+            turn_decision = "model"           # MiniCPM 全双工：模型自主 speak/listen
+
         print(f"会话已建立: session={client.session_id[:8] if client.session_id else '?'} "
-              f"url={url}")
+              f"url={url} backend={client.backend} turn_decision={turn_decision}")
 
         if args.video or args.audio:
             metrics = await run_file_replay(client, args.video, args.prompt,
-                                            args.turn_decision,
+                                            turn_decision,
                                             fps=args.fps, max_frames=args.max_frames,
                                             kv_budget_tokens=args.kv_budget,
                                             audio_path=args.audio,
@@ -1307,7 +1320,7 @@ async def main():
                                             drain_idle_s=args.drain_idle_s)
         else:
             metrics = await run_realtime(client, args.system_prompt,
-                                         args.turn_decision, args.duration,
+                                         turn_decision, args.duration,
                                          fps=args.fps, kv_budget_tokens=args.kv_budget,
                                          tail_silence_s=args.tail_silence_s,
                                          drain_idle_s=args.drain_idle_s)

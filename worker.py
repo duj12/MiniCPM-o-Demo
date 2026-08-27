@@ -282,6 +282,11 @@ async def _handle_remote_backend_runtime_ws(
 
     async def _send_runtime_event(event: Any) -> Dict[str, Any]:
         payload = _event_payload(event)
+        # 在 session.created 上附加权威的 active_model（minicpm / qwen3omni），
+        # 客户端据此判定后端类型，无需用命令行参数猜（见 streaming_chat_demo 的 init）。
+        if payload.get("type") == "session.created":
+            payload = dict(payload)
+            payload["active_model"] = WORKER_CONFIG.get("active_model", "minicpm")
         async with _ws_send_lock:
             await ws.send_json(payload)
         return payload
@@ -314,9 +319,19 @@ async def _handle_remote_backend_runtime_ws(
         init_params = dict(init_params)
         init_params.setdefault("mode", mode)
 
+        # 轮次判决：客户端显式指定时尊重之；未指定时按 active_model 推导——
+        # qwen3omni 是 turn-based，必须 VAD+TurnSense 分句触发；minicpm 全双工
+        # 用模型自主 speak/listen。服务端是权威，客户端（demo）无需传该参数。
+        req_turn_decision = (init_params.get("config") or {}).get("turn_decision")
+        if req_turn_decision not in ("vad_turnsense", "model"):
+            active_model = WORKER_CONFIG.get("active_model", "minicpm")
+            turn_decision = "vad_turnsense" if active_model == "qwen3omni" else "model"
+        else:
+            turn_decision = req_turn_decision
+
         # VAD+TurnSense 判决：压低 <|listen|> 采样概率，让模型在 TurnSense
         # 触发后倾向 Speak（否则模型自主决策常选 listen 不回复）。
-        if (init_params.get("config") or {}).get("turn_decision") == "vad_turnsense":
+        if turn_decision == "vad_turnsense":
             cfg = dict(init_params.get("config") or {})
             cfg.setdefault("listen_prob_scale", 0.4)
             init_params["config"] = cfg
@@ -362,14 +377,12 @@ async def _handle_remote_backend_runtime_ws(
         #     fsmn_model_dir: "..." }
         from runtime.half_duplex import HalfDuplexConfig, HalfDuplexSession, TurnSenseCfg, VadCfg
 
-        hd_cfg_payload = {}
         vad_cfg_payload = {}
         if init_params.get("config") and isinstance(init_params["config"], dict):
-            hd_cfg_payload = init_params["config"].get("turn_decision") or {}
             vad_p = init_params["config"].get("vad") or {}
             if isinstance(vad_p, dict):
                 vad_cfg_payload = vad_p
-        if hd_cfg_payload == "vad_turnsense":
+        if turn_decision == "vad_turnsense":
             # 优先级：请求 config > 环境变量(.env) > 代码默认值
             def _env_int(name: str, default: int) -> int:
                 try:
