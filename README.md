@@ -1,205 +1,190 @@
-# MiniCPM-o 4.5 PyTorch Simple Demo System
+# MiniCPM-o-Demo — Qwen3-Omni 全双工流式对话服务
 
-[中文简介](README_zh.md) | [Documentation](https://minicpmo45.modelbest.cn/docs/en/) | [Realtime API Docs](https://minicpmo45.modelbest.cn/docs/en/realtime-api/overview/)
+基于 llama.cpp-omni 的 C++ 后端，提供音视频全双工流式对话服务。支持：
+- **Qwen3-Omni**（主后端，turn-based VAD+TurnSense 分句回复）
+- **MiniCPM-o 4.5**（可选，free-duplex 模型自主判决）
 
-[Ready-to-use Demo Website](https://minicpmo45.modelbest.cn/) | [Discord](https://discord.gg/UTbTeCQe) | [Feishu Group](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=228m5ca0-dfa1-464c-9406-b8b2f86d76ea)
-
-This demo system is officially provided by the `MiniCPM-o 4.5` model training team. It uses a PyTorch + CUDA inference backend, combined with a lightweight frontend-backend design, aiming to demonstrate the full audio-video omnimodal full-duplex capabilities of MiniCPM-o 4.5 in a transparent, concise, and lossless manner.
-
-## About MiniCPM-o 4.5
-
-MiniCPM-o 4.5 is the latest and most capable model in the MiniCPM-o series. The model is built in an end-to-end fashion based on SigLip2, Whisper-medium, CosyVoice2, and Qwen3-8B with a total of 9B parameters. It exhibits a significant performance improvement, and introduces new features for full-duplex multimodal live streaming. Notable features of MiniCPM-o 4.5 include:
-
-- 🔥 **Leading Visual Capability.** MiniCPM-o 4.5 achieves an average score of 77.6 on OpenCompass, a comprehensive evaluation of 8 popular benchmarks. With only 9B parameters, it surpasses widely used proprietary models like GPT-4o, Gemini 2.0 Pro, and approaches Gemini 2.5 Flash for vision-language capabilities. It supports instruct and thinking modes in a single model, better covering efficiency and performance trade-offs in different user scenarios.
-
-- 🎙 **Strong Speech Capability.** MiniCPM-o 4.5 supports bilingual real-time speech conversation with configurable voices in English and Chinese. It features more natural, expressive and stable speech conversation. The model also allows for fun features such as voice cloning and role play via a simple reference audio clip, where the cloning performance surpasses strong TTS tools such as CosyVoice2.
-
-- 🎬 **New Full-Duplex and Proactive Multimodal Live Streaming Capability.** As a new feature, MiniCPM-o 4.5 can process real-time, continuous video and audio input streams simultaneously while generating concurrent text and speech output streams in an end-to-end fashion, without mutual blocking. This allows MiniCPM-o 4.5 to see, listen, and speak simultaneously, creating a fluid, real-time omnimodal conversation experience. Beyond reactive responses, the model can also perform proactive interaction, such as initiating reminders or comments based on its continuous understanding of the live scene.
-
-- 💪 **Strong OCR Capability, Efficiency and Others.** Advancing popular visual capabilities from MiniCPM-V series, MiniCPM-o 4.5 can process high-resolution images (up to 1.8 million pixels) and high-FPS videos (up to 10fps) in any aspect ratio efficiently. It achieves state-of-the-art performance for end-to-end English document parsing on OmniDocBench, outperforming proprietary models such as Gemini-3 Flash and GPT-5, and specialized tools such as DeepSeek-OCR 2. It also features trustworthy behaviors, matching Gemini 2.5 Flash on MMHal-Bench, and supports multilingual capabilities on more than 30 languages.
-
-- 💫 **Easy Usage.** MiniCPM-o 4.5 can be easily used in various ways: Basic usage, recommended for 100% precision: PyTorch inference with Nvidia GPU. Other end-side adaptation includes (1) llama.cpp and Ollama support for efficient CPU inference on local devices, (2) int4 and GGUF format quantized models in 16 sizes, (3) vLLM and SGLang support for high-throughput and memory-efficient inference, (4) FlagOS support for the unified multi-chip backend plugin. We also open-sourced web demos which enable the full-duplex multimodal live streaming experience on local devices such as GPUs, PCs (e.g., on a MacBook).
-
-<details>
-<summary><b>Model Architecture</b></summary>
-
-- **End-to-end Omni-modal Architecture.** The modality encoders/decoders and LLM are densely connected via hidden states in an end-to-end fashion. This enables better information flow and control, and also facilitates full exploitation of rich multimodal knowledge during training.
-
-- **Full-Duplex Omni-modal Live Streaming Mechanism.** (1) We turn the offline modality encoder/decoders into online and full-duplex ones for streaming inputs/outputs. The speech token decoder models text and speech tokens in an interleaved fashion to support full-duplex speech generation (i.e., sync timely with new input). This also facilitates more stable long speech generation (e.g., > 1min). (2) We sync all the input and output streams on timeline in milliseconds, which are jointly modeled by a time-division multiplexing (TDM) mechanism for omni-modality streaming processing in the LLM backbone. It divides parallel omni-modality streams into sequential info groups within small periodic time slices.
-
-- **Proactive Interaction Mechanism.** The LLM continuously monitors the input video and audio streams, and decides at a frequency of 1Hz to speak or not. This high decision-making frequency together with full-duplex nature are crucial to enable the proactive interaction capability.
-
-- **Configurable Speech Modeling Design.** We inherit the multimodal system prompt design of MiniCPM-o 2.6, which includes a traditional text system prompt, and a new audio system prompt to determine the assistant voice. This enables cloning new voices and role play in inference time for speech conversation.
-
-</details>
+服务 = **gateway**（网页入口 :8006）+ **worker-backend**（模型推理 :22400/:22500），
+镜像构建时自动从 git 拉取 llama.cpp-omni 源码、从 SVN 下载模型到 `checkpoints/`。
 
 ---
 
-| Mode | Features | I/O Modalities | Paradigm
-|------|----------|------|------
-| **Turn-based Chat** | Low-latency streaming interaction; button-triggered responses; supports offline video/audio understanding and analysis; high response accuracy; strong basic capabilities | Audio + Text + Video input, Audio + Text output | Turn-based
-| **Omnimodal Full-Duplex** | Real-time omnimodal full-duplex interaction; visual and voice input with simultaneous voice output; model autonomously decides when to speak; powerful cutting-edge capabilities | Vision + Audio input, Text + Voice output | Full-duplex
-| **Audio Full-Duplex** | Real-time audio full-duplex interaction; voice input and voice output happen simultaneously; model autonomously decides when to speak; powerful cutting-edge capabilities | Audio input, Text + Voice output | Full-duplex
+## 一、模型目录约定
 
-The 3 currently supported modes share a single model instance with millisecond-level hot-switching (< 0.1ms).
-
-**Additional features:**
-
-- Customizable system prompts
-- Customizable reference audio
-- Simple and readable codebase for continual development
-- Serve as API backend for third-party applications
-
-![Demo Preview](assets/images/demo_preview.png)
-
-## Architecture
+模型统一放项目根 `checkpoints/` 下（三子目录，可从 SVN 下载或用软链指向已有模型）：
 
 ```
-Frontend (HTML/JS)
-    |  HTTPS / WSS
-Gateway (:8006, HTTPS)
-    |  HTTP / WS (internal)
-Worker Pool (:22400+)
-    +-- Worker 0 (GPU 0)
-    +-- Worker 1 (GPU 1)
-    +-- ...
+checkpoints/
+├── qwen3omni-gguf/            # Qwen3-Omni 主模型
+│   ├── Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf
+│   └── mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf
+├── fsmn-vad-onnx/             # FSMN-VAD（语音活动检测）
+│   └── model_quant.onnx       # 8bit 量化模型
+└── TurnSense/                 # TurnSense（语义完整性判定）
+    └── pretrained_models/v1.0/
+        ├── model_int8.onnx    # 8bit 量化模型（默认）
+        └── am.mvn
 ```
 
-- **Frontend** — Mode selection homepage, Turn-based Chat, Omni / Audio Duplex full-duplex interaction, Admin Dashboard
-- **Gateway** — Request routing and dispatching, WebSocket proxy, request queuing and session affinity
-- **Worker** — Each Worker occupies one GPU exclusively, supports Turn-based Chat / Duplex protocols, Duplex supports pause/resume (auto-release on timeout)
-
-
-## Quick Start
-
-### Check System Requirements
-1. Make sure you have an NVIDIA GPU with more than 28GB of VRAM.
-2. Make sure your machine is running a Linux operating system.
-
-### Deployment Steps
-The fastest deployment path is Docker Compose. For bare-metal deployment, use the Dockerfiles and entrypoints as the reference for dependencies and for the three startup stages: Gateway, Python Worker, and Backend.
-
-**Deployment Architecture**
-
-The current deployment is split into three runtime roles:
-
-```text
-Browser -> Gateway -> Python Worker -> Backend
+从 SVN 下载（`svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest`）：
+```bash
+svn export svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest ./checkpoints
 ```
 
-- **Gateway** is the public HTTPS/WebSocket entrypoint. It does not load the model; it handles routing, queueing, session recording, and worker health checks.
-- **Python Worker** exposes the worker WebSocket/health API, owns worker state, and forwards runtime protocol messages to a backend server.
-- **Backend** runs the model. The backend can be the PyTorch implementation (`py_backend/server.py`) or the C++ implementation (`llama-omni-server` from `llama.cpp-omni`).
+> `checkpoints/` 已加入 `.gitignore`（不进 git）；CI 构建时自动从 SVN export。
 
-**Docker Deployment (Recommended)**
+---
 
-Docker Compose is the maintained quick-start deployment path. Use the Compose files for deployment, and refer to `docker-compose*.yml`, `docker/Dockerfile.*`, and `docker/entrypoint-*.sh` for the exact startup flow, ports, mounts, health checks, and backend arguments.
+## 二、服务端部署（Docker Compose）
 
-**Prerequisites:**
-- Docker with the Compose v2 plugin
-- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-- One NVIDIA GPU per worker-backend instance
-- Model weights mounted from the host; weights are not baked into images
+### 前置
+- Docker + Compose v2、[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- 一张 ≥24GB 显存的 NVIDIA GPU（Qwen3-Omni 30B-A3B 量化）
+- 模型已放好（见上，`checkpoints/`）
 
-**PyTorch backend via Compose:**
-
+### 1. 生成证书 + 配置
 ```bash
 mkdir -p certs data
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
-
-MODEL_HOST_PATH=/path/to/MiniCPM-o-4_5 docker compose up -d --build
-docker compose logs -f gateway
-docker compose logs -f worker-backend-0
+cp .env.example .env   # 或手改 .env
 ```
 
-Edit `docker-compose.yml` to match your GPU count. Use `docker-compose.multi.yml` only if you intentionally want multiple worker instances per GPU.
-
-**C++ backend via Compose:**
-
+`.env` 关键项：
 ```bash
-mkdir -p certs data
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
+ACTIVE_MODEL=qwen3omni
+GGUF_MODEL_HOST_PATH=/path/to/your/models   # 或留空用默认 ./checkpoints
+CPP_GPU_ID=0                                # GPU 编号（多卡逗号分隔）
+GATEWAY_HOST_PORT=8006
+```
 
-GGUF_MODEL_HOST_PATH=/path/to/MiniCPM-o-4_5-gguf \
-GATEWAY_HOST_PORT=8006 \
-CPP_GPU_ID=0 \
+### 2. 构建并启动
+```bash
+# 构建镜像（llama.cpp-omni 自动 git clone duj12/dev；模型从 ./checkpoints 打进镜像）
 docker compose -f docker-compose.cpp.yml up -d --build
-
-docker compose -f docker-compose.cpp.yml logs -f gateway
-docker compose -f docker-compose.cpp.yml logs -f cpp-worker-backend
+# 只构建
+docker compose -f docker-compose.cpp.yml build cpp-worker-backend
 ```
 
-For the C++ backend, `docker-compose.cpp.yml` is the intended entrypoint. It uses the C++ worker image defined by `docker/Dockerfile.cpp-worker-backend` and `docker/entrypoint-cpp-worker-backend.sh`. Read those files for the exact llama.cpp-omni ref, backend command, and default `LLAMA_SERVER_EXTRA_ARGS`.
+> 模型默认从项目内 `./checkpoints` 挂载到容器 `/models`。可用 `MODEL_HOST_PATH` 覆盖
+> 到别的目录（如 SVN 下载目录）。镜像内 `COPY . .` 也会带上 checkpoints（CI 构建时）。
 
-**Bare-metal deployment:**
-
-For bare-metal deployment, map the Docker dependencies and entrypoint commands to your host environment. Keep the same three-stage startup flow: Gateway, Python Worker, and Backend.
-
-**Stop Docker services:**
-
+### 3. 健康检查
 ```bash
-docker compose down                      # PyTorch backend compose
-docker compose -f docker-compose.cpp.yml down  # C++ backend compose
+docker compose -f docker-compose.cpp.yml ps            # 等 healthy（模型加载 ~1-2min）
+curl -sk https://127.0.0.1:8006/                       # gateway
+docker logs -f minicpm-o-demo-cpp-worker-1             # worker 日志（VAD/TurnSense 就绪）
 ```
 
-<br/>
-<br/>
-
-
-## C++ Backend (llama.cpp)
-
-This demo also supports a **C++ inference backend** based on llama.cpp-omni. Use the Docker deployment section above as the authoritative setup path; inspect `docker-compose.cpp.yml` and `docker/Dockerfile.cpp-worker-backend` for startup details.
-
-### Desktop App (Windows & macOS)
-
-Ready-to-use desktop installers are available for Windows and macOS. Download from [llama.cpp-omni Releases](https://github.com/tc-mb/llama.cpp-omni/releases/).
+### 4. 停止
+```bash
+docker compose -f docker-compose.cpp.yml down
+```
 
 ---
 
-## Project Structure
+## 三、Gateway 网页客户端
 
-**Project Code Structure**
+服务起来后浏览器打开 **`https://<host>:8006/`**（内网机器用 `https://192.168.89.105:8006/`）。
+证书是自签的，浏览器需信任/忽略告警。首页按模式选择：
+
+| 页面 | 路径 | 说明 |
+|------|------|------|
+| 首页 | `/` | 模式选择入口 |
+| Turn-based Chat | `/turnbased.html` | 按钮触发回复；支持离线音视频上传理解，低延迟 |
+| Omni 全双工 | `/omni/omni.html` | 实时音视频全双工，模型自主发言 |
+| Audio 全双工 | `/audio-duplex/audio_duplex.html` | 纯音频全双工对话 |
+| Half-duplex (VAD+TurnSense) | `/half-duplex/half_duplex.html` | VAD 检测停顿 + TurnSense 语义完整才回复 |
+| 管理 | `/admin.html` | Worker/会话状态 |
+
+> 音视频实时采集页需要麦克风/摄像头，浏览器只在 **https 或 localhost** 下提供
+> `navigator.mediaDevices` —— 所以 gateway 默认 HTTPS。
+
+---
+
+## 四、命令行客户端 `streaming_chat_demo.py`
+
+独立 Python 客户端，直连 gateway 的 `/v1/realtime?mode=video` WebSocket，做文件回放 /
+并发压力测试。后端类型（qwen3omni/minicpm）由服务端 `session.created` 的 `active_model`
+自动判定，`turn_decision` 按后端推导，无需手动指定。
+
+### 单路回放（视频理解）
+```bash
+python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
+    --prompt "你是一个多模态助手，请简练回复用户的问题。" \
+    --host 192.168.89.105 --port 8006
 ```
-minicpmo45_service/
-├── config.json               # Service config (copied from config.example.json, gitignored)
-├── config.example.json       # Config example (full fields + defaults)
-├── config.py                 # Config loading logic (Pydantic definition + JSON loading)
-├── requirements.txt          # Python dependencies
-├── docker-compose.yml        # Recommended PyTorch backend deployment
-├── docker-compose.cpp.yml    # Recommended C++ backend deployment
-├── docker-compose.multi.yml  # Multi-worker-per-GPU deployment variant
-├── docker/                   # Dockerfiles and container entrypoints
-│
-├── gateway.py                # Gateway (routing, queuing, WS proxy)
-├── worker.py                 # Worker (runtime protocol proxy)
-├── gateway_modules/          # Gateway business modules
-├── py_backend/               # PyTorch backend server
-├── runtime/                  # Backend protocol client/session layer
-│
-├── core/                     # Core encapsulation
-│   ├── schemas/              # Pydantic schemas (request/response)
-│   └── processors/           # Inference processors (UnifiedProcessor)
-│
-├── MiniCPMO45/               # Model core inference code
-├── static/                   # Frontend pages
-├── resources/                # Resource files (reference audio, etc.)
-└── tmp/                      # Runtime logs and PID files
+
+### 纯音频交互（只给音频文件）
+```bash
+python streaming_chat_demo.py --audio assets/audio/xxx.wav
 ```
 
-## Configuration
+### 并发压力测试（N 路）
+```bash
+python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
+    --concurrency 10 --gpu-ids 0,1 --host 192.168.89.105 --port 8006
+```
 
-`config.json` provides defaults for processes started directly on the host, or for containers when a file is mounted explicitly. Docker deployment does not copy the host `config.json` into images by default; Compose files, entrypoints, environment variables, and CLI arguments define the deployment behavior.
+### 实时采集（麦克风 + 摄像头）
+```bash
+pip install sounddevice
+python streaming_chat_demo.py --realtime
+```
 
-If you need bare-metal debugging, start from `config.example.json` and `config.py`. CLI arguments still take precedence over `config.json`, and missing fields fall back to Pydantic defaults.
+### 常用参数
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--host` / `--port` | `192.168.89.106` / `8006` | gateway 地址（生产入口） |
+| `--concurrency N` | `1` | 并发路数，`>1` 进入并发测试并监控 GPU |
+| `--gpu-ids` | `0,1` | 并发时监控的 GPU |
+| `--video` | 空 | 视频路径（回放模式） |
+| `--audio` | 空 | 音频路径（纯音频交互 / 替换视频音轨） |
+| `--audio-chunk-ms` | `1000` | 音频块大小（VAD 需 ≥25ms） |
+| `--max-audio-s` | 全 | 限制音频时长（长音频约 25 tok/s 注意 KV） |
+| `--kv-budget` | `20000` | 单分句视频帧 token 预算 |
+| `--tail-silence-s` | `2.0` | 收尾补发静音（VAD 闭合最后一段） |
+| `--drain-idle-s` | `5.0` | 收尾空闲兜底（正常靠 response_id 判定不等超时） |
+| `--show-reply-text` | 关 | 并发结果打印每轮完整回复文本 |
+| `--realtime` | — | 实时采集模式 |
 
+### 输出指标（每轮）
+```
+turn#1: TTFT=0.23s in_audio=9.0s in_video=9.0s reply=1.2s (120ch, 240ch/s)
+```
+- **TTFT**：首字延迟（服务端 `turn.turnsense=complete` → 首个文本 token，用服务端时间戳）
+- **in_audio_s / in_video_s**：本轮输入音视频时长
+- **reply_s**：纯生成耗时（首字 → 本轮结束）
+- **speed_cps**：生成速度（字符/秒）
 
-## Resource Consumption
+并发汇总输出每路每轮（`--show-reply-text` 显示文本）+ 全体 P50/P90/P99。
 
-| Resource | Token2Wav (default) | + torch.compile |
-|----------|---------------------|-----------------|
-| VRAM (per Worker, after initialization) | ~21.5 GB | ~21.5 GB |
-| Model loading time | ~16s | ~16s + ~5 min (warm) / ~15 min (cold) |
-| Mode switching latency | < 0.1ms | < 0.1ms |
-| Omni Full-Duplex per-unit latency (A100) | ~0.9s | **~0.5s** |
+---
+
+## 五、CI（GitLab）
+
+`.gitlab-ci.yml` 构建 worker 镜像时：
+1. `svn export svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest ./checkpoints`（按分支映射）
+2. `docker compose -f docker-compose.cpp.yml build cpp-worker-backend`（llama.cpp-omni git clone + 模型进镜像）
+3. push 镜像并打 tag
+
+---
+
+## 六、目录结构（关键）
+
+```
+MiniCPM-o-Demo/
+├── checkpoints/              # 模型权重（gitignored，CI/SVN 生成）
+├── docker-compose.cpp.yml    # C++ backend 部署（qwen3omni 推荐）
+├── docker/Dockerfile.cpp-worker-backend  # 镜像（llama.cpp-omni git clone）
+├── docker/entrypoint-cpp-worker-backend.sh
+├── gateway.py                # gateway（网页入口 :8006）
+├── worker.py                 # worker（转发 :22400）
+├── py_backend/               # PyTorch backend（可选）
+├── runtime/
+│   ├── half_duplex.py        # VAD+TurnSense 分句状态机
+│   ├── turnsense/            # TurnSense 运行代码（vendor）
+│   └── fsmn_vad_onnx/        # FSMN-VAD 运行代码
+├── streaming_chat_demo.py    # 命令行客户端
+└── static/                   # 网页前端
+```

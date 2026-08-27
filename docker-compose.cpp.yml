@@ -22,7 +22,7 @@
 #   mkdir -p certs data
 #   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 #     -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
-#   GGUF_MODEL_HOST_PATH=/path/to/models_dir \
+#   MODEL_HOST_PATH=./checkpoints \   # 默认即 ./checkpoints，可省略
 #   GATEWAY_HOST_PORT=8006 \
 #   CPP_GPU_ID=0 \
 #   docker compose -f docker-compose.cpp.yml up -d --build
