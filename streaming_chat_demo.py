@@ -245,7 +245,6 @@ class StreamingChatClient:
         self.turn_no = 0
         self.max_seq = 0                # 已确认处理的最大 push 序号
         self.triggers = 0               # 服务端自注入的触发 push 数
-        self._recv_task: Optional[asyncio.Task] = None
 
         self._trigger_at: Optional[float] = None
         self._first_delta_at: Optional[float] = None
@@ -351,28 +350,15 @@ class StreamingChatClient:
         self._sent_chunks += 1   # 内部计数：供回退的 audio_sent_s / sent_pushes 用
 
     # ------------------------------------------------------------------
-    # 同时收发：独立 receiver task 收事件（到达即处理），发送侧只管发
+    # 显式收发：send_input 由调用方逐帧调用；receive_loop 由调用方作为独立
+    # task await。websockets 同连接不能同时 send/recv，所以调用方用
+    # asyncio.gather 并发两个 task（一个发一个收），由调用方掌握收的时机。
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """启动 receiver task（需在 connect+init 之后）。"""
-        self._recv_task = asyncio.create_task(self._receiver())
-
-    async def stop(self) -> None:
-        """停止 receiver task。"""
-        if self._recv_task is None:
-            return
-        self._recv_task.cancel()
-        try:
-            await self._recv_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        self._recv_task = None
-
-    async def _receiver(self) -> None:
-        """长驻收包循环：不设短超时，事件一到就处理（真流式）。"""
+    async def receive_loop(self) -> None:
+        """显式接收循环：持续收事件并处理，直到会话结束。调用方作为 task await。"""
         import websockets
-        while True:
+        while not self.closed:
             try:
                 ev = await self._recv(timeout=3600.0)
             except (TimeoutError, websockets.ConnectionClosed, ConnectionError):
@@ -711,18 +697,17 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
     print(f"  尾静音 {tail_silence_s:.1f}s ({n_tail} 块), 收尾空闲判据 {drain_idle_s:.0f}s")
 
     sent_frames = 0     # 已发送视频帧数
-    turn_frames_0 = 0   # 本轮分句起始的帧计数（KV 预算按分句算，不跨轮累计）
-    last_turn_no = 0
 
-    # ── 收发分离 ──
-    # client 的 receiver task 独立收事件（到达即打印，真流式）；本协程只管按
-    # 节奏发送，通过 client.in_reply / client.turn_no 决定暂停与分句帧预算。
-    # 指标回调注入 client：audio_sent_s 由 client 内部计数回退，video 用这里
-    # 的帧计数。
+    # ── 显式双 task：一个发送、一个接收，都由调用方创建，asyncio.gather 并发 ──
+    # 发送 task 只管按节奏 send_input；接收 task 是 client.receive_loop（阻塞收，
+    # 到达即处理）。两者交替跑在同一个 event loop 上。指标回调注入 client：
+    # audio_sent_s 由 client 内部计数回退，video 用这里的帧计数。
     client._video_sent_s = lambda: sent_frames / max(fps, 0.1)
-    client.start()
 
-    try:
+    async def send_loop():
+        nonlocal sent_frames   # sent_frames 是闭包外部变量（跨轮累计），send_loop 内自增
+        turn_frames_0 = 0      # 本轮分句起始的帧计数（KV 预算按分句算，不跨轮累计）
+        last_turn_no = 0
         for idx in range(n_chunks + n_tail):
             if client.closed:
                 break
@@ -764,13 +749,21 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
             )
             await asyncio.sleep(_chunk_ms / 1000.0 / replay_speed)
 
-        # 收尾：最后一段回复往往还在生成中，必须等，否则 close() 会掐断它。
-        if not client.closed:
-            print(f"\n  [收尾] 音频发送完毕，等待剩余回复"
-                  f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
-            await client.drain(idle_s=drain_idle_s)
-    finally:
-        await client.stop()
+    send_task = asyncio.create_task(send_loop())
+    recv_task = asyncio.create_task(client.receive_loop())
+    # 发送完/会话结束后：收尾等剩余回复（send 结束后 receive_loop 仍在收）。
+    await send_task
+    if not client.closed:
+        print(f"\n  [收尾] 音频发送完毕，等待剩余回复"
+              f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
+        await client.drain(idle_s=drain_idle_s)
+    # 会话已结束则接收循环也退出了；否则取消它（drain 已完成）。
+    if not recv_task.done():
+        recv_task.cancel()
+        try:
+            await recv_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     return client.metrics
 
@@ -811,25 +804,26 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
 
     TOKENS_PER_FRAME = 540
     sent_frames = 0     # 已发送视频帧数
-    turn_frames_0 = 0   # 本轮分句起始的帧计数
-    last_turn_no = 0
-    last_frame_at = 0.0
 
     # 指标回调：audio 用 client 内部计数回退；video 用这里的帧计数。
     client._video_sent_s = lambda: sent_frames / max(fps, 0.1)
-    client.start()
 
     # sounddevice 回调在音频线程里跑：只做 deque.append（GIL 下原子），
     # 不碰 numpy 拼接，避免与主协程的切片竞争。
     from collections import deque
     audio_q: deque = deque()
-    audio_buf = np.zeros(0, dtype=np.float32)
 
     def audio_cb(indata, n_frames, t, status):
         audio_q.append(indata[:, 0].copy().astype(np.float32))
 
-    t0 = time.monotonic()
-    try:
+    # ── 显式双 task：采集发送 + 接收，都由调用方创建并发 ──
+    async def capture_loop():
+        nonlocal sent_frames   # sent_frames 是闭包外部变量，capture_loop 内自增
+        turn_frames_0 = 0      # 本轮分句起始的帧计数
+        last_turn_no = 0
+        last_frame_at = 0.0
+        audio_buf = np.zeros(0, dtype=np.float32)
+        t0 = time.monotonic()
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                             blocksize=FRAME_SAMPLES, callback=audio_cb):
             while (time.monotonic() - t0) < duration_s and not client.closed:
@@ -859,24 +853,33 @@ async def run_realtime(client: StreamingChatClient, system_prompt: str,
                 await client.send_input(audio_b64=b64(chunk), video_frames=frame_b64,
                                         force_listen=(turn_decision == "vad_turnsense"))
 
-            # 尾静音 + 收尾：同回放，让 VAD 闭合最后一句并收完还在路上的回复。
-            if not client.closed:
-                silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
-                for _ in range(max(0, int(round(tail_silence_s * 1000 / CHUNK_MS)))):
-                    if client.closed:
-                        break
-                    await client.send_input(
-                        audio_b64=b64(silence),
-                        force_listen=(turn_decision == "vad_turnsense"))
-                    await asyncio.sleep(CHUNK_MS / 1000.0)
-                print(f"\n  [收尾] 采集结束，等待剩余回复"
-                      f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
-                await client.drain(idle_s=drain_idle_s)
-    finally:
-        await client.stop()
-        if cap:
-            cap.release()
+        # 尾静音：同回放，让 VAD 闭合最后一句并收完还在路上的回复。
+        if not client.closed:
+            silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+            for _ in range(max(0, int(round(tail_silence_s * 1000 / CHUNK_MS)))):
+                if client.closed:
+                    break
+                await client.send_input(
+                    audio_b64=b64(silence),
+                    force_listen=(turn_decision == "vad_turnsense"))
+                await asyncio.sleep(CHUNK_MS / 1000.0)
 
+    cap_task = asyncio.create_task(capture_loop())
+    recv_task = asyncio.create_task(client.receive_loop())
+    await cap_task
+    if not client.closed:
+        print(f"\n  [收尾] 采集结束，等待剩余回复"
+              f"（{drain_idle_s:.0f}s 无事件即结束）...", flush=True)
+        await client.drain(idle_s=drain_idle_s)
+    if not recv_task.done():
+        recv_task.cancel()
+        try:
+            await recv_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if cap:
+        cap.release()
     return client.metrics
 
 
@@ -1178,12 +1181,12 @@ async def main():
                         help="VAD 模型: fsmn(FunASR,默认) 或 silero")
     parser.add_argument("--vad-tail-sil", type=int, default=600,
                         help="VAD 尾静音(ms)，fsmn 的 max_end_silence_time，默认600")
-    parser.add_argument("--vad-max-len", type=int, default=60000,
-                        help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认60000")
-    parser.add_argument("--ts-wait-ms", type=int, default=900,
-                        help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认900")
-    parser.add_argument("--ts-invalid-threshold", type=float, default=0.9,
-                        help="TurnSense invalid 丢弃阈值(0~1)：invalid 概率≥此值则丢弃该句不回复，默认0.9")
+    parser.add_argument("--vad-max-len", type=int, default=30000,
+                        help="VAD 最大段长(ms)，fsmn 的 max_single_segment_time，默认30000")
+    parser.add_argument("--ts-wait-ms", type=int, default=1000,
+                        help="TurnSense incomplete 等待(ms)：语义不完整时等多久，超时强制回复，默认1000")
+    parser.add_argument("--ts-invalid-threshold", type=float, default=0.5,
+                        help="TurnSense invalid 丢弃阈值(0~1)：invalid 概率≥此值则丢弃该句不回复，默认0.5")
 
 
     args = parser.parse_args()
