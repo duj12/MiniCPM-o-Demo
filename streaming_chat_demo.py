@@ -970,7 +970,8 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
                               audio_chunk_ms=1000, kv_budget=20000,
                               max_audio_s=None, tail_silence_s=2.0,
                               drain_idle_s=5.0, accumulate_context=False,
-                              echo=False, show_reply_text=False):
+                              echo=False, show_reply_text=False,
+                              audio_path=""):
     """单路并发会话：独立连接，与单路 run_file_replay 完全相同的发送/收尾/统计。
 
     echo=False：并发下不逐字流式（多路交错会错乱）。
@@ -1003,6 +1004,7 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
             max_audio_s=max_audio_s,
             tail_silence_s=tail_silence_s,
             drain_idle_s=drain_idle_s,
+            audio_path=audio_path,
         )
         st = _turn_stats(metrics)
         ok = bool(metrics) and any(m.reply_chars for m in metrics)
@@ -1051,19 +1053,22 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
                           accumulate_context=False,
                           audio_chunk_ms=1000, kv_budget=20000,
                           tail_silence_s=2.0, drain_idle_s=5.0,
-                          show_reply_text=False):
+                          show_reply_text=False, audio_path=""):
     """视频/音频回放的统一入口：N 路各自独立连接，与单路同口径统计。
 
     concurrency==1 即单路（--concurrency 默认 1）：每路 echo=True 流式输出，
     结束后打单路汇总；N>1 加 GPU 监控 + 全体 P50/P90/P99。
     每路结果由 _run_one_concurrent 完成即打印（不逐字流式，避免交错）。
     gpu_ids=None 或 N==1 时不启 GPU 监控。
+    audio_path: 指定人声音频（替代 video_path 音轨）。video_path 为空且 audio_path
+      给定时为纯音频交互（无视频帧）。
     """
     N = concurrency
     gpu_ids = gpu_ids or ()
     multi = N > 1
+    src = os.path.basename(audio_path or video_path)
     print(f"\n=== 回放测试（{N} 路）===")
-    print(f"  视频: {video_path} | 每路音频完整音轨（或 --max-audio-s 截断）")
+    print(f"  音频来源: {src} | 每路音频完整音轨（或 --max-audio-s 截断）")
 
     monitor_running = multi and bool(gpu_ids)
     peak = {g: (0, 0) for g in gpu_ids}
@@ -1096,6 +1101,7 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
         drain_idle_s=drain_idle_s, accumulate_context=accumulate_context,
         echo=not multi,          # 单路可流式；多路不流式，避免交错
         show_reply_text=show_reply_text,
+        audio_path=audio_path,
     ) for i in range(N)]
     results = await asyncio.gather(*tasks)
 
@@ -1155,7 +1161,7 @@ async def main():
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     
-    parser.add_argument("--video", default="assets/video/turnbased/121.mp4", help="视频文件路径（回放模式）")
+    parser.add_argument("--video", default="", help="视频文件路径（回放模式）。空=纯音频（需 --audio）")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="视频抽帧率(帧/秒)，0=不抽帧只发音频") 
     parser.add_argument("--max-frames", type=int, default=0,
@@ -1212,8 +1218,8 @@ async def main():
     if not args.video and not args.audio and not args.realtime and args.concurrency <= 1:
         parser.error("需要 --video / --audio 或 --realtime 之一（纯音频模式用 --audio）")
 
-    if args.concurrency > 1 and not args.video:
-        parser.error("并发测试需要 --video 提供测试音视频")
+    if args.concurrency > 1 and not args.video and not args.audio:
+        parser.error("并发测试需要 --video 或 --audio 提供测试音视频")
 
     # 按 --audio-chunk-ms 重算全局发送 chunk（并发/实时模式用；回放模式直接传参）
     global CHUNK_MS, CHUNK_SAMPLES
@@ -1298,6 +1304,7 @@ async def main():
             "invalid_confidence_threshold": args.ts_invalid_threshold,
         },
         video_path=args.video,
+        audio_path=args.audio,
         prompt=args.prompt,
         concurrency=args.concurrency,
         max_audio_s=args.max_audio_s,
