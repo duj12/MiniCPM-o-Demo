@@ -267,8 +267,9 @@ def _default_turnsense_paths() -> Dict[str, str]:
     root = root_for_deploy()
     rels = [
         os.path.join("checkpoints", "TurnSense", "pretrained_models"),
-        # 容器内 compose 挂载点（checkpoints 挂到 /models）
+        # 容器内 compose 挂载点（checkpoints 挂到 /models；TurnSense 独立挂 /turnsense）
         os.path.join("/models", "TurnSense", "pretrained_models"),
+        os.path.join("/turnsense", "pretrained_models"),
         # 兼容旧布局
         os.path.join("Fun-ASR-deploy", "checkpoints", "TurnSense", "pretrained_models"),
         os.path.join("FullDuplexDemo", "TurnSense", "pretrained_models"),

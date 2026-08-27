@@ -60,6 +60,10 @@ services:
       #     fsmn-vad-onnx/     (VAD, model_quant.onnx)
       #     TurnSense/         (pretrained_models/v1.0/model_int8.onnx)
       - ${MODEL_HOST_PATH:-./checkpoints}:/models:ro
+      # TurnSense 模型独立挂载（默认 MODEL_HOST_PATH/TurnSense，可覆盖为别处）。
+      # 注意：/models 挂为 ro，其下不能建 /models/TurnSense 子挂载点（read-only fs）。
+      # 因此 TurnSense 挂到独立 /turnsense，half_duplex 探测候选含 /turnsense。
+      - ${TURNSENSE_HOST_PATH:-${MODEL_HOST_PATH:-./checkpoints}/TurnSense}:/turnsense:ro
       # 预设（presets）挂载，宿主机改动即时生效，避免镜像内残留旧品牌文案。
       - ./assets/presets:/app/assets/presets:ro
     deploy:

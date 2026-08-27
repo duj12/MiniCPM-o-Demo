@@ -328,12 +328,17 @@ async def _handle_remote_backend_runtime_ws(
         # 轮次判决：客户端显式指定时尊重之；未指定时按 active_model 推导——
         # qwen3omni 是 turn-based，必须 VAD+TurnSense 分句触发；minicpm 全双工
         # 用模型自主 speak/listen。服务端是权威，客户端（demo）无需传该参数。
+        # 注意：只在 full_duplex 模式做推导。turn_based（chat）模式前端直接发
+        # messages 给后端，VAD+TurnSense 会把 input 交给 hd_session.feed() 丢弃
+        # messages → 后端报 empty_messages。
+        turn_decision = "model"   # 默认（turn_based / minicpm 全双工都安全）
         req_turn_decision = (init_params.get("config") or {}).get("turn_decision")
-        if req_turn_decision not in ("vad_turnsense", "model"):
-            active_model = WORKER_CONFIG.get("active_model", "minicpm")
-            turn_decision = "vad_turnsense" if active_model == "qwen3omni" else "model"
-        else:
-            turn_decision = req_turn_decision
+        if mode == "full_duplex":
+            if req_turn_decision in ("vad_turnsense", "model"):
+                turn_decision = req_turn_decision
+            else:
+                active_model = WORKER_CONFIG.get("active_model", "minicpm")
+                turn_decision = "vad_turnsense" if active_model == "qwen3omni" else "model"
 
         # VAD+TurnSense 判决：压低 <|listen|> 采样概率，让模型在 TurnSense
         # 触发后倾向 Speak（否则模型自主决策常选 listen 不回复）。
