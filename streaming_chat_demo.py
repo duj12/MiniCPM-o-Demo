@@ -952,15 +952,16 @@ def _turn_stats(metrics: List[TurnMetrics]) -> dict:
     }
 
 
-async def _run_one_concurrent(url, ssl_ctx, direct, system_prompt,
+async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
                               vad_cfg, ts_cfg, video_path, prompt,
                               audio_chunk_ms=1000, kv_budget=20000,
                               max_audio_s=None, tail_silence_s=2.0,
                               drain_idle_s=5.0, accumulate_context=False,
-                              echo=False):
+                              echo=False, show_reply_text=False):
     """单路并发会话：独立连接，与单路 run_file_replay 完全相同的发送/收尾/统计。
 
-    echo=False：并发下不逐字流式（多路交错会错乱），只收指标。
+    echo=False：并发下不逐字流式（多路交错会错乱）。
+    完成后即时打印本路结果（含每轮 summary），不等 gather 全部结束。
     """
     t0 = time.perf_counter()
     client = None
@@ -984,8 +985,17 @@ async def _run_one_concurrent(url, ssl_ctx, direct, system_prompt,
             drain_idle_s=drain_idle_s,
         )
         st = _turn_stats(metrics)
+        ok = bool(metrics) and any(m.reply_chars for m in metrics)
+        # 即时打印本路结果（每路完成即打，不等全部）
+        print(f"\n  #{label} {'PASS' if ok else 'FAIL'} setup={setup_ms:.0f}ms "
+              f"{st['n_turns']}轮 平均TTFT={st['avg_ttft_s']:.2f}s "
+              f"平均speed={st['avg_speed']:.0f}ch/s 总{st['chars']}ch", flush=True)
+        for m in metrics:
+            print(f"      {m.summary}")
+            if show_reply_text and m.reply_text:
+                print(f"        {m.reply_text}")
         return {
-            "ok": bool(metrics) and any(m.reply_chars for m in metrics),
+            "ok": ok,
             "setup_ms": setup_ms,
             "total_ms": (time.perf_counter() - t0) * 1000,
             "metrics": metrics,
@@ -995,6 +1005,8 @@ async def _run_one_concurrent(url, ssl_ctx, direct, system_prompt,
             "chars": st["chars"],
         }
     except Exception as e:
+        print(f"\n  #{label} FAIL setup=0ms 0轮 平均TTFT=0.00s "
+              f"平均speed=0ch/s 总0ch [{str(e)[:80]}]", flush=True)
         return {"ok": False, "setup_ms": 0, "total_ms": 0, "metrics": [],
                 "n_turns": 0, "avg_ttft_s": 0.0, "avg_speed": 0.0,
                 "chars": 0, "info": str(e)[:80]}
@@ -1023,11 +1035,12 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
                           accumulate_context=False,
                           audio_chunk_ms=1000, kv_budget=20000,
                           tail_silence_s=2.0, drain_idle_s=5.0,
-                          show_reply_text=True):
+                          show_reply_text=False):
     """视频/音频回放的统一入口：N 路各自独立连接，与单路同口径统计。
 
     concurrency==1 即单路（--concurrency 默认 1）：每路 echo=True 流式输出，
-    结束后打单路汇总；N>1 加 GPU 监控 + 每路逐轮汇总表 + 全体 P50/P90/P99。
+    结束后打单路汇总；N>1 加 GPU 监控 + 全体 P50/P90/P99。
+    每路结果由 _run_one_concurrent 完成即打印（不逐字流式，避免交错）。
     gpu_ids=None 或 N==1 时不启 GPU 监控。
     """
     N = concurrency
@@ -1060,13 +1073,14 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
 
     t_all = time.perf_counter()
     tasks = [_run_one_concurrent(
-        url, ssl_ctx, direct, system_prompt,
+        i + 1, url, ssl_ctx, direct, system_prompt,
         vad_cfg, ts_cfg, video_path, prompt,
         audio_chunk_ms=audio_chunk_ms, kv_budget=kv_budget,
         max_audio_s=max_audio_s, tail_silence_s=tail_silence_s,
         drain_idle_s=drain_idle_s, accumulate_context=accumulate_context,
-        echo=not multi,   # 单路可流式；多路不流式，避免交错
-    ) for _ in range(N)]
+        echo=not multi,          # 单路可流式；多路不流式，避免交错
+        show_reply_text=show_reply_text,
+    ) for i in range(N)]
     results = await asyncio.gather(*tasks)
 
     if monitor_running:
@@ -1081,18 +1095,6 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
         _print_summary(results[0]["metrics"])
         print(f"  wall={wall_ms:.0f}ms")
         return ok
-
-    print(f"\n  --- {N} 路并发 ---")
-    for i, r in enumerate(results):
-        st = "PASS" if r["ok"] else "FAIL"
-        extra = f" {r.get('info','')}" if not r["ok"] else ""
-        print(f"    #{i+1:<2} {st:<4} setup={r['setup_ms']:.0f}ms "
-              f"{r['n_turns']}轮 平均TTFT={r['avg_ttft_s']:.2f}s "
-              f"平均speed={r['avg_speed']:.0f}ch/s 总{r['chars']}ch{extra}")
-        for m in r["metrics"]:
-            print(f"      {m.summary}")
-            if show_reply_text and m.reply_text:
-                print(f"        {m.reply_text}")
 
     if monitor_running:
         peak_str = ", ".join(
@@ -1132,8 +1134,8 @@ async def main():
                         help="并发路数(默认1=单路)。>1 时进入并发测试，同时监控 GPU 显存/利用率")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
-    parser.add_argument("--no-reply-text", action="store_true",
-                        help="并发结果不打印每轮完整回复文本（只看指标）")
+    parser.add_argument("--show-reply-text", action="store_true",
+                        help="并发结果打印每轮完整回复文本（默认只打印指标行）")
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
     parser.add_argument("--duration", type=float, default=30.0, help="实时模式时长(秒)")
     
@@ -1289,7 +1291,7 @@ async def main():
         kv_budget=args.kv_budget,
         tail_silence_s=args.tail_silence_s,
         drain_idle_s=args.drain_idle_s,
-        show_reply_text=not args.no_reply_text,
+        show_reply_text=args.show_reply_text,
     )
 
 
