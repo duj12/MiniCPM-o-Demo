@@ -1,14 +1,17 @@
-# MiniCPM-o-Demo 镜像构建 CI
+# Omni-LLM-Server 镜像构建 CI
 #
-# 参考 Fun-ASR-deploy/.gitlab-ci.yml：构建镜像时从 SVN 下载模型到 checkpoints/，
-# 随 `COPY . .` 打进镜像。模型仓库：svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM
+# 构建两个镜像（depend_on SVN 下载模型到 checkpoints/，随 `COPY . .` 打进镜像）：
+#   - omnillm-cpp-backend : worker+后端 镜像（C++ llama 服务 + worker.py + VAD/TurnSense）
+#   - omnillm-gateway     : gateway 镜像（网页入口 :8006，不加载模型）
+# 模型仓库：svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM
 #   - latest 分支（默认）：qwen3omni-gguf/ fsmn-vad-onnx/ TurnSense/
-# 分支映射（同 Fun-ASR-deploy）：master/pre/qa 各对应 SVN 子目录，私分支不变。
+# 分支映射（同 Fun-ASR-deploy）：master/pre 各对应 SVN 子目录，其他分支用 latest。
 
 variables:
   SVN_REPO_URL: 'svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest'
   SVN_LOCAL_PATH: '/data/nas/xmov_app/omni-llm/svn/latest'
-  IMAGE_NAMES: 'minicpm-cpp-worker-backend'
+  WORKER_IMAGE: 'omnillm-cpp-backend'
+  GATEWAY_IMAGE: 'omnillm-gateway'
 
 include:
   - project: 'devops1/gitlab-ci'
@@ -54,12 +57,16 @@ build_image:
     - rm -rf ./checkpoints
     - svn export "$SVN_LOCAL_PATH" ./checkpoints
     - ls -la ./checkpoints/
-    - echo "Building image with tag $CI_COMMIT_SHORT_SHA"
+    - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
+    # worker+backend 镜像（构建时 git clone llama.cpp-omni + 模型进镜像）
+    - docker compose -f docker-compose.cpp.yml build cpp-worker-backend
+    # gateway 镜像（纯转发，无模型）
+    - docker compose -f docker-compose.cpp.yml build gateway
     - |
-      docker compose -f docker-compose.cpp.yml build cpp-worker-backend
-    - |
-      for IMAGE_NAME in "${IMAGE_NAME_ARRAY[@]}"; do
-        docker tag minicpm-cpp-worker-backend:dev $DEV_REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+      # 打 tag 并推送两个镜像（worker + gateway）
+      for IMAGE_NAME in "$WORKER_IMAGE" "$GATEWAY_IMAGE"; do
+        SRC_TAG=$IMAGE_NAME:dev
+        docker tag $SRC_TAG $DEV_REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
         docker push $DEV_REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
         if [[ $CI_COMMIT_REF_NAME == $CI_COMMIT_BRANCH ]]; then
           if [[ "$CI_COMMIT_REF_NAME" == "master" || "$CI_COMMIT_REF_NAME" == "pre" ]]; then

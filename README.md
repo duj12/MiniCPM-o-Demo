@@ -1,4 +1,4 @@
-# MiniCPM-o-Demo — Qwen3-Omni 全双工流式对话服务
+# Omni-LLM-Server — Qwen3-Omni 全双工流式对话服务
 
 基于 llama.cpp-omni 的 C++ 后端，提供音视频全双工流式对话服务。支持：
 - **Qwen3-Omni**（主后端，turn-based VAD+TurnSense 分句回复）
@@ -163,17 +163,22 @@ turn#1: TTFT=0.23s in_audio=9.0s in_video=9.0s reply=1.2s (120ch, 240ch/s)
 
 ## 五、CI（GitLab）
 
-`.gitlab-ci.yml` 构建 worker 镜像时：
+`.gitlab-ci.yml` 构建并推送两个镜像：
+- **`omnillm-cpp-backend`**（worker + 后端：C++ llama 服务 + worker.py + VAD/TurnSense）
+- **`omnillm-gateway`**（gateway 网页入口，不加载模型）
+
+流程：
 1. `svn export svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest ./checkpoints`（按分支映射）
 2. `docker compose -f docker-compose.cpp.yml build cpp-worker-backend`（llama.cpp-omni git clone + 模型进镜像）
-3. push 镜像并打 tag
+3. `docker compose -f docker-compose.cpp.yml build gateway`
+4. push 两个镜像并打 tag
 
 ---
 
 ## 六、目录结构（关键）
 
 ```
-MiniCPM-o-Demo/
+Omni-LLM-Server/
 ├── checkpoints/              # 模型权重（gitignored，CI/SVN 生成）
 ├── docker-compose.cpp.yml    # C++ backend 部署（qwen3omni 推荐）
 ├── docker/Dockerfile.cpp-worker-backend  # 镜像（llama.cpp-omni git clone）
