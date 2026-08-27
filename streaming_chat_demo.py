@@ -926,8 +926,7 @@ def _gpu_baseline(gpu_ids=(0, 1)):
     return {g: stats.get(g, (0, 0))[0] for g in gpu_ids}
 
 
-async def _run_one_concurrent(url, ssl_ctx, direct, backend,
-                              turn_decision, system_prompt,
+async def _run_one_concurrent(url, ssl_ctx, direct, system_prompt,
                               vad_cfg, ts_cfg, audio_frames, prompt,
                               n_frames=5, accumulate_context=False):
     """单路并发会话：独立连接，发短音频触发一轮回复，返回结果 dict。"""
@@ -935,14 +934,18 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
     t0 = time.perf_counter()
     client = None
     try:
-        client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct, backend=backend)
+        client = StreamingChatClient(url, ssl_ctx=ssl_ctx, direct=direct)
         await client.connect()
         await client.init(
             mode="full_duplex",
             system_prompt=system_prompt,
-            turn_decision=turn_decision,
             config={"accumulate_context": accumulate_context, "vad": vad_cfg, "turnsense": ts_cfg},
         )
+        # 后端类型由服务端 session.created 的 active_model 判定（init 里赋值）。
+        if client.backend == "qwen3omni":
+            turn_decision = "vad_turnsense"   # turn-based：VAD+TurnSense 分句触发解码
+        else:
+            turn_decision = "model"           # MiniCPM 全双工：模型自主 speak/listen
         setup_ms = (time.perf_counter() - t0) * 1000
 
         text = ""
@@ -1059,8 +1062,7 @@ async def _run_one_concurrent(url, ssl_ctx, direct, backend,
                 pass
 
 
-async def run_concurrency(url, ssl_ctx, direct, backend,
-                          turn_decision, system_prompt,
+async def run_concurrency(url, ssl_ctx, direct, system_prompt,
                           vad_cfg, ts_cfg, video_path, prompt,
                           concurrency, max_audio_s, gpu_ids=(0, 1),
                           accumulate_context=False):
@@ -1108,7 +1110,7 @@ async def run_concurrency(url, ssl_ctx, direct, backend,
     t_all = time.perf_counter()
 
     tasks = [_run_one_concurrent(
-        url, ssl_ctx, direct, backend, turn_decision, system_prompt,
+        url, ssl_ctx, direct, system_prompt,
         vad_cfg, ts_cfg, audio_frames, prompt,
         n_frames=len(audio_frames),
         accumulate_context=accumulate_context,
@@ -1150,8 +1152,8 @@ async def main():
                              "22500=直连后端(ws，需后端端口映射到宿主机)。"
                              "未指定时走 --direct-backend / --gateway 默认地址")
     
-    parser.add_argument("--concurrency", type=int, default=0,
-                        help="并发路数(默认0=单路)。>0 时进入并发测试：从1递增到N，同时监控 GPU 显存/利用率")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="并发路数(默认1=单路)。>1 时进入并发测试，同时监控 GPU 显存/利用率")
     parser.add_argument("--gpu-ids", default="0,1",
                         help="要监控的 GPU 编号(逗号分隔)，默认 '0,1'")
     parser.add_argument("--realtime", action="store_true", help="实时采集模式（麦克风+摄像头）")
@@ -1211,10 +1213,10 @@ async def main():
 
     args = parser.parse_args()
 
-    if not args.video and not args.audio and not args.realtime and args.concurrency <= 0:
+    if not args.video and not args.audio and not args.realtime and args.concurrency <= 1:
         parser.error("需要 --video / --audio 或 --realtime 之一（纯音频模式用 --audio）")
 
-    if args.concurrency > 0 and not args.video:
+    if args.concurrency > 1 and not args.video:
         parser.error("并发测试需要 --video 提供测试音视频")
 
     # 按 --audio-chunk-ms 重算全局发送 chunk（并发/实时模式用；回放模式直接传参）
@@ -1251,13 +1253,10 @@ async def main():
     print(f"连接目标: {url} (direct={direct})")
 
     # 并发测试模式：不建单路 client，直接并发 N 路。
-    # 后端类型与判决无法预知（active_model 在连上才知道），并发分支统一走
-    # VAD+TurnSense 判决——与生产 VAD 判决路径一致，qwen3omni/minicpm 都支持。
-    if args.concurrency > 0:
+    if args.concurrency > 1:
         gpu_ids = tuple(int(x.strip()) for x in args.gpu_ids.split(",") if x.strip())
         await run_concurrency(
-            url, ssl_ctx, direct, "qwen3omni",
-            "vad_turnsense", args.system_prompt,
+            url, ssl_ctx, direct, args.system_prompt,
             vad_cfg={
                 "vad_model": args.vad_model,
                 "vad_tail_sil": args.vad_tail_sil,
