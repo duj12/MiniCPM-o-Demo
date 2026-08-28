@@ -13,7 +13,7 @@ x-worker-backend: &worker-backend-base
   build:
     context: .
     dockerfile: docker/Dockerfile.worker-backend
-  image: minicpm-wb:dev
+  image: omni-llm-backend:dev
   environment:
     GPU_ID: "0"
     BACKEND_PORT: "22500"
@@ -33,7 +33,7 @@ x-worker-backend: &worker-backend-base
 services:
   worker-backend-0a:
     <<: *worker-backend-base
-    container_name: minicpm-wb-0a
+    container_name: omni-llm-backend-0a
     volumes:
       - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
     deploy:
@@ -44,7 +44,7 @@ services:
 
   worker-backend-0b:
     <<: *worker-backend-base
-    container_name: minicpm-wb-0b
+    container_name: omni-llm-backend-0b
     volumes:
       - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
     deploy:
@@ -55,7 +55,7 @@ services:
 
   worker-backend-1a:
     <<: *worker-backend-base
-    container_name: minicpm-wb-1a
+    container_name: omni-llm-backend-1a
     volumes:
       - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
     deploy:
@@ -66,7 +66,7 @@ services:
 
   worker-backend-1b:
     <<: *worker-backend-base
-    container_name: minicpm-wb-1b
+    container_name: omni-llm-backend-1b
     volumes:
       - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
     deploy:
@@ -79,8 +79,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
-    image: minicpm-gateway:dev
-    container_name: minicpm-gateway
+    image: omni-llm-gateway:dev
+    container_name: omni-llm-gateway
     command:
       - "--host"
       - "0.0.0.0"

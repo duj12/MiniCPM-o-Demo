@@ -160,7 +160,7 @@ docker compose -f docker-compose.cpp.yml up -d --build               # 构建+�
 curl -k https://127.0.0.1:$GATEWAY_PORT/status
 
 # ── 直接检查后端 ──
-docker exec minicpm-o-demo-cpp-worker-1 curl -sf http://127.0.0.1:22500/v1/health
+docker exec omni-llm-cpp-backend curl -sf http://127.0.0.1:22500/v1/health
 ```
 
 ---

@@ -53,8 +53,10 @@ cp .env.example .env   # 或手改 .env
 `.env` 关键项：
 ```bash
 ACTIVE_MODEL=qwen3omni
-GGUF_MODEL_HOST_PATH=/path/to/your/models   # 或留空用默认 ./checkpoints
-CPP_GPU_ID=0                                # GPU 编号（多卡逗号分隔）
+MODEL_HOST_PATH=/path/to/your/models   # 默认 ./checkpoints（项目内三子目录）
+TURNSENSE_HOST_PATH=./checkpoints/TurnSense
+MTMD_BACKEND_DEVICE=CUDA1              # mmproj 放 GPU1，平衡双卡显存
+CPP_GPU_ID=0                           # GPU 编号（多卡逗号分隔）
 GATEWAY_HOST_PORT=8006
 ```
 
@@ -73,7 +75,7 @@ docker compose -f docker-compose.cpp.yml build cpp-worker-backend
 ```bash
 docker compose -f docker-compose.cpp.yml ps            # 等 healthy（模型加载 ~1-2min）
 curl -sk https://127.0.0.1:8006/                       # gateway
-docker logs -f minicpm-o-demo-cpp-worker-1             # worker 日志（VAD/TurnSense 就绪）
+docker logs -f omni-llm-cpp-backend             # worker 日志（VAD/TurnSense 就绪）
 ```
 
 ### 4. 停止

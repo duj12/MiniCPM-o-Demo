@@ -22,7 +22,7 @@ x-worker-backend: &worker-backend-base
   build:
     context: .
     dockerfile: docker/Dockerfile.worker-backend
-  image: minicpm-wb:dev
+  image: omni-llm-backend:dev
   environment:
     GPU_ID: "0"            # 容器内恒为 0(见上)
     BACKEND_PORT: "22500"
@@ -43,7 +43,7 @@ x-worker-backend: &worker-backend-base
 services:
   worker-backend-1:
     <<: *worker-backend-base
-    container_name: minicpm-wb-1
+    container_name: omni-llm-backend-1
     volumes:
       - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
     deploy:
@@ -58,8 +58,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
-    image: minicpm-gateway:dev
-    container_name: minicpm-gateway
+    image: omni-llm-gateway:dev
+    container_name: omni-llm-gateway
     # HTTPS:实时音视频页面(omni/audio_duplex)需要 https —— 浏览器仅在 https/localhost
     # 下提供 navigator.mediaDevices(麦克风)。证书从宿主机挂载(不进镜像),默认读 certs/cert.pem。
     # 纯文字 /turnbased 不需要麦克风,http 也能用;要降级 http 把下面 --https 段换成 ["--http"]。

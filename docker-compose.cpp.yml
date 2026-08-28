@@ -37,7 +37,7 @@ services:
         LLAMA_OMNI_REFSPEC: ${LLAMA_OMNI_REFSPEC:-dev}
         LLAMA_OMNI_REF: ${LLAMA_OMNI_REF:-origin/dev}
     image: omnillm-cpp-backend:dev
-    container_name: minicpm-o-demo-cpp-worker-1
+    container_name: omni-llm-cpp-backend
     environment:
       ACTIVE_MODEL: "${ACTIVE_MODEL:-minicpm}"
       GPU_ID: "0"
@@ -94,6 +94,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.gateway
     image: omnillm-gateway:dev
+    container_name: omni-llm-gateway
     environment:
       # 与 cpp-worker-backend 保持一致，让 gateway 的 /api/frontend_defaults
       # 能正确报告当前后端模型（config.py 里优先读 ACTIVE_MODEL 环境变量）。
