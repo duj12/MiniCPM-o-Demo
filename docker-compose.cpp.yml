@@ -45,6 +45,9 @@ services:
       WORKER_PORT: "22400"
       LLAMA_SERVER_EXTRA_ARGS: "${LLAMA_SERVER_EXTRA_ARGS:--c 16384 --parallel 4}"
       GGML_CUDA_DISABLE_GRAPHS: "1"
+      # mmproj（视觉+音频编码器）默认独占第一张 GPU（GPU0），导致 GPU0 显存 96% 满、
+      # 多路视觉并发 eval 显存不足挂起。搬到 GPU1 平衡双卡（见 clip.cpp MTMD_BACKEND_DEVICE）。
+      MTMD_BACKEND_DEVICE: "${MTMD_BACKEND_DEVICE:-CUDA1}"
       # VAD + TurnSense 半双工参数（worker 读 env 作默认值，请求 config 可覆盖）
       VAD_TAIL_SIL: "${VAD_TAIL_SIL:-600}"
       VAD_MAX_LEN: "${VAD_MAX_LEN:-60000}"
