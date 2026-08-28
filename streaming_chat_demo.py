@@ -681,11 +681,18 @@ async def run_file_replay(client: StreamingChatClient, video_path: str,
                 print(f"  [warn] --audio 采样率 {sr}≠16000，将按原采样率处理（可能不准）")
             audio = np.asarray(a, dtype=np.float32)
     else:
-        audio = extract_audio_pcm(video_path, max_s=max_audio_s)
+        # ffmpeg 抽音轨是同步 subprocess，长视频耗时几十秒。并发多路时若在
+        # 共享 event loop 里执行会阻塞所有协程（其他路 send_loop 饿死）。
+        # 放到独立线程，不阻塞 event loop。
+        audio = await asyncio.to_thread(extract_audio_pcm, video_path, max_s=max_audio_s)
 
-    # 纯音频模式：无视频帧
-    frames = extract_frames_evenly(video_path, fps=fps, max_frames=max_frames) if video_path else []
-    video_s = probe_duration(video_path) if video_path else 0.0
+    # 纯音频模式：无视频帧。ffmpeg 抽帧同理放线程。
+    if video_path:
+        frames = await asyncio.to_thread(extract_frames_evenly, video_path, fps=fps, max_frames=max_frames)
+        video_s = await asyncio.to_thread(probe_duration, video_path)
+    else:
+        frames = []
+        video_s = 0.0
     audio_s = len(audio) / SAMPLE_RATE
 
     src_name = os.path.basename(audio_path or video_path) or "(audio)"
@@ -971,7 +978,7 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
                               max_audio_s=None, tail_silence_s=2.0,
                               drain_idle_s=5.0, accumulate_context=False,
                               echo=False, show_reply_text=False,
-                              audio_path=""):
+                              audio_path="", fps=1.0, max_frames=0):
     """单路并发会话：独立连接，与单路 run_file_replay 完全相同的发送/收尾/统计。
 
     echo=False：并发下不逐字流式（多路交错会错乱）。
@@ -1005,6 +1012,7 @@ async def _run_one_concurrent(label, url, ssl_ctx, direct, system_prompt,
             tail_silence_s=tail_silence_s,
             drain_idle_s=drain_idle_s,
             audio_path=audio_path,
+            fps=fps, max_frames=max_frames,
         )
         st = _turn_stats(metrics)
         ok = bool(metrics) and any(m.reply_chars for m in metrics)
@@ -1051,7 +1059,7 @@ async def _run_round(url, ssl_ctx, direct, system_prompt,
                      vad_cfg, ts_cfg, video_path, prompt,
                      round_n, max_audio_s, gpu_ids, accumulate_context,
                      audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
-                     show_reply_text, audio_path):
+                     show_reply_text, audio_path, fps=1.0, max_frames=0):
     """跑一轮 N 路并发（单档），返回 (results, ok, wall_ms, peak, baseline)。"""
     N = round_n
     multi = N > 1
@@ -1087,6 +1095,7 @@ async def _run_round(url, ssl_ctx, direct, system_prompt,
         echo=not multi,          # 单路可流式；多路不流式，避免交错
         show_reply_text=show_reply_text,
         audio_path=audio_path,
+        fps=fps, max_frames=max_frames,
     ) for i in range(N)]
     results = await asyncio.gather(*tasks)
 
@@ -1105,7 +1114,7 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
                           audio_chunk_ms=1000, kv_budget=20000,
                           tail_silence_s=2.0, drain_idle_s=5.0,
                           show_reply_text=False, audio_path="",
-                          ramp=False):
+                          fps=1.0, max_frames=0, ramp=False):
     """视频/音频回放的统一入口：N 路各自独立连接，与单路同口径统计。
 
     concurrency==1 即单路（--concurrency 默认 1）：每路 echo=True 流式输出，
@@ -1134,6 +1143,7 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
                 k, max_audio_s, gpu_ids, accumulate_context,
                 audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
                 show_reply_text, audio_path,
+                fps=fps, max_frames=max_frames,
             )
             all_ttfts = [m.ttft_s for r in results for m in r["metrics"] if m.ttft_s is not None]
             all_speeds = [m.speed_cps for r in results for m in r["metrics"] if m.speed_cps > 0]
@@ -1156,6 +1166,7 @@ async def run_concurrency(url, ssl_ctx, direct, system_prompt,
         N, max_audio_s, gpu_ids, accumulate_context,
         audio_chunk_ms, kv_budget, tail_silence_s, drain_idle_s,
         show_reply_text, audio_path,
+        fps=fps, max_frames=max_frames,
     )
 
     if N == 1:
@@ -1364,6 +1375,7 @@ async def main():
         tail_silence_s=args.tail_silence_s,
         drain_idle_s=args.drain_idle_s,
         show_reply_text=args.show_reply_text,
+        fps=args.fps, max_frames=args.max_frames,
         ramp=args.ramp,
     )
 
