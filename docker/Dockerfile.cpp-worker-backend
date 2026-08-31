@@ -75,6 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    supervisor \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
@@ -96,12 +97,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY --from=cpp-build /opt/llama.cpp-omni /opt/llama.cpp-omni
 COPY . .
 
-# 说明：`COPY . .` 会把构建上下文的 checkpoints/ 一起拷进镜像 /app/checkpoints
-# （若存在），满足"模型进镜像"（CI 里 svn export 到 checkpoints 后构建）。
-# 本地/挂载部署时镜像内可能无模型，half_duplex 会从 /models（compose 挂载点）探测。
+# ── 模型打包进镜像（可选）──────────────────────────────
+# BUNDLE_MODELS=1：把构建上下文的 .bundle-checkpoints/（由 build-image.sh 软链
+# 实体化生成，含 qwen3omni-gguf/fsmn-vad-onnx/TurnSense）拷进 /app/checkpoints。
+# 未打包时镜像内无模型，half_duplex 会从 /models（compose 挂载点）探测。
+ARG BUNDLE_MODELS=0
+RUN if [ "$BUNDLE_MODELS" = "1" ] && [ -d .bundle-checkpoints ]; then \
+        mkdir -p /app/checkpoints \
+        && cp -r .bundle-checkpoints/checkpoints/. /app/checkpoints/; \
+    fi
+
+# ── supervisor 服务管理 ───────────────────────────────
+# 两个服务（llama server + worker）都由 supervisord 管理，autorestart + 日志落位
+# /app/logs。supervisord.conf 由 entrypoint 按 ACTIVE_MODEL 动态生成（llama 参数
+# 因模型而异），entrypoint 负责判断/校验后 exec supervisord。
 
 RUN chmod +x docker/entrypoint-cpp-worker-backend.sh \
-    && mkdir -p /app/logs
+    && mkdir -p /app/logs /var/log/supervisor
 
 EXPOSE 22500
 EXPOSE 22400

@@ -45,3 +45,7 @@ docker-compose.multi.yml
 # 运维笔记,含内部 IP / SWR / 隧道 / 凭证引用 —— 绝不进镜像(尤其推公网 registry)
 docker/34-CHANGES-AND-RECOVERY.md
 certs/
+
+# checkpoints/ 是软链（指向外部模型目录），排除避免把悬空软链拷进镜像。
+# 模型实体化由 build-image.sh 生成到 .bundle-checkpoints/（不排除，供 COPY 进镜像）。
+checkpoints/

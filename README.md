@@ -62,14 +62,23 @@ GATEWAY_HOST_PORT=8006
 
 ### 2. 构建并启动
 ```bash
-# 构建镜像（llama.cpp-omni 自动 git clone duj12/dev；模型从 ./checkpoints 打进镜像）
-docker compose -f docker-compose.cpp.yml up -d --build
-# 只构建
-docker compose -f docker-compose.cpp.yml build cpp-worker-backend
+# 构建镜像（llama.cpp-omni 自动 git clone duj12/dev）。默认打包模型进镜像
+./docker/build-image.sh
+# 不打包（运行时挂载 /models，适合开发调试）
+./docker/build-image.sh --no-bundle
+# 打包并推送（需 REGISTRY/IMAGE_TAG）
+./docker/build-image.sh --push
+# 直接 compose 起
+docker compose -f docker-compose.cpp.yml up -d
 ```
 
-> 模型默认从项目内 `./checkpoints` 挂载到容器 `/models`。可用 `MODEL_HOST_PATH` 覆盖
-> 到别的目录（如 SVN 下载目录）。镜像内 `COPY . .` 也会带上 checkpoints（CI 构建时）。
+> **模型部署方式**：
+> - **默认打进镜像**：构建时把 `checkpoints/` 三子目录（qwen3omni-gguf/fsmn-vad-onnx/TurnSense）
+>   拷贝进镜像 `/app/checkpoints`。适合 CI 分发、新机器即拉即用（镜像约 +20G）。
+> - **`--no-bundle` 挂载**：模型在宿主机 `checkpoints/`（或 `MODEL_HOST_PATH`），compose 挂 `/models`。
+>
+> 容器内由 **supervisord** 管理两个服务（llama-server + worker），autorestart + 日志落位
+> `/app/logs/`（llama 日志、worker.log）。容器 HEALTHCHECK 走 worker `/health`。
 
 ### 3. 健康检查
 ```bash
@@ -171,7 +180,7 @@ turn#1: TTFT=0.23s in_audio=9.0s in_video=9.0s reply=1.2s (120ch, 240ch/s)
 
 流程：
 1. `svn export svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest ./checkpoints`（按分支映射）
-2. `docker compose -f docker-compose.cpp.yml build cpp-worker-backend`（llama.cpp-omni git clone + 模型进镜像）
+2. `docker/build-image.sh`（git clone llama.cpp-omni + 模型打包进镜像，默认打包）
 3. `docker compose -f docker-compose.cpp.yml build gateway`
 4. push 两个镜像并打 tag
 

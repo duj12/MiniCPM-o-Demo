@@ -26,9 +26,6 @@ require_path() {
 
 cleanup() {
     echo "[entrypoint] stopping child processes..."
-    [ -n "$worker_pid" ] && kill "$worker_pid" 2>/dev/null || true
-    [ -n "$backend_pid" ] && kill "$backend_pid" 2>/dev/null || true
-    [ -n "$tail_pid" ] && kill "$tail_pid" 2>/dev/null || true
     wait 2>/dev/null || true
     exit 0
 }
@@ -72,10 +69,6 @@ echo "=================================================="
 : > "$LLAMA_LOG_FILE"
 # 转发 backend 日志到 stdout，过滤调试噪声，突出关键事件。
 # 丢弃: preprocess/[prof]/tensor 等；保留: session/duplex/decode/error/omni。
-tail -n +1 -F "$LLAMA_LOG_FILE" | \
-    grep -vE "audition_audio_preprocess|vision_|clip_model_loader|load_tensors|\[prof\]|KV cache iter|Before incrementing|Final output|mel spectrogram|build_whisper|conv2d|tensor\[|audio slice|audio decoded" &
-tail_pid=$!
-
 llama_args=(
     -m "$GGUF_MODEL"
     -ngl "$N_GPU_LAYERS"
@@ -89,41 +82,8 @@ if [ -n "${LLAMA_SERVER_EXTRA_ARGS:-}" ]; then
     llama_args+=( "${extra_args[@]}" )
 fi
 
-echo "[entrypoint] starting llama-omni-server..."
-"$LLAMA_SERVER_BIN" "${llama_args[@]}" >> "$LLAMA_LOG_FILE" 2>&1 &
-backend_pid=$!
-
-echo "[entrypoint] waiting for backend /health..."
-max_retries=$((READY_TIMEOUT_S / 2))
-if [ "$max_retries" -lt 1 ]; then max_retries=1; fi
-
-for i in $(seq 1 "$max_retries"); do
-    if ! kill -0 "$backend_pid" 2>/dev/null; then
-        echo "[entrypoint] llama server exited while loading" >&2
-        tail -50 "$LLAMA_LOG_FILE" >&2 || true
-        cleanup
-    fi
-    if curl -sf "${BACKEND_URL}/health" >/dev/null 2>&1; then
-        echo "[entrypoint] backend ready after ~$((i * 2))s"
-        break
-    fi
-    if [ "$i" -eq "$max_retries" ]; then
-        echo "[entrypoint] backend did not become ready within ${READY_TIMEOUT_S}s" >&2
-        tail -80 "$LLAMA_LOG_FILE" >&2 || true
-        cleanup
-    fi
-    sleep 2
-done
-
-# Preload omni models into VRAM
-echo "[entrypoint] preloading omni models into VRAM..."
-if curl -sf -X POST "${BACKEND_URL}/v1/stream/omni_init" \
-    -H "Content-Type: application/json" \
-    -d '{"msg_type":2,"use_tts":true}' >/dev/null 2>&1; then
-    echo "[entrypoint] omni models loaded and pinned in VRAM"
-else
-    echo "[entrypoint] omni preload failed (will load on first request)" >&2
-fi
+# 注意：llama-server 不再在此后台启动——由 supervisord 管理（见文件结尾）。
+# 仅记录启动参数供 supervisor 配置使用；backend 健康检查交给 worker 的前置脚本。
 
 # ============================================================================
 # Qwen3-Omni mode (turn-based, text-only or multimodal via mmproj)
@@ -149,10 +109,6 @@ echo "=================================================="
 : > "$LLAMA_LOG_FILE"
 # 转发 backend 日志到 stdout，过滤调试噪声，突出关键事件。
 # 丢弃: preprocess/[prof]/tensor 等；保留: session/duplex/decode/error/omni。
-tail -n +1 -F "$LLAMA_LOG_FILE" | \
-    grep -vE "audition_audio_preprocess|vision_|clip_model_loader|load_tensors|\[prof\]|KV cache iter|Before incrementing|Final output|mel spectrogram|build_whisper|conv2d|tensor\[|audio slice|audio decoded" &
-tail_pid=$!
-
 llama_args=(
     -m "$GGUF_MODEL"
     --mmproj "$MMPROJ_MODEL"
@@ -166,33 +122,8 @@ if [ -n "${LLAMA_SERVER_EXTRA_ARGS:-}" ]; then
     llama_args+=( "${extra_args[@]}" )
 fi
 
-echo "[entrypoint] starting llama-qwen3omni-server..."
-"$LLAMA_SERVER_BIN" "${llama_args[@]}" >> "$LLAMA_LOG_FILE" 2>&1 &
-backend_pid=$!
-
-echo "[entrypoint] waiting for backend /health..."
-max_retries=$((READY_TIMEOUT_S / 2))
-if [ "$max_retries" -lt 1 ]; then max_retries=1; fi
-
-for i in $(seq 1 "$max_retries"); do
-    if ! kill -0 "$backend_pid" 2>/dev/null; then
-        echo "[entrypoint] llama server exited while loading" >&2
-        tail -50 "$LLAMA_LOG_FILE" >&2 || true
-        cleanup
-    fi
-    if curl -sf "${BACKEND_URL}/health" >/dev/null 2>&1; then
-        echo "[entrypoint] backend ready after ~$((i * 2))s"
-        break
-    fi
-    if [ "$i" -eq "$max_retries" ]; then
-        echo "[entrypoint] backend did not become ready within ${READY_TIMEOUT_S}s" >&2
-        tail -80 "$LLAMA_LOG_FILE" >&2 || true
-        cleanup
-    fi
-    sleep 2
-done
-
-echo "[entrypoint] Qwen3-Omni backend ready (no omni preload needed)"
+# 注意：llama-server 不再在此后台启动——由 supervisord 管理（见文件结尾）。
+# 参数已在上面构造好，供 supervisor 配置使用；backend 健康检查交给 worker 的前置脚本。
 
 else
     echo "[entrypoint] unknown ACTIVE_MODEL: ${ACTIVE_MODEL} (expected minicpm or qwen3omni)" >&2
@@ -200,35 +131,71 @@ else
 fi
 
 # ============================================================================
-# Start Python worker (shared for both modes)
+# 生成 supervisord.conf 并 exec supervisord 管理两个服务
+#   - llama-server: C++ 推理后端（参数已按 ACTIVE_MODEL 构造）
+#   - worker:       Python 转发（--backend-server-url 指向本容器 llama）
+# supervisor 负责 autorestart + 日志落位 /app/logs；容器 HEALTHCHECK 走 worker /health。
 # ============================================================================
-echo "[entrypoint] starting worker..."
-LLAMA_SERVER_BIN="$LLAMA_SERVER_BIN" \
-ACTIVE_MODEL="$ACTIVE_MODEL" \
-python worker.py \
-    --host 0.0.0.0 \
-    --port "$WORKER_PORT" \
-    --gpu-id "$GPU_ID" \
-    --backend-server-url "$BACKEND_URL" &
-worker_pid=$!
 
-sleep 3
-if curl -sf "http://127.0.0.1:${WORKER_PORT}/health" >/dev/null 2>&1; then
-    echo "[entrypoint] worker ready"
-else
-    echo "[entrypoint] worker health check is not ready yet"
-fi
-
-echo "[entrypoint] running. backend pid=${backend_pid} worker pid=${worker_pid}"
-
-while true; do
-    if ! kill -0 "$backend_pid" 2>/dev/null; then
-        echo "[entrypoint] llama server exited" >&2
-        cleanup
+# worker 启动前等 backend ready（llama-server 由 supervisor 拉起，可能稍后）
+WAIT_BACKEND_SH="/app/docker/wait-backend.sh"
+cat > "$WAIT_BACKEND_SH" <<EOF
+#!/bin/bash
+for i in \$(seq 1 $((READY_TIMEOUT_S / 2))); do
+    if curl -sf "${BACKEND_URL}/health" >/dev/null 2>&1; then
+        echo "[wait-backend] backend ready after ~\$((i * 2))s"
+        exit 0
     fi
-    if ! kill -0 "$worker_pid" 2>/dev/null; then
-        echo "[entrypoint] worker exited" >&2
-        cleanup
-    fi
-    sleep 5
+    sleep 2
 done
+echo "[wait-backend] backend not ready within ${READY_TIMEOUT_S}s" >&2
+exit 1
+EOF
+chmod +x "$WAIT_BACKEND_SH"
+
+cat > /etc/supervisor/conf.d/supervisord.conf <<EOF
+[unix_http_server]
+file=/var/run/supervisor.sock
+chmod=0700
+
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+childlogdir=/var/log/supervisor
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[program:llama-server]
+command=${LLAMA_SERVER_BIN} ${llama_args[*]}
+autostart=true
+autorestart=true
+startretries=5
+priority=10
+stdout_logfile=${LLAMA_LOG_FILE}
+stdout_logfile_maxbytes=100MB
+stdout_logfile_backups=3
+stderr_logfile=${LLAMA_LOG_FILE}
+stderr_logfile_maxbytes=100MB
+stderr_logfile_backups=3
+
+[program:worker]
+command=/bin/bash -c "${WAIT_BACKEND_SH} && LLAMA_SERVER_BIN=${LLAMA_SERVER_BIN} ACTIVE_MODEL=${ACTIVE_MODEL} python worker.py --host 0.0.0.0 --port ${WORKER_PORT} --gpu-id ${GPU_ID} --backend-server-url ${BACKEND_URL}"
+autostart=true
+autorestart=true
+startretries=5
+priority=20
+stdout_logfile=${LOG_DIR}/worker.log
+stdout_logfile_maxbytes=100MB
+stdout_logfile_backups=3
+stderr_logfile=${LOG_DIR}/worker.log
+stderr_logfile_maxbytes=100MB
+stderr_logfile_backups=3
+EOF
+
+echo "[entrypoint] exec supervisord (llama-server + worker)"
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf

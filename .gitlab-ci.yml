@@ -58,8 +58,8 @@ build_image:
     - svn export "$SVN_LOCAL_PATH" ./checkpoints
     - ls -la ./checkpoints/
     - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
-    # worker+backend 镜像（构建时 git clone llama.cpp-omni + 模型进镜像）
-    - docker compose -f docker-compose.cpp.yml build cpp-worker-backend
+    # worker+backend 镜像：git clone llama.cpp-omni + 模型打包进镜像（默认打包）
+    - docker/build-image.sh
     # gateway 镜像（纯转发，无模型）
     - docker compose -f docker-compose.cpp.yml build gateway
     - |
