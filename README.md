@@ -54,9 +54,8 @@ cp .env.example .env   # 或手改 .env
 ```bash
 ACTIVE_MODEL=qwen3omni
 MODEL_HOST_PATH=/path/to/your/models   # 默认 ./checkpoints（项目内三子目录）
-TURNSENSE_HOST_PATH=./checkpoints/TurnSense
 MTMD_BACKEND_DEVICE=CUDA1              # mmproj 放 GPU1，平衡双卡显存
-CPP_GPU_ID=0                           # GPU 编号（多卡逗号分隔）
+CPP_GPU_ID=0,1                         # GPU 编号（多卡逗号分隔）
 GATEWAY_HOST_PORT=8006
 ```
 

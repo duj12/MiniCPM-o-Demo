@@ -122,6 +122,7 @@ class FSMNVADManager:
             here = os.path.dirname(os.path.abspath(__file__))
             cands = [
                 os.path.join(root, "checkpoints", "fsmn-vad-onnx"),   # 项目内统一模型目录
+                os.path.join("/app", "checkpoints", "fsmn-vad-onnx"),  # 镜像内打包路径
                 os.path.join("/models", "fsmn-vad-onnx"),   # 容器内 compose 挂载点
                 os.path.join(root, "vad-runtime", "model"),
                 os.path.join(here, "fsmn_vad_onnx", "model"),   # 容器内/本包内置
@@ -267,6 +268,8 @@ def _default_turnsense_paths() -> Dict[str, str]:
     root = root_for_deploy()
     rels = [
         os.path.join("checkpoints", "TurnSense", "pretrained_models"),
+        # 镜像内打包路径（模型打进 /app/checkpoints）
+        os.path.join("/app", "checkpoints", "TurnSense", "pretrained_models"),
         # 容器内 compose 挂载点（checkpoints 挂到 /models；TurnSense 独立挂 /turnsense）
         os.path.join("/models", "TurnSense", "pretrained_models"),
         os.path.join("/turnsense", "pretrained_models"),

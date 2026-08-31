@@ -45,7 +45,13 @@ echo "=================================================="
 if [ "$ACTIVE_MODEL" = "minicpm" ]; then
 
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/opt/llama.cpp-omni/bin/llama-omni-server}"
-GGUF_MODEL="${GGUF_MODEL:-/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf}"
+# 模型根路径：优先镜像内 /app/checkpoints（打包进镜像），否则 /models（运行时挂载）。
+if [ -e /app/checkpoints/MiniCPM-o-4_5-gguf ]; then
+    MODEL_ROOT=/app/checkpoints
+else
+    MODEL_ROOT=/models
+fi
+GGUF_MODEL="${GGUF_MODEL:-${MODEL_ROOT}/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-99}"
 LLAMA_LOG_FILE="${LLAMA_LOG_FILE:-${LOG_DIR}/llama-omni-server.log}"
 
@@ -91,8 +97,14 @@ fi
 elif [ "$ACTIVE_MODEL" = "qwen3omni" ]; then
 
 LLAMA_SERVER_BIN="${LLAMA_QWEN3_SERVER_BIN:-/opt/llama.cpp-omni/bin/llama-qwen3omni-server}"
-GGUF_MODEL="${GGUF_MODEL:-/models/qwen3omni-gguf/Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf}"
-MMPROJ_MODEL="${MMPROJ_MODEL:-/models/qwen3omni-gguf/mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf}"
+# 模型根路径：优先镜像内 /app/checkpoints（打包进镜像），否则 /models（运行时挂载）。
+if [ -e /app/checkpoints/qwen3omni-gguf ]; then
+    MODEL_ROOT=/app/checkpoints
+else
+    MODEL_ROOT=/models
+fi
+GGUF_MODEL="${GGUF_MODEL:-${MODEL_ROOT}/qwen3omni-gguf/Qwen3-Omni-30B-A3B-Instruct-Q4_K_S.gguf}"
+MMPROJ_MODEL="${MMPROJ_MODEL:-${MODEL_ROOT}/qwen3omni-gguf/mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-99}"
 LLAMA_LOG_FILE="${LLAMA_LOG_FILE:-${LOG_DIR}/llama-qwen3omni-server.log}"
 
