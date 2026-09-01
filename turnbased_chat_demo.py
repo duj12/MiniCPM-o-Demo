@@ -45,7 +45,7 @@ from streaming_chat_demo import (
 
 SAMPLE_RATE = 16000
 
-DEFAULT_PROMPT = """你是一个音视频理解助手。请综合画面与语音（若有）输出视频的结构化描述：
+DEFAULT_PROMPT = """你是一个音视频理解助手。请综合画面与语音输出视频的结构化描述：
 - 画面为主，语音辅助理解场景
 - 只描述实际可见/可闻的信息，不确定的写"不可见/不确定"，不编造
 
@@ -66,7 +66,10 @@ DEFAULT_PROMPT = """你是一个音视频理解助手。请综合画面与语音
 【情绪】(P1)
 - 表情/姿态/语气反映的情绪
 
-输出：按四类分条，每类先写关键词再写描述。"""
+【语音内容】(P1)
+- 说话人说的语音内容转写成文本
+
+输出：按五类分条，每类先写关键词再写描述。"""
 
 
 async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
@@ -118,15 +121,21 @@ async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
             if m.get("type") == "session.created":
                 break
 
-        # ── 组装 input：视频帧 + 音频 + 文本 ──
+        # ── 组装 input：对齐后端 turn_based 的 messages content 格式 ──
+        # 后端 parse_one_message 认 {type:"image",data:jpegb64}（画面帧）/
+        # {type:"audio",data:b64}（float32 PCM），嵌在 message 的 content 数组。
+        # 顶层 video_frames/audio 是 full_duplex 格式，turn_based 不认 → 幻觉。
+        # 注意：帧数不宜多（17 帧 + 音频会让后端 prefill 卡住），默认限 max_frames。
+        content: List[dict] = [{"type": "text", "text": prompt}]
+        for f in frames:
+            content.append({"type": "image", "data": b64(f)})
+        if audio is not None:
+            content.append({"type": "audio", "data": b64(audio)})
+
         inp: dict = {
-            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            "messages": [{"role": "user", "content": content}],
             "streaming": True,
         }
-        if frames:
-            inp["video_frames"] = [b64(f) for f in frames]
-        if audio is not None:
-            inp["audio"] = b64(audio)
 
         print("\n  ── 描述 ── ", end="", flush=True)
         await ws.send(json.dumps({"type": "input.append", "input": inp}))
@@ -159,7 +168,8 @@ def main():
     parser.add_argument("--video", default="", help="视频文件路径（抽取画面+音轨）")
     parser.add_argument("--audio", default="", help="音频文件路径（纯音频理解，或与 --video 独立用）")
     parser.add_argument("--fps", type=float, default=1.0, help="视频抽帧率(帧/秒)，默认1.0")
-    parser.add_argument("--max-frames", type=int, default=0, help="最大抽帧数，0=不限")
+    parser.add_argument("--max-frames", type=int, default=4,
+                        help="最大抽帧数，默认4（帧数过多会让后端 prefill 卡住；可调大，需配合 --max-audio-s）")
     parser.add_argument("--no-audio", action="store_true", help="只发视频帧，不发音频")
     parser.add_argument("--max-audio-s", type=float, default=None, help="音频时长上限(秒)，默认全轨")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="描述 prompt（默认内置结构化模板）")
