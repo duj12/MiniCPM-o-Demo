@@ -85,7 +85,8 @@ DEFAULT_PROMPT = """你是一个视频监控/行为分析助手。请综合画�
 
 async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
                         prompt: str, max_frames: int,
-                        use_audio: bool, max_audio_s: Optional[float]) -> None:
+                        use_audio: bool, max_audio_s: Optional[float],
+                        max_new_tokens: int = 2048) -> None:
     """连 gateway mode=chat，发音视频 + prompt，流式打印模型描述。"""
     import websockets
 
@@ -150,6 +151,7 @@ async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
         inp: dict = {
             "messages": [{"role": "user", "content": content}],
             "streaming": True,
+            "generation": {"max_new_tokens": max_new_tokens},
         }
 
         print("\n  ── 描述 ── ", end="", flush=True)
@@ -188,6 +190,8 @@ def main():
     parser.add_argument("--no-audio", action="store_true", help="只发视频帧，不发音频")
     parser.add_argument("--max-audio-s", type=float, default=None, help="音频时长上限(秒)，默认全轨")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="描述 prompt（默认内置结构化模板）")
+    parser.add_argument("--max-new-tokens", type=int, default=2048,
+                        help="回复最大 token 数，默认2048（九类描述+语音转写易超1024默认值被截断）")
     parser.add_argument("--host", default="192.168.89.106", help="gateway 主机")
     parser.add_argument("--port", type=int, default=8006, help="gateway 端口")
     args = parser.parse_args()
@@ -201,6 +205,7 @@ def main():
         url, _ssl_ctx_noverify(), args.video, args.audio,
         args.prompt, args.max_frames,
         not args.no_audio, args.max_audio_s,
+        max_new_tokens=args.max_new_tokens,
     ))
 
 
