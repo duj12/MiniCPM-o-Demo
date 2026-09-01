@@ -77,6 +77,46 @@ FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 1600
 CHUNK_MS = 1000                                       # 默认音频块节奏（1s，并发/实时模式用）
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000        # 16000
 
+# ── 视频描述模式（--describe）的 system prompt ──
+# full_duplex 的 system prompt 每轮都会作为 prompt 前缀（cumulative_prompt 以它开头），
+# 所以把它设为"只描述画面"能让 VAD 触发生成描述而非对话回复（KV 热累积 + 秒级首字）。
+DESCRIBE_SYSTEM_PROMPT = """你是一个视频监控/行为分析助手。请综合画面与语音，输出视频的结构化描述。
+要求：只描述画面中实际可见、语音中实际可闻的信息；不确定的写"不可见/不确定"，绝不编造。
+优先级：P0 为必答核心，P1 尽量回答，P2 在信息可见时回答。
+
+【P0 人物信息】
+- 性别、年龄段（如：青年男性、中年女性）
+- 穿着（上衣/下装颜色、款式、有无配饰如眼镜帽子）
+
+【P0 行为/运动状态】
+- 人物行为和状态（站/坐/行走/挥手/操作某物等）
+- 关键动作（如拿取、指向、蹲下、靠近某物）
+- 相对距离变化：靠近/远离/保持不动（相对摄像头或相对他人）
+- 运动方向与速度
+
+【P1 环境描述】
+- 场景类型（室内/室外、房间/街道等）
+- 其他人（人数、在做什么）
+- 环境要素（物品、光线、背景特征）
+
+【P1 情绪状态】
+- 根据人物表情、姿态、肢体语言判断
+- 结合人物语音内容和语气判断
+
+【P1 语音内容转写】
+- 将语音内容转写为文本，标注说话人（如有多个）
+
+【P2 视线方向】
+- 人物视线朝向（看向镜头/看向某物/看向某人），不可判断写"不可见"
+
+【P2 人物与物体相对位置】
+- 人物与画面中主要物体的相对位置（如：站在桌子右侧、靠近门口）
+
+【P2 指向物体描述】
+- 人物明确指向/拿起的物体（描述其外观），无则写"无"
+
+输出：按上述九类分条，每条先写类别名再写内容。"""
+
 
 # ============================================================================
 # 配置
@@ -1250,8 +1290,11 @@ async def main():
                         help="VAD+TurnSense 触发回复后是否暂停发送音频，等模型回复完成再继续(默认开)。"
                              "--wait-reply=false 关闭则持续发送不等回复")
     
+    parser.add_argument("--describe", action="store_true",
+                        help="视频描述模式：system prompt 自动设为\"只描述画面\"指令，"
+                             "VAD 触发生成画面描述而非对话回复（KV 热累积 + 秒级首字）")
     parser.add_argument("--system-prompt", default="你是一个友好的中文助手。",
-                        help="系统提示词")
+                        help="系统提示词（--describe 时默认用内置描述指令，可覆盖）")
     parser.add_argument("--prompt", default="你是一个多模态AI助手，请理解音频和视频内容，简洁准确地回复用户。",
                         help="对话提示词")
     parser.add_argument("--accumulate-context", action="store_true",
@@ -1274,6 +1317,10 @@ async def main():
 
 
     args = parser.parse_args()
+
+    # --describe：视频描述模式，system prompt 自动用描述指令（每轮触发的前缀）
+    if args.describe:
+        args.system_prompt = DESCRIBE_SYSTEM_PROMPT
 
     if not args.video and not args.audio and not args.realtime and args.concurrency <= 1:
         parser.error("需要 --video / --audio 或 --realtime 之一（纯音频模式用 --audio）")
