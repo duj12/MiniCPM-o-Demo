@@ -15,15 +15,16 @@
   # 只分析画面（不看语音）
   python turnbased_chat_demo.py --video xxx.mp4 --no-audio
 
-  # 自定义抽帧/音频时长
-  python turnbased_chat_demo.py --video xxx.mp4 --fps 0.5 --max-frames 10 --max-audio-s 30
+  # 自定义帧数上限/音频时长
+  python turnbased_chat_demo.py --video xxx.mp4 --max-frames 60 --max-audio-s 30
 
 常用参数：
-  --fps / --max-frames  视频抽帧（fps 每秒几帧，max-frames 上限；默认 1.0/0 不限）
-  --no-audio            只发视频帧，不发音频
-  --max-audio-s         音频时长上限（秒），默认全轨
-  --prompt              描述 prompt（默认内置结构化模板）
-  --host / --port       gateway 地址（默认 192.168.89.106:8006）
+  --max-frames         视频抽帧上限，默认40。1fps 抽帧，超过上限截断
+                       （每帧≈530token，40帧≈2.1万token < n_ctx 25600）
+  --no-audio           只发视频帧，不发音频
+  --max-audio-s        音频时长上限（秒），默认全轨
+  --prompt             描述 prompt（默认内置结构化模板）
+  --host / --port      gateway 地址（默认 192.168.89.106:8006）
 """
 
 import argparse
@@ -39,7 +40,7 @@ import numpy as np
 from streaming_chat_demo import (
     b64,
     extract_audio_pcm,
-    extract_frames_evenly,
+    extract_keyframes,
     probe_duration,
 )
 
@@ -73,7 +74,7 @@ DEFAULT_PROMPT = """你是一个音视频理解助手。请综合画面与语音
 
 
 async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
-                        prompt: str, fps: float, max_frames: int,
+                        prompt: str, max_frames: int,
                         use_audio: bool, max_audio_s: Optional[float]) -> None:
     """连 gateway mode=chat，发音视频 + prompt，流式打印模型描述。"""
     import websockets
@@ -82,8 +83,12 @@ async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
     frames: List[bytes] = []
     audio: Optional[np.ndarray] = None
     if video_path:
-        frames = extract_frames_evenly(video_path, fps=fps, max_frames=max_frames)
-        print(f"  视频帧: {len(frames)} 帧 @{fps}fps")
+        # 默认 1fps 抽帧（覆盖全视频）；超过 max_frames（默认40）时限制到 max_frames，
+        # 避免长视频帧数过多超出 KV 预算（每帧 ≈530 token，40 帧 ≈2.1 万 < 25600）。
+        dur = probe_duration(video_path)
+        n_frames = min(int(np.ceil(dur)), max_frames) if dur > 0 else max_frames
+        frames = extract_keyframes(video_path, n_frames=n_frames)
+        print(f"  视频帧: {len(frames)} 帧（1fps 抽帧, 视频 {dur:.0f}s, 上限 {max_frames}）")
         if use_audio:
             audio = extract_audio_pcm(video_path, max_s=max_audio_s)
     elif audio_path:
@@ -167,9 +172,9 @@ def main():
     parser = argparse.ArgumentParser(description="Turn-based 音视频理解 Demo")
     parser.add_argument("--video", default="", help="视频文件路径（抽取画面+音轨）")
     parser.add_argument("--audio", default="", help="音频文件路径（纯音频理解，或与 --video 独立用）")
-    parser.add_argument("--fps", type=float, default=1.0, help="视频抽帧率(帧/秒)，默认1.0")
-    parser.add_argument("--max-frames", type=int, default=4,
-                        help="最大抽帧数，默认4（帧数过多会让后端 prefill 卡住；可调大，需配合 --max-audio-s）")
+    parser.add_argument("--max-frames", type=int, default=40,
+                        help="视频抽帧上限。默认1fps抽帧，超过此上限时截断（40=40s以上视频限40帧，"
+                             "每帧≈530token，40帧≈2.1万token < n_ctx 25600）")
     parser.add_argument("--no-audio", action="store_true", help="只发视频帧，不发音频")
     parser.add_argument("--max-audio-s", type=float, default=None, help="音频时长上限(秒)，默认全轨")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="描述 prompt（默认内置结构化模板）")
@@ -184,7 +189,7 @@ def main():
     print(f"连接目标: {url}")
     asyncio.run(run_turnbased(
         url, _ssl_ctx_noverify(), args.video, args.audio,
-        args.prompt, args.fps, args.max_frames,
+        args.prompt, args.max_frames,
         not args.no_audio, args.max_audio_s,
     ))
 
