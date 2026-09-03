@@ -133,6 +133,8 @@ services:
       - ./static/half-duplex/half-duplex-app.js:/app/static/half-duplex/half-duplex-app.js:ro
       - ./static/mobile-omni/index.html:/app/static/mobile-omni/index.html:ro
       - ./static/duplex/ui/duplex-ui.js:/app/static/duplex/ui/duplex-ui.js:ro
+      # duplex 录制字幕/录音逻辑（session-video-recorder 等），改动即时生效
+      - ./static/duplex/lib:/app/static/duplex/lib:ro
       - ./static/index.html:/app/static/index.html:ro
       - ./static/admin.html:/app/static/admin.html:ro
       - ./static/session-viewer.html:/app/static/session-viewer.html:ro

@@ -453,74 +453,97 @@ export class SessionVideoRecorder {
         const msgs = this._subtitleMessages;
         if (msgs.length === 0) return;
 
-        const padding = Math.round(fontSize * 0.5);
-        const lineHeight = Math.round(fontSize * 1.4);
-        const maxTextWidth = w - padding * 6;
-        const msgGap = Math.round(fontSize * 0.35);
-        const radius = Math.round(fontSize * 0.4);
-        const maxBgWidth = Math.min(w - padding * 2, maxTextWidth + padding * 3);
-
-        ctx.font = `${fontSize}px -apple-system, "Segoe UI", Roboto, sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-
-        // Pre-compute each message's wrapped lines and block height
-        /** @type {Array<{lines: string[], blockH: number, msgIdx: number}>} */
-        const blocks = [];
-        for (let i = 0; i < msgs.length; i++) {
-            if (!msgs[i].text) continue;
-            const lines = this._wrapText(ctx, msgs[i].text, maxTextWidth);
-            blocks.push({
-                lines,
-                blockH: lines.length * lineHeight + padding * 2,
-                msgIdx: i,
-            });
-        }
-        if (blocks.length === 0) return;
-
-        // Draw from bottom to top, limited to subtitle area.
-        // Opacity is based on Y position (like CSS mask-image gradient):
-        //   bottom edge → opacityBottom,  ceiling → opacityTop
+        // 字幕区（从底部 subtitleHeight% 处向上）—— 长文本完整显示都装在这里
         const bottomMargin = Math.round(fontSize * 0.6);
         const subtitleFloor = h - bottomMargin;
         const subtitleCeiling = h - Math.round(h * this._subtitleHeight / 100);
-        const areaHeight = subtitleFloor - subtitleCeiling;
-        let curY = subtitleFloor;
+        const areaHeight = Math.max(10, subtitleFloor - subtitleCeiling);
 
-        /** Map a Y coordinate to opacity via linear gradient across the subtitle area. */
+        // 取要显示的文本：当前活跃(active, 正在说)那条必须完整显示（可能几百字）；
+        // 已固化的旧消息按需补充，空间不足时会被下方"超高即停"跳过。
+        // 若没有 active（两轮间隙），显示最近一条固化文本。
+        let texts = [];
+        const activeIdx = msgs.findIndex(m => m.active && m.text);
+        if (activeIdx >= 0) {
+            texts.push({ text: msgs[activeIdx].text, active: true });
+            // 补充 active 之前 1-2 条固化（历史），供上下文
+            for (let i = activeIdx - 1; i >= 0 && texts.length < 3; i--) {
+                if (msgs[i].text) texts.push({ text: msgs[i].text, active: false });
+            }
+        } else {
+            for (let i = msgs.length - 1; i >= 0 && texts.length < 2; i--) {
+                if (msgs[i].text) texts.push({ text: msgs[i].text, active: false });
+            }
+        }
+        if (texts.length === 0) return;
+
+        // ── 字号自适应：保证最长文本能在字幕区完整装下 ──
+        // 先用基础字号测每行能放多少字，若总行数超出字幕区可容纳行数，等比缩小字号。
+        // 逐级估算避免多次 measureText（成本高）。中文/英文混合按平均字宽近似。
+        let size = fontSize;
+        const longest = texts.reduce((a, b) => (b.text.length > a.text.length ? b : a), texts[0]);
+        // 最多重试几次缩小，防止极端长文本缩到过小（下限 11px）
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const pad = Math.round(size * 0.5);
+            const lineH = Math.round(size * 1.4);
+            const maxTextW = w - pad * 6;
+            ctx.font = `${size}px -apple-system, "Segoe UI", Roboto, sans-serif`;
+            // 估算每行字符数：CJK 每字≈size，拉丁≈size*0.55，取保守 0.65
+            const charsPerLine = Math.max(1, Math.floor(maxTextW / (size * 0.65)));
+            // 换行（用真实 measure 更准，但几百字逐字测成本高；折中用每行 cap）
+            const lineCount = texts.reduce((acc, t) => {
+                const rows = Math.max(1, Math.ceil(t.text.length / charsPerLine));
+                return acc + rows;
+            }, 0);
+            const totalBlockH = texts.length * lineH * 0 + lineCount * lineH + pad * 2 * texts.length;
+            if (totalBlockH <= areaHeight || size <= 11) break;
+            size = Math.max(11, Math.round(size * areaHeight / Math.max(1, totalBlockH)));
+        }
+
+        // 用最终字号做真实换行（不限行数，完整显示）
+        const padding = Math.round(size * 0.5);
+        const lineHeight = Math.round(size * 1.4);
+        const maxTextWidth = w - padding * 6;
+        const msgGap = Math.round(size * 0.35);
+        const radius = Math.round(size * 0.4);
+        const maxBgWidth = Math.min(w - padding * 2, maxTextWidth + padding * 3);
+        ctx.font = `${size}px -apple-system, "Segoe UI", Roboto, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+
+        // 每条换行（不限行数，完整显示几百字）
+        const blocks = [];
+        for (const t of texts) {
+            const lines = this._wrapText(ctx, t.text, maxTextWidth, 0);   // maxLines=0 不截断
+            blocks.push({ lines, blockH: lines.length * lineHeight + padding * 2, active: t.active });
+        }
+
+        // 从底部往上画，超出字幕区天花板则停止（不再硬截断单条文本）
         const opacityAtY = (y) => {
-            const t = areaHeight > 0
-                ? Math.max(0, Math.min(1, (subtitleFloor - y) / areaHeight))
-                : 0;
-            return this._subtitleOpacityBottom
-                + t * (this._subtitleOpacityTop - this._subtitleOpacityBottom);
+            const tt = areaHeight > 0 ? Math.max(0, Math.min(1, (subtitleFloor - y) / areaHeight)) : 0;
+            return this._subtitleOpacityBottom + tt * (this._subtitleOpacityTop - this._subtitleOpacityBottom);
         };
 
+        let curY = subtitleFloor;
         for (let bi = blocks.length - 1; bi >= 0; bi--) {
             const block = blocks[bi];
             const blockTop = curY - block.blockH;
-
-            // Don't draw if block extends above the subtitle area ceiling
-            if (blockTop < subtitleCeiling) break;
+            if (blockTop < subtitleCeiling) break;   // 超出字幕区则不画（但单条已完整换行不会截断）
 
             const bgX = (w - maxBgWidth) / 2;
             const textStartY = blockTop + padding;
-
-            // Background pill — opacity based on block's vertical midpoint
             const midY = blockTop + block.blockH / 2;
             const bgOpacity = opacityAtY(midY);
             ctx.fillStyle = `rgba(0, 0, 0, ${(0.55 * bgOpacity).toFixed(2)})`;
             this._roundRect(ctx, bgX, blockTop, maxBgWidth, block.blockH, radius);
             ctx.fill();
 
-            // Text lines — each line gets its own position-based opacity
             for (let li = 0; li < block.lines.length; li++) {
                 const lineY = textStartY + li * lineHeight;
                 const lineOpacity = opacityAtY(lineY);
                 ctx.fillStyle = `rgba(255, 255, 255, ${lineOpacity.toFixed(2)})`;
                 ctx.fillText(block.lines[li], w / 2, lineY);
             }
-
             curY = blockTop - msgGap;
         }
     }
@@ -533,7 +556,7 @@ export class SessionVideoRecorder {
      * @param {number} maxWidth
      * @returns {string[]}
      */
-    _wrapText(ctx, text, maxWidth) {
+    _wrapText(ctx, text, maxWidth, maxLines = 0) {
         const lines = [];
         let current = '';
 
@@ -549,9 +572,10 @@ export class SessionVideoRecorder {
         }
         if (current) lines.push(current);
 
-        // Limit to 4 lines to avoid covering too much video
-        if (lines.length > 4) {
-            return lines.slice(lines.length - 4);
+        // maxLines>0 时截断到最近 maxLines 行（旧逻辑 4 行硬截断会丢长文本内容）；
+        // maxLines=0 表示不限行数（供长字幕完整显示，配合字号自适应控制高度）。
+        if (maxLines > 0 && lines.length > maxLines) {
+            return lines.slice(lines.length - maxLines);
         }
         return lines;
     }
