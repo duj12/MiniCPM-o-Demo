@@ -224,11 +224,11 @@ export class SessionVideoRecorder {
         const msgs = this._subtitleMessages;
         const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
         if (last && last.active) {
-            last.text = text;
+            last.text = text;   // 同一轮内流式更新
         } else {
+            // 新一轮开始：清掉上一轮的消息，只显示当前这轮（避免多轮堆叠挤压字号）
+            msgs.length = 0;
             msgs.push({ text, active: true });
-            // Trim old messages to prevent unbounded growth (visual limit is height %)
-            while (msgs.length > 20) msgs.shift();
         }
     }
 
@@ -459,20 +459,13 @@ export class SessionVideoRecorder {
         const subtitleCeiling = h - Math.round(h * this._subtitleHeight / 100);
         const areaHeight = Math.max(10, subtitleFloor - subtitleCeiling);
 
-        // 取要显示的文本：当前活跃(active, 正在说)那条必须完整显示（可能几百字）；
-        // 已固化的旧消息按需补充，空间不足时会被下方"超高即停"跳过。
-        // 若没有 active（两轮间隙），显示最近一条固化文本。
-        let texts = [];
-        const activeIdx = msgs.findIndex(m => m.active && m.text);
-        if (activeIdx >= 0) {
-            texts.push({ text: msgs[activeIdx].text, active: true });
-            // 补充 active 之前 1-2 条固化（历史），供上下文
-            for (let i = activeIdx - 1; i >= 0 && texts.length < 3; i--) {
-                if (msgs[i].text) texts.push({ text: msgs[i].text, active: false });
-            }
-        } else {
-            for (let i = msgs.length - 1; i >= 0 && texts.length < 2; i--) {
-                if (msgs[i].text) texts.push({ text: msgs[i].text, active: false });
+        // 只显示当前轮：取最后一条（setSubtitleText 已清空旧轮，msgs 只有当前这轮）。
+        // 若最后一轮已固化（说话结束到下一轮间隙），仍保留显示直到新轮到来。
+        const texts = [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].text) {
+                texts.push({ text: msgs[i].text, active: !!msgs[i].active });
+                break;   // 只显示最后一条（当前轮）
             }
         }
         if (texts.length === 0) return;
