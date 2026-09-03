@@ -51,6 +51,8 @@ export class SessionVideoRecorder {
         this._subtitleHeight = 25;          // % of canvas height from bottom
         this._subtitleOpacityBottom = 0.9;
         this._subtitleOpacityTop = 0.15;
+        this._subtitleHoldMs = 3000;        // 固化后停留时长(ms)，到期无新字幕则消失
+        this._subtitleEndAt = 0;            // 最近一次固化时间（performance.now）
     }
 
     get recording() { return this._recording; }
@@ -243,6 +245,9 @@ export class SessionVideoRecorder {
         const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
         if (last && last.active) {
             last.active = false;
+            // 记录固化时间：字幕再停留 _subtitleHoldMs（3s）后淡出，
+            // 期间若有新一轮字幕来则被 setSubtitleText 立即替换。
+            this._subtitleEndAt = performance.now();
         }
     }
 
@@ -459,12 +464,21 @@ export class SessionVideoRecorder {
         const subtitleCeiling = h - Math.round(h * this._subtitleHeight / 100);
         const areaHeight = Math.max(10, subtitleFloor - subtitleCeiling);
 
-        // 只显示当前轮：取最后一条（setSubtitleText 已清空旧轮，msgs 只有当前这轮）。
-        // 若最后一轮已固化（说话结束到下一轮间隙），仍保留显示直到新轮到来。
+        // 只显示当前轮（setSubtitleText 已清空旧轮，msgs 只有当前这轮）。
+        // - active（正在说）：一直画
+        // - 已固化（本轮结束）：停留 _subtitleHoldMs 后淡出；有新轮 setSubtitleText 立即替换
         const texts = [];
         for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].text) {
-                texts.push({ text: msgs[i].text, active: !!msgs[i].active });
+                const active = !!msgs[i].active;
+                if (!active) {
+                    // 固化字幕：未到停留时长才画，超过则消失
+                    const heldMs = performance.now() - this._subtitleEndAt;
+                    if (this._subtitleEndAt > 0 && heldMs > this._subtitleHoldMs) {
+                        return;   // 停留到期且无新字幕 → 不画
+                    }
+                }
+                texts.push({ text: msgs[i].text, active });
                 break;   // 只显示最后一条（当前轮）
             }
         }
