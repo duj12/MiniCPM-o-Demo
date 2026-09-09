@@ -46,6 +46,40 @@ from streaming_chat_demo import (
 
 SAMPLE_RATE = 16000
 
+# ── 内容 token 判定（算置信度时过滤停用词/格式）──
+# 常见中文功能词 + 格式符号 + 英文停用词。delta 文本若整体落在这些里则跳过其概率
+# （内容词的几何平均置信度更接近"描述准不准"，不受"的/是/了"高频词拉高）。
+STOPWORD_SET = set("""
+的了是在我和你有他她它这那与就也都还很一个一下等被把让对从向为以于却而或及到过样些最更并
+然后因为所以如果还是可是不过但是可以应该能够需要咱们我们你们他们它很正每各另再又次
+this that these those is are was were be been am do does did have has had will would
+can could should may might must a an the of to and or in on at it its for as by with
+from not no yes but if then than so such
+""".split())
+# 格式/符号 token（大概率是换行、标点、markdown、数字列表）
+_FORMAT_CHARS = set("【】()（）：:，,。.、-—*#`~!！?？ \n\t\"'…")
+
+
+def _is_content_token(text: str) -> bool:
+    """判定一个 delta 文本片段是否算内容词（非停用词/格式）。
+
+    中文功能词多为独立 token，可直接命中停用词表。格式/标点/纯符号跳过。
+    片段若含任何内容性中文字符（非停用）则视为内容。
+    """
+    if not text:
+        return False
+    # 纯格式/符号/空白 → 跳过
+    if all(ch in _FORMAT_CHARS or ch.isspace() for ch in text):
+        return False
+    # 数字列表标记（"1."、"- "、"3）"）→ 跳过
+    stripped = text.strip(" \n\t-—*#.。、()（）0123456789")
+    if not stripped:
+        return False
+    # 整个片段是停用词 → 跳过；含其他字 → 内容
+    if stripped in STOPWORD_SET:
+        return False
+    return True
+
 DEFAULT_PROMPT = """你是一个视频监控/行为分析助手。请综合画面与语音，输出视频的结构化描述。
 要求：只描述画面中实际可见、语音中实际可闻的信息；不确定的写"不可见/不确定"，绝不编造。
 优先级：P0 为必答核心，P1 尽量回答，P2 在信息可见时回答。
@@ -158,7 +192,10 @@ async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
         print("\n  ── 描述 ── ", end="", flush=True)
         await ws.send(json.dumps({"type": "input.append", "input": inp}))
 
-        # 收事件流式打印
+        # 收事件流式打印 + 记录每 token 概率
+        full_text = ""
+        logprobs: List[float] = []   # 内容 token 的 log prob
+        probs_all: List[tuple] = []  # (文本片段, prob) 供调试
         done = False
         while not done:
             try:
@@ -168,10 +205,26 @@ async def run_turnbased(url: str, ssl_ctx, video_path: str, audio_path: str,
                 break
             t = ev.get("type")
             if t == "response.output.delta" and ev.get("kind") == "text":
-                print(ev.get("text", ""), end="", flush=True)
+                txt = ev.get("text", "")
+                print(txt, end="", flush=True)
+                full_text += txt
+                prob = ev.get("prob")
+                if isinstance(prob, (int, float)) and 0 < prob <= 1:
+                    probs_all.append((txt, float(prob)))
+                    if _is_content_token(txt):
+                        logprobs.append(np.log(float(prob)))
             elif t in ("response.done", "session.closed", "error"):
                 done = True
         print()
+
+        # 整句置信度 = exp(mean(ln(prob)))，只统计内容 token（几何平均，消除长度影响）
+        if logprobs:
+            conf = np.exp(sum(logprobs) / len(logprobs))
+            print(f"\n  [置信度] {conf:.3f} (内容token {len(logprobs)}/{len(probs_all)}, "
+                  f"几何平均置信度 0~1)")
+        if probs_all:
+            low = sorted(probs_all, key=lambda x: x[1])[:5]
+            print("  [低置信片段] " + " | ".join(f"\"{t}\"={p:.2f}" for t, p in low))
 
 
 def _ssl_ctx_noverify():
