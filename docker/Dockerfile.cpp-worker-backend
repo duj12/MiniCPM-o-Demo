@@ -37,7 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # CACHE_BUST：git clone 层缓存命中会导致 remote 新 commit 不生效（buildkit 按命令串
 # 判缓存），每次 build 传不同 CACHE_BUST（如时间戳）强制重新 clone + 重编。
 ARG CACHE_BUST
-RUN git clone --depth 1 -b ${LLAMA_OMNI_REFSPEC} ${LLAMA_OMNI_REPO} /src/llama.cpp-omni \
+# HTTP/1.1: 部分网络对 github 的 HTTP2 有 framing bug（RPC failed / HTTP2 framing layer），
+# 降级 HTTP1.1 稳定 clone。
+RUN git -c http.version=HTTP/1.1 clone --depth 1 -b ${LLAMA_OMNI_REFSPEC} ${LLAMA_OMNI_REPO} /src/llama.cpp-omni \
     && echo "cache_bust=${CACHE_BUST}" > /src/llama.cpp-omni/CACHE_BUST
 
 WORKDIR /src/llama.cpp-omni
