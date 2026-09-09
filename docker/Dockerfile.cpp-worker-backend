@@ -32,15 +32,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# 构建时从 git 拉取 llama.cpp-omni 源码（不再依赖本地 docker/llama.cpp-omni 同步目录）。
-# 默认 duj12/dev 分支，可用 --build-arg LLAMA_OMNI_REPO / LLAMA_OMNI_REFSPEC 覆盖。
-# CACHE_BUST：git clone 层缓存命中会导致 remote 新 commit 不生效（buildkit 按命令串
-# 判缓存），每次 build 传不同 CACHE_BUST（如时间戳）强制重新 clone + 重编。
-ARG CACHE_BUST
-# HTTP/1.1: 部分网络对 github 的 HTTP2 有 framing bug（RPC failed / HTTP2 framing layer），
-# 降级 HTTP1.1 稳定 clone。
-RUN git -c http.version=HTTP/1.1 clone --depth 1 -b ${LLAMA_OMNI_REFSPEC} ${LLAMA_OMNI_REPO} /src/llama.cpp-omni \
-    && echo "cache_bust=${CACHE_BUST}" > /src/llama.cpp-omni/CACHE_BUST
+# 源码来源：构建机本地 llama.cpp-omni-dev/（宿主机 clone duj12/dev 后构建）。
+# 不在容器内 git clone —— 部分网络到 github 不稳定（HTTP2/TLS 反复断开），
+# 容器内 clone 经常失败。由 build-image.sh 先确保 llama.cpp-omni-dev/ 存在。
+# LLAMA_OMNI_REFSPEC 保留作文档说明（实际用本地目录）。
+ARG LLAMA_OMNI_REFSPEC=dev
+COPY .llama-src/ /src/llama.cpp-omni
 
 WORKDIR /src/llama.cpp-omni
 

@@ -31,14 +31,33 @@ for arg in "$@"; do
 done
 
 BUNDLE_DIR=".bundle-checkpoints"
+LLAMA_SRC_DIR=".llama-src"
+# 默认源码目录（宿主机 clone 的 duj12/dev，含最新代码）；可用 --llama-src 覆盖
+DEFAULT_LLAMA_SRC="../llama.cpp-omni-dev"
+LLAMA_SRC="${LLAMA_SRC:-$DEFAULT_LLAMA_SRC}"
 
 cleanup() {
     if [ -d "$BUNDLE_DIR" ]; then
         echo "[build-image] cleaning $BUNDLE_DIR"
         rm -rf "$BUNDLE_DIR"
     fi
+    if [ -d "$LLAMA_SRC_DIR" ]; then
+        echo "[build-image] cleaning $LLAMA_SRC_DIR"
+        rm -rf "$LLAMA_SRC_DIR"
+    fi
 }
 trap cleanup EXIT
+
+# 源码进构建上下文（.llama-src/，Dockerfile COPY 它）。不在容器内 git clone
+# —— 部分网络到 github 不稳，容器内 clone 常失败。宿主机 clone 后传进来。
+if [ ! -d "$LLAMA_SRC" ]; then
+    echo "[build-image] ERROR: llama source not found at $LLAMA_SRC (host clone duj12/dev first)" >&2
+    exit 1
+fi
+echo "[build-image] staging llama source from $LLAMA_SRC ..."
+mkdir -p "$LLAMA_SRC_DIR"
+cp -r "$LLAMA_SRC"/. "$LLAMA_SRC_DIR"/
+echo "[build-image]   llama source staged ($(du -sh "$LLAMA_SRC_DIR" | cut -f1))"
 
 build_args=(
     --build-arg "CACHE_BUST=${CACHE_BUST}"
