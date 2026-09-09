@@ -77,6 +77,33 @@ FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 1600
 CHUNK_MS = 1000                                       # 默认音频块节奏（1s，并发/实时模式用）
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000        # 16000
 
+# ── 内容 token 判定（算置信度时过滤停用词/格式）──
+# 中文功能词 + 英文停用词；格式/标点/markdown/数字列表跳过。
+# 只统计内容词的几何平均置信度，不受"的/是/了"高频词拉高。
+STOPWORD_SET = set("""
+的了是在我和你有他她它这那与就也都还很一个一下等被把让对从向为以于却而或及到过样些最更并
+然后因为所以如果还是可是不过但是可以应该能够需要咱们我们你们他们它很正每各另再又次
+this that these those is are was were be been am do does did have has had will would
+can could should may might must a an the of to and or in on at it its for as by with
+from not no yes but if then than so such
+""".split())
+# 格式/符号 token（换行、标点、markdown、数字列表等）
+_FORMAT_CHARS = set("【】()（）：:，,。.、-—*#`~!！?？ \n\t\"'…")
+
+
+def _is_content_token(text: str) -> bool:
+    """delta 文本片段是否算内容词（非停用词/格式）。中文功能词多为独立 token 可命中。"""
+    if not text:
+        return False
+    if all(ch in _FORMAT_CHARS or ch.isspace() for ch in text):
+        return False
+    stripped = text.strip(" \n\t-—*#.。、()（）0123456789")
+    if not stripped:
+        return False
+    if stripped in STOPWORD_SET:
+        return False
+    return True
+
 # ── 视频描述模式（--describe）的 system prompt ──
 # full_duplex 的 system prompt 每轮都会作为 prompt 前缀（cumulative_prompt 以它开头），
 # 所以把它设为"只描述画面"能让 VAD 触发生成描述而非对话回复（KV 热累积 + 秒级首字）。
@@ -135,6 +162,7 @@ class TurnMetrics:
     model_state: str = ""                 # listening / speaking
     reply_text: str = ""                  # 完整回复文本
     is_done: bool = False                 # 已收到 response.done（回复完整）
+    confidence: Optional[float] = None    # 整句置信度（内容 token 几何平均，0~1）
 
     @property
     def summary(self) -> str:
@@ -142,11 +170,12 @@ class TurnMetrics:
         # speed_cps=0 表示样本不足以测速（见 TurnTracker._finish_turn），
         # 打 N/A 而不是 0ch/s，避免和"真的很慢"混淆。
         spd_str = f"{self.speed_cps:.0f}ch/s" if self.speed_cps > 0 else "速度N/A"
+        conf_str = f" conf={self.confidence:.2f}" if self.confidence is not None else ""
         return (
             f"turn#{self.turn_idx}: TTFT={ttft_str} "
             f"in_audio={self.in_audio_s:.1f}s in_video={self.in_video_s:.1f}s "
             f"reply={self.reply_s:.1f}s ({self.reply_chars}ch, "
-            f"{spd_str}) state={self.model_state}"
+            f"{spd_str}{conf_str}) state={self.model_state}"
         )
 
 
@@ -299,6 +328,7 @@ class StreamingChatClient:
         self._mark_video = 0.0
         self._cur_audio_s = 0.0
         self._cur_video_s = 0.0
+        self._token_probs: List[tuple] = []   # 本轮 (文本片段, prob)，算置信度
         # 事件自带 server_send_ts（后端 epoch 秒）。折算到本地单调基准：
         #   monotonic ≈ server_epoch + offset
         # 并发下客户端 event loop 会被多路挤压，本地到达时刻失真；用服务端
@@ -548,6 +578,11 @@ class StreamingChatClient:
             # 是几千 ch/s 的假值，宁可不报。
             if self._n_deltas >= 2 and m.reply_s >= 0.05:
                 m.speed_cps = m.reply_chars / m.reply_s
+        # 整句置信度 = exp(mean(ln(prob)))，停用词/格式过滤后几何平均（0~1）
+        if self._token_probs:
+            logps = [np.log(p) for txt, p in self._token_probs if _is_content_token(txt)]
+            if logps:
+                m.confidence = float(np.exp(sum(logps) / len(logps)))
         self.metrics.append(m)
         if self.on_turn is not None:
             self.on_turn(m)      # 每轮即时回调（并发下打印带路前缀的 summary）
@@ -561,6 +596,7 @@ class StreamingChatClient:
         self._first_delta_at = None
         self._text = ""
         self._n_deltas = 0
+        self._token_probs = []
         self._printing = False
 
     def handle_event(self, ev: dict) -> bool:
@@ -607,6 +643,10 @@ class StreamingChatClient:
                         self._first_delta_at = self._ev_mono(ev) or time.monotonic()
                     self._n_deltas += 1
                     self._text += txt
+                    # 收 token 概率（后端 n_probs>0 时 TEXT_DELTA 带 prob 0~1）
+                    _p = ev.get("prob")
+                    if isinstance(_p, (int, float)) and 0 < _p <= 1:
+                        self._token_probs.append((txt, float(_p)))
                     if self.echo:
                         if not self._printing:
                             self._printing = True
