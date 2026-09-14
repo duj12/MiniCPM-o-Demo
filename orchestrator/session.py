@@ -85,6 +85,11 @@ class OrchestratorSession:
         # 供 barge-in 用的原始 mic 旁路（不经过 AEC 的环形缓冲）
         self._raw_recent: Deque[float] = deque(maxlen=8)
 
+        # 指标（生产环境没有观测就是瞎子）
+        from .metrics import SessionMetrics
+        self.metrics = SessionMetrics(session_id)
+        self._mark_audio_t0: Optional[float] = None
+
     # ------------------------------------------------------------------ #
     #  浏览器侧输入
     # ------------------------------------------------------------------ #
@@ -103,6 +108,8 @@ class OrchestratorSession:
         frame = self.clock.frame_of(x)
         self.stats["audio_chunks_in"] += 1
         self.stats["audio_samples_in"] += frame.n_samples
+        self.metrics.inc("audio_chunks")
+        self.metrics.inc("audio_samples", frame.n_samples)
 
         # 原始 mic 旁路：barge-in 检测用，零额外延迟
         self._raw_recent.append(float(np.sqrt(np.mean(x ** 2))))
@@ -209,6 +216,11 @@ class OrchestratorSession:
         def on_audio(seg: np.ndarray) -> None:
             self.stats["aec_segments_out"] += 1
             self.stats["aec_samples_out"] += int(np.asarray(seg).size)
+            self.metrics.inc("aec_segments")
+            # 首窗延迟（相对会话开始收音频）
+            lat = self.aec.first_result_latency_ms() if self.aec else None
+            if lat is not None and self.metrics.aec_first_window.count == 0:
+                self.metrics.aec_first_window.record(lat)
             # 从非 asyncio 上下文回投
             try:
                 self._aec_out_q.put_nowait(np.asarray(seg).reshape(-1))
@@ -387,6 +399,28 @@ class OrchestratorSession:
 
     def post_downstream(self, ev) -> None:
         """投递事件给下游。满时丢弃并计数（本阶段用无界策略：丢最旧）。"""
+        # 指标：按事件类型统一计数（比在各回调里散着打点更不易漏）
+        k = getattr(ev, "kind", None)
+        if k == "asr.partial":
+            self.metrics.inc("asr_partials")
+        elif k == "asr.final":
+            self.metrics.inc("asr_finals")
+        elif k == "asr.turnsense":
+            self.metrics.inc("asr_turnsense")
+        elif k == "omni.delta":
+            self.metrics.inc("omni_deltas")
+        elif k == "omni.done":
+            self.metrics.inc("omni_dones")
+        elif k == "omni.turnsense":
+            self.metrics.inc("omni_turnsense")
+        elif k == "face.wake":
+            self.metrics.inc("face_wakes")
+        elif k == "face.lip":
+            self.metrics.inc("face_lips")
+        elif k == "face.identity":
+            self.metrics.inc("face_identities")
+        elif k == "playback":
+            self.metrics.inc("playback_receipts")
         try:
             self._down_q.put_nowait(ev)
         except asyncio.QueueFull:
@@ -551,6 +585,11 @@ class OrchestratorSession:
             f"时钟 {self.clock.seconds():.1f}s，"
             f"漂移 {self.clock.drift_samples()} 采样"
         ]
+        # 关键指标一行摘要
+        try:
+            lines.append(f"  指标: {self.metrics.summary_line()}")
+        except Exception:  # noqa: BLE001
+            pass
         for k, v in self.stats.items():
             lines.append(f"  {k}: {v}")
         if self.aec is not None:

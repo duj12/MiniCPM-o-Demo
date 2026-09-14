@@ -106,6 +106,12 @@ async def _shutdown_session(sess: OrchestratorSession, sid: str,
         await sess.close("client_disconnect")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[%s] 关闭异常: %s", sid, exc)
+    # 汇总到全局指标
+    try:
+        from orchestrator.metrics import GLOBAL
+        GLOBAL.on_end(sess.metrics, failed=bool(sess.error))
+    except Exception:  # noqa: BLE001
+        pass
     logger.info("[%s] 会话结束\n%s", sid, sess.summary())
 
 
@@ -289,6 +295,8 @@ async def handle_client(ws, cfg: Settings) -> None:
 
         await sess.start()
         REGISTRY.add(sid, sess)
+        from orchestrator.metrics import GLOBAL
+        GLOBAL.on_start()
         await send_to_client(SessionReady(session_id=sid))
 
         # ---- 后台任务 ----
@@ -410,6 +418,15 @@ def create_app(cfg: Settings):
     @app.get("/stats")
     async def stats():
         return REGISTRY.stats()
+
+    @app.get("/metrics")
+    async def metrics_endpoint():
+        """指标导出。生产可接 Prometheus 抓取，或供人工排查。"""
+        from orchestrator.metrics import GLOBAL
+        return {
+            "global": GLOBAL.snapshot(),
+            "active": REGISTRY.stats(),
+        }
 
     # 注意：参数**不能**写字符串注解 —— 旧版 FastAPI（0.88）会把它当成
     # 查询参数去解析，握手直接 403。直接用真实类型。

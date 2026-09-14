@@ -80,6 +80,8 @@ class ActionExecutor:
             response_id=response_id, text=act.text, sample_rate=TTS_SR,
         ))
 
+        import time as _time
+        t_synth0 = _time.monotonic()
         try:
             pcm24 = await session.tts.synthesize(
                 act.text, tts_type=act.tts_type, speaker_id=act.speaker_id,
@@ -94,6 +96,10 @@ class ActionExecutor:
             return
         finally:
             self._speak_inflight -= 1
+        # 指标：合成耗时与音频时长
+        if session.metrics is not None:
+            session.metrics.tts_total.record((_time.monotonic() - t_synth0) * 1000)
+            session.metrics.inc("tts_calls")
 
         if pcm24 is None or len(pcm24) == 0:
             logger.warning("TTS 返回空音频")
@@ -120,6 +126,8 @@ class ActionExecutor:
                          response_id, ctx_time, len(pcm24))
 
         self.speaks_done += 1
+        if session.metrics is not None:
+            session.metrics.inc("tts_audio_s", int(len(pcm24) / TTS_SR))
         logger.info("TTS 完成 response=%s 文本 %d 字 音频 %.2fs",
                     response_id, len(act.text), len(pcm24) / TTS_SR)
 
