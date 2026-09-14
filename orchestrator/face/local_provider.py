@@ -182,7 +182,9 @@ def load_face_service(model_dir: str, db_path: str, gpu_id: int = 0,
     """
     try:
         import sys
-        fi_root = Path(__file__).resolve().parents[4] / "faceidentification"
+        # parents[3] = code/ 层（faceidentification 与本仓库同层）
+        # 曾误写成 parents[4]，会解析到 Projects/DuJing/ 下而找不到仓库
+        fi_root = Path(__file__).resolve().parents[3] / "faceidentification"
         if not fi_root.is_dir():
             return None, f"faceidentification 仓库不存在: {fi_root}"
         if str(fi_root) not in sys.path:
