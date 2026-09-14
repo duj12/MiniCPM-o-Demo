@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
+import numpy as np  # noqa: F401  (类型注解与调用方都用到)
 
 SR = 16000  # 全链路统一采样率
 
@@ -54,12 +54,20 @@ class SampleClock:
     换算到会话采样轴。
     """
 
-    __slots__ = ("sr", "_t", "t_wall0")
+    __slots__ = ("sr", "_t", "_t_wall0")
 
     def __init__(self, sr: int = SR) -> None:
         self.sr = sr
         self._t = 0
-        self.t_wall0 = time.monotonic()
+        # ⚠️ 墙钟锚点**不在构造时设** —— 会话构造与开始收流之间可能隔很久
+        # （连接外部服务、握手），那段时间不该算进漂移。改为在**第一块
+        # 音频**到达时锚定（见 start()）。
+        self._t_wall0: Optional[float] = None
+
+    def start(self) -> None:
+        """锚定墙钟起点（收到第一块音频时调用）。"""
+        if self._t_wall0 is None:
+            self._t_wall0 = time.monotonic()
 
     def advance(self, n: int) -> int:
         """推进 n 个采样，返回推进**后**的位置（即 t1）。"""
@@ -76,18 +84,24 @@ class SampleClock:
         return self._t / self.sr
 
     def wall_elapsed(self) -> float:
-        return time.monotonic() - self.t_wall0
+        if self._t_wall0 is None:
+            return 0.0
+        return time.monotonic() - self._t_wall0
 
     def drift_samples(self) -> int:
         """采样轴与墙钟的偏差（采样数）。正值 = 时钟落后于实时。
 
         长会话里这个值应保持在一个小常数附近；持续增长说明有数据丢失
-        （调用方没补静音）或积压。
+        （调用方没补静音）或积压。未开始收流时返回 0。
         """
+        if self._t_wall0 is None:
+            return 0
         return int(self.wall_elapsed() * self.sr) - self._t
 
     def frame_of(self, data: np.ndarray) -> AudioFrame:
         """把一段数据登记到时间轴上，返回带 t0/t1 的帧。"""
+        if self._t_wall0 is None:
+            self.start()
         t0 = self._t
         self.advance(data.shape[1])
         return AudioFrame(t0=t0, data=data)

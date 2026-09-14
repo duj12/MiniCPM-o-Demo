@@ -80,10 +80,14 @@ class AecClient:
         self.enable_aec = enable_aec
         self.max_chunk = max_chunk
 
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws = None
         self.ready = False
         self.closed = False
         self.error: Optional[str] = None
+        # 收尾状态：drain() 发 is_end 后置 _drained；recv_loop 收到
+        # stream_end 后置 _stream_ended（drain 轮询它来判断尾部是否收全）
+        self._drained = False
+        self._stream_ended = False
 
         # 统计
         self.chunks_sent = 0
@@ -173,6 +177,7 @@ class AecClient:
                     msg = json.loads(raw)
                     mtype = msg.get("type")
                     if mtype == "stream_end":
+                        self._stream_ended = True
                         logger.info("AEC: stream_end（chunks_sent=%d）", self.chunks_sent)
                         return
                     if mtype == "error":
@@ -203,27 +208,50 @@ class AecClient:
 
     # ------------------------------------------------------------------ #
 
-    async def close(self, send_end: bool = True) -> None:
-        """优雅关闭：发 is_end 触发服务端 flush + 状态复位，再关连接。"""
+    async def drain(self, timeout: float = 10.0) -> bool:
+        """发 ``is_end`` 触发服务端 flush，并等 ``stream_end`` 回来。
+
+        ⚠️ 与 ASR 同理：发完 ``is_end`` **不能立刻关连接** —— 服务端还要
+        把缓冲区里的尾部推理出来（AEC 是滑窗，尾部窗口尚未输出）。立刻关
+        会丢掉最后一窗，表现为样本比略小于 1（如 0.966）。
+
+        拆成两步：``drain()`` 收尾（可慢），``close()`` 断开（必须快）。
+        返回是否收到 ``stream_end``。
+        """
+        if self.ws is None or self._drained:
+            return False
+        self._drained = True
+        if self.chunks_sent > 0:
+            try:
+                silent = np.zeros((1, self.max_chunk), dtype=np.float32)
+                await asyncio.wait_for(self.push(silent, is_end=True), timeout=5.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("AEC 发送 is_end 失败: %s", exc)
+                return False
+        # 等 stream_end（recv_loop 收到时置 _stream_ended）
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if self._stream_ended:
+                logger.info("AEC 已收到 stream_end（%.1fs）", time.monotonic() - t0)
+                return True
+            await asyncio.sleep(0.05)
+        logger.warning("AEC 等待 stream_end 超时（%.1fs）", timeout)
+        return False
+
+    async def close(self, send_end: bool = False) -> None:
+        """关闭连接。**必须快** —— 收尾请先调 ``drain()``。"""
         if self.ws is None:
             return
         self.closed = True
-        if send_end and self.chunks_sent > 0:
-            try:
-                silent = np.zeros((1, self.max_chunk), dtype=np.float32)
-                await asyncio.wait_for(
-                    self.push(silent, is_end=True), timeout=5.0
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("AEC 发送 is_end 失败（忽略）: %s", exc)
         try:
             await self.ws.close()
         except Exception:  # noqa: BLE001
             pass
         logger.info(
-            "AEC 已关闭: sent=%d(%.1fs) recv=%d(%.1fs) frames=%d",
+            "AEC 已关闭: sent=%d(%.1fs) recv=%d(%.1fs) frames=%d 样本比=%.4f",
             self.chunks_sent, self.samples_sent / SR,
             self.samples_recv, self.samples_recv / SR, self.result_frames,
+            self.samples_recv / self.samples_sent if self.samples_sent else 0.0,
         )
 
     def first_result_latency_ms(self) -> Optional[float]:
