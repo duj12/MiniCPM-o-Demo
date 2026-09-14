@@ -10,7 +10,11 @@
          background: #111; color: #e6e6e6; }
   .wrap { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
   .col { flex: 1 1 380px; min-width: 320px; }
-  video, canvas { width: 100%; border-radius: 8px; background: #000; }
+  video { width: 100%; border-radius: 8px; background: #000; }
+  /* 视频 + 人脸叠加层 */
+  .stage { position: relative; line-height: 0; }
+  .stage canvas#overlay { position: absolute; inset: 0; width: 100%; height: 100%;
+                          border-radius: 8px; pointer-events: none; }
   button { padding: 10px 18px; font-size: 15px; border-radius: 8px;
            border: 1px solid #444; background: #2a2a2a; color: #e6e6e6;
            cursor: pointer; margin-right: 8px; }
@@ -34,9 +38,13 @@
 <body>
 <div class="wrap">
   <div class="col">
-    <h3>摄像头</h3>
-    <video id="cam" autoplay playsinline muted></video>
+    <h3>摄像头（人脸框叠加）</h3>
+    <div class="stage">
+      <video id="cam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
     <canvas id="cv" style="display:none"></canvas>
+    <div class="stats" id="faceinfo">人脸：等待中…</div>
     <div style="margin-top:12px">
       <button id="btnStart" class="primary">开始会话</button>
       <button id="btnSpeak">触发播报(测试)</button>
@@ -155,6 +163,73 @@ async function startCapture() {
   workletNode.port.postMessage({ command: 'start' });
 }
 
+/* ---------- 人脸叠加绘制 ----------
+ * G1 库的框坐标基于其处理分辨率（默认 640×480），需要映射到视频的
+ * 显示尺寸。视频是 object-fit 填充，这里按视频的自然宽高比等比换算。
+ */
+const G1_W = 640, G1_H = 480;
+function drawFace(m) {
+  const video = $('cam'), ov = $('overlay');
+  const w = video.clientWidth || 320;
+  const h = video.clientHeight || 240;
+  if (ov.width !== w || ov.height !== h) { ov.width = w; ov.height = h; }
+  const ctx = ov.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+
+  // 视频显示区与 G1 处理区的映射（保持宽高比，取较大缩放）
+  const sx = w / G1_W, sy = h / G1_H;
+
+  const t = (m.tracks && m.tracks[0]) || null;
+  const id = m.identity || null;
+  const wake = m.wake || null;
+
+  if (t && t.valid && t.box) {
+    const [l, tp, r, b] = t.box;
+    const x = l * sx, y = tp * sy;
+    const bw = (r - l) * sx, bh = (b - tp) * sy;
+
+    // 唤醒中：绿框；否则黄框
+    ctx.strokeStyle = t.interacting ? '#22c55e' : '#eab308';
+    ctx.lineWidth = t.interacting ? 3 : 2;
+    ctx.strokeRect(x, y, bw, bh);
+
+    // 标签：置信度 + 唇动 + 身份
+    const parts = [t.score.toFixed(2)];
+    if (t.speaking) parts.push('说话中');
+    else parts.push(t.lip || 'SILENT');
+    if (id && id.enrolled && id.name) parts.push(id.name);
+    else if (id && id.uid) parts.push('未注册');
+    if (t.interacting) parts.push('✓唤醒');
+    const label = parts.join(' · ');
+
+    ctx.font = '600 13px ui-monospace, monospace';
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(x, Math.max(0, y - 20), tw + 10, 19);
+    ctx.fillStyle = t.interacting ? '#86efac' : '#fde68a';
+    ctx.fillText(label, x + 5, Math.max(14, y - 6));
+  }
+
+  // 文本面板
+  const fi = $('faceinfo');
+  if (!t || !t.valid) {
+    fi.textContent = '人脸：未检测到';
+  } else {
+    fi.innerHTML =
+      `人脸：<b>检测到</b>  置信度 <b>${t.score.toFixed(3)}</b>  ` +
+      `唇动 <b>${t.speaking ? '说话中' : (t.lip || 'SILENT')}</b>  ` +
+      `唤醒 <b>${t.interacting ? '是' : '否'}</b>` +
+      (wake ? `  （最近唤醒 ${wake.phase} dwell=${wake.dwell_ms}ms）` : '') +
+      `<br>身份：` +
+      (id
+        ? (id.enrolled
+            ? `<b>${id.name || '?'}</b>  uid=${id.uid}  sim=${id.similarity}`
+            : `不在库（sim=${id.similarity}）`)
+        : '尚未识别');
+  }
+  if (t) evtCounts['face.state'] = (evtCounts['face.state'] || 0) + 1;
+}
+
 /* ---------- 统计 ---------- */
 let evtCounts = {};
 function refreshStats() {
@@ -187,7 +262,7 @@ $('btnStart').onclick = async () => {
         } else if (m.type === 'tts.start') {
           subEl.innerHTML += '<br><b>播报</b> ' + (m.text || '').slice(0, 80);
         } else if (m.type === 'face.state') {
-          log('m', 'face ' + JSON.stringify(m).slice(0, 120));
+          drawFace(m);
         } else if (m.type === 'error') {
           log('e', 'ERROR ' + m.code + ': ' + m.message);
         } else if (m.type === 'tts.audio') {

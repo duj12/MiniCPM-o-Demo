@@ -151,9 +151,15 @@ class AsrDisplay:
 
 @dataclass
 class FaceDisplay:
-    """人脸状态（仅 UI 显示）。"""
+    """人脸状态（仅 UI 显示，不参与控制流）。
+
+    ``tracks[0]`` 是主说话人：``{valid, box, score, speaking, lip,
+    interacting, person_id}``。``identity`` 是最近一次识别结果
+    （在库里才有 name/uid）。``wake`` 是最近一次唤醒事件。
+    """
     tracks: List[Dict[str, Any]] = field(default_factory=list)
     identity: Optional[Dict[str, Any]] = None
+    wake: Optional[Dict[str, Any]] = None
     type: Literal["face.state"] = "face.state"
 
 

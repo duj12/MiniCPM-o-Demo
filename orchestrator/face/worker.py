@@ -44,12 +44,16 @@ class FaceWorker:
     def __init__(self, provider, on_wake: Callable[[WakeEvent], None],
                  on_lip: Callable[[LipEvent], None],
                  on_identity: Optional[Callable[[IdentityEvent], None]] = None,
+                 on_obs: Optional[Callable[[FaceObservation], None]] = None,
                  queue_maxsize: int = 3,
                  lip_immediate_edge: bool = True) -> None:
         self.provider = provider
         self.on_wake = on_wake
         self.on_lip = on_lip
         self.on_identity = on_identity
+        # on_obs：每帧的原始观测，**仅供 UI 叠加显示**。
+        # 不进 downstream（那是控制流，25Hz 会把下游淹没）。
+        self.on_obs = on_obs
         self.lip_immediate_edge = lip_immediate_edge
 
         self._q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=queue_maxsize)
@@ -140,6 +144,10 @@ class FaceWorker:
         self._flush_lip_window()
 
     def _handle_observation(self, obs: FaceObservation) -> None:
+        # ---- UI 叠加（每帧，仅显示用）----
+        if self.on_obs is not None:
+            self._safe(self.on_obs, obs)
+
         # ---- 唤醒 ----
         if obs.interacting and not self._was_interacting:
             self._was_interacting = True

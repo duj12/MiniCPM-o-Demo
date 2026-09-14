@@ -234,6 +234,7 @@ def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
         on_wake=sess._face_cb("wake"),
         on_lip=sess._face_cb("lip"),
         on_identity=sess._face_cb("identity"),
+        on_obs=sess._face_cb("obs"),      # 每帧观测，供 UI 叠加
     )
     logger.info("人脸模块已装配（身份识别=%s）", svc is not None)
 

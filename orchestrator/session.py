@@ -323,15 +323,31 @@ class OrchestratorSession:
             except asyncio.TimeoutError:
                 continue
             kind, ev = item
-            if kind == "wake":
+            if kind == "obs":
+                # 每帧的人脸观测 → UI 叠加显示（人脸框/置信度/唇动/
+                # 身份/唤醒）。**不进 downstream** —— 那是控制流，
+                # 每帧 25Hz 投递会把下游淹没。控制信号走 wake/lip/identity。
+                self._last_face = {
+                    "valid": bool(ev.valid),
+                    "box": [round(v, 1) for v in ev.box] if ev.box else None,
+                    "score": round(ev.score, 3),
+                    "speaking": bool(ev.speaking),
+                    "lip": ev.lip_state,
+                    "interacting": bool(ev.interacting),
+                    "person_id": int(ev.person_id),
+                }
+                self._push_face_display()
+            elif kind == "wake":
                 self.post_downstream(FaceWake(
                     t=ev.t, phase=ev.phase, track_id=ev.track_id,
                     dwell_ms=ev.dwell_ms, mean_confidence=ev.mean_confidence,
                 ))
-                self._send_display(FaceDisplay(tracks=[{
-                    "phase": ev.phase, "score": round(ev.mean_confidence, 3),
-                    "box": ev.box,
-                }]))
+                self._last_wake = {
+                    "phase": ev.phase,
+                    "dwell_ms": int(ev.dwell_ms),
+                    "score": round(ev.mean_confidence, 3),
+                }
+                self._push_face_display()
             elif kind == "lip":
                 self.post_downstream(FaceLipState(
                     t0=ev.t0, t1=ev.t1, track_id=ev.track_id,
@@ -344,11 +360,31 @@ class OrchestratorSession:
                     uid=ev.uid, name=ev.name, similarity=ev.similarity,
                     is_enrolled=ev.is_enrolled,
                 ))
-                self._send_display(FaceDisplay(identity={
-                    "name": ev.name, "uid": ev.uid,
+                # 记住识别结果，后续每帧的 face.state 都带上（否则前端
+                # 只在识别那一瞬间能看到名字，之后又变回"未知"）
+                self._last_identity = {
+                    "name": ev.name, "uid": ev.uid, "person_id": ev.person_id,
                     "similarity": round(ev.similarity, 3),
-                    "enrolled": ev.is_enrolled,
-                }))
+                    "enrolled": bool(ev.is_enrolled),
+                }
+                self._push_face_display()
+
+    def _push_face_display(self) -> None:
+        """把最新的观测/唤醒/身份合成一条 face.state 发给 UI。
+
+        节流到 ~10Hz（人脸是 25fps，UI 不需要那么细）—— 每帧发会白占
+        带宽且前端画不过来。
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_face_push", 0.0) < 0.1:
+            return
+        self._last_face_push = now
+        from .protocol import FaceDisplay
+        self._send_display(FaceDisplay(
+            tracks=[self._last_face] if getattr(self, "_last_face", None) else [],
+            identity=getattr(self, "_last_identity", None),
+            wake=getattr(self, "_last_wake", None),
+        ))
 
     def _face_cb(self, kind: str):
         """构造人脸线程用的同步回调（入队，不阻塞）。"""
