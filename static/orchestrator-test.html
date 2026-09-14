@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Orchestrator 前端验证</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font: 14px/1.6 -apple-system, "Segoe UI", sans-serif; margin: 0;
+         background: #111; color: #e6e6e6; }
+  .wrap { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+  .col { flex: 1 1 380px; min-width: 320px; }
+  video, canvas { width: 100%; border-radius: 8px; background: #000; }
+  button { padding: 10px 18px; font-size: 15px; border-radius: 8px;
+           border: 1px solid #444; background: #2a2a2a; color: #e6e6e6;
+           cursor: pointer; margin-right: 8px; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.danger  { background: #b91c1c; border-color: #b91c1c; }
+  .log { height: 340px; overflow-y: auto; background: #1a1a1a;
+         border: 1px solid #333; border-radius: 8px; padding: 10px;
+         font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .log div { margin-bottom: 3px; word-break: break-all; }
+  .k { color: #7dd3fc; }  .v { color: #86efac; }  .e { color: #fca5a5; }
+  .m { color: #fcd34d; }
+  .stats { font-family: ui-monospace, monospace; font-size: 12px;
+           background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+           padding: 10px; margin-top: 10px; }
+  .sub { margin-top: 10px; min-height: 60px; background: #1a1a1a;
+         border: 1px solid #333; border-radius: 8px; padding: 10px; }
+  h3 { margin: 0 0 8px; font-size: 14px; color: #aaa; font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="col">
+    <h3>摄像头</h3>
+    <video id="cam" autoplay playsinline muted></video>
+    <canvas id="cv" style="display:none"></canvas>
+    <div style="margin-top:12px">
+      <button id="btnStart" class="primary">开始会话</button>
+      <button id="btnSpeak">触发播报(测试)</button>
+      <button id="btnStop" class="danger">停止</button>
+    </div>
+    <div class="stats" id="stats">未开始</div>
+  </div>
+  <div class="col">
+    <h3>字幕 / 事件</h3>
+    <div class="sub" id="subtitle">（等待 ASR/OmniLLM 输出）</div>
+    <h3 style="margin-top:14px">事件日志</h3>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script src="/static/duplex/lib/orchestrator-session.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log'), statsEl = $('stats'), subEl = $('subtitle');
+let session = null, micStream = null, audioCtx = null, workletNode = null;
+let videoStream = null, running = false, frameCounter = 0;
+
+function log(cls, msg) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+  while (logEl.childNodes.length > 400) logEl.removeChild(logEl.firstChild);
+}
+
+/* ---------- 播放器：PCM16 24kHz → WebAudio，并暴露 ctx 时间供回执 ---------- */
+class PcmPlayer {
+  constructor(ctx) {
+    this.ctx = ctx; this.queue = []; this.nextAt = 0; this.responseId = null;
+    this.scheduled = 0; this.sampleRate = 24000;
+  }
+  now() { return this.ctx.currentTime; }
+  beginResponse(id, sr) {
+    this.responseId = id; this.sampleRate = sr || 24000;
+    // 起播留 200ms 提前量（与云端 config 的 playback_delay_ms 一致）
+    this.nextAt = Math.max(this.nextAt, this.ctx.currentTime + 0.2);
+  }
+  playBase64(b64, sr) {
+    const bin = atob(b64);
+    const n = bin.length >> 1;
+    const i16 = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+      i16[i] = (bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8)) << 16 >> 16;
+    }
+    const f32 = new Float32Array(n);
+    for (let i = 0; i < n; i++) f32[i] = i16[i] / 32768;
+    const rate = sr || this.sampleRate;
+    const buf = this.ctx.createBuffer(1, n, rate);
+    buf.copyToChannel(f32, 0);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.ctx.destination);
+    const at = Math.max(this.nextAt, this.ctx.currentTime + 0.02);
+    src.start(at);
+    this.nextAt = at + buf.duration;
+  }
+  endResponse() { /* 队列自然播完 */ }
+  stop() {
+    this.nextAt = this.ctx.currentTime;
+    this.queue = [];
+  }
+}
+
+/* ---------- 采集 ---------- */
+async function startCapture() {
+  // ⚠️ 浏览器 AEC/NS/AGC 必须关闭 —— 回声消除交给云端 AEC
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false,
+             noiseSuppression: false, autoGainControl: false },
+    video: false,
+  });
+  videoStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+  });
+  $('cam').srcObject = videoStream;
+
+  audioCtx = new AudioContext({ sampleRate: 16000 });
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  await audioCtx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+
+  const src = audioCtx.createMediaStreamSource(micStream);
+  const chunkSize = Math.max(160, Math.floor(audioCtx.sampleRate / 10)); // 100ms
+  workletNode = new AudioWorkletNode(audioCtx, 'capture-processor',
+                                     { processorOptions: { chunkSize } });
+  const sink = audioCtx.createGain(); sink.gain.value = 0;
+  src.connect(workletNode); workletNode.connect(sink); sink.connect(audioCtx.destination);
+  log('k', '采集启动：chunkSize=' + chunkSize + ' (' +
+      (chunkSize / audioCtx.sampleRate * 1000).toFixed(0) + 'ms)');
+
+  const cv = $('cv'), ctx2d = cv.getContext('2d'), video = $('cam');
+
+  function grab(maxW, maxH, q) {
+    if (!video.videoWidth) return null;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.min(1, maxW / vw, maxH / vh);
+    cv.width = Math.round(vw * s); cv.height = Math.round(vh * s);
+    ctx2d.drawImage(video, 0, 0, cv.width, cv.height);
+    return cv.toDataURL('image/jpeg', q).split(',')[1] || null;
+  }
+
+  workletNode.port.onmessage = (ev) => {
+    if (!running || ev.data.type !== 'chunk') return;
+    frameCounter = (frameCounter + 1) % 10;   // 10 块 = 1s
+    session && session.sendChunk({
+      audio: ev.data.audio,
+      frameBase64: grab(320, 240, 0.5),                    // 人脸 25fps
+      frameOmniBase64: frameCounter === 0 ? grab(1280, 720, 0.7) : null, // Omni 1fps
+    });
+  };
+  workletNode.port.postMessage({ command: 'start' });
+}
+
+/* ---------- 统计 ---------- */
+let evtCounts = {};
+function refreshStats() {
+  if (!session) return;
+  const s = session.stats;
+  const evs = Object.entries(evtCounts)
+    .map(([k, v]) => k + '=' + v).join(' ');
+  statsEl.textContent =
+    `会话 ${session.sessionId || '-'}  ready=${session.ready}\n` +
+    `音频块 ${s.audioSent}  人脸帧 ${s.faceFramesSent}  Omni帧 ${s.omniFramesSent}\n` +
+    `TTS ${s.ttsFrames} 帧 / ${(s.ttsBytes / 2 / 24000).toFixed(2)}s\n` +
+    `事件: ${evs}`;
+}
+
+/* ---------- 会话 ---------- */
+$('btnStart').onclick = async () => {
+  try {
+    $('btnStart').disabled = true;
+    running = true;
+    await startCapture();
+    const player = new PcmPlayer(audioCtx);
+    session = new OrchestratorSession({
+      player,
+      onEvent: (m) => {
+        evtCounts[m.type] = (evtCounts[m.type] || 0) + 1;
+        if (m.type === 'asr') {
+          subEl.innerHTML = '<b>ASR</b> ' +
+            (m.phase === 'partial' ? '<i>' : '') + (m.text || '') +
+            (m.phase === 'partial' ? '</i>' : '');
+        } else if (m.type === 'tts.start') {
+          subEl.innerHTML += '<br><b>播报</b> ' + (m.text || '').slice(0, 80);
+        } else if (m.type === 'face.state') {
+          log('m', 'face ' + JSON.stringify(m).slice(0, 120));
+        } else if (m.type === 'error') {
+          log('e', 'ERROR ' + m.code + ': ' + m.message);
+        } else if (m.type === 'tts.audio') {
+          /* 高频，不逐个记日志 */
+        } else {
+          log('v', m.type + ' ' + JSON.stringify(m).slice(0, 100));
+        }
+        refreshStats();
+      },
+      onOpen: (m) => log('v', 'session.ready id=' + m.session_id),
+      onClose: () => { log('e', '连接关闭'); running = false; },
+      onError: (e) => log('e', 'WS 错误'),
+    });
+    await session.start({ identity: { page: 'orchestrator-test' } });
+    log('v', '会话已建立');
+    refreshStats();
+  } catch (e) {
+    log('e', '启动失败：' + e.message);
+    $('btnStart').disabled = false;
+    running = false;
+  }
+};
+
+$('btnSpeak').onclick = () => {
+  // 触发播报的测试路径：改用 ASR/OmniLLM 自然触发更好，
+  // 这里只用于确认 TTS 通道（需要服务端 downstream 支持手动触发）。
+  log('m', '提示：播报由 ASR 最终结果或 OmniLLM 回复自动触发；' +
+           '本按钮保留给后续手动测试接口。');
+};
+
+$('btnStop').onclick = async () => {
+  running = false;
+  if (workletNode) { try { workletNode.port.postMessage({ command: 'stop' }); } catch (e) {} }
+  if (session) await session.stop('user_stop');
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+  if (audioCtx) await audioCtx.close();
+  workletNode = null; session = null;
+  $('btnStart').disabled = false;
+  log('v', '已停止');
+};
+
+log('k', '就绪。点「开始会话」授权摄像头与麦克风。');
+</script>
+</body>
+</html>

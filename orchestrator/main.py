@@ -408,8 +408,25 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
 
 def create_app(cfg: Settings):
     from fastapi import FastAPI
+    from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title="Orchestrator", version="0.1.0")
+
+    # 静态前端：复用 MiniCPM-o-Demo 的 static/ 目录（采集 worklet、
+    # 播放器、duplex-utils 都在那里），Orchestrator 只需多提供自己的
+    # 会话客户端与验证页。路径与本仓库既有约定一致（/static/...）。
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+        @app.get("/")
+        async def index():
+            from fastapi.responses import FileResponse
+            page = static_dir / "orchestrator-test.html"
+            if page.is_file():
+                return FileResponse(str(page))
+            return {"service": "orchestrator",
+                    "hint": "static/orchestrator-test.html 不存在"}
 
     @app.get("/healthz")
     async def healthz():

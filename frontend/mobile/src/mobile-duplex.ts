@@ -78,7 +78,12 @@ type DuplexRuntime = {
 
 type MobileChunk = {
   audio: Float32Array
+  /** 人脸用的小图（25fps，320×240 q≈0.5，~10-20KB/帧） */
   frameBase64: string | null
+  /** OmniLLM 用的大图（1fps，≤1280×720，走质量阶梯压到 ≤190KB）。
+   *  与 frameBase64 **解耦**：两者帧率差 25 倍，捆在一起会让 25fps
+   *  那路带宽失控。 */
+  frameOmniBase64: string | null
 }
 
 let duplexRuntimePromise: Promise<DuplexRuntime> | null = null
@@ -136,6 +141,9 @@ export class MobileLiveMediaProvider {
   private micEnabled = true
 
   private cameraEnabled = true
+
+  /** OmniLLM 大图的节流计数：每 10 个音频块（100ms×10 = 1s）抓一次 */
+  private omniFrameCounter = 0
 
   running = false
 
@@ -249,12 +257,17 @@ export class MobileLiveMediaProvider {
       await this.openVideoStream(this.usingFrontCamera)
     }
 
+    // ⚠️ 浏览器端 AEC/NS/AGC **必须关闭** —— 回声消除交给云端 AEC：
+    //   · 浏览器 AEC 在串联时会先消掉云端正要建模的信号
+    //   · autoGainControl 随时间调制回声路径增益，任何 AEC 都追不上
+    //   · noiseSuppression 破坏参考对齐
+    // 云端 AEC 是权威，浏览器不得抢先。
     this.audioStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
       },
       video: false,
     })
@@ -285,12 +298,15 @@ export class MobileLiveMediaProvider {
 
     this.audioSource =
       this.audioContext.createMediaStreamSource(this.audioStream)
+    // ⚠️ 100ms（= sampleRate/10）而非默认的 1 秒 —— 流式 ASR 需要更细的
+    // 粒度才能实时出部分结果；1 秒块的端到端延迟不可接受。
+    const captureChunkSize = Math.max(160, Math.floor(this.sampleRate / 10))
     this.captureNode = new AudioWorkletNode(
       this.audioContext,
       'capture-processor',
       {
         processorOptions: {
-          chunkSize: this.sampleRate,
+          chunkSize: captureChunkSize,
         },
       },
     )
@@ -314,11 +330,21 @@ export class MobileLiveMediaProvider {
       const audio = this.micEnabled
         ? sourceAudio
         : new Float32Array(sourceAudio.length)
-      const frameBase64 = this.captureFrame()
+
+      // 两条视频路**解耦**（帧率差 25 倍，捆在一起会让高频那路带宽失控）：
+      //   · 人脸：每个音频块都抓（100ms/块 → 10fps 音频节拍下相当于
+      //     每块一帧；真正的 25fps 由 requestVideoFrameCallback 驱动更好，
+      //     这里用音频节拍是因为 worklet 已是稳定的时间源）
+      //   · OmniLLM：每 10 块抓一次（= 1 秒 = 1fps）
+      const frameBase64 = this.captureFaceFrame()
+      this.omniFrameCounter = (this.omniFrameCounter + 1) % 10
+      const frameOmniBase64 =
+        this.omniFrameCounter === 0 ? this.captureOmniFrame() : null
 
       this.onChunk?.({
         audio,
         frameBase64,
+        frameOmniBase64,
       })
     }
 
@@ -405,22 +431,44 @@ export class MobileLiveMediaProvider {
     this.videoEl.style.transform = 'none'
   }
 
-  private captureFrame(): string | null {
+  /** 抓一帧并编码。maxW/maxH 限尺寸，quality 为 JPEG 质量。
+   *
+   *  原实现是**原分辨率 + q=0.7 无上限**（约 100-200KB/帧），25fps 下
+   *  是 2.5-5MB/s，移动上行扛不住。这里按用途分别限尺寸/质量。 */
+  private captureFrame(maxW = 0, maxH = 0, quality = 0.7): string | null {
     if (!this.cameraEnabled) {
       return null
     }
-
     if (!this.videoEl.videoWidth || !this.videoEl.videoHeight) {
       return null
     }
 
-    const width = this.videoEl.videoWidth
-    const height = this.videoEl.videoHeight
+    const vw = this.videoEl.videoWidth
+    const vh = this.videoEl.videoHeight
+    let width = vw
+    let height = vh
+    if (maxW > 0 && maxH > 0) {
+      const scale = Math.min(1, maxW / vw, maxH / vh)
+      width = Math.max(1, Math.round(vw * scale))
+      height = Math.max(1, Math.round(vh * scale))
+    }
 
+    // 人脸路与 Omni 路共用一块 canvas，但**不能同帧抓两次** ——
+    // 调用方错开节奏（人脸 25fps / Omni 1fps），避免互相覆盖。
     this.canvasEl.width = width
     this.canvasEl.height = height
     this.ctx2d.drawImage(this.videoEl, 0, 0, width, height)
 
-    return this.canvasEl.toDataURL('image/jpeg', 0.7).split(',')[1] ?? null
+    return this.canvasEl.toDataURL('image/jpeg', quality).split(',')[1] ?? null
+  }
+
+  /** 人脸路：小图高频（25fps）。带宽约 10-20KB/帧 × 25 = 250-500KB/s。 */
+  private captureFaceFrame(): string | null {
+    return this.captureFrame(320, 240, 0.5)
+  }
+
+  /** OmniLLM 路：大图低频（1fps）。带宽约 ≤190KB/s。 */
+  private captureOmniFrame(): string | null {
+    return this.captureFrame(1280, 720, 0.7)
   }
 }
