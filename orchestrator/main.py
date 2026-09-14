@@ -149,6 +149,9 @@ async def build_session(sid: str, cfg: Settings,
                     text=ev.get("text"),
                 ))
             elif t == "response.done":
+                # 计数器供 drain 观察「本轮是否已结束」——不去窥探事件队列
+                # （run_downstream 是同一队列的消费者，会互抢）
+                sess.stats["omni_done"] = sess.stats.get("omni_done", 0) + 1
                 sess.post_downstream(OmniResponseDone(
                     t=now,
                     response_id=str(ev.get("response_id") or ""),
@@ -157,7 +160,7 @@ async def build_session(sid: str, cfg: Settings,
 
         sess.omni = OmniClient(
             cfg.omni_url, system_prompt=cfg.omni_system_prompt,
-            on_event=on_omni_event,
+            on_event=on_omni_event, verify_ssl=cfg.verify_ssl,
         )
 
     # ---- TTS ----

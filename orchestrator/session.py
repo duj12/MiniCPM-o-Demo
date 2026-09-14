@@ -444,7 +444,9 @@ class OrchestratorSession:
             self.face_worker.start()
 
     async def drain(self, reason: str = "client_stop",
-                    asr_timeout: float = 15.0) -> None:
+                    asr_timeout: float = 15.0,
+                    omni_turn_timeout: float = 15.0,
+                    tts_idle_timeout: float = 30.0) -> None:
         """优雅收尾：把残余数据推完、等最终结果。
 
         与 ``close()`` 分离的原因：收尾**可以慢**（等 ASR 跑完最终识别、
@@ -454,25 +456,67 @@ class OrchestratorSession:
         if self.closed:
             return
         logger.info("会话 %s 开始收尾（%s）", self.session_id, reason)
-        # 顺序有讲究：先 drain AEC（它会把尾部窗口推给 ASR），
-        # 再 drain ASR（吃下尾部后才会吐最终结果）。
+        # 顺序有讲究：
+        #   AEC（推完尾部窗口，让 ASR 有完整输入）
+        #   → OmniLLM（说完整当前这轮，触发的 Speak 才有机会合成）
+        #   → ASR（吃下尾部后才会吐最终结果）
         if self.aec is not None:
             try:
                 await self.aec.drain(timeout=8.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("AEC drain 异常: %s", exc)
-        # 把 OmniLLM 里不足 1s 的音频残余发出去
+
+        # ⚠️ 等 OmniLLM 把**当前这一轮**说完。
+        # 不等的话，close() 会抢先关掉 omni，response.done 永远到不了 ——
+        # 于是 downstream 收不到 OmniResponseDone、不会触发 Speak，
+        # 表现为"偶发地一句 TTS 都没有"。
         if self.omni is not None:
             try:
                 await self.omni.flush_audio()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("omni.flush_audio 异常: %s", exc)
+            await self._wait_omni_turn(timeout=omni_turn_timeout)
+            # 再等执行器把这一轮触发的 TTS 跑完
+            await self._wait_executor_idle(timeout=tts_idle_timeout)
+
         # 等 ASR 最终结果
         if self.asr is not None:
             try:
                 await self.asr.drain(timeout=asr_timeout)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ASR drain 异常: %s", exc)
+
+    async def _wait_omni_turn(self, timeout: float = 15.0) -> bool:
+        """等 OmniLLM 当前这一轮说完整（收到 response.done）。
+
+        ⚠️ **不能**去窥探 ``_down_q`` —— ``run_downstream`` 是同一个队列的
+        消费者，两个消费者会互抢事件。这里改用计数器（由 OmniClient 的
+        事件回调递增），只观察不消费。
+        """
+        baseline = self.stats.get("omni_done", 0)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if self.stats.get("omni_done", 0) > baseline:
+                logger.info("收尾：OmniLLM 本轮已结束（%.1fs）",
+                            time.monotonic() - t0)
+                return True
+            if self.closed:
+                return False
+            await asyncio.sleep(0.05)
+        logger.info("收尾：等待 OmniLLM 本轮结束超时（%.1fs）", timeout)
+        return False
+
+    async def _wait_executor_idle(self, timeout: float = 20.0) -> bool:
+        """等执行器把在飞的 TTS 合成跑完。"""
+        if self.executor is None:
+            return True
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if getattr(self.executor, "_speak_inflight", 0) == 0:
+                return True
+            await asyncio.sleep(0.1)
+        logger.info("收尾：等待 TTS 合成完成超时（%.1fs）", timeout)
+        return False
 
     async def close(self, reason: str = "client_stop") -> None:
         if self.closed:

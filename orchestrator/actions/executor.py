@@ -39,6 +39,8 @@ class ActionExecutor:
         self._tts_seq = 0
         self.speaks_done = 0
         self.cancels_done = 0
+        # 在飞的合成数：会话收尾要等它归零，否则 close() 会打断 RPC
+        self._speak_inflight = 0
         # 播放起点的墙钟锚（用于没有回执时的退化路径）
         self._playback_anchor_ctx: Optional[float] = None
 
@@ -62,10 +64,17 @@ class ActionExecutor:
         if session.tts is None:
             logger.warning("Speak 但未配置 TTS 客户端，忽略")
             return
+        # ⚠️ 只在**已关闭**时跳过，不能在 drain（收尾）期间跳过 ——
+        # 收尾恰恰是要把 OmniLLM 最后那句合成出来的时机。
+        # close() 之后 TTS 的 gRPC channel 已关，再发起只会得到假错误。
+        if session.closed:
+            logger.info("会话已关闭，跳过 TTS 合成（%d 字）", len(act.text or ""))
+            return
 
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
+        self._speak_inflight += 1
 
         await session.send_to_client(TtsStart(
             response_id=response_id, text=act.text, sample_rate=TTS_SR,
@@ -77,9 +86,14 @@ class ActionExecutor:
                 speaker_vector_b64=act.speaker_vector_b64,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("TTS 合成失败: %s", exc)
-            await session.send_to_client(TtsEnd(response_id=response_id))
+            # 会话收尾时的中断不是真错误（sess.closed 已置），降级为 info
+            lvl = logger.info if session.closed else logger.error
+            lvl("TTS 合成未完成: %s: %s", type(exc).__name__, str(exc)[:200])
+            if not session.closed:
+                await session.send_to_client(TtsEnd(response_id=response_id))
             return
+        finally:
+            self._speak_inflight -= 1
 
         if pcm24 is None or len(pcm24) == 0:
             logger.warning("TTS 返回空音频")

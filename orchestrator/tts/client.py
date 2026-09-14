@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -72,6 +73,10 @@ class TtsClient:
         self._channel = None
         self._stub = None
         self.closed = False
+        # 收尾竞态防护：_closing 阻止新请求；_inflight 让 close() 能等在飞
+        # 的合成跑完，而不是直接关 channel 把 RPC 打断
+        self._closing = False
+        self._inflight = 0
         self.calls = 0
         self.total_audio_s = 0.0
         self.last_total_s = 0.0
@@ -150,18 +155,29 @@ class TtsClient:
                          speaker_id: Optional[str] = None,
                          speaker_vector_b64: Optional[str] = None
                          ) -> Optional[np.ndarray]:
-        """整段合成。返回 int16 @ 24kHz 的 1-D 数组，失败返回 None。"""
-        if self.closed:
+        """整段合成。返回 int16 @ 24kHz 的 1-D 数组，失败返回 None。
+
+        ⚠️ 会话收尾期间的竞态：drain 时 OmniLLM 仍在产出，可能触发新的
+        Speak，而此时 ``close()`` 已关掉 gRPC channel → RPC 被中断
+        （表现为 ``_MultiThreadedRendezvous ... terminated``）。
+        这里用 ``_closing`` 标志显式拒绝关停后的请求，避免误报为错误。
+        """
+        if self.closed or self._closing:
+            logger.debug("TTS 已停止，忽略合成请求（%d 字）", len(text or ""))
             return None
         text = (text or "").strip()
         if not text:
             return None
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(
-            None, self._synth_blocking, text,
-            tts_type or self.default_tts_type,
-            speaker_id, speaker_vector_b64,
-        )
+        self._inflight += 1
+        try:
+            res = await loop.run_in_executor(
+                None, self._synth_blocking, text,
+                tts_type or self.default_tts_type,
+                speaker_id, speaker_vector_b64,
+            )
+        finally:
+            self._inflight -= 1
         self.calls += 1
         self.total_audio_s += res.duration_s
         self.last_total_s = res.total_s
@@ -174,17 +190,21 @@ class TtsClient:
 
     async def synthesize_full(self, text: str, **kw) -> Optional[TtsResult]:
         """同 ``synthesize`` 但返回完整结果（含字级时间戳）。"""
-        if self.closed:
+        if self.closed or self._closing:
             return None
         text = (text or "").strip()
         if not text:
             return None
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(
-            None, self._synth_blocking, text,
-            kw.get("tts_type") or self.default_tts_type,
-            kw.get("speaker_id"), kw.get("speaker_vector_b64"),
-        )
+        self._inflight += 1
+        try:
+            res = await loop.run_in_executor(
+                None, self._synth_blocking, text,
+                kw.get("tts_type") or self.default_tts_type,
+                kw.get("speaker_id"), kw.get("speaker_vector_b64"),
+            )
+        finally:
+            self._inflight -= 1
         self.calls += 1
         self.total_audio_s += res.duration_s
         return res
@@ -192,8 +212,22 @@ class TtsClient:
     # ------------------------------------------------------------------ #
 
     async def close(self) -> None:
+        """关闭。
+
+        先置 ``_closing`` 拒绝新请求，再**等在飞的合成跑完**，最后才关
+        channel —— 否则正在进行的 RPC 会被打断，表现为
+        ``_MultiThreadedRendezvous ... terminated`` 的假错误
+        （会话收尾时 OmniLLM 仍在产出、可能触发新的 Speak）。
+        """
         if self.closed:
             return
+        self._closing = True
+        if self._inflight > 0:
+            deadline = time.monotonic() + 15.0
+            while self._inflight > 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            if self._inflight > 0:
+                logger.warning("TTS 关闭时仍有 %d 个合成在飞", self._inflight)
         self.closed = True
         if self._channel is not None:
             try:
@@ -213,11 +247,13 @@ class MockTtsClient:
     def __init__(self, ms_per_char: float = 150.0) -> None:
         self.ms_per_char = ms_per_char
         self.closed = False
+        self._closing = False      # 与 TtsClient 接口对齐
+        self._inflight = 0
         self.calls = 0
         self.total_audio_s = 0.0
 
     async def synthesize(self, text: str, **kw) -> Optional[np.ndarray]:
-        if self.closed or not (text or "").strip():
+        if self.closed or self._closing or not (text or "").strip():
             return None
         n = int(TTS_SR * len(text) * self.ms_per_char / 1000.0)
         n = max(n, TTS_SR // 4)

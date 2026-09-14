@@ -40,6 +40,7 @@ async def run_client(host: str, port: int, duration_s: float,
 
     url = f"ws://{host}:{port}/v1/orchestrator"
     stats = {"audio_sent": 0, "tts_frames": 0, "tts_audio_bytes": 0,
+             "tts_ends": 0, "tts_starts": 0,
              "asr_partials": 0, "asr_finals": 0, "playbacks_sent": 0,
              "ready": False, "errors": []}
     tts_buffers: dict = {}
@@ -68,6 +69,7 @@ async def run_client(host: str, port: int, duration_s: float,
                         print(f"[recv] session.ready id={msg.get('session_id')}")
                 elif t == "tts.start":
                     tts_buffers[msg["response_id"]] = []
+                    stats["tts_starts"] += 1
                     if verbose:
                         print(f"[recv] tts.start '{msg.get('text','')[:30]}'")
                 elif t == "tts.audio":
@@ -79,6 +81,7 @@ async def run_client(host: str, port: int, duration_s: float,
                 elif t == "tts.end":
                     rid = msg["response_id"]
                     total = sum(len(b) for b in tts_buffers.get(rid, []))
+                    stats["tts_ends"] += 1
                     if verbose:
                         print(f"[recv] tts.end {rid} {total} bytes "
                               f"({total/2/24000:.2f}s)")
@@ -169,10 +172,23 @@ async def run_client(host: str, port: int, duration_s: float,
             await ws.send(json.dumps({"type": "session.stop"}))
         except Exception:
             pass
-        # 收尾需要时间（ASR 最终结果 + TTS 合成 + 音频回送）
+        # 收尾需要时间，且**长度不定**（OmniLLM 的回复时短时长，TTS 合成
+        # 耗时随之变化）。固定 sleep 会偶发"没等到" —— 改为轮询等待
+        # 稳定条件：已收到至少一次 tts.end 且 N 秒内无新增帧，或超时。
         deadline = time.monotonic() + drain_s
+        stable_since = None
+        last_frames = -1
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
+            if stats["tts_frames"] != last_frames:
+                last_frames = stats["tts_frames"]
+                stable_since = time.monotonic()
+                continue
+            # 无新帧满 3s，且已收到 tts.end → 收尾完成
+            if (stable_since is not None and
+                    time.monotonic() - stable_since > 3.0 and
+                    stats.get("tts_ends", 0) > 0):
+                break
         recv_task.cancel()
         try:
             await recv_task

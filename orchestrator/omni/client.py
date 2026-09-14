@@ -47,11 +47,14 @@ class OmniClient:
 
     def __init__(self, url: str, system_prompt: str = "",
                  on_event: Optional[Callable[[dict], None]] = None,
-                 connect_timeout: float = 30.0) -> None:
+                 connect_timeout: float = 30.0,
+                 verify_ssl: bool = False) -> None:
         self.url = url
         self.system_prompt = system_prompt
         self.on_event = on_event
         self.connect_timeout = connect_timeout
+        # gateway 默认自签证书；公网部署应置 True 并配正规 CA
+        self.verify_ssl = verify_ssl
 
         self.client = None            # StreamingChatClient
         self.backend: Optional[str] = None
@@ -77,7 +80,17 @@ class OmniClient:
     async def connect(self) -> None:
         from streaming_chat_demo import StreamingChatClient  # type: ignore
 
-        self.client = StreamingChatClient(self.url, echo=False)
+        # gateway 用自签证书（config.json 里 gateway 跑 https/wss），
+        # 需要跳过校验。公网部署应改为带 CA 的正规校验。
+        ssl_ctx = None
+        if self.url.startswith("wss://"):
+            import ssl as _ssl
+            ssl_ctx = _ssl.create_default_context()
+            if not self.verify_ssl:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+        self.client = StreamingChatClient(self.url, ssl_ctx=ssl_ctx, echo=False)
         await self.client.connect()
         ev = await self.client.init(
             mode="full_duplex",
