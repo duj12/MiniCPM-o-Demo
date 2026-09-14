@@ -61,20 +61,33 @@ class ActionExecutor:
     # ------------------------------------------------------------------ #
 
     async def _speak(self, act: Speak, session: "OrchestratorSession") -> None:
+        """合成并发送 TTS 音频。
+
+        ``_speak_inflight`` 覆盖**整个方法**（合成 + 分帧发送），不只是
+        合成 —— 收尾时必须等音频真正送达浏览器，否则 close() 会把它截断，
+        表现为「合成成功但客户端一帧没收到」。
+        """
         if session.tts is None:
             logger.warning("Speak 但未配置 TTS 客户端，忽略")
             return
         # ⚠️ 只在**已关闭**时跳过，不能在 drain（收尾）期间跳过 ——
-        # 收尾恰恰是要把 OmniLLM 最后那句合成出来的时机。
+        # 收尾恰恰是要把最后那句合成出来的时机。
         # close() 之后 TTS 的 gRPC channel 已关，再发起只会得到假错误。
         if session.closed:
             logger.info("会话已关闭，跳过 TTS 合成（%d 字）", len(act.text or ""))
             return
+        self._speak_inflight += 1
+        try:
+            await self._speak_inner(act, session)
+        finally:
+            self._speak_inflight -= 1
+
+    async def _speak_inner(self, act: Speak,
+                           session: "OrchestratorSession") -> None:
 
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
-        self._speak_inflight += 1
 
         await session.send_to_client(TtsStart(
             response_id=response_id, text=act.text, sample_rate=TTS_SR,
@@ -94,8 +107,6 @@ class ActionExecutor:
             if not session.closed:
                 await session.send_to_client(TtsEnd(response_id=response_id))
             return
-        finally:
-            self._speak_inflight -= 1
         # 指标：合成耗时与音频时长
         if session.metrics is not None:
             session.metrics.tts_total.record((_time.monotonic() - t_synth0) * 1000)

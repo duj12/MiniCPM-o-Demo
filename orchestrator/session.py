@@ -510,8 +510,6 @@ class OrchestratorSession:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("omni.flush_audio 异常: %s", exc)
             await self._wait_omni_turn(timeout=omni_turn_timeout)
-            # 再等执行器把这一轮触发的 TTS 跑完
-            await self._wait_executor_idle(timeout=tts_idle_timeout)
 
         # 等 ASR 最终结果
         if self.asr is not None:
@@ -519,6 +517,13 @@ class OrchestratorSession:
                 await self.asr.drain(timeout=asr_timeout)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ASR drain 异常: %s", exc)
+
+        # ⚠️ 必须**最后**等执行器：ASR 的最终结果也会触发 Speak
+        # （downstream_mode=asr 时），而 TTS 合成+分帧发送需要时间。
+        # 不等的话 close() 会抢先把会话关掉 —— 音频合成出来了但没送到
+        # 浏览器，测试端表现为 tts_end=0。
+        # 注意这一步**不能**包在 omni 分支里（ASR 模式同样需要）。
+        await self._wait_executor_idle(timeout=tts_idle_timeout)
 
     async def _wait_omni_turn(self, timeout: float = 15.0) -> bool:
         """等 OmniLLM 当前这一轮说完整（收到 response.done）。
