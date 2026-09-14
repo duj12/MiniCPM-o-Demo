@@ -1,0 +1,193 @@
+"""OmniLLM 客户端 —— 包装 MiniCPM-o-Demo 的 ``StreamingChatClient``。
+
+**直接复用 ``StreamingChatClient``，不自己写协议** —— 它已经处理好了
+minicpm/qwen3omni 两种后端的话轮语义差异，尤其是最容易写错的那条：
+
+> **qwen3omni 下 ``listen`` delta 是本轮内的分块 prefill 回执，绝不能
+> 据此收尾**；只有 ``response.done`` 才是完整回复结束。按 ``listen``
+> 收尾会把回复截断在开头。
+
+音频格式：``send_input`` 的 audio 是 **float32 raw base64**（``b64()``
+内部 ``.astype(np.float32).tobytes()``），16kHz。
+
+⚠️ 生效后端**必须读 ``session.created.active_model``**，不能读 config.json ——
+实测容器里 ``ACTIVE_MODEL=qwen3omni`` 环境变量覆盖了配置文件里的
+``"active_model": "minicpm"``。
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import sys
+from pathlib import Path
+from typing import Callable, List, Optional
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# 复用 streaming_chat_demo.py 的 StreamingChatClient
+_DEMO_ROOT = Path(__file__).resolve().parents[2]
+if str(_DEMO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DEMO_ROOT))
+
+
+def _b64_float32(x: np.ndarray) -> str:
+    return base64.b64encode(
+        np.ascontiguousarray(x, dtype=np.float32).tobytes()
+    ).decode()
+
+
+class OmniClient:
+    """一路 OmniLLM 会话。
+
+    把 ``StreamingChatClient`` 的原始事件流翻译成 downstream 事件。
+    """
+
+    def __init__(self, url: str, system_prompt: str = "",
+                 on_event: Optional[Callable[[dict], None]] = None,
+                 connect_timeout: float = 30.0) -> None:
+        self.url = url
+        self.system_prompt = system_prompt
+        self.on_event = on_event
+        self.connect_timeout = connect_timeout
+
+        self.client = None            # StreamingChatClient
+        self.backend: Optional[str] = None
+        self.session_id: Optional[str] = None
+        self.closed = False
+
+        # 待发送的视频帧（1fps）。用最新的替换旧的 —— 旧画面没有价值。
+        self._pending_frame: Optional[str] = None
+        # 音频缓冲：凑够 1s 再发（StreamingChatClient 的节奏）
+        self._audio_buf: List[np.ndarray] = []
+        self._audio_len = 0
+        self._chunk_samples = 16000
+
+        # 统计
+        self.frames_sent = 0
+        self.audio_sent_s = 0.0
+        self.text_deltas = 0
+        self.listen_deltas = 0
+        self.done_count = 0
+
+    # ------------------------------------------------------------------ #
+
+    async def connect(self) -> None:
+        from streaming_chat_demo import StreamingChatClient  # type: ignore
+
+        self.client = StreamingChatClient(self.url, echo=False)
+        await self.client.connect()
+        ev = await self.client.init(
+            mode="full_duplex",
+            system_prompt=self.system_prompt or "你是一个实时视频对话助手。",
+        )
+        self.session_id = self.client.session_id
+        self.backend = self.client.backend
+        logger.info("OmniLLM 已连接: session=%s backend=%s",
+                    self.session_id, self.backend)
+
+    def offer_frame(self, jpeg: bytes) -> None:
+        """登记一帧待发的视频（1fps）。只保留最新的一帧。"""
+        self._pending_frame = base64.b64encode(jpeg).decode()
+
+    async def push_audio(self, seg: np.ndarray) -> None:
+        """送一段 AEC 清洗后的音频。内部按 1s 聚合。"""
+        if self.closed or self.client is None:
+            return
+        self._audio_buf.append(np.asarray(seg, dtype=np.float32).reshape(-1))
+        self._audio_len += self._audio_buf[-1].size
+        if self._audio_len < self._chunk_samples:
+            return
+        audio = np.concatenate(self._audio_buf)[: self._chunk_samples]
+        self._audio_buf = []
+        self._audio_len = 0
+        await self._send(audio)
+
+    async def flush_audio(self) -> None:
+        """把不足 1s 的残余也发出去（收尾时用）。"""
+        if not self._audio_buf:
+            return
+        audio = np.concatenate(self._audio_buf)
+        self._audio_buf = []
+        self._audio_len = 0
+        await self._send(audio)
+
+    async def _send(self, audio: np.ndarray) -> None:
+        frames = None
+        if self._pending_frame is not None:
+            frames = [self._pending_frame]
+            self._pending_frame = None
+            self.frames_sent += 1
+        # qwen3omni 走 vad_turnsense 判决：必须 force_listen，只累积不触发
+        force_listen = (self.backend == "qwen3omni")
+        try:
+            await self.client.send_input(
+                audio_b64=_b64_float32(audio), video_frames=frames,
+                force_listen=force_listen,
+            )
+            self.audio_sent_s += audio.size / 16000.0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Omni send_input 失败: %s", exc)
+
+    async def send_text(self, text: str, force_listen: bool = False) -> None:
+        """直接注入文本输入（下游 SendToOmni 用）。"""
+        if self.closed or self.client is None:
+            return
+        await self.client.send_input(text=text, force_listen=force_listen)
+
+    # ------------------------------------------------------------------ #
+
+    async def recv_loop(self) -> None:
+        """接收事件并转成 downstream 事件。
+
+        直接复用 ``StreamingChatClient.handle_event`` 的判定逻辑，只在其
+        基础上旁路出 downstream 事件 —— 避免重新实现那套易错的语义。
+        """
+        if self.client is None:
+            return
+        orig = self.client.handle_event
+
+        def hooked(ev: dict) -> bool:
+            self._emit(ev)
+            return orig(ev)
+
+        self.client.handle_event = hooked  # type: ignore[assignment]
+        await self.client.receive_loop()
+
+    def _emit(self, ev: dict) -> None:
+        if self.on_event is None:
+            return
+        t = ev.get("type")
+        if t == "turn.turnsense":
+            self.on_event(ev)
+        elif t == "response.output.delta":
+            kind = ev.get("kind")
+            if kind == "text":
+                self.text_deltas += 1
+            elif kind == "listen":
+                self.listen_deltas += 1
+            self.on_event(ev)
+        elif t == "response.done":
+            self.done_count += 1
+            self.on_event(ev)
+        elif t in ("session.closed", "session.error"):
+            self.on_event(ev)
+
+    # ------------------------------------------------------------------ #
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.client is not None:
+            try:
+                await self.client.close(reason="orchestrator_stop")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OmniLLM 关闭异常: %s", exc)
+        logger.info(
+            "OmniLLM 已关闭: backend=%s 音频=%.1fs 帧=%d text=%d listen=%d done=%d",
+            self.backend, self.audio_sent_s, self.frames_sent,
+            self.text_deltas, self.listen_deltas, self.done_count,
+        )

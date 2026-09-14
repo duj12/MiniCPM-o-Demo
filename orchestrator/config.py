@@ -1,0 +1,84 @@
+"""Orchestrator 配置。
+
+所有外部服务地址走配置，便于在不同环境切换（开发机 / 106 / 生产）。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ---------------- 外部服务默认地址（阶段 0 实测确认） ---------------- #
+
+# AEC：speech_frontend 的 /ws/asr_frontend
+DEFAULT_AEC_URL = "ws://192.168.88.253:30255/ws/asr_frontend"
+# ASR：Fun-ASR 协议
+DEFAULT_ASR_URL = "ws://192.168.88.101:31366"
+# TTS：gRPC
+DEFAULT_TTS_HOST = "192.168.88.253"
+DEFAULT_TTS_PORT = 31058
+# OmniLLM：MiniCPM-o-Demo gateway
+DEFAULT_OMNI_URL = "wss://127.0.0.1:8006/v1/realtime?mode=video"
+
+
+@dataclass
+class Settings:
+    """运行配置。环境变量优先，其次是这里的默认值。"""
+
+    # 监听
+    host: str = "0.0.0.0"
+    port: int = 8100
+
+    # 外部服务
+    aec_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_AEC_URL", DEFAULT_AEC_URL))
+    asr_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_ASR_URL", DEFAULT_ASR_URL))
+    tts_host: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_TTS_HOST", DEFAULT_TTS_HOST))
+    tts_port: int = field(default_factory=lambda: int(os.environ.get(
+        "ORCH_TTS_PORT", str(DEFAULT_TTS_PORT))))
+    omni_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_URL", DEFAULT_OMNI_URL))
+
+    # 功能开关（便于分阶段验证/降级）
+    enable_aec: bool = True
+    enable_asr: bool = True
+    enable_omni: bool = True
+    enable_tts: bool = True
+    enable_face: bool = False        # 阶段 4 后开启
+    verify_ssl: bool = False         # gateway 用自签证书
+
+    # downstream 桩模式：asr | omni | echo | none
+    downstream_mode: str = "omni"
+
+    # TTS 参数
+    tts_type: str = "mltts"
+    tts_speaker_id: str = "17"
+
+    # OmniLLM
+    omni_system_prompt: str = "你是一个实时视频对话助手。请一边观看用户传来的实时画面，一边倾听并用自然口语即时回复。"
+
+    # 人脸（阶段 4）
+    face_lib_path: Optional[str] = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_SO"))
+    face_model_dir: Optional[str] = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_MODELS"))
+    face_db_path: Optional[str] = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_DB"))
+
+    # 调参
+    tick_interval_s: float = 0.05
+    playback_delay_ms: int = 200
+    # 会话收尾超时：等 ASR 最终结果 + 各组件 flush 的总上限。
+    # 实测 ASR 从 is_speaking=false 到 is_final 约 1~2s，留足余量。
+    drain_timeout_s: float = 20.0
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        s = cls()
+        if os.environ.get("ORCH_DOWNSTREAM_MODE"):
+            s.downstream_mode = os.environ["ORCH_DOWNSTREAM_MODE"]
+        if os.environ.get("ORCH_ENABLE_FACE"):
+            s.enable_face = os.environ["ORCH_ENABLE_FACE"] not in ("0", "false", "")
+        return s
