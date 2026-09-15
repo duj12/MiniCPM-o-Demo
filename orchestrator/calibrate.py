@@ -166,11 +166,14 @@ class CalibrationSession:
         mag[mag < 1e-10] = 1e-10
         cc = np.fft.irfft(R / mag, n_fft)
 
-        # 搜索范围：从 0 到 search（mic 滞后 ref）
-        win = min(self.search, len(cc) - 1)
+        # 搜索范围：搜索 **整个正延迟范围**，不预设上限。
+        # 早先限制在 search（1.5s）内，若真实往返延迟超出就会让 argmax
+        # 落到噪声上 —— 表现为"负的净延迟 + 极低峰值比"（实测见过
+        # -78ms/4.35、-34ms/6.78，就是真峰在窗外）。
+        win = min(len(cc) // 2, len(cc) - 1)
         seg = np.abs(cc[:win + 1])
         peak = int(np.argmax(seg))
-        # 置信度：峰值 / 次峰
+        # 置信度：峰值 / 次峰（排除主峰附近 ±32 采样）
         tmp = seg.copy()
         tmp[max(0, peak - 32):peak + 33] = 0
         ratio = float(seg[peak] / tmp.max()) if tmp.max() > 0 else 0.0
@@ -178,6 +181,23 @@ class CalibrationSession:
         # 扣除播放提前量得到"真实"声学+网络延迟
         d_samples = peak - lead
         d_ms = d_samples / self.sr * 1000.0
+
+        # 诊断：把互相关的几个最强峰打出来 —— 排障时能直接看出
+        # 真实峰是否落在预期范围内、以及信号强度是否够
+        top_idx = np.argsort(seg)[::-1][:5]
+        tops = [(int(i), round((int(i) - lead) / self.sr * 1000, 1),
+                 round(float(seg[i] / (seg.max() or 1)), 3)) for i in top_idx]
+        mic_rms = float(np.sqrt(np.mean(mic ** 2)))
+        ref_rms = float(np.sqrt(np.mean(ref ** 2)))
+        logger.info(
+            "校准诊断：mic_rms=%.4f ref_rms=%.4f 峰比=%.2f 前5峰"
+            "(位置,净延迟ms,相对强度)=%s",
+            mic_rms, ref_rms, ratio, tops,
+        )
+        if mic_rms < 0.002:
+            logger.warning("麦克风信号过弱（rms=%.4f）—— 手机音量调大些、"
+                           "靠近麦克风外放", mic_rms)
+
         ok = ratio > 1.8 and 0 <= d_ms <= 1500
         logger.info(
             "校准完成：相关峰 %d 采样，提前量 %d，净延迟 %.0fms"

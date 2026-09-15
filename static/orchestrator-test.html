@@ -51,9 +51,11 @@
     <div style="margin-top:12px">
       <label style="display:block;margin-bottom:8px">
         回声消除：
+        <!-- 默认 service（与后端 ORCH_AEC_MODE 默认一致）。
+             选了会记住（localStorage），刷新后保持上次的选择。 -->
         <select id="aecMode">
-          <option value="browser">浏览器原生 AEC（推荐，不受网络延迟影响）</option>
           <option value="service">算法服务 AEC（需先校准延迟）</option>
+          <option value="browser">浏览器原生 AEC（不受网络延迟影响）</option>
           <option value="off">不做回声消除</option>
         </select>
       </label>
@@ -205,9 +207,25 @@ class PcmPlayer {
 }
 
 /* ---------- AEC 模式 / 延迟显示 ---------- */
+const AEC_MODE_KEY = 'orch_aec_mode';
+
 function selectedAecMode() {
   const el = $('aecMode');
-  return el ? el.value : 'browser';
+  return el ? el.value : 'service';
+}
+
+/** 恢复上次选择（刷新后保持），并绑定变更持久化。 */
+function initAecMode() {
+  const el = $('aecMode');
+  if (!el) return;
+  try {
+    const saved = localStorage.getItem(AEC_MODE_KEY);
+    if (saved) el.value = saved;
+  } catch (e) { /* ignore */ }
+  // onchange 在别处已绑（切换逻辑），这里只加持久化
+  el.addEventListener('change', () => {
+    try { localStorage.setItem(AEC_MODE_KEY, el.value); } catch (e) {}
+  });
 }
 
 /** 设备标识：用于让服务端记住这台设备的延迟（下次冷启动即准）。 */
@@ -693,7 +711,9 @@ $('btnStop').onclick = async () => {
   log('v', '已停止');
 };
 
-log('k', '就绪。点「开始会话」授权摄像头与麦克风。');
+initAecMode();
+log('k', `就绪。当前回声消除模式：${selectedAecMode()}`
+       + `（选算法服务请先点「校准延迟」）`);
 </script>
 </body>
 </html>
