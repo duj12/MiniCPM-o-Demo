@@ -68,6 +68,40 @@ def test_ref_track_placement() -> None:
           "read_raw(t_play) 有值 —— 供延迟估计使用")
 
 
+def test_ref_track_scale() -> None:
+    """参考轨必须与麦克风**同量纲**（[-1,1]）—— 回归护栏。
+
+    ⚠️ TTS 服务返回 int16 PCM（实测幅度 ±18000），而麦克风是 [-1,1]。
+    早先 ``place()`` 把 int16 量纲原样存进轨里，送进 AEC 的 farend 比
+    nearend 大约 **32768 倍** —— 模型看到的参考大了 5 个数量级，回声估计
+    被压到 0，回声完全不消。报告里"farend 峰值 rms=4848"那条看似正常的
+    记录就是现场（4848 是 int16 量纲，而 mic 只有 0.01~0.1）。
+    """
+    print("== 参考轨量纲（必须与 mic 同量纲）==")
+    rt = RefTrack()
+    n24 = 24000
+    t = np.arange(n24, dtype=np.float32) / 24000.0
+    pcm = (np.sin(2 * np.pi * 440 * t) * 30000).astype(np.int16)
+    rt.place("r1", 0, pcm, 0)
+    ref = rt.read(0, 8000)
+    peak = float(np.abs(ref).max())
+    check(0.5 < peak <= 1.0,
+          f"int16 输入被归一化（峰值 {peak:.4f}，应 ~0.92 而非 ~30000）")
+
+    # float32 但仍是 int16 量纲（调用方 astype 了但没归一化）也要处理
+    rt2 = RefTrack()
+    rt2.place("r2", 0, (np.sin(2 * np.pi * 440 * t) * 30000).astype(np.float32), 0)
+    peak2 = float(np.abs(rt2.read(0, 8000)).max())
+    check(0.5 < peak2 <= 1.0, f"float32(int16 量纲) 也被归一化（峰值 {peak2:.4f}）")
+
+    # 已归一化的 float32 不能被二次缩放
+    rt3 = RefTrack()
+    rt3.place("r3", 0, (np.sin(2 * np.pi * 440 * t) * 0.5).astype(np.float32), 0)
+    peak3 = float(np.abs(rt3.read(0, 8000)).max())
+    check(abs(peak3 - 0.5) < 0.05,
+          f"已归一化输入保持不变（峰值 {peak3:.4f}，应 ~0.5）")
+
+
 def test_ref_track_truncate() -> None:
     print("== RefTrack 截断（barge-in）==")
     rt = RefTrack()
@@ -123,6 +157,62 @@ def test_delay_tracker() -> None:
         check(ok, f"D={true_d} -> 估计 {got}（{'±1 内' if ok else '偏差过大'}）")
 
 
+def test_delay_tracker_production_window() -> None:
+    """生产链路的窗口几何：``ref`` 比 ``mic`` 长 ``offset``（回归护栏）。
+
+    ⚠️ 这正是线上 `_maybe_update_delay` 的调用形态（读
+    ``WINDOW + dmax`` 个参考采样喂 ``WINDOW`` 个 mic 采样）。早先
+    ``estimate()`` 要求两者**等长**，于是每次调用都在形状校验处 return
+    None —— 自适应延迟估计整条路径从未生效，``D`` 永远停在 seed 值。
+    这个用例在那版代码上必然全部失败。
+
+    同时验证 ``n_fft`` 足够大：按 ``2*len(mic)`` 算会循环卷绕，把真峰折到
+    错误的 lag 上。
+    """
+    print("== 声学延迟估计（生产窗口几何 ref = mic + offset）==")
+    rng = np.random.default_rng(11)
+
+    WINDOW = SR              # 1s，与 session._maybe_update_delay 一致
+    OFFSET = int(0.3 * SR)   # 4800 = 默认 max_delay（300ms）
+
+    # D ∈ {20, 84, 284} ms —— 20ms 是模型容忍窗量级，284ms 是报告里的
+    # 真机值，84ms 是"扣掉 200ms 播放提前量后的残差"（假说）
+    # 造一段"整轨"信号，再按文档约定切窗：
+    #   ref_earlier[i] = full[t0 + i]                 （长 WINDOW + OFFSET）
+    #   mic[j]         = full[t0 + OFFSET - D + j]    （长 WINDOW）
+    # 于是 mic[j] == ref_earlier[j + OFFSET - D]，与约定一致。
+    N_WIN = 4
+    for true_d in (320, 1344, 4544):
+        n = WINDOW + OFFSET + (N_WIN + 1) * WINDOW
+        full = rng.standard_normal(n).astype(np.float32) * 0.3
+        t = np.arange(n, dtype=np.float32) / SR
+        full += 0.3 * np.sin(2 * np.pi * 300 * t).astype(np.float32)
+
+        tr = AcousticDelayTracker(sr=SR, max_delay_ms=300.0)
+        for w in range(N_WIN):
+            t0 = w * WINDOW
+            r = full[t0: t0 + WINDOW + OFFSET]
+            m = full[t0 + OFFSET - true_d: t0 + OFFSET - true_d + WINDOW]
+            assert r.shape[0] == m.shape[0] + OFFSET, \
+                f"窗口几何错误：mic={m.shape[0]} ref={r.shape[0]}"
+            tr.estimate(m, r, offset=OFFSET)
+
+        got = tr.delay
+        err = got - true_d
+        ok = abs(err) <= 2 and tr.estimates == N_WIN
+        check(ok, f"D={true_d} 采样（{true_d/SR*1000:.0f}ms）-> "
+                 f"估计 {got}（误差 {err:+d} 采样，"
+                 f"{tr.estimates}/{N_WIN} 次成功）")
+
+    # offset 不匹配时必须**报出原因**而不是静默 None
+    tr = AcousticDelayTracker(sr=SR, max_delay_ms=300.0)
+    m = np.random.randn(WINDOW).astype(np.float32) * 0.1
+    r_wrong = np.random.randn(WINDOW).astype(np.float32) * 0.1
+    res = tr.estimate(m, r_wrong, offset=OFFSET)
+    check(res is None and tr.last_reason is not None,
+          f"形状不符被拒绝且给出原因（{tr.last_reason}）")
+
+
 def test_delay_tracker_rejects_silence() -> None:
     print("== 延迟估计器拒绝无效输入 ==")
     tr = AcousticDelayTracker(sr=SR)
@@ -145,8 +235,10 @@ def test_delay_tracker_rejects_silence() -> None:
 
 def main() -> None:
     test_ref_track_placement()
+    test_ref_track_scale()
     test_ref_track_truncate()
     test_delay_tracker()
+    test_delay_tracker_production_window()
     test_delay_tracker_rejects_silence()
     print()
     if _failures:

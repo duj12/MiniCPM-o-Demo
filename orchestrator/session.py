@@ -93,6 +93,12 @@ class OrchestratorSession:
         # 声学延迟估计用的原始 mic 累积缓冲（**AEC 之前**的信号才有回声）
         self._raw_mic_buf: Optional[list] = []
         self._raw_mic_len = 0
+        # 音频转储（仅在 ORCH_DUMP_AUDIO 设置时开启；默认零开销）
+        import os as _os
+        self._dump_path = _os.environ.get("ORCH_DUMP_AUDIO") or None
+        self._dump_mic: list = []
+        self._dump_ref: list = []
+        self._dump_aec: list = []
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
@@ -101,12 +107,16 @@ class OrchestratorSession:
         # 声学延迟：优先用该设备的历史记录，没有则用配置默认值
         self._delay_store = None
         self._client_key = "default"
-        self.delay_default_ms = float(config.get("aec_default_delay_ms") or 250.0)
+        # ⚠️ 只在**键缺失**时兜底，不用 `or`：`or` 会把合法的 0 变成 250
+        # （0 是 falsy），让 config 里显式设的 0 失效。
+        _dd = config.get("aec_default_delay_ms")
+        self.delay_default_ms = float(250.0 if _dd is None else _dd)
         self.delay_adaptive = bool(config.get("aec_adaptive_delay", True))
         self.delay_source = "default"
         self._last_stats_push = 0.0
         # 播放提前量（前端起播预留的时间）—— 校准时要从中扣除
-        self.playback_delay_ms = int(config.get("playback_delay_ms") or 200)
+        _pd = config.get("playback_delay_ms")
+        self.playback_delay_ms = int(200 if _pd is None else _pd)
         # 进行中的校准会话
         self._cal = None
         # ASR 流式文本的累积缓冲。
@@ -169,9 +179,58 @@ class OrchestratorSession:
         if self.aec is not None:
             ref = self._ref_for(frame)
             self._trace_ref(ref, frame)
+            self._dump_audio(frame.data, ref)
             await self.aec.push(frame.data, ref)
         else:
             await self._fanout_direct(frame.data)
+
+    def _dump_audio(self, mic: np.ndarray, ref: np.ndarray) -> None:
+        """把 mic / farend 落盘（仅在开启转储时）。
+
+        「回声消不掉」这个问题的**唯一确诊手段**：拿到 mic 与 farend 的
+        原始波形，就能直接算出 mic 里到底有没有回声、以及它与 farend 差
+        多少采样。在此之前我们一直在用"互相关峰比""ERLE""mic_peak"这些
+        间接指标推断，已经推错过好几次（甚至得出过与 ASR 现象矛盾的
+        结论）—— 必须看波形。
+
+        开启：环境变量 ``ORCH_DUMP_AUDIO=/path/prefix``（会话结束时写成
+        ``<prefix>-<sid>-mic.wav`` / ``-ref.wav`` / ``-aec.wav``）。
+        默认关闭，零开销 —— 实时路径上不该有额外 I/O。
+        """
+        if self._dump_path is None:
+            return
+        self._dump_mic.append(mic.reshape(-1).copy())
+        self._dump_ref.append(ref.reshape(-1).copy())
+
+    def _dump_aec_out(self, seg: np.ndarray) -> None:
+        if self._dump_path is None:
+            return
+        self._dump_aec.append(np.asarray(seg).reshape(-1).copy())
+
+    def flush_audio_dump(self) -> None:
+        """会话结束时把转储写成 wav（三路：mic / farend / aec 输出）。"""
+        if self._dump_path is None or not self._dump_mic:
+            return
+        import wave
+        from pathlib import Path
+        base = Path(self._dump_path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        for name, chunks in (("mic", self._dump_mic), ("ref", self._dump_ref),
+                             ("aec", self._dump_aec)):
+            if not chunks:
+                continue
+            x = np.concatenate(chunks)
+            # mic/ref 是 [-1,1] float32；aec 输出同为 float32
+            peak = float(np.abs(x).max()) if x.size else 0.0
+            path = f"{base}-{self.session_id}-{name}.wav"
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(
+                    np.clip(x * 32767.0, -32768, 32767).astype(np.int16).tobytes())
+            logger.info("[%s] 音频转储 %s：%.1fs 峰值=%.5f",
+                        self.session_id, path, x.size / SR, peak)
 
     def _normalize_chunk(self, x: np.ndarray) -> np.ndarray:
         """把任意长度的块规整成 MIC_CHUNK 长度（必要时应改造为环形缓冲）。"""
@@ -271,17 +330,25 @@ class OrchestratorSession:
         self.push_stats(force=True)
 
     async def start_calibration(self) -> bool:
-        """开始一次声学延迟校准（播放啁啾 + 采集回声）。
+        """开始一次声学延迟校准（播放双段啁啾 + 采集回声）。
 
         与自适应的区别：**主动**发起，不依赖 TTS 播放窗口，用户点一下
         按钮即可；用的是宽带啁啾，互相关峰值比语音尖锐得多。
+
+        ⚠️ 浏览器页面用的是**独立通道** ``/v1/calibrate``（见
+        calibrate_endpoint.py），那条路径让前端直接复用 PcmPlayer，
+        播放行为与 TTS 完全一致。本方法是会话内的备用路径，同样走
+        ``tts.*`` 消息通道，并**由服务端自己算起播锚点**（它知道发送
+        时刻 + 约定的播放提前量）。
         """
         from .calibrate import CalibrationSession
         if getattr(self, "_cal", None) is not None and not self._cal.done:
             logger.info("[%s] 校准已在进行中", self.session_id)
             return False
         self._cal = CalibrationSession(sr=SR)
-        chirp = self._cal.start()
+        signal, _starts = self._cal.start()
+        # 采集起点 = 会话当前采样位置（之后每帧都喂给它）
+        self._cal_t0 = self.clock.now()
         # 走**与 TTS 相同的播放通道** —— 否则测的是另一条链路的延迟
         rid = f"cal_{int(time.monotonic())}"
         from .protocol import TtsAudio, TtsEnd, TtsStart
@@ -290,18 +357,20 @@ class OrchestratorSession:
         # 分块送，与 TTS 一致
         chunk = 24000 // 2
         seq = 0
-        for i in range(0, len(chirp), chunk):
+        for i in range(0, len(signal), chunk):
             await self.send_to_client(TtsAudio.from_int16(
-                chirp[i:i + chunk], rid, seq))
+                signal[i:i + chunk], rid, seq))
             seq += 1
         await self.send_to_client(TtsEnd(response_id=rid))
         # 校准信号也进参考轨（这样 AEC 期间不会把啁啾当回声残留）
         if self.ref_track is not None:
             at = self.clock.now() + int(
                 self.playback_delay_ms * SR / 1000.0)
-            self.ref_track.place(rid, 0, chirp, at)
+            self.ref_track.place(rid, 0, signal, at)
+            # 浏览器按同一约定起播 → 起播位置相对采集起点就是这段偏移
+            self._cal.set_play_anchor(at - self._cal_t0)
         logger.info("[%s] 校准信号已发出（%.1fs）", self.session_id,
-                    len(chirp) / 24000)
+                    len(signal) / 24000)
         return True
 
     def _feed_calibration(self, frame: AudioFrame) -> None:
@@ -314,16 +383,17 @@ class OrchestratorSession:
             self._finish_calibration()
 
     def _finish_calibration(self) -> None:
-        from .protocol import ErrorMsg, SessionStats
+        from .protocol import ErrorMsg
         cal = getattr(self, "_cal", None)
         if cal is None:
             return
-        res = cal.finish(playback_delay_ms=self.playback_delay_ms)
+        res = cal.finish()
         if res is None or not res.get("ok"):
-            msg = (f"校准置信度低（峰值比 {res.get('peak_ratio') if res else '-'}）。"
-                   "请确认环境安静、音量适中后重试。")
-            logger.warning("[%s] %s", self.session_id, msg)
-            self._send_display(ErrorMsg(code="calibrate_failed", message=msg))
+            reason = (res or {}).get("reason") or (res or {}).get("error") \
+                or "校准失败，请重试"
+            logger.warning("[%s] 校准失败：%s", self.session_id, reason)
+            self._send_display(ErrorMsg(code="calibrate_failed",
+                                        message=reason))
             self._cal = None
             return
         d_ms = res["delay_ms"]
@@ -389,6 +459,8 @@ class OrchestratorSession:
             ref_nonzero_ratio=round(nz / total, 3) if total else 0.0,
             erle_db=(round(self.current_erle_db(), 1)
                      if self.current_erle_db() is not None else None),
+            delay_estimates=int(self.stats.get("delay_estimates", 0)),
+            delay_estimate_fails=int(self.stats.get("delay_estimate_fails", 0)),
         ))
 
     def _periodic_diag(self, frame: AudioFrame) -> None:
@@ -497,8 +569,19 @@ class OrchestratorSession:
             return
         if self._raw_mic_buf is None:
             return
-        # 播放窗口判断：当前或未来有参考在播
+        # 关闭自适应时直接返回：不做互相关（省 CPU），固定用 seed 值。
+        # 早先这个判断放在 estimate() **之后** —— 算完了再丢，纯浪费。
+        if not self.delay_adaptive:
+            return
+        # 播放窗口判断：当前或未来有参考在播。
+        # ⚠️ 不在播放窗口时要**清掉半截缓冲**：窗口是按"攒满 1s"触发的，
+        # 若一次播报短于 1s，残留的半个窗口会被带到**下一次播报**里，
+        # 拼出一段横跨两次播报、含静音间隙的假窗口 —— 互相关会在上面
+        # 选错峰。清了才是"每窗素材都来自同一次连续播报"。
         if not self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR)):
+            if self._raw_mic_buf:
+                self._raw_mic_buf = []
+                self._raw_mic_len = 0
             return
 
         # ⚠️ 窗口长度必须 **大于可能的最大延迟**，否则互相关搜不到：
@@ -515,17 +598,44 @@ class OrchestratorSession:
         # raw ref 要往前多读一个"最大延迟"的长度：
         # mic 窗 [t-W, t) 里的回声，其源在 raw 的 [t-W-D, t-D)。
         # 读 [t-W-Dmax, t) 这一整段，让互相关自己找偏移。
+        #
+        # ⚠️ 参考窗比 mic 长 dmax 个采样，所以必须把 dmax 作为 ``offset``
+        # 传给 estimate()。早先没传 —— 而 estimate() 当时要求两者等长，
+        # 于是**每次调用都在形状校验处返回 None**，自适应延迟从未生效。
         dmax = int(self.delay_tracker.max_delay)
         raw = self.ref_track.read_raw(frame.t1 - WINDOW - dmax, WINDOW + dmax)
         self._raw_mic_buf = []
         self._raw_mic_len = 0
-        if raw.shape[0] < WINDOW:
+        if raw.shape[0] != mic.shape[0] + dmax:
+            # 这条断言本可以早点点破上面那个 bug —— 保留它，别再让契约
+            # 不符静默通过
+            logger.warning(
+                "[%s] 延迟估计窗口契约不符：mic=%d raw=%d（期望 raw=mic+%d）",
+                self.session_id, mic.shape[0], raw.shape[0], dmax,
+            )
             return
-        est = self.delay_tracker.estimate(mic, raw)
+        est = self.delay_tracker.estimate(mic, raw, offset=dmax)
         if est is None:
+            # 「估不出来」必须可见 —— 早先这里是静默 return，导致延迟估计
+            # 整条路径失效而无人察觉。限流到每 5s 一条，避免刷屏。
+            self.stats["delay_estimate_fails"] = \
+                self.stats.get("delay_estimate_fails", 0) + 1
+            now = time.monotonic()
+            if now - getattr(self, "_last_delay_fail_log", 0.0) >= 5.0:
+                self._last_delay_fail_log = now
+                logger.info(
+                    "[%s] 声学延迟估计未产出（%s；累计失败 %d 次）—— "
+                    "参考非零占比 %.0f%%，当前 D=%.0fms",
+                    self.session_id,
+                    self.delay_tracker.last_reason or "未知原因",
+                    self.stats["delay_estimate_fails"],
+                    100.0 * self.stats.get("ref_push_nonzero", 0)
+                    / max(1, self.stats.get("ref_push_total", 0)),
+                    self.current_delay_ms(),
+                )
             return
-        if not self.delay_adaptive:
-            return
+        self.stats["delay_estimates"] = \
+            self.stats.get("delay_estimates", 0) + 1
         prev = self.ref_track.delay_samples
         self.ref_track.delay_samples = self.delay_tracker.delay
         self.stats["delay_measured"] = 1
@@ -592,13 +702,31 @@ class OrchestratorSession:
         """
         if self.closed or self.ref_track is None:
             return
-        if phase in ("ended", "cancelled"):
-            # 取消/结束时必须截断 ref 尾部：否则 AEC 会拿着没播出的
-            # 音频当参考，主动误适配去追一个不存在的回声 —— 比不给更糟
+        # ⚠️ **只有 cancelled 才截断，ended 绝不能截**。
+        #
+        # 曾经 ended 也调 truncate(from_sample=clock.now())，理由是"没播出的
+        # 音频不该留在参考轨上"。但那个语义是**错的**：
+        #   · truncate 清的是「从**当前会话时刻**往后」的区间，它假定音频
+        #     已经播到那儿了
+        #   · 实际 `tts.end` 到达时浏览器**才刚开始播**（还有 200ms 提前量），
+        #     而 TTS 是**整段一次性送完**的
+        #   → 于是整段参考被清掉，只剩到达那一刻之前的一小截。
+        #
+        # 真机实测（s-6d21f3ab5f3c）：TTS 报 5.85s、ref 写入区间也正是
+        # 5.85s，但实际非零只有 **0.6s**（日志 `非零 6/152 = 4%`）——
+        # 参考轨只剩 10%，AEC 等于没有参考，回声自然消不掉。
+        #
+        # 播放是**排程好**的（WebAudio 按 nextAt 连续排），`ended` 只表示
+        # "音频已全部交给播放器"，不代表"已经播完了"。没用上的那部分由
+        # 后续播报覆盖或被环形缓冲自然淘汰，不需要主动清。
+        #
+        # cancelled 则不同：那是**真的没播**，必须立刻清 —— 否则 AEC 会
+        # 拿着不存在的回声去适配，比不给参考更糟。
+        if phase == "cancelled":
             n = self.ref_track.truncate(response_id,
                                         from_sample=self.clock.now())
             if n:
-                logger.debug("截断 ref %d 采样（%s）", n, phase)
+                logger.debug("取消 %s：截断 ref %d 采样", response_id, n)
         self._post_downstream_playback(response_id, phase, ctx_time, seq)
 
     def _post_downstream_playback(self, response_id: str, phase: str,
@@ -620,6 +748,7 @@ class OrchestratorSession:
         loop = asyncio.get_running_loop()
 
         def on_audio(seg: np.ndarray) -> None:
+            self._dump_aec_out(seg)
             self.stats["aec_segments_out"] += 1
             self.stats["aec_samples_out"] += int(np.asarray(seg).size)
             self.metrics.inc("aec_segments")
@@ -1048,6 +1177,11 @@ class OrchestratorSession:
             return
         self.closed = True
         logger.info("会话 %s 关闭（%s）", self.session_id, reason)
+        # 音频转储落盘（默认关闭，无副作用）
+        try:
+            self.flush_audio_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("音频转储写入失败: %s", exc)
         if self.downstream is not None:
             try:
                 await self.downstream.on_session_end(reason)

@@ -71,6 +71,33 @@ _min_infer_samples = int(window_samples * 0.2)      # 640 = 40ms 最小累积
 
 > 待确认：首尾窗会被裁剪（实测 min=1200 / max=5200），尾部 flush 行为需用真实音频再验。
 
+#### ⚠️ 模型不做时延对齐（2026-09-15 读源码确认）
+
+线上部署的是 `SD_AEC`（`asr_frontend_api.py:137` **硬编码**，无 env/CLI
+开关）。仓库里的 `xmov_aec/delay_estimator.py`（GCC-PHAT）与
+`linear_aec.py` 在流式路径里是**死代码** —— `linear_aec.py` 甚至 import
+一个不存在的 `config/aec_config.py`，根本无法导入。模型唯一的"对齐"是
+alpha predictor 里 k=10 帧 ≈ **100ms** 的学习式 lookback。
+
+**结论：调用方必须自己做样本级预对齐**，且精度要求很高 —— 实测容忍窗
+只有约 ±5ms（见 `test_aec_live_fidelity.py` 的扫描表：D 偏 6ms 回声抑制
+从 12.6dB 掉到 2.5dB）。这正是 `RefTrack` 的职责。
+
+#### 实测：补偿量 D 与回声抑制的关系
+
+`test_aec_live_fidelity.py`（真实服务，`mic = ref延迟D + near`）：
+
+| 补偿 D | ERLE总 | 回声抑制 | 近端保留 |
+|---|---|---|---|
+| 0 ms | 4.8 dB | 10.1 dB | +1.1 dB |
+| 40 ms | 4.8 dB | 10.2 dB | +1.0 dB |
+| **84 ms（真值）** | **5.2 dB** | **12.6 dB** | +0.6 dB |
+| 90 ms | 1.7 dB | 2.5 dB | +4.1 dB |
+| 120 ms | 0.3 dB | 0.4 dB | +5.5 dB |
+| **250 ms（旧默认值）** | **0.2 dB** | **0.3 dB** | +5.6 dB |
+
+对齐时自适应延迟估计能精确恢复真值（误差 **0 采样**）。
+
 ### ASR（`ws://192.168.88.101:31366`）
 
 真实中文语音（`assets/ref_audio/ref_minicpm_signature.wav`，6.02s）实测，识别准确。

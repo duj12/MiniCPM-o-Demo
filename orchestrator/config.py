@@ -64,6 +64,12 @@ class Settings:
 
     # 声学延迟（毫秒）的冷启动默认值。没有历史记录时用它，
     # 会话内测得真实值后会自适应更新并持久化（见 delay_store.py）。
+    #
+    # 250 是历史默认值。曾经改成 0（理由是"参考轨落位已含 200ms 播放
+    # 提前量，D 应当只是纯声学延迟"），但那只是**推断**，且真机上自适应
+    # 估计一次都没成功过（峰比恒 ≈1.0，mic 与参考轨完全不相关），无从
+    # 验证哪个更接近真值。在没有实测依据前先用回 250 —— 这个值至少是
+    # 之前被当作"能用"的那个。
     aec_default_delay_ms: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_AEC_DEFAULT_DELAY_MS", "250")))
     # 延迟自适应开关（关闭则固定用 default_delay_ms）

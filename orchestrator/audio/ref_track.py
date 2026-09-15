@@ -85,6 +85,23 @@ class RefTrack:
 
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _normalize_pcm(x: np.ndarray) -> np.ndarray:
+        """把 TTS PCM 统一到 [-1, 1] float32。
+
+        int16（TTS 服务的原生格式）除以 32768；float32 若幅度超过 1.5
+        也按 int16 量纲处理（容错：有些调用方传 float 但没归一化）。
+        已经是 [-1,1] 的 float 原样返回。
+        """
+        if x.dtype == np.int16:
+            return x.astype(np.float32) / 32768.0
+        x = x.astype(np.float32, copy=False)
+        peak = float(np.abs(x).max()) if x.size else 0.0
+        if peak > 1.5:
+            # 明显是 int16 量纲的浮点（如 pcm.astype(np.float32)）
+            return x / 32768.0
+        return x
+
     def place(self, response_id: str, seq: int, pcm24: np.ndarray,
               at_sample: int) -> PlaybackChunk:
         """把一段 TTS PCM 落位到轨上。
@@ -92,9 +109,18 @@ class RefTrack:
         ``at_sample``：**会话采样时钟**上"开始出声"的位置。
         由调用方按 ``clock.now() + playback_delay_samples`` 计算，
         **不要**传浏览器的 ``ctx_time``。
+
+        ⚠️ **量纲统一到 [-1, 1]**：TTS 服务返回的是 int16 PCM
+        （实测幅度 ±18000，见 tests/README.md），而麦克风（nearend）是
+        [-1,1] 的 float32。若把 int16 量纲原样存在轨上，送进 AEC 的
+        farend 就会比 nearend **大约 32768 倍** —— 模型看到的参考大了 5 个
+        数量级，回声估计会被压到 0，表现为**回声完全不消**。
+        （报告里"farend 峰值 rms=4848"这条"正常"的记录，正是这个量纲
+        问题的现场：4848 是 int16 量纲，而 mic 只有 0.01~0.1 量级。）
         """
         if pcm24.ndim != 1:
             raise ValueError("pcm24 必须是 1-D")
+        pcm24 = self._normalize_pcm(pcm24)
         x16 = self._rs.process(pcm24)
         self.buf.write(at_sample, x16)
         chunk = PlaybackChunk(
@@ -182,6 +208,12 @@ class AcousticDelayTracker:
         self._median_window = median_window
         self.delay = 0
         self.estimates = 0
+        # 最近一次 estimate() 的失败原因 / 置信度 —— 供调用方分级记日志。
+        # ⚠️ 没有这两个字段时，"估不出来"是完全静默的：下面的形状校验
+        # 曾经因为契约不符而**每次直接 return None**，整条自适应延迟路径
+        # 因此从未生效，却没有任何日志能看出来（潜伏了很久）。
+        self.last_reason: Optional[str] = None
+        self.last_ratio: float = 0.0
 
     def estimate(self, mic: np.ndarray, ref_earlier: np.ndarray,
                  offset: int = 0, min_ratio: float = 1.5) -> Optional[int]:
@@ -194,25 +226,52 @@ class AcousticDelayTracker:
             —— 参考窗必须**覆盖更早的时间**，因为 mic 里的回声来自
             ``D_path`` 之前的播放
 
-        两者长度须相同。返回的 ``D_path`` 满足
+        返回的 ``D_path`` 满足
         ``mic[j] ≈ ref_earlier[j + offset - D_path]``。
         ``offset == D_path`` 时两者恰好对齐。
 
-        搜索范围 ``[-offset, +offset]``，因此 ``offset`` 必须
-        **不小于可能的最大延迟**，否则搜不到（这正是早先恒报 0 的原因：
-        只读了与 mic 同时刻的 ref，两者没有重叠片段）。
+        **两种窗口几何**（由 ``offset`` 选择，都可以，但含义不同）：
+
+          · ``offset > 0``（**生产链路用这个**）：参考窗比 mic 多出
+            ``offset`` 个采样，显式覆盖 mic 窗之前的时间。此时
+            ``D_path ∈ [0, offset]``。互相关搜 ``k ∈ [-offset, 0]``。
+            ⚠️ 早先这里写的是 ``mic.shape != ref_earlier.shape``（要求
+            等长），而调用方按这个几何传的是 ``N`` 与 ``N + offset`` ——
+            于是**每次调用都在形状校验处返回 None**，自适应延迟估计整条
+            路径从未生效过。
+
+          · ``offset == 0``：等长窗口（离线分析：手上只有一段录音）。
+            此时依赖"回声落在窗口内部"的部分重叠，``D_path ∈ [0, search]``。
+            互相关搜 ``k ∈ [0, search]``。
         """
-        if mic.shape != ref_earlier.shape or mic.shape[0] < 2048:
+        self.last_reason = None
+        self.last_ratio = 0.0
+        offset = int(offset)
+        n_mic = int(mic.shape[0])
+
+        if ref_earlier.shape[0] != n_mic + offset:
+            self.last_reason = (
+                f"形状不符：mic={n_mic} ref={ref_earlier.shape[0]}，"
+                f"期望 ref=mic+offset={n_mic + offset}"
+            )
+            return None
+        if n_mic < 2048:
+            self.last_reason = f"mic 窗过短（{n_mic} < 2048）"
             return None
         if float(np.sqrt(np.mean(ref_earlier ** 2))) < 1e-4:
-            return None  # ref 近似静音，估不出
+            self.last_reason = "参考窗近似静音 —— 不在播放窗口内"
+            return None
         if float(np.sqrt(np.mean(mic ** 2))) < 1e-5:
+            self.last_reason = "麦克风近似静音"
             return None
 
-        n = mic.shape[0]
+        # ⚠️ 线性互相关不能循环卷绕：需要 n_fft ≥ len(mic) + len(ref) - 1。
+        # 早先按 2*len(mic) 算，在 ref 变长（= mic + offset）后会卷绕 ——
+        # 真峰被折到错误的 lag 上，表现为测出的延迟离谱但置信度不低。
         n_fft = 1
-        while n_fft < 2 * n:
+        while n_fft < n_mic + ref_earlier.shape[0]:
             n_fft <<= 1
+
         X = np.fft.rfft(mic, n_fft)
         Y = np.fft.rfft(ref_earlier, n_fft)
         # GCC-PHAT：只保留相位，对幅度差异不敏感
@@ -220,24 +279,53 @@ class AcousticDelayTracker:
         mag = np.abs(R)
         mag[mag < 1e-10] = 1e-10
         cc = np.fft.irfft(R / mag, n_fft)
-        # cc[k] 表示 mic 与 ref 平移 k 的相关（k 可为负）
-        # 把负延迟折到数组尾部：cc[N-k] 即 k = -k
-        search = max(1, min(int(offset) or self.max_delay, n_fft // 2 - 1))
-        pos = np.abs(cc[: search + 1])
-        neg = np.abs(cc[n_fft - search:]) if search > 0 else np.zeros(0)
-        cand = np.concatenate([pos, neg])          # [0..search, -search..-1]
+
+        # cc[k] = Σ_j mic[j]·ref[j-k]，即峰值在 k 处表示
+        # mic[j] ≈ ref[j-k]。代入上面的约定得 **D = k + offset**。
+        if offset > 0:
+            search = min(offset, self.max_delay, n_fft // 2 - 1)
+            if search < 1:
+                self.last_reason = f"搜索窗为空（offset={offset}, n_fft={n_fft}）"
+                return None
+            # D ∈ [0, offset] → k ∈ [-search, 0]：只搜负 lag（含 k=0，
+            # 它对应端点 D == offset）。正 lag 是 mic 领先 ref，在这个
+            # 几何下非物理，搜它只会引入假峰。
+            cand = np.concatenate([
+                np.abs(cc[n_fft - search:]),        # k = -search .. -1
+                np.abs(cc[:1]),                     # k = 0
+            ])
+            d_max = offset
+        else:
+            search = min(self.max_delay, n_fft // 2 - 1)
+            if search < 1:
+                self.last_reason = f"搜索窗为空（n_fft={n_fft}）"
+                return None
+            cand = np.abs(cc[: search + 1])        # k = 0 .. search
+            d_max = search
+
         peak_i = int(np.argmax(cand))
-        k = peak_i if peak_i <= search else peak_i - (len(cand))
-        # 置信度：峰值须显著高于次峰
+        k = peak_i - (search if offset > 0 else 0)
+
         tmp = cand.copy()
         lo = max(0, peak_i - 2)
         tmp[lo:peak_i + 3] = 0
+        ratio = float(cand[peak_i] / tmp.max()) if tmp.max() > 0 else 0.0
+        self.last_ratio = ratio
+        # 置信度：峰值须显著高于次峰
         if tmp.max() > 0 and cand[peak_i] < min_ratio * tmp.max():
+            self.last_reason = f"相关峰不明显（峰比 {ratio:.2f} < {min_ratio}）"
             return None
 
-        d_path = k + int(offset)
-        if d_path < 0 or d_path > search + int(offset):
+        d_path = k + offset
+        if d_path < 0 or d_path > d_max:
+            self.last_reason = f"估计值 {d_path} 超出物理范围 [0, {d_max}]"
             return None
+        if d_path > self.max_delay:
+            logger.warning(
+                "声学延迟估计 %d 采样（%.0fms）超出 max_delay=%d —— "
+                "可能是选错峰，仍会采纳但请留意",
+                d_path, d_path / self.sr * 1000, self.max_delay,
+            )
         self._history.append(d_path)
         if len(self._history) > self._median_window:
             self._history.pop(0)
@@ -249,3 +337,5 @@ class AcousticDelayTracker:
         self._history.clear()
         self.delay = 0
         self.estimates = 0
+        self.last_reason = None
+        self.last_ratio = 0.0

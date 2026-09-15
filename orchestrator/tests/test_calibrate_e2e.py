@@ -35,8 +35,17 @@ def check(cond: bool, msg: str) -> None:
 
 
 async def fake_browser(url: str, true_delay_ms: float,
-                       lead_ms: float = 200.0) -> dict:
-    """模拟浏览器：**先注册 handler 再发 start**，回传带已知延迟的麦克风。"""
+                       lead_ms: float = 200.0,
+                       send_anchor: bool = True,
+                       mic_sr: int = SR,
+                       echo_gain: float = 0.5,
+                       noise: float = 0.001) -> dict:
+    """模拟浏览器：**先注册 handler 再发 start**，回传带已知延迟的麦克风。
+
+    ``lead_ms`` 是"起播相对采集起点"的偏移，由前端上报（真实浏览器算的
+    是 AudioContext 上的实际差值）。麦克风 = 播放信号延迟 ``true_delay_ms``
+    后衰减 ``echo_gain`` + 噪声 —— 服务端应当恢复出 ``true_delay_ms``。
+    """
     import websockets
 
     received_play = False
@@ -46,8 +55,21 @@ async def fake_browser(url: str, true_delay_ms: float,
         async def recv_loop():
             nonlocal received_play
             while True:
-                raw = await ws.recv()
+                try:
+                    raw = await ws.recv()
+                except Exception:
+                    # 服务端因协议违规主动断开 —— 真浏览器会先收到错误帧
+                    # 再看到连接关闭，这里同样终止等待（否则测试挂 30s）
+                    if not result_fut.done():
+                        result_fut.set_result(
+                            {"ok": False, "error": "服务端断开连接"})
+                    return
                 m = json.loads(raw)
+                if "ok" in m and m.get("type") != "calibrate.play":
+                    # 错误帧不是 calibrate.done 形式也要收下
+                    if not result_fut.done():
+                        result_fut.set_result(m)
+                    return
                 if m.get("type") == "calibrate.play":
                     received_play = True
                     # 收到音频后：构造"麦克风"= 该音频延迟 lead+true 后 + 噪声
@@ -64,35 +86,41 @@ async def fake_browser(url: str, true_delay_ms: float,
 
                     lead = int(lead_ms * SR / 1000)
                     delay = int(true_delay_ms * SR / 1000)
-                    # 采集时长要覆盖「播放 + 最大搜索延迟」——与服务端
-                    # ready() 的判据一致（1.5s 播放 + 1.5s 搜索 + 余量）
-                    total = lead + delay + len(a16) + int(1.6 * SR)
-                    mic = np.random.randn(total).astype(np.float32) * 0.001
+                    # 采集时长要覆盖「起播偏移 + 播放 + 最大搜索延迟」——
+                    # 与服务端 ready() 的判据一致
+                    total = lead + delay + len(a16) + int(1.7 * SR)
+                    mic = np.random.randn(total).astype(np.float32) * noise
                     s = lead + delay
-                    mic[s:s + len(a16)] += a16 * 0.5
+                    mic[s:s + len(a16)] += a16 * echo_gain
 
-                    # 按 100ms 分块回传
+                    # ⚠️ 上报起播锚点（真实前端在 src.start() 时上报）
+                    if send_anchor:
+                        await ws.send(json.dumps({
+                            "type": "calibrate.anchor",
+                            "play_offset_samples": lead,
+                        }))
+
+                    # 按 100ms 分块回传（**16kHz** —— 协议要求）
                     for i in range(0, len(mic), 1600):
                         chunk = mic[i:i + 1600]
                         if chunk.size < 1600:
                             chunk = np.pad(chunk, (0, 1600 - chunk.size))
+                        if ws.state.name != "OPEN":
+                            break       # 服务端已因协议违规断开
                         await ws.send(json.dumps({
                             "type": "calibrate.mic",
+                            "sample_rate": mic_sr,
                             "audio_base64": base64.b64encode(
                                 chunk.astype(np.float32).tobytes()).decode(),
                         }))
                         await asyncio.sleep(0.01)
-                elif "ok" in m:
-                    if not result_fut.done():
-                        result_fut.set_result(m)
-                    return
 
         rtask = asyncio.create_task(recv_loop())
         # handler 已注册，现在才发 start
         await ws.send(json.dumps({"type": "calibrate.start",
                                   "client_key": "e2e_test"}))
         try:
-            res = await asyncio.wait_for(result_fut, timeout=25)
+            res = await asyncio.wait_for(result_fut, timeout=30)
         finally:
             rtask.cancel()
         res["_received_play"] = received_play
@@ -127,7 +155,9 @@ async def main_async() -> int:
     print("-" * 66)
 
     try:
-        for true_d in (150.0, 284.0):
+        # ⚠️ 判定要严：实测 D 的容忍窗只有约 ±5ms（偏 6ms 回声抑制就从
+        # 12.6dB 掉到 2.5dB），所以校准必须精确到毫秒级。
+        for true_d in (20.0, 84.0, 284.0):
             print(f"\n--- 真实延迟 {true_d:.0f}ms ---")
             res = await fake_browser(url, true_d)
             check(res.get("_received_play", False),
@@ -135,17 +165,43 @@ async def main_async() -> int:
             if res.get("ok"):
                 got = res["delay_ms"]
                 err = got - true_d
-                check(abs(err) <= 25,
-                      f"测得 {got:.0f}ms（真值 {true_d:.0f}ms，误差 {err:+.0f}ms）")
+                check(abs(err) <= 5.0,
+                      f"测得 {got:.1f}ms（真值 {true_d:.0f}ms，误差 {err:+.1f}ms）"
+                      f" 段数={res.get('segments')} 段间差={res.get('spread_ms')}ms")
                 check(res.get("saved", False), "结果已保存")
             else:
                 check(False, f"校准失败: {res.get('error')}")
+
+        # 起播偏移只影响"何时开始出声"，**不该**被算进声学延迟。
+        # 这条路径覆盖"前端上报的锚点确实被用上了"：
+        # 若服务端忽略 anchor、或拿 mic 位置直接减 anchor（搞反语义），
+        # 测出来就会是 284ms 而非 84ms。
+        print(f"\n--- 起播偏移 200ms + 声学 84ms（应仍测得 84ms）---")
+        res = await fake_browser(url, 84.0, lead_ms=200.0)
+        if res.get("ok"):
+            check(abs(res["delay_ms"] - 84.0) <= 5.0,
+                  f"测得 {res['delay_ms']:.1f}ms（应 84ms，不是 284ms）"
+                  f" —— 锚点被正确使用")
+        else:
+            check(False, f"校准失败: {res.get('error')}")
+
+        # 未上报锚点 → 必须**拒绝**给结论，而不是拿常量兜底
+        print(f"\n--- 未上报起播锚点（应被拒绝，不用常量兜底）---")
+        res = await fake_browser(url, 84.0, send_anchor=False)
+        check(not res.get("ok"),
+              f"未上报锚点时拒绝（{str(res.get('error'))[:50]}）")
+
+        # 采样率不符 → 必须明确报错，而不是静默按 16k 解析
+        print(f"\n--- 回传 48kHz 数据（协议应拒绝）---")
+        res = await fake_browser(url, 84.0, mic_sr=48000)
+        check(not res.get("ok"),
+              f"非 16kHz 回传被拒绝（{str(res.get('error'))[:50]}）")
 
         # 异常值应被拒绝
         print(f"\n--- 异常值 900ms（应被拒绝，多半是选错峰）---")
         res = await fake_browser(url, 900.0)
         check(not res.get("ok"),
-              f"900ms 被拒绝（{res.get('error', '')[:40]}）")
+              f"900ms 被拒绝（{str(res.get('error'))[:40]}）")
     finally:
         server.should_exit = True
         await asyncio.sleep(0.3)

@@ -139,6 +139,74 @@ AEC 的参考信号必须与**实际播出**的时刻对齐（不是音频到达
 后者让云端 `truncate()` 参考轨，否则 AEC 会拿着没播出的音频当参考，
 **主动误适配去追一个不存在的回声，比不给参考更糟**。
 
+#### ⚠️⚠️ 但 `ended` **绝不能**截断参考轨（真机头号故障）
+
+这是真机上「算法 AEC 完全没起作用」的**根本原因**，务必不要退回：
+
+`truncate(rid, from_sample=clock.now())` 的语义是「从**当前会话时刻**
+往后清空」，它假定音频已经播到那儿了。而：
+
+  · TTS 是**整段一次性**送达并整段落位的（`executor._speak_inner`）
+  · `tts.end` 到达浏览器时，浏览器**才刚开始播**（还有 200ms 提前量）
+
+于是"当前位置"远在整段音频之前 → **整段参考被清掉，只剩到达那一瞬间的
+一小截**。真机实测（会话 `s-6d21f3ab5f3c`）：TTS 报 5.85s、ref 写入区间
+也正好 5.85s，但实际非零只有 **0.6s**（日志 `非零 6/152 = 4%`）——参考
+只剩 10%，AEC 等于没有 farend。用户听到的现象是"ref 里只剩开头几个字、
+还被拉得很长"。
+
+**只有 `cancelled` 才截断**。播放是排好程的（WebAudio 按 `nextAt` 连续
+排），`ended` 只表示"音频已全部交给播放器"，**不代表已经播完**；没用上
+的部分由后续播报覆盖或被环形缓冲淘汰，不需要主动清。
+回归护栏：`tests/test_ref_truncate_bug.py`。
+
+修复前后对比（真机）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| farend 非零占比 | 4% | **43%** |
+| ref 写入区间 | 5.85s | **23.6s** |
+| ERLE | 8.3 dB | **31.6 dB** |
+
+### ⚠️⚠️ 声学延迟 D 必须准到 ±5ms（算法 AEC 的生死线）
+
+实测（`tests/test_aec_live_fidelity.py`，真实 AEC 服务）：
+
+| 补偿 D | 回声抑制 |
+|---|---|
+| 84ms（真值） | **12.6 dB** |
+| 90ms | 2.5 dB |
+| 250ms（旧默认值） | **0.3 dB**（等于完全不工作） |
+
+**容忍窗只有约 ±5ms** —— 差 6ms 就从 12.6dB 掉到 2.5dB。所以：
+
+- 默认值 `aec_default_delay_ms` 是 **0**（"假定浏览器按约定提前量起播"），
+  不是 250。250 是把**全程往返**当成了参考轨要补的残差 —— 而
+  `RefTrack.place()` 的落位已含 200ms 提前量，D 只需补剩下的声学延迟。
+- 服务端**不做**时延对齐（`SD_AEC` 是硬编码的 ONNX 模型；仓库里的
+  `GCCPHATDelayEstimator`/`LinearAEC` 在流式路径中是死代码，唯一"对齐"
+  是 alpha predictor 里 k=10 帧 ≈100ms 的学习式 lookback）。
+  **所以调用方必须自己保证样本级预对齐** —— 这正是 `RefTrack` 的职责。
+- 前端会显示 D 的三态（未测量 / 收敛中 / 已收敛）。**显示"未测量"时
+  算法 AEC 基本不会生效**，别把它当成一个正常数字。
+
+### farend 量纲（应当归一化，但别高估其影响）
+
+TTS 返回 **int16**（±32768），麦克风是 **[-1,1] float32**。
+`RefTrack.place()` 会归一化 —— 这是"不该靠模型兜底"的正确做法。
+
+⚠️ 但**实测影响很小**（`tests/test_aec_scale_bug.py`，同一段 mic 只改
+farend 量纲）：
+
+| farend | ERLE | 近端保真 |
+|---|---|---|
+| 归一化 [-1,1] | 5.0 dB | +1.1 dB |
+| int16 量纲 | 5.8 dB | +0.3 dB |
+| 放大 100× | 5.9 dB | +0.2 dB |
+
+模型对量纲不敏感。归一化保留，但它**不是**"回声消不掉"的原因 ——
+真正的主因是上面那条 D 对齐（容忍窗 ±5ms）。
+
 ---
 
 ## 下游接口（Policy / Agent 预留）
@@ -189,6 +257,33 @@ class Downstream(Protocol):
       omni=223d/1done tts=1call(总171ms) face=0frm drop=0
 ```
 
+### ⚠️ 排「回声没消掉」：**先看波形，别看指标**
+
+这是本项目最贵的一课。ERLE / 峰比 / 非零占比 / mic_rms 这些间接指标
+已经把人带偏过**两次**（一度推出"麦克风里没有回声"这种与"ASR 一直能
+识别到播报"**直接矛盾**的结论，浪费了一轮真机验证）。
+
+开启会话级音频转储：
+
+```bash
+ORCH_DUMP_AUDIO=/data/.../orchdump/s python -m orchestrator.main ...
+```
+
+会话结束时写三个 wav（默认关闭，实时路径零开销）：
+
+| 文件 | 内容 | 用它能判断 |
+|---|---|---|
+| `<前缀>-<sid>-mic.wav` | 浏览器送来的**原始麦克风**（AEC 之前） | 里面有没有回声 |
+| `<前缀>-<sid>-ref.wav` | 我们算的 **farend**（以为在播什么） | 与实际播报是否一致、长度对不对 |
+| `<前缀>-<sid>-aec.wav` | **AEC 输出**（ASR 听的就是这个） | 回声消掉多少 |
+
+三个波形一比即可定论。真机故障就是这样定位的：`ref.wav` 只有 0.6s 有
+内容而 TTS 报了 5.85s → 直接指向 `truncate` bug（见上文）。
+
+前端侧也有对应的「导出诊断」（环境/约束/D/ERLE/日志）与
+「导出校准录音」（校准通道的 mic + 播放信号，配
+`tests/analyze_calib_wav.py` 可区分"没播出来/太轻/被设备侧消掉"三种失败）。
+
 ### 收尾时序（易踩）
 
 会话结束分两步：
@@ -226,7 +321,18 @@ python -m orchestrator.tests.test_face --so <libsdk_stream.so> --models <models>
 
 # 单元测试（无外部依赖）
 python -m orchestrator.tests.test_clock
-python -m orchestrator.tests.test_ref_track
+python -m orchestrator.tests.test_ref_track    # 含 D 恢复 + 量纲回归护栏
+
+# 校准（无外部依赖 / 或走真实端点）
+python -m orchestrator.tests.test_calibrate        # 算法：已知延迟的合成回声
+python -m orchestrator.tests.test_calibrate_e2e    # 端点：模拟浏览器走全流程
+
+# ⭐ 保真验证：线上链路重建 vs 离线实验（需 AEC 服务）
+#    回答"网页真机调用能否产出与离线模拟实验等价的输出"
+python -m orchestrator.tests.test_aec_live_fidelity \
+  --far assets/ref_audio/ref_minicpm_signature.wav \
+  --near assets/ref_audio/ref_en_dlc_1.wav \
+  --out /tmp/aec_live        # ⚠️ 106 的 / 分区已满，用 /data/... 下的路径
 
 # 服务量测（阶段 0 工具）
 python -m orchestrator.tests.probe_aec --duration 60
@@ -250,7 +356,10 @@ orchestrator/
   metrics.py           指标（延迟滑动窗口 + 计数器）
   audio/
     resample.py        有状态重采样（24k→16k，跨块保相位）
-    ref_track.py       TTS 参考轨 + 声学延迟估计（GCC-PHAT）
+    ref_track.py       TTS 参考轨 + 声学延迟估计（GCC-PHAT）+ 量纲归一化
+  calibrate.py         主动校准：双段啁啾 + 起播锚点 + 自洽性校验
+  calibrate_endpoint.py /v1/calibrate 独立校准通道
+  delay_store.py       D 的持久化（新旧值差 >150ms 直接覆盖，不做滑动平均）
   aec/client.py        AEC WebSocket 客户端
   asr/client.py        ASR 客户端 + 消息解析
   omni/client.py       OmniLLM 客户端（复用 StreamingChatClient）

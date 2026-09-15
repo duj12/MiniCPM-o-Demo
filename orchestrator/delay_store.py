@@ -14,8 +14,8 @@ D 由三部分构成：网络往返、浏览器播放调度、设备声学路径
 环境变，第三者随设备变。用 ``client_key``（前端上报的设备/身份标识）
 分组，同一设备复用同一份。
 
-首次没有记录时用 ``default_ms``（默认取 ``playback_delay_ms``，因为
-那是最主要的已知分量）。
+首次没有记录时用 ``default_ms``（默认 250，与
+``config.aec_default_delay_ms`` 一致）。
 """
 from __future__ import annotations
 
@@ -42,7 +42,8 @@ class DelayStore:
     def __init__(self, path: Optional[str] = None,
                  default_ms: float = 250.0) -> None:
         self.path = Path(path or DEFAULT_PATH)
-        self.default_ms = default_ms
+        # ⚠️ 0 是有效值（"假定浏览器按约定提前量起播"），不能被 `or` 吞掉
+        self.default_ms = 0.0 if default_ms is None else float(default_ms)
         self._lock = threading.Lock()
         self._data: Dict[str, dict] = {}
         self._load()
@@ -85,6 +86,11 @@ class DelayStore:
     MAX_REASONABLE_MS = 700.0
     MIN_REASONABLE_MS = 10.0
 
+    # 新旧值相差超过这个量（毫秒）就判定旧值不可信，直接覆盖而不做滑动
+    # 平均。150ms 远大于正常测量的抖动（实测量级 ±20ms），又小于"错值"
+    # 与"真值"的典型差距（如 250 默认值 vs 84ms 真值 = 166ms）。
+    RESET_DELTA_MS = 150.0
+
     def put(self, client_key: str, delay_ms: float, n_samples: int = 0) -> bool:
         """记录一次测量。``n_samples`` 是该值的样本数（越多越可信）。
 
@@ -101,11 +107,25 @@ class DelayStore:
             return False
         with self._lock:
             prev = self._data.get(client_key) or {}
-            # 新值与旧值差很大时不急着覆盖（可能是异常测量）——
-            # 用滑动平均，样本多的旧值权重更高
+            # 新值与旧值接近时用滑动平均（抑制单次测量的抖动）。
+            #
+            # ⚠️ 但**差得远时必须直接覆盖**：旧值本身可能是错的（早先校准
+            # 通道有 3× 采样率错配 + 凭空减 200ms 两个 bug，产出的值系统性
+            # 偏移；也可能来自那个"把全程往返当残差"的 250 默认值）。滑动
+            # 平均会让这种错值以 0.7 的权重长期把正确的新值拖住 —— 表现为
+            # "校准了但没变化"。
             old = prev.get("delay_ms")
             if isinstance(old, (int, float)):
-                delay_ms = 0.7 * float(old) + 0.3 * delay_ms
+                if abs(float(old) - delay_ms) > self.RESET_DELTA_MS:
+                    logger.warning(
+                        "延迟记录 %s 旧值 %.0fms 与新值 %.0fms 相差超过 "
+                        "%.0fms —— **直接覆盖**（旧值多半来自有缺陷的测量）",
+                        client_key, float(old), delay_ms,
+                        self.RESET_DELTA_MS,
+                    )
+                    prev = {**prev, "n_samples": 0}
+                else:
+                    delay_ms = 0.7 * float(old) + 0.3 * delay_ms
             self._data[client_key] = {
                 "delay_ms": round(float(delay_ms), 1),
                 "n_samples": int(prev.get("n_samples", 0)) + max(1, n_samples),

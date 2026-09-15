@@ -191,6 +191,11 @@ class SessionStats:
     # 播放期间实测的回声抑制比（dB）。含近端故绝对值偏低，
     # 但**调 D 前后的相对变化**能直接判断配置对不对。
     erle_db: Optional[float] = None
+    # 延迟自适应估计的成功 / 失败次数。失败次数 >0 且持续增长说明参考
+    # 没送到或不在播放窗口 —— 早先这条路径完全静默，导致整条自适应
+    # 延迟估计失效而无人察觉。
+    delay_estimates: int = 0
+    delay_estimate_fails: int = 0
     type: Literal["session.stats"] = "session.stats"
 
 

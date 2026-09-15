@@ -63,10 +63,14 @@
       <button id="btnUnlock">🔊 解锁音频</button>
       <button id="btnCalib">⏱ 校准延迟</button>
       <button id="btnStop" class="danger">停止</button>
+      <button id="btnExport">⤓ 导出诊断</button>
+      <button id="btnCalibWav">🎧 导出校准录音</button>
     </div>
     <div style="margin-top:8px;font-size:12px;color:#888">
-      「校准延迟」不需要先开始会话：点一下 → 授权麦克风 → 播放 1.5 秒校准音
+      「校准延迟」不需要先开始会话：点一下 → 授权麦克风 → 播放 1.7 秒校准音
       → 自动算出声学延迟并保存。<b>请外放，不要戴耳机</b>（耳机没有回声路径）。
+      <br>校准失败时点「导出校准录音」，把两个 WAV 发出来即可确诊是「没播出来」
+      还是「没进麦克风」。
     </div>
     <div class="stats" id="delayinfo">延迟：未测量</div>
     <div class="stats" id="audiostat">音频：未开始</div>
@@ -158,7 +162,6 @@ class PcmPlayer {
       i16[i] = (bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8)) << 16 >> 16;
     }
     const srcRate = sr || this.srcRate;
-    const ctxRate = this.ctx.sampleRate;
     // int16 → float32 + 峰值统计（诊断用：能区分"没送到"与"送到了但没响"）
     let peak = 0;
     const f32src = new Float32Array(n);
@@ -169,6 +172,15 @@ class PcmPlayer {
       if (a > peak) peak = a;
     }
     diag.peak = Math.max(diag.peak, peak);
+    return this.playFloat32(f32src, srcRate);
+  }
+  /** 播放一段 float32 PCM（[-1,1]）。返回**实际起播时刻**（ctx 秒）。
+   *
+   *  校准通道走这里 —— 与 TTS 共用同一条播放路径（同一份重采样、同一个
+   *  提前量、同一个 AudioContext），否则测出的延迟无法迁移到实际会话。 */
+  playFloat32(f32src, srcRate) {
+    const n = f32src.length;
+    const ctxRate = this.ctx.sampleRate;
 
     // 线性重采样到 context 采样率
     let f32 = f32src, rate = srcRate;
@@ -193,11 +205,13 @@ class PcmPlayer {
     const at = Math.max(this.nextAt, this.ctx.currentTime + 0.02);
     node.start(at);
     this.nextAt = at + buf.duration;
+    this.lastStartAt = at;      // 起播时刻（ctx 秒）—— 校准要上报锚点
     diag.scheduled += 1;
     if (diag.startedAt === '-') {
       diag.startedAt = `+${(at - this.ctx.currentTime).toFixed(2)}s`;
     }
     diagUpdate();
+    return at;
   }
   endResponse() { /* 队列自然播完 */ }
   stop() {
@@ -240,6 +254,13 @@ function deviceKey() {
 
 /** 显示服务端推来的链路状态（重点是声学延迟）。 */
 let lastStats = null;
+let lastCalibResult = null;
+// 最近一次校准的原始录音（供「导出校准录音」做离线确诊）
+let calCapture = null;
+// 实测容忍窗：D 偏 5ms 就开始掉，偏 166ms 完全失效
+// （见 tests/test_aec_live_fidelity.py 的扫描表）
+const DELAY_TOLERANCE_MS = 5;
+
 function renderDelay(s) {
   lastStats = s;
   const el = $('delayinfo');
@@ -250,26 +271,58 @@ function renderDelay(s) {
                     client: '前端上报' };
   let html =
     `回声消除：<b>${modeName[s.aec_mode] || s.aec_mode}</b>　` +
-    `声学延迟：<b>${s.delay_ms.toFixed(0)} ms</b> ` +
+    `声学延迟：<b>${s.delay_ms.toFixed(1)} ms</b> ` +
     `（${srcName[s.delay_source] || s.delay_source}）`;
   if (s.aec_mode === 'service') {
-    html += `<br>推荐设置：<b>${s.suggested_delay_ms.toFixed(0)} ms</b>`;
-    if (!s.delay_measured) {
-      html += `　<span style="color:#fcd34d">← 尚未测量，建议点「校准延迟」</span>`;
-    } else if (s.delay_ms > 400) {
-      html += `　<span style="color:#fca5a5">延迟偏高，云端 AEC 抑制效果会明显下降</span>`;
+    // D 的三态 —— "未测量"必须**显著**，不能显示成一个看似正常的数字。
+    // 实测：D 错 166ms（旧默认值 250 vs 真值 84）时回声抑制只有 0.3dB，
+    // 等于完全不工作；而 UI 上两者长得一模一样。
+    if (s.delay_source === 'default') {
+      html += `<br><span style="color:#fca5a5"><b>⚠️ D 尚未测量</b> —— `
+            + `现在用的是默认值 ${s.delay_ms.toFixed(0)}ms，`
+            + `算法 AEC 大概率**不生效**（容忍窗仅 ±${DELAY_TOLERANCE_MS}ms）。`
+            + `请点「校准延迟」或先播报一轮让自适应收敛。</span>`;
+    } else if (s.delay_source === 'measured') {
+      const n = s.delay_estimates || 0;
+      if (n < 3) {
+        html += `<br><span style="color:#fcd34d">D 收敛中（第 ${n} 次估计）`
+              + ` —— 再播报一两轮会更准</span>`;
+      } else {
+        html += `<br><span style="color:#86efac">D 已收敛`
+              + `（${n} 次估计）</span>`;
+      }
+    } else if (s.delay_source === 'calibrated') {
+      html += `<br><span style="color:#86efac">D 已校准</span>`;
+    }
+    // 建议值 = 服务端认为应当采用的 D（已测量时为实测值，否则为默认值）。
+    // 与当前值并列显示：两者不一致就说明还没收敛/被历史记录拖住。
+    html += `<br>建议设置：<b>${s.suggested_delay_ms.toFixed(1)} ms</b>`;
+    if (s.delay_measured && Math.abs(s.suggested_delay_ms - s.delay_ms) > 1) {
+      html += ` <span style="color:#fcd34d">（与当前值不一致，`
+            + `下一次播报会收敛）</span>`;
+    }
+    if (s.delay_measured && s.delay_ms > 400) {
+      html += `<br><span style="color:#fca5a5">D 偏大（${s.delay_ms.toFixed(0)}ms）`
+            + ` —— 请确认外放且未戴耳机；该值可能是选错峰</span>`;
     }
   }
   if (s.aec_active) {
-    html += `<br>云端 AEC：工作中，farend 非零占比 ${(s.ref_nonzero_ratio*100).toFixed(0)}%`;
+    html += `<br>云端 AEC：工作中，farend 非零占比 `
+          + `${(s.ref_nonzero_ratio*100).toFixed(0)}%`;
     if (s.erle_db != null) {
       // 每轮播报独立测量（近端也计入，故绝对值偏低；看**变化**）
-      const good = s.erle_db >= 8;
+      // 参照实测：D 对齐时 10~12dB，错位时 0.3dB。
+      const good = s.erle_db >= 6;
       html += `　本轮 ERLE：<b style="color:${good ? '#86efac' : '#fca5a5'}">` +
               `${s.erle_db.toFixed(1)} dB</b>`;
       if (!good) {
-        html += `　<span style="color:#fcd34d">← 抑制偏弱，可试其他 D 值</span>`;
+        html += `　<span style="color:#fca5a5">← 抑制≈0，AEC 基本没生效：`
+              + `多半是 D 不对（容忍窗 ±${DELAY_TOLERANCE_MS}ms）</span>`;
       }
+    }
+    if (s.delay_estimate_fails) {
+      html += `<br><span style="color:#fcd34d">延迟估计失败 `
+            + `${s.delay_estimate_fails} 次</span>`;
     }
   }
   el.innerHTML = html;
@@ -285,12 +338,17 @@ async function startCapture() {
   // ⚠️ 选 service 时**必须关掉浏览器 AEC**：否则回声在设备侧就被消掉了，
   //    送到云端时已经没有回声，算法 AEC 无从下手 —— 这时"测试云端效果"
   //    实际上是浏览器在做功，结论完全失真。
-  //    （AGC 保持开启：它只影响增益，不破坏回声路径的线性性。）
+  // ⚠️ **AGC 也必须关**（早先注释说"AGC 不破坏线性性"是错的）：
+  //    AGC 是**时变增益**，它会让扬声器→麦克风这条回声路径的增益随信号
+  //    起伏 —— 而算法 AEC 的线性自适应滤波器假定该路径是**线性时不变**
+  //    的。AGC 一动，滤波器就追不上，抑制上限被显著拉低。
+  //    browser 模式保持原样（原生 AEC 自己能处理 AGC）。
   const mode = selectedAecMode();
   const useBrowserAEC = (mode === 'browser');
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: useBrowserAEC,
-             noiseSuppression: useBrowserAEC, autoGainControl: true },
+             noiseSuppression: useBrowserAEC,
+             autoGainControl: useBrowserAEC },
     video: false,
   });
   // ⚠️ 必须读**实际生效**的值 —— 浏览器可能忽略/改写请求的约束，
@@ -300,6 +358,8 @@ async function startCapture() {
     const tr = micStream.getAudioTracks()[0];
     actual = (tr && tr.getSettings) ? tr.getSettings() : {};
   } catch (e) { /* ignore */ }
+  // 供「导出诊断」用 —— 真机排查时"申请了什么"与"实际生效什么"经常不同
+  window._lastMicSettings = actual;
   log('k', `麦克风约束：请求 echoCancellation=${useBrowserAEC} `
          + `noiseSuppression=${useBrowserAEC}（模式=${mode}）`);
   log('k', `实际生效：echoCancellation=${actual.echoCancellation} `
@@ -594,27 +654,55 @@ $('btnCalib').onclick = async () => {
     // 与 timeout 竞争）。现在：建好采集 → 收到音频 → 立刻播放。
     await ctx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
     const micSrc = ctx.createMediaStreamSource(mic);
+    // ⚠️ chunkSize 按 ctx 实际采样率取"100ms" —— 服务端就是按 16k/100ms
+    // 的节奏理解回传数据的。固定写 1600 在 48k 设备上只有 33ms/块。
     worklet = new AudioWorkletNode(ctx, 'capture-processor',
-                                   { processorOptions: { chunkSize: 1600 } });
+                                   { processorOptions: {
+                                       chunkSize: Math.max(
+                                         160, Math.round(ctx.sampleRate / 10)) } });
     const sink = ctx.createGain(); sink.gain.value = 0;
     micSrc.connect(worklet); worklet.connect(sink); sink.connect(ctx.destination);
 
+    // ⚠️ **复用与 TTS 完全相同的播放器**，而不是另写一份播放代码。
+    // 早先校准自己写了一套「收到就 src.start()、不预留提前量」的播放，
+    // 而 TTS 走 PcmPlayer（预留 200ms）。两条路径的播放时刻不同，测出的
+    // 延迟无法迁移到实际会话 —— 这是校准"测了没用"的根源之一。
+    // 现在同一个 PcmPlayer、同一份重采样、同一个 AudioContext。
+    const calPlayer = new PcmPlayer(ctx);
+    // 麦克风流的起点（ctx 秒）—— 锚点要相对它计算
+    let captureStartCtx = null;
+    let anchorSent = false;
+    // 保存本次校准的原始麦克风（16k）与播放信号 —— 供「导出校准录音」。
+    // 目的：真机上"回声没进麦克风"这件事，只有拿到原始波形才能确诊
+    // （是没播出来？音量太小？还是被设备侧处理掉了？）。
+    calCapture = { mic: [], chirp: null, sampleRate: 16000,
+                   anchor: null, result: null };
+
     const result = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('校准超时')), 25000);
+      const timeout = setTimeout(() => reject(new Error('校准超时')), 30000);
       let playing = false;
       let micChunks = 0;
+      let micSent = 0;
 
       worklet.port.onmessage = (e) => {
         if (e.data.type !== 'chunk') return;
         micChunks += 1;
+        if (captureStartCtx === null) captureStartCtx = ctx.currentTime;
+        // ⚠️ 全程回传（不等播放开始）—— 服务端用锚点定位播放时刻，
+        //    锚点相对采集起点，所以采集必须先于播放并持续覆盖。
         if (!playing || ws.readyState !== WebSocket.OPEN) return;
-        const a = e.data.audio;
-        const ab = new ArrayBuffer(a.length * 4);
-        new Float32Array(ab).set(a);
+        // ⚠️ **必须重采样到 16kHz** 再回传。早先直接回传 ctx 原始率的
+        //    数据（通常 48k），而服务端按 16k 解析 —— 时间尺度整体错 3 倍。
+        const a16 = resampleTo16k(e.data.audio, ctx.sampleRate);
+        if (calCapture) calCapture.mic.push(new Float32Array(a16));
+        const ab = new ArrayBuffer(a16.length * 4);
+        new Float32Array(ab).set(a16);
         ws.send(JSON.stringify({
           type: 'calibrate.mic',
+          sample_rate: 16000,
           audio_base64: b64FromBuffer(ab),
         }));
+        micSent += 1;
       };
       worklet.port.postMessage({ command: 'start' });
 
@@ -622,42 +710,41 @@ $('btnCalib').onclick = async () => {
        try {
         const m = JSON.parse(ev.data);
         if (m.type === 'calibrate.play') {
-          log('v', `收到校准音频 ${m.duration_s.toFixed(1)}s —— 正在播放，`
-                 + `请保持安静（外放，别戴耳机）`);
-          // 2) 播放：用与 TTS 相同的 WebAudio 路径
+          log('v', `收到校准音频 ${m.duration_s.toFixed(1)}s（${m.segments || 1} 段）`
+                 + ` —— 正在播放，请保持安静（外放，别戴耳机）`);
+          // 解码 int16 → float32，交给与 TTS 相同的播放器
           const bin = atob(m.audio_base64);
           const n = bin.length >> 1;
-          const i16 = new Int16Array(n);
-          for (let i = 0; i < n; i++) {
-            i16[i] = (bin.charCodeAt(i*2) | (bin.charCodeAt(i*2+1) << 8)) << 16 >> 16;
-          }
           const f32 = new Float32Array(n);
-          for (let i = 0; i < n; i++) f32[i] = i16[i] / 32768;
-          // 重采样到 ctx 采样率
-          const outN = Math.max(1, Math.round(n * ctx.sampleRate / m.sample_rate));
-          const out = new Float32Array(outN);
-          const ratio = n / outN;
-          for (let i = 0; i < outN; i++) {
-            const p = i * ratio, i0 = Math.floor(p),
-                  i1 = Math.min(i0+1, n-1), fr = p - i0;
-            out[i] = f32[i0]*(1-fr) + f32[i1]*fr;
+          for (let i = 0; i < n; i++) {
+            const v = (bin.charCodeAt(i*2) | (bin.charCodeAt(i*2+1) << 8)) << 16 >> 16;
+            f32[i] = v / 32768;
           }
-          const buf = ctx.createBuffer(1, outN, ctx.sampleRate);
-          buf.copyToChannel(out, 0);
-          const src = ctx.createBufferSource();
-          src.buffer = buf; src.connect(ctx.destination);
-          src.start();
           playing = true;
-          log('v', '麦克风采集已启动，正在回传…');
-          // 采集到「播放时长 + 最大搜索延迟」即可 —— 与服务端 ready()
-          // 的判据一致，避免多等或早停
-          const needS = m.duration_s + 1.5;
-          setTimeout(() => {
-            playing = false;
-            log('v', `采集结束（共 ${micChunks} 个块 ≈ ${(micChunks*0.1).toFixed(1)}s），`
-                   + `等待服务端计算结果…`);
-          }, needS * 1000);
-
+          // 留档：播放信号（16k）+ 样本率，供导出时对齐比较
+          if (calCapture) {
+            const c = new Float32Array(f32.length);
+            c.set(f32);
+            calCapture.chirp = resampleTo16k(c, m.sample_rate);
+            calCapture.chirpRate = m.sample_rate;
+          }
+          // beginResponse 会预留 200ms 提前量（与 TTS 一致）
+          calPlayer.beginResponse('cal', m.sample_rate);
+          const at = calPlayer.playFloat32(f32, m.sample_rate);
+          // ⚠️ 上报**真实起播锚点**：起播时刻相对采集起点的采样数。
+          //    同一 AudioContext 内取差 —— 精确、与设备采样率无关、
+          //    无网络竞态。服务端据此定位播放时刻，不再靠猜的常量。
+          if (captureStartCtx !== null && !anchorSent) {
+            anchorSent = true;
+            const off = Math.max(0, Math.round((at - captureStartCtx) * 16000));
+            if (calCapture) calCapture.anchor = off;
+            ws.send(JSON.stringify({
+              type: 'calibrate.anchor', play_offset_samples: off,
+            }));
+            log('v', `已上报起播锚点 ${(off/16000).toFixed(3)}s `
+                   + `（ctx 提前量 ${(at - ctx.currentTime).toFixed(3)}s）`);
+          }
+          log('v', '麦克风正在回传（16kHz）…');
         } else if (m.type === 'calibrate.done' || 'ok' in m) {
           clearTimeout(timeout);
           resolve(m);
@@ -675,15 +762,22 @@ $('btnCalib').onclick = async () => {
       log('v', '已连接校准通道，等待校准音频…');
     });
 
+    if (calCapture) calCapture.result = result;
     if (result.ok) {
-      log('v', `✓ 校准完成：声学延迟 ${result.delay_ms.toFixed(0)} ms`
-             + `（已保存，下次自动使用）`);
+      log('v', `✓ 校准完成：声学延迟 ${result.delay_ms.toFixed(1)} ms`
+             + `（${result.segments || 1} 段一致，段间差 ${result.spread_ms ?? 0}ms，`
+             + `峰比 ${result.peak_ratio ?? '-'}）`);
+      log('m', '⚠️ 容忍窗只有约 ±5ms —— 该值已保存，下次会话自动使用');
+      // 立刻刷新一次显示（会话中会由 session.stats 推送更新）
+      lastCalibResult = result;
     } else {
       log('e', '校准失败：' + (result.error || '未知原因'));
-      if (result.mic_rms != null) {
-        log('m', `诊断：麦克风信号 rms=${result.mic_rms}，`
-               + `播放信号 rms=${result.ref_rms}（两者差距过大说明`
-               + `扬声器声音没进麦克风）`);
+      if (result.sig_rms != null) {
+        log('m', `诊断：啁啾段 rms=${result.sig_rms}，`
+               + `本底 rms=${result.noise_rms}，`
+               + `信噪比 ${result.snr_db ?? '-'}dB，`
+               + `峰比 ${result.peak_ratio ?? '-'}，`
+               + `段间差 ${result.spread_ms ?? '-'}ms`);
       }
     }
   } catch (e) {
@@ -696,6 +790,32 @@ $('btnCalib').onclick = async () => {
     btn.disabled = false;
   }
 };
+
+/** float32 → base64（会话通道用） */
+function b64FromF32(a) {
+  const ab = new ArrayBuffer(a.length * 4);
+  new Float32Array(ab).set(a);
+  return b64FromBuffer(ab);
+}
+
+/** 线性重采样到 16kHz。
+ *
+ *  校准通道**必须**在回传前做这一步：浏览器 AudioContext 的采样率通常是
+ *  设备默认的 44.1k/48k，而服务端按 16k 解析 —— 早先直接回传原始率，
+ *  时间尺度整体错 3 倍，测出的延迟完全不可用。 */
+function resampleTo16k(x, srcRate) {
+  srcRate = srcRate || 16000;
+  if (!srcRate || Math.abs(srcRate - 16000) < 1) return x;
+  const outN = Math.max(1, Math.round(x.length * 16000 / srcRate));
+  const out = new Float32Array(outN);
+  const ratio = x.length / outN;
+  for (let i = 0; i < outN; i++) {
+    const p = i * ratio, i0 = Math.floor(p),
+          i1 = Math.min(i0 + 1, x.length - 1), fr = p - i0;
+    out[i] = x[i0] * (1 - fr) + x[i1] * fr;
+  }
+  return out;
+}
 
 /** ArrayBuffer → base64（校准通道用） */
 function b64FromBuffer(buffer) {
@@ -718,6 +838,126 @@ $('aecMode').onchange = () => {
       log('m', '算法服务 AEC 需要延迟校准 —— 建议点「校准延迟」');
     }
   }
+};
+
+/* 导出校准录音 —— 麦克风原始波形 + 播放信号，各存一个 WAV。
+ *
+ * 为什么需要：真机上"回声没进麦克风"有三个完全不同的原因，从指标上
+ * 分不出来，只有看波形才能确诊：
+ *   ① 校准音根本没播出来（扬声器静音 / 路由到听筒）
+ *   ② 播出来了但音量太小，被环境噪声盖住
+ *   ③ 播了也被设备侧处理掉了（iOS 的 play-and-record 音频会话会启用
+ *      系统级 VPIO，自带 AEC/降噪，会先把回声消掉再交给页面）
+ * 拿到 WAV 后跑 `orchestrator/tests/analyze_calib_wav.py` 即可判定。 */
+function writeWav(f32, sampleRate) {
+  const n = f32.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (off, s) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); str(36, 'data');
+  v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function downloadBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+$('btnCalibWav').onclick = () => {
+  if (!calCapture || !calCapture.mic.length) {
+    log('e', '还没有校准录音 —— 请先点「校准延迟」');
+    return;
+  }
+  const mic = concatF32(calCapture.mic);
+  const stamp = Date.now();
+  downloadBlob(writeWav(mic, calCapture.sampleRate),
+               `calib-mic-${stamp}.wav`);
+  if (calCapture.chirp) {
+    downloadBlob(writeWav(calCapture.chirp, calCapture.sampleRate),
+                 `calib-chirp-${stamp}.wav`);
+  }
+  // 一并存元数据：锚点、结果、设备约束 —— 离线分析要用
+  const meta = {
+    anchor_samples: calCapture.anchor,
+    anchor_s: calCapture.anchor != null ? calCapture.anchor / 16000 : null,
+    mic_s: mic.length / 16000,
+    mic_peak: Math.max(...Array.from(mic.slice(0, 400000),
+                                     x => Math.abs(x))),
+    result: calCapture.result,
+    mic_constraints: window._lastMicSettings || null,
+    ua: navigator.userAgent,
+  };
+  downloadBlob(new Blob([JSON.stringify(meta, null, 2)],
+                        { type: 'application/json' }),
+               `calib-meta-${stamp}.json`);
+  log('v', `已导出校准录音（mic ${(mic.length/16000).toFixed(1)}s，`
+         + `峰值 ${meta.mic_peak.toFixed(4)}）+ 播放信号 + 元数据`);
+};
+
+/** 把多个 Float32Array 拼成一个 */
+function concatF32(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const out = new Float32Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+/* 导出诊断 —— 把本次会话的**实际链路状态**落到本地文件。
+ *
+ * 动机：真机上"回声没消掉"这件事在服务器日志里只能看间接指标（ERLE、
+ * D、farend 非零占比）。有了这份快照，就能拿它回灌离线 harness 复算，
+ * 把真机问题变成可复现的实验 —— 而不是只能靠"听"来判断。
+ *
+ * 数据量刻意做小（不含原始音频）：环境、约束、D、ERLE、日志即可定位
+ * 绝大多数问题。 */
+$('btnExport').onclick = () => {
+  const dump = {
+    exported_at: new Date().toISOString(),
+    page: location.href,
+    ua: navigator.userAgent,
+    device_key: deviceKey(),
+    aec_mode: selectedAecMode(),
+    audio: {
+      ctx_state: diag.ctxState,
+      ctx_rate: diag.ctxRate,
+      tts_frames: diag.frames,
+      tts_seconds: +(diag.bytes / 2 / 24000).toFixed(2),
+      scheduled: diag.scheduled,
+      peak: diag.peak,
+      started_at: diag.startedAt,
+      last_err: diag.lastErr,
+    },
+    mic_constraints: window._lastMicSettings || null,
+    last_stats: lastStats,
+    last_calibration: lastCalibResult,
+    event_counts: evtCounts,
+    log: Array.from(logEl.children).slice(-300)
+              .map(d => d.textContent),
+  };
+  const blob = new Blob([JSON.stringify(dump, null, 2)],
+                        { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `orch-diag-${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log('v', '诊断已导出（含环境/约束/D/ERLE/日志，不含原始音频）');
 };
 
 $('btnStop').onclick = async () => {
