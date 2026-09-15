@@ -466,6 +466,8 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
         await sess.start_calibration()
     elif t == "set_aec_mode":
         sess.set_aec_mode(str(msg.get("mode") or "browser"))
+    elif t == "set_delay":
+        sess.set_delay_ms(float(msg.get("delay_ms") or 0))
     elif t == "session.stop":
         # 客户端要求停止：先 drain 再 close（drain 会等 ASR 最终结果）。
         # 注意不能在 dispatch 里 await 太久 —— 主接收循环还等着收后续消息。

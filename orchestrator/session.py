@@ -109,6 +109,15 @@ class OrchestratorSession:
         self.playback_delay_ms = int(config.get("playback_delay_ms") or 200)
         # 进行中的校准会话
         self._cal = None
+        # ASR 流式文本的累积缓冲。
+        # 2pass-online 给的是**增量片段**（"今天"/"吃饭"/"了吗"），必须自己
+        # 拼接；2pass-offline 到达时用它覆盖并清空。
+        self._asr_online_text = ""
+
+        # 实时 ERLE 统计（播放期间才有效）：mic 能量 vs AEC 输出能量。
+        # 用来**实测**当前延迟配置到底消掉多少 —— 排障时最直接的依据。
+        self._mic_e = 0.0
+        self._aec_out_e = 0.0
 
     # ------------------------------------------------------------------ #
     #  浏览器侧输入
@@ -130,6 +139,10 @@ class OrchestratorSession:
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
         self.metrics.inc("audio_samples", frame.n_samples)
+        # 实时 ERLE 的输入侧（仅播放期间累计，见 _update_erle）
+        if (self.aec is not None and self.ref_track is not None
+                and self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR))):
+            self._mic_e += float(np.mean(frame.data ** 2)) * frame.n_samples
 
         # 原始 mic 旁路：barge-in 检测用，零额外延迟
         self._raw_recent.append(float(np.sqrt(np.mean(x ** 2))))
@@ -316,6 +329,24 @@ class OrchestratorSession:
         self.push_stats(force=True)
         self._cal = None
 
+    def set_delay_ms(self, ms: float) -> None:
+        """手动设置声学延迟（调试/对比用）。
+
+        用途：不确定该用哪个 D 时，逐个试并观察 ``session.stats`` 里的
+        ERLE —— 抑制最强的那个就是对的。比推理可靠。
+        """
+        if self.ref_track is None:
+            return
+        self.ref_track.delay_samples = int(max(0.0, ms) * SR / 1000.0)
+        self.delay_source = "manual"
+        self.stats["delay_measured"] = 1
+        # 重置 ERLE 累计，让新配置的效果可独立观察
+        self._mic_e = 0.0
+        self._aec_out_e = 0.0
+        logger.info("[%s] 手动设置声学延迟 = %.0f ms（ERLE 计数已重置）",
+                    self.session_id, ms)
+        self.push_stats(force=True)
+
     def current_delay_ms(self) -> float:
         if self.ref_track is None:
             return 0.0
@@ -344,6 +375,8 @@ class OrchestratorSession:
             suggested_delay_ms=round(suggested, 1),
             aec_active=(self.aec_mode == "service" and self.aec is not None),
             ref_nonzero_ratio=round(nz / total, 3) if total else 0.0,
+            erle_db=(round(self.current_erle_db(), 1)
+                     if self.current_erle_db() is not None else None),
         ))
 
     def _periodic_diag(self, frame: AudioFrame) -> None:
@@ -364,16 +397,30 @@ class OrchestratorSession:
         rt = self.ref_track
         d = rt.delay_samples if rt else -1
         lo, hi = rt.buf.written_span() if rt else (None, None)
+        erle = self.current_erle_db()
         logger.info(
             "[%s] 诊断: 音频块=%d ref推送=%d(非零 %d, %.0f%%) D=%d采样(%.0fms) "
-            "写入区间=[%s,%s] now=%d omni触发=%d",
+            "ERLE=%s 写入区间=[%s,%s] now=%d omni触发=%d",
             self.session_id,
             self.stats.get("audio_chunks_in", 0), total, nz,
             (100.0 * nz / total) if total else 0.0,
             d, (d / SR * 1000) if d >= 0 else -1,
+            f"{erle:.1f}dB" if erle is not None else "n/a",
             lo, hi, self.clock.now(),
             self.stats.get("omni_triggers", 0),
         )
+
+    def current_erle_db(self) -> Optional[float]:
+        """播放期间实测的回声抑制比（dB）。
+
+        ``10·log10(mic能量 / AEC输出能量)``，只在有过播放窗口时有效。
+        排障时看它最直接：**调 D 前后 ERLE 的变化**能立刻判断配置对不对。
+        注意它含近端语音（故绝对值偏低），但**不同 D 之间的相对比较**
+        是有效的。
+        """
+        if self._mic_e <= 0 or self._aec_out_e <= 0:
+            return None
+        return 10.0 * np.log10(self._mic_e / self._aec_out_e)
 
     def _maybe_update_delay(self, frame: AudioFrame) -> None:
         """在**播放窗口内**估计声学路径延迟 D 并喂给参考轨。
@@ -391,20 +438,29 @@ class OrchestratorSession:
             return
         if self._raw_mic_buf is None:
             return
-        # 播放窗口判断：当前或未来 0.5s 内有参考
+        # 播放窗口判断：当前或未来有参考在播
         if not self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR)):
             return
-        # 攒够 8192 采样（~0.5s）再估一次
+
+        # ⚠️ 窗口长度必须 **大于可能的最大延迟**，否则互相关搜不到：
+        # mic 里的回声来自 D 之前的播放，若只读"当前窗"的 raw，两者
+        # 没有重叠片段，argmax 会落在噪声上 —— 表现为恒报 0ms。
+        # 取 WINDOW（1s）覆盖 0~1s 的延迟范围。
+        WINDOW = SR
         self._raw_mic_buf.append(frame.data.reshape(-1))
         self._raw_mic_len += frame.n_samples
-        if self._raw_mic_len < 8192:
+        if self._raw_mic_len < WINDOW:
             return
-        mic = np.concatenate(self._raw_mic_buf)[-8192:]
-        # 与 mic 同一时间窗的 raw ref（未补偿）
-        raw = self.ref_track.read_raw(frame.t1 - 8192, 8192)
+        mic = np.concatenate(self._raw_mic_buf)[-WINDOW:]
+
+        # raw ref 要往前多读一个"最大延迟"的长度：
+        # mic 窗 [t-W, t) 里的回声，其源在 raw 的 [t-W-D, t-D)。
+        # 读 [t-W-Dmax, t) 这一整段，让互相关自己找偏移。
+        dmax = int(self.delay_tracker.max_delay)
+        raw = self.ref_track.read_raw(frame.t1 - WINDOW - dmax, WINDOW + dmax)
         self._raw_mic_buf = []
         self._raw_mic_len = 0
-        if raw.shape[0] < 8192:
+        if raw.shape[0] < WINDOW:
             return
         est = self.delay_tracker.estimate(mic, raw)
         if est is None:
@@ -508,6 +564,9 @@ class OrchestratorSession:
             self.stats["aec_segments_out"] += 1
             self.stats["aec_samples_out"] += int(np.asarray(seg).size)
             self.metrics.inc("aec_segments")
+            # 实时 ERLE：累加 AEC 输出的能量，与同期 mic 能量比。
+            # 播放期间才有意义（无回声时 ERLE≈0 反映的是纯近端）。
+            self._aec_out_e += float(np.mean(np.asarray(seg) ** 2)) * np.asarray(seg).size
             # 首窗延迟（相对会话开始收音频）
             lat = self.aec.first_result_latency_ms() if self.aec else None
             if lat is not None and self.metrics.aec_first_window.count == 0:
@@ -550,15 +609,20 @@ class OrchestratorSession:
                 return
 
             if mode == "2pass-online":
-                text = msg.get("text", "")
-                if text:
+                delta = msg.get("text", "")
+                if delta:
+                    # ⚠️ 2pass-online 是**增量片段**（"今天" / "吃饭" / "了吗"），
+                    # 不是累积文本 —— 官方客户端也是自己 += 拼起来显示的
+                    # （funasr_wss_client.py: `text_print_2pass_online += text`）。
+                    # 必须自己累积，否则 UI 上只剩最后一个词。
+                    self._asr_online_text += delta
                     self.post_downstream(AsrPartial(
-                        t=self.clock.now(), text=text,
+                        t=self.clock.now(), text=self._asr_online_text,
                         confidence=parse_confidence(msg),
                         segment_id=self.asr.partials,
                     ))
                     self._send_display(AsrDisplay(
-                        phase="partial", text=text,
+                        phase="partial", text=self._asr_online_text,
                         t_ms=int(self.clock.seconds() * 1000),
                     ))
                 return
@@ -576,6 +640,9 @@ class OrchestratorSession:
                 token_times_ms=fin["token_times"],
                 is_final=fin["is_final"],
             ))
+            # 最终结果到达：用它覆盖流式累积文本，并**清空缓冲**为下一段
+            # 做准备（服务端也是这么做的：text_print_2pass_online = ""）
+            self._asr_online_text = ""
             if fin["text"]:
                 self._send_display(AsrDisplay(
                     phase="final", text=fin["text"],

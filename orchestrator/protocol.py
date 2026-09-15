@@ -188,6 +188,9 @@ class SessionStats:
     suggested_delay_ms: float = 0.0    # 建议值（通常 = playback_delay + 声学）
     aec_active: bool = False           # 云端 AEC 是否在工作
     ref_nonzero_ratio: float = 0.0     # 送出的 farend 非零占比
+    # 播放期间实测的回声抑制比（dB）。含近端故绝对值偏低，
+    # 但**调 D 前后的相对变化**能直接判断配置对不对。
+    erle_db: Optional[float] = None
     type: Literal["session.stats"] = "session.stats"
 
 

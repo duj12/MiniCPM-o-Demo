@@ -183,14 +183,28 @@ class AcousticDelayTracker:
         self.delay = 0
         self.estimates = 0
 
-    def estimate(self, mic: np.ndarray, ref: np.ndarray) -> Optional[int]:
-        """用一对等长信号估计延迟。返回本次估计值，不满足条件返回 None。
+    def estimate(self, mic: np.ndarray, ref_earlier: np.ndarray,
+                 offset: int = 0, min_ratio: float = 1.5) -> Optional[int]:
+        """估计 mic 中回声的延迟 D_path（采样）。
 
-        mic/ref 均为 1-D float32。正值 = ref 领先 mic。
+        **信号约定**（很关键，错了会恒报 0）：
+
+          · ``mic[j]`` 对应绝对时间 ``T0 + j``
+          · ``ref_earlier[i]`` 对应绝对时间 ``T0 - offset + i``
+            —— 参考窗必须**覆盖更早的时间**，因为 mic 里的回声来自
+            ``D_path`` 之前的播放
+
+        两者长度须相同。返回的 ``D_path`` 满足
+        ``mic[j] ≈ ref_earlier[j + offset - D_path]``。
+        ``offset == D_path`` 时两者恰好对齐。
+
+        搜索范围 ``[-offset, +offset]``，因此 ``offset`` 必须
+        **不小于可能的最大延迟**，否则搜不到（这正是早先恒报 0 的原因：
+        只读了与 mic 同时刻的 ref，两者没有重叠片段）。
         """
-        if mic.shape != ref.shape or mic.shape[0] < 2048:
+        if mic.shape != ref_earlier.shape or mic.shape[0] < 2048:
             return None
-        if float(np.sqrt(np.mean(ref ** 2))) < 1e-4:
+        if float(np.sqrt(np.mean(ref_earlier ** 2))) < 1e-4:
             return None  # ref 近似静音，估不出
         if float(np.sqrt(np.mean(mic ** 2))) < 1e-5:
             return None
@@ -200,28 +214,36 @@ class AcousticDelayTracker:
         while n_fft < 2 * n:
             n_fft <<= 1
         X = np.fft.rfft(mic, n_fft)
-        Y = np.fft.rfft(ref, n_fft)
-        # GCC-PHAT：只保留相位
+        Y = np.fft.rfft(ref_earlier, n_fft)
+        # GCC-PHAT：只保留相位，对幅度差异不敏感
         R = X * np.conj(Y)
         mag = np.abs(R)
         mag[mag < 1e-10] = 1e-10
         cc = np.fft.irfft(R / mag, n_fft)
-        # 只看正延迟方向（mic 滞后于 ref），搜索窗限 max_delay
-        window = min(self.max_delay, n_fft // 2 - 1)
-        cc_abs = np.abs(cc[:window + 1])
-        peak = int(np.argmax(cc_abs))
-        # 置信度：峰值须显著高于次峰。太低说明估计不可靠。
-        tmp = cc_abs.copy()
-        tmp[max(0, peak - 2):peak + 3] = 0
-        if tmp.max() > 0 and cc_abs[peak] < 1.5 * tmp.max():
+        # cc[k] 表示 mic 与 ref 平移 k 的相关（k 可为负）
+        # 把负延迟折到数组尾部：cc[N-k] 即 k = -k
+        search = max(1, min(int(offset) or self.max_delay, n_fft // 2 - 1))
+        pos = np.abs(cc[: search + 1])
+        neg = np.abs(cc[n_fft - search:]) if search > 0 else np.zeros(0)
+        cand = np.concatenate([pos, neg])          # [0..search, -search..-1]
+        peak_i = int(np.argmax(cand))
+        k = peak_i if peak_i <= search else peak_i - (len(cand))
+        # 置信度：峰值须显著高于次峰
+        tmp = cand.copy()
+        lo = max(0, peak_i - 2)
+        tmp[lo:peak_i + 3] = 0
+        if tmp.max() > 0 and cand[peak_i] < min_ratio * tmp.max():
             return None
 
-        self._history.append(peak)
+        d_path = k + int(offset)
+        if d_path < 0 or d_path > search + int(offset):
+            return None
+        self._history.append(d_path)
         if len(self._history) > self._median_window:
             self._history.pop(0)
         self.estimates += 1
         self.delay = int(np.median(self._history))
-        return peak
+        return d_path
 
     def reset(self) -> None:
         self._history.clear()

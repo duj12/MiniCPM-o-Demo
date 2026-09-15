@@ -59,6 +59,15 @@
       <button id="btnCalib">⏱ 校准延迟</button>
       <button id="btnStop" class="danger">停止</button>
     </div>
+    <div style="margin-top:8px">
+      手动设延迟：
+      <input id="delayInput" type="number" min="0" max="1500" step="10"
+             style="width:80px;padding:4px" placeholder="ms">
+      <button id="btnSetDelay">应用</button>
+      <span id="delayHint" style="font-size:12px;color:#999">
+        切换不同值并观察上方 ERLE，找抑制最强的（含近端故绝对值偏低，看相对变化）
+      </span>
+    </div>
     <div class="stats" id="delayinfo">延迟：未测量</div>
     <div class="stats" id="audiostat">音频：未开始</div>
     <div class="stats" id="stats">未开始</div>
@@ -230,6 +239,15 @@ function renderDelay(s) {
   }
   if (s.aec_active) {
     html += `<br>云端 AEC：工作中，farend 非零占比 ${(s.ref_nonzero_ratio*100).toFixed(0)}%`;
+    if (s.erle_db != null) {
+      // 含近端故绝对值偏低；关键是**调延迟前后的相对变化**
+      const good = s.erle_db >= 8;
+      html += `　实测 ERLE：<b style="color:${good ? '#86efac' : '#fca5a5'}">` +
+              `${s.erle_db.toFixed(1)} dB</b>`;
+      if (!good && s.delay_measured) {
+        html += `　<span style="color:#fcd34d">← 抑制偏弱，可试试校准/改延迟</span>`;
+      }
+    }
   }
   el.innerHTML = html;
 }
@@ -494,6 +512,16 @@ $('btnCalib').onclick = async () => {
   } finally {
     $('btnCalib').disabled = false;
   }
+};
+
+/* 手动设延迟：直接试不同 D 值，用 ERLE 找最优。
+ * 这是判断"到底该用哪个 D"最直接的手段 —— 不用猜，看数字。*/
+$('btnSetDelay').onclick = () => {
+  if (!session || !session.ready) { log('e', '请先点「开始会话」'); return; }
+  const v = parseInt($('delayInput').value, 10);
+  if (!(v >= 0 && v <= 1500)) { log('e', '请输入 0~1500 的毫秒数'); return; }
+  session.send({ type: 'set_delay', delay_ms: v });
+  log('v', `已设置声学延迟 = ${v} ms（观察 2~3 秒后的 ERLE 变化）`);
 };
 
 /* 切换 AEC 模式：会话中可直接切，服务端会启用/停用云端 AEC */
