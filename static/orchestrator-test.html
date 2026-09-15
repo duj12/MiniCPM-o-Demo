@@ -275,8 +275,23 @@ async function startCapture() {
              noiseSuppression: useBrowserAEC, autoGainControl: true },
     video: false,
   });
-  log('k', `麦克风约束：echoCancellation=${useBrowserAEC} `
+  // ⚠️ 必须读**实际生效**的值 —— 浏览器可能忽略/改写请求的约束，
+  // 尤其移动端。申请了不等于生效，写日志时要用 getSettings()。
+  let actual = {};
+  try {
+    const tr = micStream.getAudioTracks()[0];
+    actual = (tr && tr.getSettings) ? tr.getSettings() : {};
+  } catch (e) { /* ignore */ }
+  log('k', `麦克风约束：请求 echoCancellation=${useBrowserAEC} `
          + `noiseSuppression=${useBrowserAEC}（模式=${mode}）`);
+  log('k', `实际生效：echoCancellation=${actual.echoCancellation} `
+         + `noiseSuppression=${actual.noiseSuppression} `
+         + `autoGainControl=${actual.autoGainControl} `
+         + `sampleRate=${actual.sampleRate} deviceId=${(actual.deviceId||'').slice(0,8)}`);
+  if (useBrowserAEC && actual.echoCancellation === false) {
+    log('e', '⚠️ 浏览器**拒绝**了 echoCancellation —— 此设备/浏览器上'
+           + '原生 AEC 不可用，回声不会被消除');
+  }
   videoStream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
   });
@@ -536,6 +551,13 @@ $('btnCalib').onclick = async () => {
       ws.onopen = res;
       ws.onerror = () => rej(new Error('无法连接校准通道'));
     });
+    // ⚠️ 必须发这条 —— 服务端等它才开始生成并下发校准音频。
+    // （早先漏了，表现为"连上了但没声音"，服务端侧是 NO_STATUS_RCVD 断开）
+    ws.send(JSON.stringify({
+      type: 'calibrate.start',
+      client_key: deviceKey(),
+    }));
+    log('v', '已连接校准通道，等待校准音频…');
 
     const result = await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('校准超时')), 20000);

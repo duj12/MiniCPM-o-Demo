@@ -123,11 +123,19 @@ async def _shutdown_session(sess: OrchestratorSession, sid: str,
 #  组件装配
 # ====================================================================== #
 
-async def build_session(sid: str, cfg: Settings,
-                        send_to_client) -> OrchestratorSession:
-    """为一个浏览器连接装配所有组件。"""
+async def build_session(sid: str, cfg: Settings, send_to_client,
+                        hello: Optional[dict] = None) -> OrchestratorSession:
+    """为一个浏览器连接装配所有组件。
+
+    ``hello`` 是客户端首条 ``session.start`` 消息 —— **必须在装配前传入**，
+    因为 AEC 模式要据此决定是否连云端（早先在装配后才读，导致用户选的
+    "算法服务"被 config 默认的 "browser" 覆盖，云端 AEC 根本没连上）。
+    """
     sess = OrchestratorSession(sid, config=vars(cfg))
     sess.send_to_client = send_to_client
+    # 用户选择的 AEC 模式优先于 config 默认值
+    if hello and hello.get("aec_mode"):
+        sess.aec_mode = str(hello["aec_mode"])
 
     # ---- AEC ----
     # 只有「算法服务 AEC」模式才连云端；「浏览器原生 AEC」在前端做，
@@ -317,22 +325,16 @@ async def handle_client(ws, cfg: Settings) -> None:
             ))
             return
 
-        sess = await build_session(sid, cfg, send_to_client)
+        sess = await build_session(sid, cfg, send_to_client, hello)
         identity = hello.get("identity", {}) or {}
         sess.config["identity"] = identity
         # 前端可覆盖 AEC 模式（用户在 UI 上选）。
         # build_session 时还不知道用户的选择（hello 在这之后才读到），
         # 所以若模式从 browser 变成 service，这里补建 AEC 客户端。
-        want_mode = str(hello.get("aec_mode") or sess.aec_mode)
-        if want_mode != sess.aec_mode:
-            sess.aec_mode = want_mode
-            if want_mode == "service" and sess.aec is None and cfg.enable_aec:
-                from orchestrator.aec.client import AecClient
-                sess.aec = AecClient(cfg.aec_url, connection_id=sid)
-                logger.info("[%s] 按前端选择启用云端 AEC", sid)
-            elif want_mode != "service" and sess.aec is not None:
-                sess.aec = None
-                logger.info("[%s] 按前端选择停用云端 AEC", sid)
+        logger.info("[%s] session.start: aec_mode=%s 云端AEC=%s identity=%s",
+                    sid, sess.aec_mode,
+                    "已连" if sess.aec is not None else "未连",
+                    sorted(identity.keys()))
 
         # 声学延迟初值：按设备标识查历史记录，冷启动即准
         # 优先用前端上报的设备键；没有就退化为"页面 + UA"的组合键

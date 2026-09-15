@@ -180,31 +180,51 @@ async def handle_calibrate_ws(ws, cfg) -> None:
     client_key = "default"
 
     try:
+        # 首条必须是 calibrate.start —— 超时给出明确提示（而不是静默断开，
+        # 那样前端只看到"连上了但没反应"，很难排查）
+        try:
+            first = await asyncio.wait_for(ws.receive_text(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("校准连接 10s 未收到 calibrate.start —— 断开")
+            await ws.send_text(json.dumps(
+                {"ok": False, "error": "未收到 calibrate.start"}, ensure_ascii=False))
+            return
+        m0 = json.loads(first)
+        if m0.get("type") != "calibrate.start":
+            await ws.send_text(json.dumps(
+                {"ok": False,
+                 "error": f"首条消息必须是 calibrate.start，收到 {m0.get('type')!r}"},
+                ensure_ascii=False))
+            return
+        client_key = str(m0.get("client_key") or "default")
+        handler = CalibrationHandler(
+            wav_path=DEFAULT_CAL_WAV,
+            playback_delay_ms=cfg.playback_delay_ms,
+            prefer_chirp=bool(m0.get("chirp")),
+        )
+        await ws.send_text(json.dumps(handler.start()))
+
         while True:
-            raw = await ws.receive_text()
+            raw = await asyncio.wait_for(ws.receive_text(), timeout=30)
             msg = json.loads(raw)
             t = msg.get("type")
 
-            if t == "calibrate.start":
-                client_key = str(msg.get("client_key") or "default")
-                # 允许前端指定用语音还是啁啾
-                prefer_chirp = bool(msg.get("chirp"))
-                handler = CalibrationHandler(
-                    wav_path=DEFAULT_CAL_WAV,
-                    playback_delay_ms=cfg.playback_delay_ms,
-                    prefer_chirp=prefer_chirp,
-                )
-                await ws.send_text(json.dumps(handler.start()))
-
-            elif t == "calibrate.mic":
+            if t == "calibrate.mic":
                 if handler is not None:
                     handler.feed(msg.get("audio_base64", ""))
                     if handler.ready():
                         res = handler.finish()
                         if res.get("ok"):
-                            store.put(client_key, res["delay_ms"], n_samples=10)
-                            res["saved"] = True
+                            saved = store.put(client_key, res["delay_ms"],
+                                              n_samples=10)
+                            res["saved"] = bool(saved)
                             res["source"] = "calibrated"
+                            if not saved:
+                                res["ok"] = False
+                                res["error"] = (
+                                    f"测得 {res['delay_ms']:.0f} ms 超出合理"
+                                    "区间（10~700ms），多半是相关峰选错。"
+                                    "请确认外放、环境安静后重试。")
                         await ws.send_text(json.dumps(res, ensure_ascii=False))
                         handler = None
 

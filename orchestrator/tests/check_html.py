@@ -124,6 +124,10 @@ def main() -> int:
          "mode === 'browser'" in html),
         ("移除手动设延迟入口（不该让用户做这个）",
          "btnSetDelay" not in html),
+        ("校准前发 calibrate.start（否则服务端不发音频）",
+         "calibrate.start" in html),
+        ("读 getSettings() 确认约束**实际生效**",
+         "getSettings" in html and "实际生效" in html),
     ]
     for desc, ok in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {desc}")

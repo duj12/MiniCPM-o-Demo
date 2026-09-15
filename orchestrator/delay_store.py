@@ -79,10 +79,26 @@ class DelayStore:
             return float(rec["delay_ms"]), "stored"
         return float(self.default_ms), "default"
 
-    def put(self, client_key: str, delay_ms: float, n_samples: int = 0) -> None:
-        """记录一次测量。``n_samples`` 是该值的样本数（越多越可信）。"""
-        if delay_ms <= 0 or delay_ms > 5000:
-            return                       # 明显异常，不记
+    # 合理区间：声学+网络延迟实测在 100~500ms 量级。超出这个范围的
+    # 测量值多半是互相关选错了峰（对准了语音的次级峰），存下来会持续
+    # 污染后续会话 —— 宁可不记。
+    MAX_REASONABLE_MS = 700.0
+    MIN_REASONABLE_MS = 10.0
+
+    def put(self, client_key: str, delay_ms: float, n_samples: int = 0) -> bool:
+        """记录一次测量。``n_samples`` 是该值的样本数（越多越可信）。
+
+        返回是否采纳。超出合理区间的值**不记录** —— 实测遇到过
+        820ms 这种明显选错峰的结果被存下来，之后每次会话都用它，
+        回声完全消不掉。
+        """
+        if not (self.MIN_REASONABLE_MS <= delay_ms <= self.MAX_REASONABLE_MS):
+            logger.warning(
+                "延迟测量值 %.0fms 超出合理区间 [%.0f, %.0f]，不予记录"
+                "（多半是互相关选错峰）",
+                delay_ms, self.MIN_REASONABLE_MS, self.MAX_REASONABLE_MS,
+            )
+            return False
         with self._lock:
             prev = self._data.get(client_key) or {}
             # 新值与旧值差很大时不急着覆盖（可能是异常测量）——
@@ -95,6 +111,7 @@ class DelayStore:
                 "n_samples": int(prev.get("n_samples", 0)) + max(1, n_samples),
             }
             self._save()
+            return True
 
     def snapshot(self) -> Dict[str, dict]:
         with self._lock:
