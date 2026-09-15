@@ -76,6 +76,12 @@ def main() -> int:
          "deviceKey" in html and "device_id" in html),
         ("browser 模式不依赖云端延迟",
          "浏览器原生 AEC" in html and "无需校准" in html),
+        ("ASR 与 TTS 分区（替换语义不冲掉追加语义）",
+         'id="asrline"' in html and 'id="ttslog"' in html),
+        ("播报字幕不截断（去掉 slice 限制）",
+         ".slice(0, 80)" not in html),
+        ("有手动设延迟入口",
+         "btnSetDelay" in html and "delayInput" in html),
     ]
     for desc, ok in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {desc}")

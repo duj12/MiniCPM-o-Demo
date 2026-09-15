@@ -31,9 +31,11 @@ logger = logging.getLogger(__name__)
 class PassthroughDownstream:
     """把语音/模型输出直接转成 TTS 播报。无状态、无 LLM、确定性。"""
 
-    def __init__(self, mode: str = "asr", max_text_chars: int = 200,
+    def __init__(self, mode: str = "asr", max_text_chars: int = 0,
                  prefix: str = "") -> None:
         self.mode = mode
+        # 0 = 不截断。默认不截断：OmniLLM 的回复常有几百字，截断会让
+        # TTS 只念前半句（实测踩过）。需要限制时显式传值。
         self.max_text_chars = max_text_chars
         self.prefix = prefix
         self.speaks = 0
@@ -61,7 +63,9 @@ class PassthroughDownstream:
             text = ev.text
 
         if text:
-            text = (self.prefix + text).strip()[: self.max_text_chars]
+            text = (self.prefix + text).strip()
+            if self.max_text_chars > 0:
+                text = text[: self.max_text_chars]
             if text:
                 self.speaks += 1
                 logger.info("[downstream] 触发 TTS #%d: %r", self.speaks, text)

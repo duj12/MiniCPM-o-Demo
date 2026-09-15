@@ -30,8 +30,11 @@
   .stats { font-family: ui-monospace, monospace; font-size: 12px;
            background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
            padding: 10px; margin-top: 10px; }
-  .sub { margin-top: 10px; min-height: 60px; background: #1a1a1a;
-         border: 1px solid #333; border-radius: 8px; padding: 10px; }
+  /* 字幕区：长回复要能完整显示并可滚动（早先限高+截断，长回复看不全） */
+  .sub { margin-top: 10px; min-height: 60px; max-height: 300px;
+         overflow-y: auto; background: #1a1a1a;
+         border: 1px solid #333; border-radius: 8px; padding: 10px;
+         line-height: 1.6; word-break: break-word; }
   h3 { margin: 0 0 8px; font-size: 14px; color: #aaa; font-weight: 500; }
 </style>
 </head>
@@ -74,7 +77,14 @@
   </div>
   <div class="col">
     <h3>字幕 / 事件</h3>
-    <div class="sub" id="subtitle">（等待 ASR/OmniLLM 输出）</div>
+    <!-- ASR 与 TTS 分两个区域：ASR 是**替换**语义（流式刷新同一行），
+         TTS 是**追加**语义（多轮累积）。早先共用一个元素，ASR 的替换
+         会把播报记录冲掉。 -->
+    <div class="sub" id="subtitle">
+      <div id="asrline">（等待 ASR 输出）</div>
+    </div>
+    <h3 style="margin-top:10px">播报记录</h3>
+    <div class="sub" id="ttslog">（等待播报）</div>
     <h3 style="margin-top:14px">事件日志</h3>
     <div class="log" id="log"></div>
   </div>
@@ -83,7 +93,7 @@
 <script src="/static/duplex/lib/orchestrator-session.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
-const logEl = $('log'), statsEl = $('stats'), subEl = $('subtitle');
+const logEl = $('log'), statsEl = $('stats');
 let session = null, micStream = null, audioCtx = null, workletNode = null;
 let videoStream = null, running = false, frameCounter = 0;
 
@@ -422,11 +432,20 @@ $('btnStart').onclick = async () => {
       onEvent: (m) => {
         evtCounts[m.type] = (evtCounts[m.type] || 0) + 1;
         if (m.type === 'asr') {
-          subEl.innerHTML = '<b>ASR</b> ' +
+          // 服务端已把增量片段拼成累积文本，这里**替换**显示即可
+          $('asrline').innerHTML = '<b>ASR</b> ' +
             (m.phase === 'partial' ? '<i>' : '') + (m.text || '') +
             (m.phase === 'partial' ? '</i>' : '');
         } else if (m.type === 'tts.start') {
-          subEl.innerHTML += '<br><b>播报</b> ' + (m.text || '').slice(0, 80);
+          // 完整显示，不截断 —— 早先限制 80 字，长回复的字幕被砍掉。
+          // 用独立区域追加（ASR 的替换不会冲掉这里）。
+          const log = $('ttslog');
+          if (log.textContent.startsWith('（等待')) log.textContent = '';
+          const d = document.createElement('div');
+          d.style.marginBottom = '6px';
+          d.innerHTML = '<b>播报</b> ' + (m.text || '');
+          log.appendChild(d);
+          log.scrollTop = log.scrollHeight;
         } else if (m.type === 'face.state') {
           drawFace(m);
         } else if (m.type === 'session.stats') {
