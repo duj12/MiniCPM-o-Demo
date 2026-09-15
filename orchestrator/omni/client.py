@@ -48,13 +48,22 @@ class OmniClient:
     def __init__(self, url: str, system_prompt: str = "",
                  on_event: Optional[Callable[[dict], None]] = None,
                  connect_timeout: float = 30.0,
-                 verify_ssl: bool = False) -> None:
+                 verify_ssl: bool = False,
+                 turn_trigger: str = "turnsense") -> None:
         self.url = url
         self.system_prompt = system_prompt
         self.on_event = on_event
         self.connect_timeout = connect_timeout
         # gateway 默认自签证书；公网部署应置 True 并配正规 CA
         self.verify_ssl = verify_ssl
+        # 回复触发方式：
+        #   "turnsense" —— 服务端 VAD+TurnSense 判决（默认，模型被服务端
+        #                  自动触发；客户端只 force_listen 累积）
+        #   "asr"       —— **由我方按 ASR 文本触发**。服务端设
+        #                  turn_decision="model" 穿透（不注入自触发），
+        #                  客户端持续 force_listen 累积视听上下文，
+        #                  收到 ASR final 时补一个 force_listen=False 触发
+        self.turn_trigger = turn_trigger
 
         self.client = None            # StreamingChatClient
         self.backend: Optional[str] = None
@@ -74,6 +83,7 @@ class OmniClient:
         self.text_deltas = 0
         self.listen_deltas = 0
         self.done_count = 0
+        self.triggers = 0        # 我方主动触发的回复数（turn_trigger="asr"）
 
     # ------------------------------------------------------------------ #
 
@@ -92,9 +102,15 @@ class OmniClient:
 
         self.client = StreamingChatClient(self.url, ssl_ctx=ssl_ctx, echo=False)
         await self.client.connect()
+        # turn_trigger="asr" 时显式请求 "model"（穿透）—— 服务端就不会包
+        # HalfDuplexSession，也就不会自注入触发；触发权完全归我方。
+        init_kw = {}
+        if self.turn_trigger == "asr":
+            init_kw["turn_decision"] = "model"
         ev = await self.client.init(
             mode="full_duplex",
             system_prompt=self.system_prompt or "你是一个实时视频对话助手。",
+            **init_kw,
         )
         self.session_id = self.client.session_id
         self.backend = self.client.backend
@@ -133,16 +149,41 @@ class OmniClient:
             frames = [self._pending_frame]
             self._pending_frame = None
             self.frames_sent += 1
-        # qwen3omni 走 vad_turnsense 判决：必须 force_listen，只累积不触发
-        force_listen = (self.backend == "qwen3omni")
+        # ⚠️ 所有音频推送一律 force_listen（只 prefill 进 KV，"边听边看"），
+        # 由触发源决定何时生成：
+        #   · turn_trigger="asr"      → 我方在 ASR final 时补触发
+        #   · turn_trigger="turnsense"→ 服务端 VAD+TurnSense 自注入触发
+        # 两种模式下客户端推送都不应自己触发回复（否则与触发源打架）。
         try:
             await self.client.send_input(
                 audio_b64=_b64_float32(audio), video_frames=frames,
-                force_listen=force_listen,
+                force_listen=True,
             )
             self.audio_sent_s += audio.size / 16000.0
         except Exception as exc:  # noqa: BLE001
             logger.warning("Omni send_input 失败: %s", exc)
+
+    async def trigger_reply(self, text: str = "") -> bool:
+        """主动触发一次回复（``turn_trigger="asr"`` 时用）。
+
+        机制：不带 ``force_listen`` 的 push 会让后端 **decode**（生成），
+        而不带它则只 prefill。见 ``runtime/half_duplex.py:639``
+        「force_listen intentionally omitted → decode」。
+
+        ``text`` 非空时同时注入文本（给模型一个明确的话轮边界提示）。
+        返回是否成功送出。
+        """
+        if self.closed or self.client is None:
+            return False
+        try:
+            await self.client.send_input(text=text, force_listen=False)
+            self.triggers += 1
+            logger.info("ASR 触发回复 #%d%s", self.triggers,
+                        f"（附文本 {len(text)} 字）" if text else "")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("触发回复失败: %s", exc)
+            return False
 
     async def send_text(self, text: str, force_listen: bool = False) -> None:
         """直接注入文本输入（下游 SendToOmni 用）。"""

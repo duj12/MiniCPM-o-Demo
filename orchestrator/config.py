@@ -58,6 +58,14 @@ class Settings:
 
     # OmniLLM
     omni_system_prompt: str = "你是一个实时视频对话助手。请一边观看用户传来的实时画面，一边倾听并用自然口语即时回复。"
+    # 回复触发方式：
+    #   "asr"       —— **按 ASR 最终文本触发**（推荐）。OmniLLM 持续以
+    #                  force_listen 累积视听上下文（"边听边看"），收到
+    #                  ASR 的 2pass-offline 时由我方补触发。回复是"看到
+    #                  截止此刻的画面 + 听到整句语音"后生成的。
+    #   "turnsense" —— 服务端 VAD+TurnSense 判决（原行为）。
+    omni_turn_trigger: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_TRIGGER", "asr"))
 
     # 人脸（阶段 4）
     face_lib_path: Optional[str] = field(default_factory=lambda: os.environ.get(

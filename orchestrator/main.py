@@ -167,6 +167,7 @@ async def build_session(sid: str, cfg: Settings,
         sess.omni = OmniClient(
             cfg.omni_url, system_prompt=cfg.omni_system_prompt,
             on_event=on_omni_event, verify_ssl=cfg.verify_ssl,
+            turn_trigger=cfg.omni_turn_trigger,
         )
 
     # ---- TTS ----
@@ -202,6 +203,44 @@ async def build_session(sid: str, cfg: Settings,
         build_face(sess, cfg)
 
     return sess
+
+
+def preflight_face(cfg: Settings) -> bool:
+    """启动期人脸预检：只验证资产存在，**不加载模型**（避免空跑占 GPU）。
+
+    为什么需要：人脸是会话建立时才懒加载的，如果路径配错，服务能正常
+    起来、直到第一个用户连进来才失败 —— 那是很差的失败模式。这里在
+    启动时就把问题暴露出来。
+    """
+    import os
+    problems = []
+    if not cfg.face_lib_path or not os.path.isfile(cfg.face_lib_path):
+        problems.append(f"G1 库不存在: {cfg.face_lib_path}")
+    if not cfg.face_model_dir or not os.path.isdir(cfg.face_model_dir):
+        problems.append(f"模型目录不存在: {cfg.face_model_dir}")
+    else:
+        need = ["blazeface.onnx", "face_landmarks_op12.onnx", "anchors_192_v5.bin"]
+        miss = [n for n in need
+                if not os.path.isfile(os.path.join(cfg.face_model_dir, n))]
+        if miss:
+            problems.append(f"缺模型文件: {miss}")
+    db_ok = bool(cfg.face_db_path) and os.path.isfile(cfg.face_db_path)
+    if not db_ok:
+        # 不阻断：没有离线库仍可做检测/唇动/唤醒，只是不做身份识别
+        logger.warning("人脸：离线库不可用（%s）—— 将只做检测/唇动/唤醒，"
+                       "不做身份识别", cfg.face_db_path)
+
+    if problems:
+        for p in problems:
+            logger.error("人脸预检失败: %s", p)
+        logger.error("人脸已开启但预检不通过 —— **会话将降级为无人脸**")
+        return False
+    logger.info(
+        "人脸预检通过: lib=%s  models=%s  db=%s",
+        os.path.basename(cfg.face_lib_path), cfg.face_model_dir,
+        "可用" if db_ok else "不可用",
+    )
+    return True
 
 
 def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
@@ -484,6 +523,15 @@ def main() -> None:
     cfg.mock_tts = args.mock_tts  # type: ignore[attr-defined]
     if args.mock_tts:
         logger.info("使用 MockTtsClient（本地正弦，不连 TTS 服务）")
+
+    # 启动期能力清单 —— 让"服务起来了"与"功能真的可用"区分开
+    logger.info(
+        "能力: aec=%s asr=%s omni=%s tts=%s face=%s downstream=%s",
+        cfg.enable_aec, cfg.enable_asr, cfg.enable_omni, cfg.enable_tts,
+        cfg.enable_face, cfg.downstream_mode,
+    )
+    if cfg.enable_face:
+        preflight_face(cfg)
 
     app = create_app(cfg)
 
