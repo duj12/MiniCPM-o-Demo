@@ -47,9 +47,12 @@ def main() -> int:
         print(f"  {op}{cl}: {a} vs {b}  {tag}")
 
     print()
-    syms = ("PcmPlayer", "diagUpdate", "btnUnlock", "btnTestTone",
+    syms = ("PcmPlayer", "diagUpdate", "btnUnlock",
             "audiostat", "src_w", "src_h", "createConstantSource",
-            "statechange", "grab(320, 240")
+            "statechange", "grab(320, 240",
+            # AEC 模式 / 延迟显示 / 校准
+            "aecMode", "btnCalib", "renderDelay", "selectedAecMode",
+            "deviceKey", "session.stats", "calibrate", "delayinfo")
     for sym in syms:
         print(f"  {sym:22s} {html.count(sym)}")
 
@@ -61,8 +64,18 @@ def main() -> int:
         ("播放器手动重采样到 ctx.sampleRate",
          "Math.abs(ctxRate - srcRate)" in html),
         ("有音频解锁按钮", "btnUnlock" in html and "audioCtx.resume()" in html),
-        ("有 AudioContext 状态诊断", "diagState" in html or "diag.ctxState" in html),
+        ("有 AudioContext 状态诊断", "diag.ctxState" in html),
         ("suspended 时有明确提示", "解锁音频" in html),
+        ("AEC 模式可选（browser/service/off）",
+         'value="browser"' in html and 'value="service"' in html
+         and 'value="off"' in html),
+        ("有延迟校准按钮", "btnCalib" in html and "'calibrate'" in html),
+        ("显示声学延迟与建议值",
+         "delay_ms" in html and "suggested_delay_ms" in html),
+        ("设备标识随会话上报（用于记住延迟）",
+         "deviceKey" in html and "device_id" in html),
+        ("browser 模式不依赖云端延迟",
+         "浏览器原生 AEC" in html and "无需校准" in html),
     ]
     for desc, ok in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {desc}")

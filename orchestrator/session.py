@@ -96,6 +96,20 @@ class OrchestratorSession:
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
+        # 回声消除模式：browser | service | off（可被 session.start 覆盖）
+        self.aec_mode = str(config.get("aec_mode") or "browser")
+        # 声学延迟：优先用该设备的历史记录，没有则用配置默认值
+        self._delay_store = None
+        self._client_key = "default"
+        self.delay_default_ms = float(config.get("aec_default_delay_ms") or 250.0)
+        self.delay_adaptive = bool(config.get("aec_adaptive_delay", True))
+        self.delay_source = "default"
+        self._last_stats_push = 0.0
+        # 播放提前量（前端起播预留的时间）—— 校准时要从中扣除
+        self.playback_delay_ms = int(config.get("playback_delay_ms") or 200)
+        # 进行中的校准会话
+        self._cal = None
+
     # ------------------------------------------------------------------ #
     #  浏览器侧输入
     # ------------------------------------------------------------------ #
@@ -120,10 +134,13 @@ class OrchestratorSession:
         # 原始 mic 旁路：barge-in 检测用，零额外延迟
         self._raw_recent.append(float(np.sqrt(np.mean(x ** 2))))
 
-        # 声学延迟估计（用原始 mic + raw ref，只在播放窗口内做）
+        # 校准中：优先喂校准器（它要的是原始 mic，且需要连续采集）
+        self._feed_calibration(frame)
+        # 声学延迟自适应估计（用原始 mic + raw ref，只在播放窗口内做）
         self._maybe_update_delay(frame)
-        # 周期性链路诊断（每 5s）
+        # 周期性链路诊断（每 5s）+ 状态推送（每 2s，供 UI 显示延迟）
         self._periodic_diag(frame)
+        self.push_stats()
 
         # 送去清洗：有 AEC 走 AEC，否则直接扇出。
         # AEC 是**可选**的清洗环节，不是链路的一环 —— 缺它不影响正确性。
@@ -190,6 +207,145 @@ class OrchestratorSession:
                     self.stats.get("ref_rms_max", 0.0),
                 )
 
+    # ------------------------------------------------------------------ #
+    #  AEC 模式与声学延迟
+    # ------------------------------------------------------------------ #
+
+    def apply_delay_seed(self, client_key: str, store=None) -> float:
+        """用该设备的历史延迟作为初值（冷启动即准，不必从头收敛）。
+
+        返回采用的延迟（ms）。``source`` 记在 ``self.delay_source``：
+        ``stored``（有历史记录）/ ``default``（用配置默认值）。
+        """
+        self._client_key = client_key or "default"
+        self._delay_store = store
+        ms, source = self.delay_default_ms, "default"
+        if store is not None:
+            ms, source = store.get(self._client_key)
+        self.delay_source = source
+        if self.ref_track is not None:
+            self.ref_track.delay_samples = int(ms * SR / 1000.0)
+        logger.info(
+            "[%s] 声学延迟初值 %.0fms（来源=%s，client=%s）",
+            self.session_id, ms, source, self._client_key,
+        )
+        return ms
+
+    def set_aec_mode(self, mode: str) -> None:
+        """运行时切换回声消除模式。
+
+        ``browser`` 时不连云端 AEC（省一次云往返）；``service`` 时启用并
+        按延迟预对齐。会话中途切换是允许的 —— 前端可以两个都试听再决定。
+        """
+        if mode not in ("browser", "service", "off"):
+            logger.warning("[%s] 未知 AEC 模式 %r，忽略", self.session_id, mode)
+            return
+        if mode == self.aec_mode:
+            return
+        old, self.aec_mode = self.aec_mode, mode
+        logger.info("[%s] AEC 模式切换: %s → %s", self.session_id, old, mode)
+        if mode == "service" and self.aec is None:
+            self._want_aec_client = True       # main.py 的任务会拉起连接
+        self.push_stats(force=True)
+
+    async def start_calibration(self) -> bool:
+        """开始一次声学延迟校准（播放啁啾 + 采集回声）。
+
+        与自适应的区别：**主动**发起，不依赖 TTS 播放窗口，用户点一下
+        按钮即可；用的是宽带啁啾，互相关峰值比语音尖锐得多。
+        """
+        from .calibrate import CalibrationSession
+        if getattr(self, "_cal", None) is not None and not self._cal.done:
+            logger.info("[%s] 校准已在进行中", self.session_id)
+            return False
+        self._cal = CalibrationSession(sr=SR)
+        chirp = self._cal.start()
+        # 走**与 TTS 相同的播放通道** —— 否则测的是另一条链路的延迟
+        rid = f"cal_{int(time.monotonic())}"
+        from .protocol import TtsAudio, TtsEnd, TtsStart
+        await self.send_to_client(TtsStart(
+            response_id=rid, text="（正在校准回声延迟…）", sample_rate=24000))
+        # 分块送，与 TTS 一致
+        chunk = 24000 // 2
+        seq = 0
+        for i in range(0, len(chirp), chunk):
+            await self.send_to_client(TtsAudio.from_int16(
+                chirp[i:i + chunk], rid, seq))
+            seq += 1
+        await self.send_to_client(TtsEnd(response_id=rid))
+        # 校准信号也进参考轨（这样 AEC 期间不会把啁啾当回声残留）
+        if self.ref_track is not None:
+            at = self.clock.now() + int(
+                self.playback_delay_ms * SR / 1000.0)
+            self.ref_track.place(rid, 0, chirp, at)
+        logger.info("[%s] 校准信号已发出（%.1fs）", self.session_id,
+                    len(chirp) / 24000)
+        return True
+
+    def _feed_calibration(self, frame: AudioFrame) -> None:
+        """把原始麦克风喂给进行中的校准。"""
+        cal = getattr(self, "_cal", None)
+        if cal is None or cal.done:
+            return
+        cal.feed(frame.data.reshape(-1))
+        if cal.ready():
+            self._finish_calibration()
+
+    def _finish_calibration(self) -> None:
+        from .protocol import ErrorMsg, SessionStats
+        cal = getattr(self, "_cal", None)
+        if cal is None:
+            return
+        res = cal.finish(playback_delay_ms=self.playback_delay_ms)
+        if res is None or not res.get("ok"):
+            msg = (f"校准置信度低（峰值比 {res.get('peak_ratio') if res else '-'}）。"
+                   "请确认环境安静、音量适中后重试。")
+            logger.warning("[%s] %s", self.session_id, msg)
+            self._send_display(ErrorMsg(code="calibrate_failed", message=msg))
+            self._cal = None
+            return
+        d_ms = res["delay_ms"]
+        if self.ref_track is not None:
+            self.ref_track.delay_samples = int(d_ms * SR / 1000.0)
+        self.stats["delay_measured"] = 1
+        self.delay_source = "calibrated"
+        if self._delay_store is not None:
+            self._delay_store.put(self._client_key, d_ms, n_samples=10)
+        logger.info("[%s] 校准完成：D=%.0fms（已保存，下次自动使用）",
+                    self.session_id, d_ms)
+        self.push_stats(force=True)
+        self._cal = None
+
+    def current_delay_ms(self) -> float:
+        if self.ref_track is None:
+            return 0.0
+        return self.ref_track.delay_samples / SR * 1000.0
+
+    def push_stats(self, force: bool = False) -> None:
+        """定期把链路状态推给前端（含声学延迟，供 UI 显示）。"""
+        now = time.monotonic()
+        if not force and now - self._last_stats_push < 2.0:
+            return
+        self._last_stats_push = now
+        from .protocol import SessionStats
+        total = self.stats.get("ref_push_total", 0)
+        nz = self.stats.get("ref_push_nonzero", 0)
+        d_ms = self.current_delay_ms()
+        suggested = self.delay_default_ms
+        # 已实测到就用实测值作为"建议设置"
+        if self.stats.get("delay_measured"):
+            suggested = d_ms
+        self._send_display(SessionStats(
+            aec_mode=self.aec_mode,
+            delay_ms=round(d_ms, 1),
+            delay_source=self.delay_source,
+            delay_measured=bool(self.stats.get("delay_measured")),
+            delay_samples=self.ref_track.delay_samples if self.ref_track else 0,
+            suggested_delay_ms=round(suggested, 1),
+            aec_active=(self.aec_mode == "service" and self.aec is not None),
+            ref_nonzero_ratio=round(nz / total, 3) if total else 0.0,
+        ))
+
     def _periodic_diag(self, frame: AudioFrame) -> None:
         """每 5 秒打一条链路诊断 —— 排查"回声没消掉"时这是第一现场。
 
@@ -251,15 +407,30 @@ class OrchestratorSession:
         if raw.shape[0] < 8192:
             return
         est = self.delay_tracker.estimate(mic, raw)
-        if est is not None:
-            prev = self.ref_track.delay_samples
-            self.ref_track.delay_samples = self.delay_tracker.delay
-            if abs(self.ref_track.delay_samples - prev) >= 16:  # 变化 >1ms
-                logger.info(
-                    "声学延迟 D=%d 采样（%.0fms），本次估计 %d（%d 次样本）",
-                    self.ref_track.delay_samples,
-                    self.ref_track.delay_samples / SR * 1000,
-                    est, self.delay_tracker.estimates,
+        if est is None:
+            return
+        if not self.delay_adaptive:
+            return
+        prev = self.ref_track.delay_samples
+        self.ref_track.delay_samples = self.delay_tracker.delay
+        self.stats["delay_measured"] = 1
+        self.delay_source = "measured"
+        changed = abs(self.ref_track.delay_samples - prev) >= 16  # >1ms
+        if changed:
+            logger.info(
+                "[%s] 声学延迟自适应: %d → %d 采样（%.0fms），"
+                "本次估计 %d（累计 %d 次样本）",
+                self.session_id, prev, self.ref_track.delay_samples,
+                self.ref_track.delay_samples / SR * 1000,
+                est, self.delay_tracker.estimates,
+            )
+            self.push_stats(force=True)
+            # 持久化：下次同一设备冷启动就用这个值，不必重新收敛
+            if self._delay_store is not None and self.delay_tracker.estimates >= 3:
+                self._delay_store.put(
+                    self._client_key,
+                    self.ref_track.delay_samples / SR * 1000.0,
+                    n_samples=self.delay_tracker.estimates,
                 )
 
     def _ref_for(self, frame: AudioFrame) -> np.ndarray:

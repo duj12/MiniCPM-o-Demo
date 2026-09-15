@@ -46,11 +46,20 @@
     <canvas id="cv" style="display:none"></canvas>
     <div class="stats" id="faceinfo">人脸：等待中…</div>
     <div style="margin-top:12px">
+      <label style="display:block;margin-bottom:8px">
+        回声消除：
+        <select id="aecMode">
+          <option value="browser">浏览器原生 AEC（推荐，不受网络延迟影响）</option>
+          <option value="service">算法服务 AEC（需先校准延迟）</option>
+          <option value="off">不做回声消除</option>
+        </select>
+      </label>
       <button id="btnStart" class="primary">开始会话</button>
       <button id="btnUnlock">🔊 解锁音频</button>
-      <button id="btnTestTone">测试音</button>
+      <button id="btnCalib">⏱ 校准延迟</button>
       <button id="btnStop" class="danger">停止</button>
     </div>
+    <div class="stats" id="delayinfo">延迟：未测量</div>
     <div class="stats" id="audiostat">音频：未开始</div>
     <div class="stats" id="stats">未开始</div>
   </div>
@@ -181,21 +190,64 @@ class PcmPlayer {
   }
 }
 
+/* ---------- AEC 模式 / 延迟显示 ---------- */
+function selectedAecMode() {
+  const el = $('aecMode');
+  return el ? el.value : 'browser';
+}
+
+/** 设备标识：用于让服务端记住这台设备的延迟（下次冷启动即准）。 */
+function deviceKey() {
+  let k = localStorage.getItem('orch_device_key');
+  if (!k) {
+    k = 'dev_' + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem('orch_device_key', k);
+  }
+  return k;
+}
+
+/** 显示服务端推来的链路状态（重点是声学延迟）。 */
+let lastStats = null;
+function renderDelay(s) {
+  lastStats = s;
+  const el = $('delayinfo');
+  if (!el) return;
+  const modeName = { browser: '浏览器原生', service: '算法服务', off: '关闭' };
+  const srcName = { stored: '历史记录', default: '默认值',
+                    measured: '自适应测量', calibrated: '校准值',
+                    client: '前端上报' };
+  let html =
+    `回声消除：<b>${modeName[s.aec_mode] || s.aec_mode}</b>　` +
+    `声学延迟：<b>${s.delay_ms.toFixed(0)} ms</b> ` +
+    `（${srcName[s.delay_source] || s.delay_source}）`;
+  if (s.aec_mode === 'service') {
+    html += `<br>推荐设置：<b>${s.suggested_delay_ms.toFixed(0)} ms</b>`;
+    if (!s.delay_measured) {
+      html += `　<span style="color:#fcd34d">← 尚未测量，建议点「校准延迟」</span>`;
+    } else if (s.delay_ms > 400) {
+      html += `　<span style="color:#fca5a5">延迟偏高，云端 AEC 抑制效果会明显下降</span>`;
+    }
+  }
+  if (s.aec_active) {
+    html += `<br>云端 AEC：工作中，farend 非零占比 ${(s.ref_nonzero_ratio*100).toFixed(0)}%`;
+  }
+  el.innerHTML = html;
+}
+
 /* ---------- 采集 ---------- */
 async function startCapture() {
-  // ⚠️ 回声消除**交给浏览器原生 AEC**。
-  //
-  // 曾经的判断是"关掉浏览器 AEC、交给云端"，实测后推翻：
-  //   · 云端 AEC 的有效对齐窗口是 **<20ms**（离线扫描：>40ms 时
-  //     ERLE <2dB，完全不消除）
-  //   · 真机实测声学+网络延迟 **284ms**，是窗口的 14 倍
-  //   → 云端 AEC 在真实链路上必然不工作，回声会原样回传
-  //
-  // 浏览器原生 AEC 在设备侧工作，不受网络延迟影响，是这里唯一可行的方案。
-  // 三项全开 = 浏览器为语音通话调优的标准组合（AEC + 降噪 + 自动增益）。
+  // 回声消除模式由用户在页面上选（见 #aecMode）：
+  //   browser —— 浏览器原生 AEC（设备侧工作，不受网络延迟影响，推荐）
+  //   service —— 云端算法 AEC。需要参考轨按声学延迟 D 预对齐；实测
+  //              抑制 9~11dB，弱于浏览器原生，但可验证算法链路。
+  //   off     —— 不消（调试用）
+  // 选 browser/service 时都要开浏览器 AEC —— 两者叠加是安全的（浏览器
+  // AEC 在设备侧先粗消，云端做精消），而选 service 但不开浏览器 AEC 时
+  // 人声也会被麦克风的原始回声淹没。
+  const useBrowserAEC = (selectedAecMode() !== 'off');
   micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true,
-             noiseSuppression: true, autoGainControl: true },
+    audio: { channelCount: 1, echoCancellation: useBrowserAEC,
+             noiseSuppression: useBrowserAEC, autoGainControl: true },
     video: false,
   });
   videoStream = await navigator.mediaDevices.getUserMedia({
@@ -359,6 +411,8 @@ $('btnStart').onclick = async () => {
           subEl.innerHTML += '<br><b>播报</b> ' + (m.text || '').slice(0, 80);
         } else if (m.type === 'face.state') {
           drawFace(m);
+        } else if (m.type === 'session.stats') {
+          renderDelay(m);
         } else if (m.type === 'error') {
           log('e', 'ERROR ' + m.code + ': ' + m.message);
         } else if (m.type === 'tts.audio') {
@@ -378,7 +432,15 @@ $('btnStart').onclick = async () => {
       onClose: () => { log('e', '连接关闭'); running = false; },
       onError: (e) => log('e', 'WS 错误'),
     });
-    await session.start({ identity: { page: 'orchestrator-test' } });
+    const aecMode = selectedAecMode();
+    await session.start({
+      identity: { page: 'orchestrator-test', device_id: deviceKey() },
+      aec_mode: aecMode,
+    });
+    log('v', `会话已建立（回声消除=${aecMode}）`);
+    if (aecMode === 'service') {
+      log('m', '已选算法服务 AEC —— 建议先点「校准延迟」，否则第一句播报消得不准');
+    }
     log('v', '会话已建立');
     refreshStats();
   } catch (e) {
@@ -411,15 +473,39 @@ $('btnUnlock').onclick = async () => {
   }
 };
 
-$('btnTestTone').onclick = () => {
-  if (!audioCtx) { log('e', '请先点「开始会话」'); return; }
-  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  g.gain.value = 0.1;
-  o.frequency.value = 440;
-  o.connect(g); g.connect(audioCtx.destination);
-  o.start();
-  o.stop(audioCtx.currentTime + 0.4);
-  log('v', `测试音 440Hz，ctx=${audioCtx.state} @${audioCtx.sampleRate}Hz`);
+/* 校准：让服务端播一段专用啁啾，同时采集回声，用互相关求延迟。
+ * 比自适应估计更可靠 —— 不依赖 TTS 播放窗口，且啁啾的自相关是尖锐单峰。*/
+$('btnCalib').onclick = async () => {
+  if (!session || !session.ready) { log('e', '请先点「开始会话」'); return; }
+  if (selectedAecMode() !== 'service') {
+    log('m', '当前是浏览器原生 AEC，无需校准延迟（它工作在设备侧）');
+    return;
+  }
+  try {
+    if (audioCtx && audioCtx.state !== 'running') await audioCtx.resume();
+    $('btnCalib').disabled = true;
+    log('v', '开始校准：将播放约 1.5 秒校准音（一声短促扫频），请保持环境安静…');
+    session.send({ type: 'calibrate' });
+    // 校准需要播放 + 采集 + 计算，约 3~5 秒
+    await new Promise(r => setTimeout(r, 6000));
+    log('v', '校准结束，结果见上方「声学延迟」');
+  } catch (e) {
+    log('e', '校准失败：' + e.message);
+  } finally {
+    $('btnCalib').disabled = false;
+  }
+};
+
+/* 切换 AEC 模式：会话中可直接切，服务端会启用/停用云端 AEC */
+$('aecMode').onchange = () => {
+  const m = selectedAecMode();
+  log('v', `回声消除模式 → ${m}`);
+  if (session && session.ready) {
+    session.send({ type: 'set_aec_mode', mode: m });
+    if (m === 'service') {
+      log('m', '算法服务 AEC 需要延迟校准 —— 建议点「校准延迟」');
+    }
+  }
 };
 
 $('btnStop').onclick = async () => {

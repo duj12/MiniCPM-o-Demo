@@ -93,6 +93,16 @@ class SessionStop:
     type: Literal["session.stop"] = "session.stop"
 
 
+@dataclass
+class CalibrateRequest:
+    """请求一次声学延迟校准。
+
+    服务端会用扬声器播一段**专用校准信号**（宽带啁啾，比语音更适合
+    互相关），同时采集麦克风，用 GCC-PHAT 估计延迟。全程约 2 秒。
+    """
+    type: Literal["calibrate"] = "calibrate"
+
+
 # ====================================================================== #
 #  服务端 → 客户端
 # ====================================================================== #
@@ -161,6 +171,24 @@ class FaceDisplay:
     identity: Optional[Dict[str, Any]] = None
     wake: Optional[Dict[str, Any]] = None
     type: Literal["face.state"] = "face.state"
+
+
+@dataclass
+class SessionStats:
+    """服务端定期推送的链路状态（供 UI 显示与排障）。
+
+    重点是**声学延迟**：用算法服务 AEC 时，参考轨要按它做预对齐，
+    用户需要能看到"当前测到多少、是否已收敛"。
+    """
+    aec_mode: str = "browser"          # browser | service | off
+    delay_ms: float = 0.0              # 当前使用的声学延迟
+    delay_source: str = "default"      # stored | default | measured
+    delay_measured: bool = False       # 是否已实测到（而非用默认值）
+    delay_samples: int = 0
+    suggested_delay_ms: float = 0.0    # 建议值（通常 = playback_delay + 声学）
+    aec_active: bool = False           # 云端 AEC 是否在工作
+    ref_nonzero_ratio: float = 0.0     # 送出的 farend 非零占比
+    type: Literal["session.stats"] = "session.stats"
 
 
 @dataclass

@@ -77,6 +77,10 @@ REGISTRY = SessionRegistry()
 # 持有引用防止被 GC，done 回调里移除。
 SHUTDOWN_TASKS: set = set()
 
+# 声学延迟的持久化记录（按设备分组，跨会话复用）
+from orchestrator.delay_store import DelayStore  # noqa: E402
+DELAY_STORE = DelayStore()
+
 
 async def _shutdown_session(sess: OrchestratorSession, sid: str,
                             cfg: Settings, tasks: list) -> None:
@@ -126,9 +130,15 @@ async def build_session(sid: str, cfg: Settings,
     sess.send_to_client = send_to_client
 
     # ---- AEC ----
-    if cfg.enable_aec:
+    # 只有「算法服务 AEC」模式才连云端；「浏览器原生 AEC」在前端做，
+    # 连过去只是白跑一次云往返（实测该服务在此延迟下还相当于直通）。
+    mode = getattr(sess, "aec_mode", cfg.aec_mode)
+    sess.aec_mode = mode
+    if cfg.enable_aec and mode == "service":
         from orchestrator.aec.client import AecClient
         sess.aec = AecClient(cfg.aec_url, connection_id=sid)
+    elif mode == "browser":
+        logger.info("[%s] AEC 模式=browser —— 不连云端 AEC（前端原生处理）", sid)
 
     # ---- ASR ----
     if cfg.enable_asr:
@@ -308,11 +318,37 @@ async def handle_client(ws, cfg: Settings) -> None:
             return
 
         sess = await build_session(sid, cfg, send_to_client)
-        sess.config["identity"] = hello.get("identity", {})
+        identity = hello.get("identity", {}) or {}
+        sess.config["identity"] = identity
+        # 前端可覆盖 AEC 模式（用户在 UI 上选）。
+        # build_session 时还不知道用户的选择（hello 在这之后才读到），
+        # 所以若模式从 browser 变成 service，这里补建 AEC 客户端。
+        want_mode = str(hello.get("aec_mode") or sess.aec_mode)
+        if want_mode != sess.aec_mode:
+            sess.aec_mode = want_mode
+            if want_mode == "service" and sess.aec is None and cfg.enable_aec:
+                from orchestrator.aec.client import AecClient
+                sess.aec = AecClient(cfg.aec_url, connection_id=sid)
+                logger.info("[%s] 按前端选择启用云端 AEC", sid)
+            elif want_mode != "service" and sess.aec is not None:
+                sess.aec = None
+                logger.info("[%s] 按前端选择停用云端 AEC", sid)
+
+        # 声学延迟初值：按设备标识查历史记录，冷启动即准
+        # 优先用前端上报的设备键；没有就退化为"页面 + UA"的组合键
+        client_key = str(
+            identity.get("device_id")
+            or identity.get("client_id")
+            or hello.get("client_key")
+            or "default"
+        )
         seeded = int(hello.get("seeded_delay_samples") or 0)
-        if seeded and sess.ref_track is not None:
+        if seeded > 0 and sess.ref_track is not None:
             sess.ref_track.delay_samples = seeded
-            logger.info("[%s] 用种子声学延迟 %d 采样", sid, seeded)
+            sess.delay_source = "client"
+            logger.info("[%s] 用前端上报的声学延迟 %d 采样", sid, seeded)
+        else:
+            sess.apply_delay_seed(client_key, DELAY_STORE)
 
         if cfg.omni_system_prompt and hello.get("system_prompt"):
             pass  # 已在 build_session 里设置；如需覆盖可在此处理
@@ -426,6 +462,10 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
             msg.get("response_id", ""), msg.get("phase", "started"),
             float(msg.get("ctx_time", 0.0)), int(msg.get("seq", 0)),
         )
+    elif t == "calibrate":
+        await sess.start_calibration()
+    elif t == "set_aec_mode":
+        sess.set_aec_mode(str(msg.get("mode") or "browser"))
     elif t == "session.stop":
         # 客户端要求停止：先 drain 再 close（drain 会等 ASR 最终结果）。
         # 注意不能在 dispatch 里 await 太久 —— 主接收循环还等着收后续消息。

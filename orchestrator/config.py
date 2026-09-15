@@ -49,6 +49,28 @@ class Settings:
     enable_face: bool = False        # 阶段 4 后开启
     verify_ssl: bool = False         # gateway 用自签证书
 
+    # ---- 回声消除模式（可被前端 session.start 覆盖）----
+    #   "browser" —— 浏览器原生 AEC（getUserMedia 的 echoCancellation）。
+    #                在设备侧工作，**不受网络延迟影响**；不连云端 AEC，
+    #                省一次云往返。
+    #   "service" —— 云端算法 AEC。需要参考轨按声学延迟 D 预对齐
+    #                （本模块自适应测量）；实测抑制 9~11dB，弱于浏览器
+    #                原生，但可验证算法链路。
+    #   "off"     —— 都不做。
+    aec_mode: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_AEC_MODE", "browser"))
+
+    # 声学延迟（毫秒）的冷启动默认值。没有历史记录时用它，
+    # 会话内测得真实值后会自适应更新并持久化（见 delay_store.py）。
+    aec_default_delay_ms: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_AEC_DEFAULT_DELAY_MS", "250")))
+    # 延迟自适应开关（关闭则固定用 default_delay_ms）
+    aec_adaptive_delay: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_AEC_ADAPTIVE", "1") not in ("0", "false", ""))
+    # 延迟记录持久化路径
+    delay_store_path: Optional[str] = field(default_factory=lambda:
+        os.environ.get("ORCH_DELAY_STORE"))
+
     # downstream 桩模式：asr | omni | echo | none
     downstream_mode: str = "omni"
 

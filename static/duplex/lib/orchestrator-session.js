@@ -234,6 +234,11 @@
       this._send({ type: 'cancel', reason: reason || 'bargein' });
     }
 
+    /** 发送任意控制消息（校准、切换 AEC 模式等）。 */
+    send(obj) {
+      return this._send(obj);
+    }
+
     /** 优雅停止：先让服务端收尾（等 ASR 最终结果、TTS 送达），再关闭。 */
     stop(reason) {
       if (this.closed) return Promise.resolve();
