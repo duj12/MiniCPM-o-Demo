@@ -68,7 +68,7 @@
              style="width:80px;padding:4px" placeholder="ms">
       <button id="btnSetDelay">应用</button>
       <span id="delayHint" style="font-size:12px;color:#999">
-        切换不同值并观察上方 ERLE，找抑制最强的（含近端故绝对值偏低，看相对变化）
+        改完 D 后请**触发一次新播报**，看上方 ERLE 变化（每轮播报独立测量）
       </span>
     </div>
     <div class="stats" id="delayinfo">延迟：未测量</div>
@@ -250,12 +250,12 @@ function renderDelay(s) {
   if (s.aec_active) {
     html += `<br>云端 AEC：工作中，farend 非零占比 ${(s.ref_nonzero_ratio*100).toFixed(0)}%`;
     if (s.erle_db != null) {
-      // 含近端故绝对值偏低；关键是**调延迟前后的相对变化**
+      // 每轮播报独立测量（近端也计入，故绝对值偏低；看**变化**）
       const good = s.erle_db >= 8;
-      html += `　实测 ERLE：<b style="color:${good ? '#86efac' : '#fca5a5'}">` +
+      html += `　本轮 ERLE：<b style="color:${good ? '#86efac' : '#fca5a5'}">` +
               `${s.erle_db.toFixed(1)} dB</b>`;
-      if (!good && s.delay_measured) {
-        html += `　<span style="color:#fcd34d">← 抑制偏弱，可试试校准/改延迟</span>`;
+      if (!good) {
+        html += `　<span style="color:#fcd34d">← 抑制偏弱，可试其他 D 值</span>`;
       }
     }
   }

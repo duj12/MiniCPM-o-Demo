@@ -114,10 +114,18 @@ class OrchestratorSession:
         # 拼接；2pass-offline 到达时用它覆盖并清空。
         self._asr_online_text = ""
 
-        # 实时 ERLE 统计（播放期间才有效）：mic 能量 vs AEC 输出能量。
-        # 用来**实测**当前延迟配置到底消掉多少 —— 排障时最直接的依据。
-        self._mic_e = 0.0
-        self._aec_out_e = 0.0
+        # ---- 实时 ERLE：**按每次播报独立统计** ----
+        # ⚠️ 早先的实现有 bug：mic 能量只在播放窗口累加，而 AEC 输出能量
+        # 无条件累加 —— 两者的门控条件不同，比值根本不是"回声消除了多少"，
+        # 而是"播放期能量 / 全程能量"。空闲时间一长分母无限增长，ERLE 会
+        # 一路漂到 -40dB 并卡住，且新配置的影响被历史累积稀释到看不见。
+        #
+        # 现在：一次播报 = 一个测量窗口。窗口开始时清零，结束时结算。
+        self._erle_active = False      # 当前是否处于测量窗口
+        self._erle_windows = []        # 已完成窗口的 ERLE(dB)
+        self._erle_cur_mic = 0.0
+        self._erle_cur_aec = 0.0
+        self._erle_idle_since = 0.0    # 播放结束后的静默起点（用于收窗）
 
     # ------------------------------------------------------------------ #
     #  浏览器侧输入
@@ -139,10 +147,9 @@ class OrchestratorSession:
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
         self.metrics.inc("audio_samples", frame.n_samples)
-        # 实时 ERLE 的输入侧（仅播放期间累计，见 _update_erle）
-        if (self.aec is not None and self.ref_track is not None
-                and self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR))):
-            self._mic_e += float(np.mean(frame.data ** 2)) * frame.n_samples
+        # 实时 ERLE 的输入侧：只在**测量窗口**内累加（见 _erle_window）
+        if self._erle_active:
+            self._erle_cur_mic += float(np.mean(frame.data ** 2)) * frame.n_samples
 
         # 原始 mic 旁路：barge-in 检测用，零额外延迟
         self._raw_recent.append(float(np.sqrt(np.mean(x ** 2))))
@@ -151,6 +158,8 @@ class OrchestratorSession:
         self._feed_calibration(frame)
         # 声学延迟自适应估计（用原始 mic + raw ref，只在播放窗口内做）
         self._maybe_update_delay(frame)
+        # ERLE 测量窗口维护（开窗/收窗）
+        self._update_erle_window(frame)
         # 周期性链路诊断（每 5s）+ 状态推送（每 2s，供 UI 显示延迟）
         self._periodic_diag(frame)
         self.push_stats()
@@ -340,11 +349,14 @@ class OrchestratorSession:
         self.ref_track.delay_samples = int(max(0.0, ms) * SR / 1000.0)
         self.delay_source = "manual"
         self.stats["delay_measured"] = 1
-        # 重置 ERLE 累计，让新配置的效果可独立观察
-        self._mic_e = 0.0
-        self._aec_out_e = 0.0
-        logger.info("[%s] 手动设置声学延迟 = %.0f ms（ERLE 计数已重置）",
-                    self.session_id, ms)
+        # 清空历史窗口 —— 之后**下一次播报**的 ERLE 就是新配置的独立测量值。
+        # 不清的话中位数会被旧配置的结果拖住，看不出变化。
+        self._erle_windows.clear()
+        self._erle_active = False
+        self._erle_cur_mic = 0.0
+        self._erle_cur_aec = 0.0
+        logger.info("[%s] 手动设置声学延迟 = %.0f ms（ERLE 历史已清空，"
+                    "请触发一次新播报来看效果）", self.session_id, ms)
         self.push_stats(force=True)
 
     def current_delay_ms(self) -> float:
@@ -410,17 +422,64 @@ class OrchestratorSession:
             self.stats.get("omni_triggers", 0),
         )
 
-    def current_erle_db(self) -> Optional[float]:
-        """播放期间实测的回声抑制比（dB）。
+    def _update_erle_window(self, frame: AudioFrame) -> None:
+        """维护「一次播报 = 一个测量窗口」的 ERLE 统计。
 
-        ``10·log10(mic能量 / AEC输出能量)``，只在有过播放窗口时有效。
-        排障时看它最直接：**调 D 前后 ERLE 的变化**能立刻判断配置对不对。
-        注意它含近端语音（故绝对值偏低），但**不同 D 之间的相对比较**
-        是有效的。
+        窗口语义（这很关键，早先实现没有窗口概念导致指标失真）：
+          · 参考轨开始有内容 → **开窗**，清零累加器
+          · 播放结束且静默 >0.5s → **收窗**，结算本次 ERLE 入列表
+          · 下次播报重新开窗
+
+        这样每次改配置后的**下一次播报**给出的就是该配置的独立测量值，
+        不受历史累积影响。
         """
-        if self._mic_e <= 0 or self._aec_out_e <= 0:
+        if self.ref_track is None or self.aec is None:
+            return
+        playing = self.ref_track.is_active(frame.t0, lookahead=int(0.3 * SR))
+        now = time.monotonic()
+        if playing:
+            if not self._erle_active:
+                self._erle_active = True
+                self._erle_cur_mic = 0.0
+                self._erle_cur_aec = 0.0
+                logger.debug("[%s] ERLE 测量窗口开启", self.session_id)
+            self._erle_idle_since = 0.0
+        elif self._erle_active:
+            # 播放结束：等 0.5s 让 AEC 的尾部输出也收进来，再结算
+            if self._erle_idle_since == 0.0:
+                self._erle_idle_since = now
+            elif now - self._erle_idle_since > 0.5:
+                self._close_erle_window()
+
+    def _close_erle_window(self) -> None:
+        self._erle_active = False
+        self._erle_idle_since = 0.0
+        if self._erle_cur_mic <= 0 or self._erle_cur_aec <= 0:
+            return
+        erle = 10.0 * np.log10(self._erle_cur_mic / self._erle_cur_aec)
+        self._erle_windows.append(erle)
+        if len(self._erle_windows) > 20:
+            self._erle_windows.pop(0)
+        logger.info(
+            "[%s] 本轮播报 ERLE = %.1f dB（D=%d 采样/%.0fms，累计 %d 轮）",
+            self.session_id, erle, self.ref_track.delay_samples if self.ref_track else -1,
+            (self.ref_track.delay_samples / SR * 1000) if self.ref_track else -1,
+            len(self._erle_windows),
+        )
+        self.push_stats(force=True)
+
+    def current_erle_db(self) -> Optional[float]:
+        """最近若干次播报的 ERLE 中位数（dB）。
+
+        ``10·log10(mic能量 / AEC输出能量)``。含近端语音，故绝对值偏低；
+        看**改配置前后的变化**才有意义 —— 抑制变强说明方向对了。
+        """
+        if self._erle_active and self._erle_cur_mic > 0 and self._erle_cur_aec > 0:
+            # 窗口进行中：给个实时值（播报未结束时的粗略参考）
+            return 10.0 * np.log10(self._erle_cur_mic / self._erle_cur_aec)
+        if not self._erle_windows:
             return None
-        return 10.0 * np.log10(self._mic_e / self._aec_out_e)
+        return float(np.median(self._erle_windows[-5:]))
 
     def _maybe_update_delay(self, frame: AudioFrame) -> None:
         """在**播放窗口内**估计声学路径延迟 D 并喂给参考轨。
@@ -564,9 +623,11 @@ class OrchestratorSession:
             self.stats["aec_segments_out"] += 1
             self.stats["aec_samples_out"] += int(np.asarray(seg).size)
             self.metrics.inc("aec_segments")
-            # 实时 ERLE：累加 AEC 输出的能量，与同期 mic 能量比。
-            # 播放期间才有意义（无回声时 ERLE≈0 反映的是纯近端）。
-            self._aec_out_e += float(np.mean(np.asarray(seg) ** 2)) * np.asarray(seg).size
+            # 实时 ERLE 的输出侧：只看**测量窗口内**的输出。
+            # （早先无条件累加 → 分母被空闲时段的输出灌大，比值失真）
+            if self._erle_active:
+                a = np.asarray(seg)
+                self._erle_cur_aec += float(np.mean(a ** 2)) * a.size
             # 首窗延迟（相对会话开始收音频）
             lat = self.aec.first_result_latency_ms() if self.aec else None
             if lat is not None and self.metrics.aec_first_window.count == 0:
