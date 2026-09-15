@@ -198,11 +198,41 @@ class CalibrationSession:
             logger.warning("麦克风信号过弱（rms=%.4f）—— 手机音量调大些、"
                            "靠近麦克风外放", mic_rms)
 
-        ok = ratio > 1.8 and 0 <= d_ms <= 1500
+        # ⚠️ **绝对信号强度门槛**：峰比只反映"最强峰比次峰高多少"，
+        # 而噪声本身也有结构 —— 实测 mic_rms=0.0015（比播放信号弱 50 倍）
+        # 时峰比仍达 10.23，若只看峰比会误判为可信。必须同时要求
+        # 麦克风确实收到了可观的信号。
+        #
+        # 经验值：手机外放、距离 20~50cm 时 mic_rms 通常在 0.01~0.1。
+        # 低于 0.004 基本可断定「扬声器声音没进麦克风」（戴耳机、
+        # 静音、音量过低、或麦克风被遮挡）。
+        MIN_MIC_RMS = 0.004
+        signal_ok = mic_rms >= MIN_MIC_RMS
+
+        ok = ratio > 1.8 and 0 <= d_ms <= 1500 and signal_ok
+        if not signal_ok:
+            logger.warning(
+                "校准判为不可信：麦克风信号过弱（rms=%.4f < %.4f）。"
+                "峰值比 %.2f 虽高，但那是噪声的结构，不是真实回声。",
+                mic_rms, MIN_MIC_RMS, ratio,
+            )
         logger.info(
             "校准完成：相关峰 %d 采样，提前量 %d，净延迟 %.0fms"
             "（峰值比 %.2f，%s）",
             peak, lead, d_ms, ratio, "可信" if ok else "**置信度低**",
         )
+        # 失败时给出**可操作**的原因（而非笼统的"置信度低"）
+        reason = ""
+        if not signal_ok:
+            reason = (f"麦克风信号过弱（rms={mic_rms:.4f}）—— 扬声器的声音"
+                      "没进麦克风。请确认：① 用扬声器外放而非耳机 "
+                      "② 手机音量调大 ③ 别挡住麦克风")
+        elif ratio <= 1.8:
+            reason = (f"相关峰不明显（峰比 {ratio:.2f}）—— 环境太吵或"
+                      "音量不当，请保持安静后重试")
+        elif not (0 <= d_ms <= 1500):
+            reason = f"测得延迟 {d_ms:.0f}ms 不在合理范围，请重试"
         return {"delay_ms": d_ms, "delay_samples": d_samples,
-                "peak": peak, "peak_ratio": round(ratio, 2), "ok": ok}
+                "peak": peak, "peak_ratio": round(ratio, 2), "ok": ok,
+                "mic_rms": round(mic_rms, 5), "ref_rms": round(ref_rms, 5),
+                "reason": reason}

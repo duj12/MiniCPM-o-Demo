@@ -664,6 +664,11 @@ $('btnCalib').onclick = async () => {
              + `（已保存，下次自动使用）`);
     } else {
       log('e', '校准失败：' + (result.error || '未知原因'));
+      if (result.mic_rms != null) {
+        log('m', `诊断：麦克风信号 rms=${result.mic_rms}，`
+               + `播放信号 rms=${result.ref_rms}（两者差距过大说明`
+               + `扬声器声音没进麦克风）`);
+      }
     }
   } catch (e) {
     log('e', '校准失败：' + e.message);

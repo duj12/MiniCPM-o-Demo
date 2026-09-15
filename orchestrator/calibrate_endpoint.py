@@ -158,8 +158,11 @@ class CalibrationHandler:
             "peak_ratio": res.get("peak_ratio", 0),
         }
         if not ok:
-            out["error"] = ("置信度低 —— 请确认手机外放（不是耳机）、"
-                            "环境较安静、音量适中后重试")
+            # 用具体原因（信号弱 / 峰不明显 / 延迟越界），而不是笼统的
+            # "置信度低" —— 用户据此知道该做什么
+            out["error"] = res.get("reason") or "校准失败，请重试"
+            out["mic_rms"] = res.get("mic_rms")
+            out["ref_rms"] = res.get("ref_rms")
         logger.info("校准结果: %s", out)
         return out
 
