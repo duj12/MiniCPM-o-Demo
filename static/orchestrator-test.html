@@ -554,14 +554,30 @@ $('btnCalib').onclick = async () => {
   btn.disabled = true;
   let ws = null, mic = null, ctx = null, worklet = null;
   try {
+    // ⚠️ **AudioContext 必须在用户手势的同步处理链中创建**。
+    // 移动端（尤其 iOS）里，若先 `await getUserMedia` 再建 AudioContext，
+    // 手势上下文已失效 —— context 会被挂起或音量极低，**校准音根本没响**。
+    // 那会让麦克风收不到回声，表现为 mic_rms 极低、校准必然失败。
+    //
+    // 也不能强制 sampleRate:16000（很多移动设备只支持 44.1k/48k）。
+    // 播放时按 ctx.sampleRate 重采样即可。
+    const AC = window.AudioContext || window.webkitAudioContext;
+    ctx = new AC();
+    // 同一个手势里立刻 resume（必须同步链路，不能等 await）
+    const resumeP = (ctx.state === 'suspended') ? ctx.resume() : Promise.resolve();
+
     // 1) 麦克风：**关掉 AEC/NS**，只要原始信号（才含真实回声）
     mic = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: false,
                noiseSuppression: false, autoGainControl: false },
       video: false,
     });
-    ctx = new AudioContext({ sampleRate: 16000 });
-    if (ctx.state === 'suspended') await ctx.resume();
+    await resumeP;
+    log('v', `校准用 AudioContext：${ctx.state} @${ctx.sampleRate}Hz`);
+    if (ctx.state !== 'running') {
+      log('e', '⚠️ AudioContext 未运行 —— 校准音可能不会播放，'
+             + '请确认已授权并且不是静音模式');
+    }
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/v1/calibrate`);
