@@ -116,8 +116,19 @@ class CalibrationSession:
         return len(self.chirp24) / CAL_SR + self.search / self.sr + 0.5
 
     def ready(self) -> bool:
-        """采集是否足够。"""
-        return self._mic_len >= int(self.expected_total_s() * self.sr)
+        """采集是否足够。
+
+        只要**覆盖了播放时段 + 一个最大搜索窗**就够算。不必死等
+        ``expected_total_s()`` 的理论上限 —— 那只是个宽裕估计，等它会让
+        用户多等一秒多；而浏览器提前停发时更糟：服务端会一直等到 recv
+        超时，用户看到的是"卡住"。
+        """
+        need = len(self.chirp24) / CAL_SR * self.sr + self.search
+        return self._mic_len >= int(need)
+
+    def min_needed_s(self) -> float:
+        """最低需要的采集时长（秒）—— 供日志与前端对齐。"""
+        return (len(self.chirp24) / CAL_SR) + self.search / self.sr
 
     # ------------------------------------------------------------------ #
 

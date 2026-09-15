@@ -551,19 +551,41 @@ $('btnCalib').onclick = async () => {
       ws.onopen = res;
       ws.onerror = () => rej(new Error('无法连接校准通道'));
     });
-    // ⚠️ 必须发这条 —— 服务端等它才开始生成并下发校准音频。
-    // （早先漏了，表现为"连上了但没声音"，服务端侧是 NO_STATUS_RCVD 断开）
-    ws.send(JSON.stringify({
-      type: 'calibrate.start',
-      client_key: deviceKey(),
-    }));
-    log('v', '已连接校准通道，等待校准音频…');
+    // ⚠️ **必须先注册 onmessage，再发 start**。
+    // 服务端加载完音频只要 ~5ms 就回消息，而 onmessage 赋值前到达的消息
+    // 会被直接丢弃 —— 早先就是先发后注册，导致校准音频永远收不到、
+    // 前端 20s 超时（服务端侧表现为"一直等麦克风数据"）。
+    // ⚠️ **先把采集链路搭好**（AudioWorklet 加载是异步的，放 onmessage
+    // 里会拖到播放之后才开始录，而且 onmessage 里的 await 会让后续逻辑
+    // 与 timeout 竞争）。现在：建好采集 → 收到音频 → 立刻播放。
+    await ctx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
+    const micSrc = ctx.createMediaStreamSource(mic);
+    worklet = new AudioWorkletNode(ctx, 'capture-processor',
+                                   { processorOptions: { chunkSize: 1600 } });
+    const sink = ctx.createGain(); sink.gain.value = 0;
+    micSrc.connect(worklet); worklet.connect(sink); sink.connect(ctx.destination);
 
     const result = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('校准超时')), 20000);
-      let playing = false, player = null;
+      const timeout = setTimeout(() => reject(new Error('校准超时')), 25000);
+      let playing = false;
+      let micChunks = 0;
 
-      ws.onmessage = async (ev) => {
+      worklet.port.onmessage = (e) => {
+        if (e.data.type !== 'chunk') return;
+        micChunks += 1;
+        if (!playing || ws.readyState !== WebSocket.OPEN) return;
+        const a = e.data.audio;
+        const ab = new ArrayBuffer(a.length * 4);
+        new Float32Array(ab).set(a);
+        ws.send(JSON.stringify({
+          type: 'calibrate.mic',
+          audio_base64: b64FromBuffer(ab),
+        }));
+      };
+      worklet.port.postMessage({ command: 'start' });
+
+      ws.onmessage = (ev) => {
+       try {
         const m = JSON.parse(ev.data);
         if (m.type === 'calibrate.play') {
           log('v', `收到校准音频 ${m.duration_s.toFixed(1)}s —— 正在播放，`
@@ -592,40 +614,36 @@ $('btnCalib').onclick = async () => {
           src.buffer = buf; src.connect(ctx.destination);
           src.start();
           playing = true;
-
-          // 3) 采集：从播放**之前**就开始录，覆盖整个回声路径
-          await ctx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
-          const ms = ctx.createMediaStreamSource(mic);
-          worklet = new AudioWorkletNode(ctx, 'capture-processor',
-                                         { processorOptions: { chunkSize: 1600 } });
-          const sink = ctx.createGain(); sink.gain.value = 0;
-          ms.connect(worklet); worklet.connect(sink); sink.connect(ctx.destination);
-          worklet.port.onmessage = (e) => {
-            if (e.data.type !== 'chunk' || !playing) return;
-            if (ws.readyState !== WebSocket.OPEN) return;
-            const a = e.data.audio;
-            const ab = new ArrayBuffer(a.length * 4);
-            new Float32Array(ab).set(a);
-            ws.send(JSON.stringify({
-              type: 'calibrate.mic',
-              audio_base64: b64FromBuffer(ab),
-            }));
-          };
-          worklet.port.postMessage({ command: 'start' });
-          // 播放结束后再多收 1.5s（覆盖最大搜索延迟）
-          setTimeout(() => { playing = false; }, (m.duration_s + 1.2) * 1000);
+          log('v', '麦克风采集已启动，正在回传…');
+          // 采集到「播放时长 + 最大搜索延迟」即可 —— 与服务端 ready()
+          // 的判据一致，避免多等或早停
+          const needS = m.duration_s + 1.5;
+          setTimeout(() => {
+            playing = false;
+            log('v', `采集结束（共 ${micChunks} 个块 ≈ ${(micChunks*0.1).toFixed(1)}s），`
+                   + `等待服务端计算结果…`);
+          }, needS * 1000);
 
         } else if (m.type === 'calibrate.done' || 'ok' in m) {
           clearTimeout(timeout);
           resolve(m);
         }
+       } catch (err) {
+         log('e', '处理校准消息出错：' + err.message);
+       }
       };
+
+      // ⚠️ handler 注册完毕，**现在**才发 start
+      ws.send(JSON.stringify({
+        type: 'calibrate.start',
+        client_key: deviceKey(),
+      }));
+      log('v', '已连接校准通道，等待校准音频…');
     });
 
     if (result.ok) {
       log('v', `✓ 校准完成：声学延迟 ${result.delay_ms.toFixed(0)} ms`
              + `（已保存，下次自动使用）`);
-      $('delayInput').value = Math.round(result.delay_ms);
     } else {
       log('e', '校准失败：' + (result.error || '未知原因'));
     }

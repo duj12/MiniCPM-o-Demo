@@ -57,8 +57,10 @@ class Settings:
     #                （本模块自适应测量）；实测抑制 9~11dB，弱于浏览器
     #                原生，但可验证算法链路。
     #   "off"     —— 都不做。
+    # 默认 service：音频端点用云端算法 AEC（需延迟校准，见 /v1/calibrate）。
+    # 若该服务不可用或延迟过大，前端可切到 browser。
     aec_mode: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_AEC_MODE", "browser"))
+        "ORCH_AEC_MODE", "service"))
 
     # 声学延迟（毫秒）的冷启动默认值。没有历史记录时用它，
     # 会话内测得真实值后会自适应更新并持久化（见 delay_store.py）。

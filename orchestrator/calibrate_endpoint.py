@@ -178,6 +178,7 @@ async def handle_calibrate_ws(ws, cfg) -> None:
     store = DelayStore(cfg.delay_store_path, cfg.aec_default_delay_ms)
     handler: Optional[CalibrationHandler] = None
     client_key = "default"
+    mic_pkts = 0
 
     try:
         # 首条必须是 calibrate.start —— 超时给出明确提示（而不是静默断开，
@@ -205,13 +206,33 @@ async def handle_calibrate_ws(ws, cfg) -> None:
         await ws.send_text(json.dumps(handler.start()))
 
         while True:
-            raw = await asyncio.wait_for(ws.receive_text(), timeout=30)
+            try:
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=15)
+            except asyncio.TimeoutError:
+                # 浏览器停发了但还没 ready —— **不要干等**。若已有可用数据
+                # 就试着结算（可能仍能算出），否则给出明确诊断。
+                if handler is not None:
+                    got_s = mic_pkts * 0.1
+                    logger.warning("校准超时：收到 %.1fs 麦克风数据（需要 %.1fs）",
+                                   got_s, handler._session.min_needed_s()
+                                   if handler._session else 0)
+                    res = handler.finish() if mic_pkts > 0 else {
+                        "ok": False,
+                        "error": f"只收到 {got_s:.1f}s 麦克风数据，"
+                                 "浏览器可能未回传音频",
+                    }
+                    await ws.send_text(json.dumps(res, ensure_ascii=False))
+                return
             msg = json.loads(raw)
             t = msg.get("type")
 
             if t == "calibrate.mic":
                 if handler is not None:
                     handler.feed(msg.get("audio_base64", ""))
+                    mic_pkts += 1
+                    if mic_pkts % 10 == 0:
+                        logger.info("校准：已收 %d 个麦克风包（约 %.1fs）",
+                                    mic_pkts, mic_pkts * 0.1)
                     if handler.ready():
                         res = handler.finish()
                         if res.get("ok"):
