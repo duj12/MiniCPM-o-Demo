@@ -534,6 +534,15 @@ def create_app(cfg: Settings):
         await ws.accept()
         await handle_client(ws, cfg)
 
+    # 独立的延迟校准通道 —— **不需要建立完整会话**。
+    # 校准只要"播一段已知音频 + 收麦克风 + 算互相关"，不需要
+    # ASR/OmniLLM/TTS，走完整会话既慢又强迫用户先"开始会话"。
+    @app.websocket("/v1/calibrate")
+    async def calibrate_ws(ws: WebSocket):
+        await ws.accept()
+        from orchestrator.calibrate_endpoint import handle_calibrate_ws
+        await handle_calibrate_ws(ws, cfg)
+
     return app
 
 
