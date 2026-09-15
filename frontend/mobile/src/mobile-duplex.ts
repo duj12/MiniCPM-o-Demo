@@ -257,17 +257,18 @@ export class MobileLiveMediaProvider {
       await this.openVideoStream(this.usingFrontCamera)
     }
 
-    // ⚠️ 浏览器端 AEC/NS/AGC **必须关闭** —— 回声消除交给云端 AEC：
-    //   · 浏览器 AEC 在串联时会先消掉云端正要建模的信号
-    //   · autoGainControl 随时间调制回声路径增益，任何 AEC 都追不上
-    //   · noiseSuppression 破坏参考对齐
-    // 云端 AEC 是权威，浏览器不得抢先。
+    // 回声消除用**浏览器原生 AEC**。
+    //
+    // 曾经打算关掉它、把回声消除交给云端 AEC，实测后推翻：云端 AEC 的
+    // 有效对齐窗口是 **<20ms**（离线扫描 >40ms 时 ERLE <2dB，完全不消除），
+    // 而真机实测延迟 **284ms**。云端那道在真实链路上必然不工作。
+    // 浏览器 AEC 在设备侧工作，不受网络延迟影响。
     this.audioStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
       },
       video: false,
     })

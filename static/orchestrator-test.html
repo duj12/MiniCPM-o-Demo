@@ -47,9 +47,11 @@
     <div class="stats" id="faceinfo">人脸：等待中…</div>
     <div style="margin-top:12px">
       <button id="btnStart" class="primary">开始会话</button>
-      <button id="btnSpeak">触发播报(测试)</button>
+      <button id="btnUnlock">🔊 解锁音频</button>
+      <button id="btnTestTone">测试音</button>
       <button id="btnStop" class="danger">停止</button>
     </div>
+    <div class="stats" id="audiostat">音频：未开始</div>
     <div class="stats" id="stats">未开始</div>
   </div>
   <div class="col">
@@ -77,17 +79,52 @@ function log(cls, msg) {
 }
 
 /* ---------- 播放器：PCM16 24kHz → WebAudio，并暴露 ctx 时间供回执 ---------- */
+/* 播放诊断：把每一步的可疑点暴露到页面上。
+ * 远程调试时看不到控制台，必须让状态可见。 */
+const diag = {
+  ctxState: '-', ctxRate: '-', frames: 0, bytes: 0,
+  scheduled: 0, startedAt: '-', lastErr: '-', peak: 0,
+};
+function diagUpdate() {
+  const el = $('audiostat');
+  if (!el) return;
+  el.innerHTML =
+    `AudioContext: <b>${diag.ctxState}</b> @${diag.ctxRate}Hz　` +
+    `TTS 帧 <b>${diag.frames}</b> / ${(diag.bytes/2/24000).toFixed(2)}s　` +
+    `已调度 <b>${diag.scheduled}</b>　峰值 ${diag.peak.toFixed(3)}<br>` +
+    (diag.startedAt !== '-' ? `起播时刻 ${diag.startedAt}<br>` : '') +
+    (diag.lastErr !== '-' ? `<span style="color:#fca5a5">错误: ${diag.lastErr}</span>` : '');
+}
+
 class PcmPlayer {
   constructor(ctx) {
-    this.ctx = ctx; this.queue = []; this.nextAt = 0; this.responseId = null;
-    this.scheduled = 0; this.sampleRate = 24000;
+    this.ctx = ctx;
+    this.nextAt = 0;
+    this.responseId = null;
+    this.srcRate = 24000;       // 服务端 TTS 输出采样率
+    this.gain = ctx.createGain();
+    this.gain.gain.value = 1.0;
+    this.gain.connect(ctx.destination);
+    // 保活节点：某些移动浏览器在没有持续音源时会挂起 context
+    this._keep = ctx.createConstantSource
+      ? ctx.createConstantSource() : null;
+    if (this._keep) {
+      this._keep.offset.value = 0;
+      this._keep.connect(ctx.destination);
+      this._keep.start();
+    }
   }
   now() { return this.ctx.currentTime; }
   beginResponse(id, sr) {
-    this.responseId = id; this.sampleRate = sr || 24000;
+    this.responseId = id;
+    this.srcRate = sr || 24000;
     // 起播留 200ms 提前量（与云端 config 的 playback_delay_ms 一致）
     this.nextAt = Math.max(this.nextAt, this.ctx.currentTime + 0.2);
   }
+  /** 播放一段 int16 base64 PCM。
+   *  **手动重采样到 AudioContext 的实际采样率** —— 不用 createBuffer 的
+   *  异采样率路径。部分移动浏览器（尤其 Safari 旧版）在 buffer 采样率与
+   *  context 不一致时行为不可靠，会静默无声。 */
   playBase64(b64, sr) {
     const bin = atob(b64);
     const n = bin.length >> 1;
@@ -95,31 +132,70 @@ class PcmPlayer {
     for (let i = 0; i < n; i++) {
       i16[i] = (bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8)) << 16 >> 16;
     }
-    const f32 = new Float32Array(n);
-    for (let i = 0; i < n; i++) f32[i] = i16[i] / 32768;
-    const rate = sr || this.sampleRate;
-    const buf = this.ctx.createBuffer(1, n, rate);
+    const srcRate = sr || this.srcRate;
+    const ctxRate = this.ctx.sampleRate;
+    // int16 → float32 + 峰值统计（诊断用：能区分"没送到"与"送到了但没响"）
+    let peak = 0;
+    const f32src = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = i16[i] / 32768;
+      f32src[i] = v;
+      const a = Math.abs(v);
+      if (a > peak) peak = a;
+    }
+    diag.peak = Math.max(diag.peak, peak);
+
+    // 线性重采样到 context 采样率
+    let f32 = f32src, rate = srcRate;
+    if (ctxRate && Math.abs(ctxRate - srcRate) > 1) {
+      const outN = Math.max(1, Math.round(n * ctxRate / srcRate));
+      f32 = new Float32Array(outN);
+      const ratio = n / outN;
+      for (let i = 0; i < outN; i++) {
+        const p = i * ratio;
+        const i0 = Math.floor(p), i1 = Math.min(i0 + 1, n - 1);
+        const fr = p - i0;
+        f32[i] = f32src[i0] * (1 - fr) + f32src[i1] * fr;
+      }
+      rate = ctxRate;
+    }
+
+    const buf = this.ctx.createBuffer(1, f32.length, rate);
     buf.copyToChannel(f32, 0);
-    const src = this.ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(this.ctx.destination);
+    const node = this.ctx.createBufferSource();
+    node.buffer = buf;
+    node.connect(this.gain);
     const at = Math.max(this.nextAt, this.ctx.currentTime + 0.02);
-    src.start(at);
+    node.start(at);
     this.nextAt = at + buf.duration;
+    diag.scheduled += 1;
+    if (diag.startedAt === '-') {
+      diag.startedAt = `+${(at - this.ctx.currentTime).toFixed(2)}s`;
+    }
+    diagUpdate();
   }
   endResponse() { /* 队列自然播完 */ }
   stop() {
-    this.nextAt = this.ctx.currentTime;
-    this.queue = [];
+    try { this.gain.gain.value = 0; this.gain.gain.value = 1; } catch (e) {}
+    this.nextAt = this.ctx.currentTime + 0.05;
   }
 }
 
 /* ---------- 采集 ---------- */
 async function startCapture() {
-  // ⚠️ 浏览器 AEC/NS/AGC 必须关闭 —— 回声消除交给云端 AEC
+  // ⚠️ 回声消除**交给浏览器原生 AEC**。
+  //
+  // 曾经的判断是"关掉浏览器 AEC、交给云端"，实测后推翻：
+  //   · 云端 AEC 的有效对齐窗口是 **<20ms**（离线扫描：>40ms 时
+  //     ERLE <2dB，完全不消除）
+  //   · 真机实测声学+网络延迟 **284ms**，是窗口的 14 倍
+  //   → 云端 AEC 在真实链路上必然不工作，回声会原样回传
+  //
+  // 浏览器原生 AEC 在设备侧工作，不受网络延迟影响，是这里唯一可行的方案。
+  // 三项全开 = 浏览器为语音通话调优的标准组合（AEC + 降噪 + 自动增益）。
   micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: false,
-             noiseSuppression: false, autoGainControl: false },
+    audio: { channelCount: 1, echoCancellation: true,
+             noiseSuppression: true, autoGainControl: true },
     video: false,
   });
   videoStream = await navigator.mediaDevices.getUserMedia({
@@ -127,8 +203,25 @@ async function startCapture() {
   });
   $('cam').srcObject = videoStream;
 
+  // ⚠️ 采集与播放共用一个 AudioContext（16kHz）。某些移动浏览器不支持
+  // 16kHz 的 AudioContext，会退到设备默认率 —— 这没关系，播放器会手动
+  // 重采样到 ctx.sampleRate。但如果 context 一直是 suspended（iOS 需要
+  // 用户手势），就会「有字幕没声音」。
   audioCtx = new AudioContext({ sampleRate: 16000 });
+  diag.ctxState = audioCtx.state;
+  diag.ctxRate = audioCtx.sampleRate;
+  diagUpdate();
+  audioCtx.addEventListener?.('statechange', () => {
+    diag.ctxState = audioCtx.state;
+    diagUpdate();
+    if (audioCtx.state === 'suspended') {
+      log('e', 'AudioContext 被挂起 —— 点「解锁音频」恢复');
+    }
+  });
   if (audioCtx.state === 'suspended') await audioCtx.resume();
+  diag.ctxState = audioCtx.state;
+  diag.ctxRate = audioCtx.sampleRate;
+  diagUpdate();
   await audioCtx.audioWorklet.addModule('/static/duplex/lib/capture-processor.js');
 
   const src = audioCtx.createMediaStreamSource(micStream);
@@ -164,10 +257,11 @@ async function startCapture() {
 }
 
 /* ---------- 人脸叠加绘制 ----------
- * G1 库的框坐标基于其处理分辨率（默认 640×480），需要映射到视频的
- * 显示尺寸。视频是 object-fit 填充，这里按视频的自然宽高比等比换算。
+ * ⚠️ 框坐标基于**服务端实际收到的帧尺寸**，必须用它做映射。
+ * 曾写死 640×480，而实际喂的是 320×240 —— 位置与尺寸都变成一半，
+ * 表现为"框在左上角且比脸小很多"。
+ * 服务端在每条 face.state 里带 src_w/src_h。
  */
-const G1_W = 640, G1_H = 480;
 function drawFace(m) {
   const video = $('cam'), ov = $('overlay');
   const w = video.clientWidth || 320;
@@ -176,12 +270,14 @@ function drawFace(m) {
   const ctx = ov.getContext('2d');
   ctx.clearRect(0, 0, w, h);
 
-  // 视频显示区与 G1 处理区的映射（保持宽高比，取较大缩放）
-  const sx = w / G1_W, sy = h / G1_H;
-
   const t = (m.tracks && m.tracks[0]) || null;
   const id = m.identity || null;
   const wake = m.wake || null;
+
+  // 源分辨率优先用服务端下发的；缺失时退回采集分辨率
+  const srcW = (t && t.src_w) || 320;
+  const srcH = (t && t.src_h) || 240;
+  const sx = w / srcW, sy = h / srcH;
 
   if (t && t.valid && t.box) {
     const [l, tp, r, b] = t.box;
@@ -266,7 +362,13 @@ $('btnStart').onclick = async () => {
         } else if (m.type === 'error') {
           log('e', 'ERROR ' + m.code + ': ' + m.message);
         } else if (m.type === 'tts.audio') {
-          /* 高频，不逐个记日志 */
+          diag.frames += 1;
+          diag.bytes += Math.floor((m.audio_base64 || '').length * 3 / 4);
+          if (diag.ctxState === 'suspended') {
+            // 音频被浏览器挂起了 —— 这是"有字幕没声音"的头号原因
+            diag.lastErr = 'AudioContext suspended（点「解锁音频」）';
+          }
+          diagUpdate();
         } else {
           log('v', m.type + ' ' + JSON.stringify(m).slice(0, 100));
         }
@@ -286,11 +388,38 @@ $('btnStart').onclick = async () => {
   }
 };
 
-$('btnSpeak').onclick = () => {
-  // 触发播报的测试路径：改用 ASR/OmniLLM 自然触发更好，
-  // 这里只用于确认 TTS 通道（需要服务端 downstream 支持手动触发）。
-  log('m', '提示：播报由 ASR 最终结果或 OmniLLM 回复自动触发；' +
-           '本按钮保留给后续手动测试接口。');
+/* 音频解锁：移动浏览器（iOS 尤其）要求 AudioContext 在**用户手势**中
+ * resume()，否则一直是 suspended —— 表现为"有字幕没声音"。 */
+$('btnUnlock').onclick = async () => {
+  if (!audioCtx) { log('e', '请先点「开始会话」'); return; }
+  try {
+    if (audioCtx.state !== 'running') await audioCtx.resume();
+    diag.ctxState = audioCtx.state;
+    diag.ctxRate = audioCtx.sampleRate;
+    diagUpdate();
+    log('v', `音频已解锁：state=${audioCtx.state} rate=${audioCtx.sampleRate}`);
+    // 播一个短促提示音，确认真的出声
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    g.gain.value = 0.08;
+    o.frequency.value = 880;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + 0.25);
+    log('v', '已播放 880Hz 提示音（0.25s）—— 应能听到');
+  } catch (e) {
+    log('e', '解锁失败：' + e.message);
+  }
+};
+
+$('btnTestTone').onclick = () => {
+  if (!audioCtx) { log('e', '请先点「开始会话」'); return; }
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  g.gain.value = 0.1;
+  o.frequency.value = 440;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + 0.4);
+  log('v', `测试音 440Hz，ctx=${audioCtx.state} @${audioCtx.sampleRate}Hz`);
 };
 
 $('btnStop').onclick = async () => {

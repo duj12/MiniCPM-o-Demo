@@ -90,6 +90,12 @@ class OrchestratorSession:
         self.metrics = SessionMetrics(session_id)
         self._mark_audio_t0: Optional[float] = None
 
+        # 声学延迟估计用的原始 mic 累积缓冲（**AEC 之前**的信号才有回声）
+        self._raw_mic_buf: Optional[list] = []
+        self._raw_mic_len = 0
+        # ASR 触发的在途任务（turn_trigger="asr"）
+        self._trigger_task: Optional[asyncio.Task] = None
+
     # ------------------------------------------------------------------ #
     #  浏览器侧输入
     # ------------------------------------------------------------------ #
@@ -114,10 +120,16 @@ class OrchestratorSession:
         # 原始 mic 旁路：barge-in 检测用，零额外延迟
         self._raw_recent.append(float(np.sqrt(np.mean(x ** 2))))
 
+        # 声学延迟估计（用原始 mic + raw ref，只在播放窗口内做）
+        self._maybe_update_delay(frame)
+        # 周期性链路诊断（每 5s）
+        self._periodic_diag(frame)
+
         # 送去清洗：有 AEC 走 AEC，否则直接扇出。
         # AEC 是**可选**的清洗环节，不是链路的一环 —— 缺它不影响正确性。
         if self.aec is not None:
             ref = self._ref_for(frame)
+            self._trace_ref(ref, frame)
             await self.aec.push(frame.data, ref)
         else:
             await self._fanout_direct(frame.data)
@@ -148,6 +160,107 @@ class OrchestratorSession:
                 await self.omni.push_audio(seg)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Omni push 失败: %s", exc)
+
+    def _trace_ref(self, ref: np.ndarray, frame: AudioFrame) -> None:
+        """追踪送进 AEC 的 farend 是否真的非零。
+
+        「回声消不掉」的第一件事就是看这里：如果 ``ref_nonzero`` 恒为 0，
+        说明参考轨没送到，AEC 压根没得消 —— 而不是 AEC 算法不行。
+        """
+        self.stats["ref_push_total"] = self.stats.get("ref_push_total", 0) + 1
+        rms = float(np.sqrt(np.mean(ref ** 2))) if ref.size else 0.0
+        if rms > 1e-6:
+            prev = self.stats.get("ref_push_nonzero", 0)
+            self.stats["ref_push_nonzero"] = prev + 1
+            if rms > self.stats.get("ref_rms_max", 0.0):
+                self.stats["ref_rms_max"] = round(rms, 5)
+            if prev == 0:
+                # 首次出现非零参考 —— 最关键的转折点，必须打日志
+                logger.info(
+                    "[%s] 参考轨首次送出非零 farend：t0=%d rms=%.4f "
+                    "（写入区间=%s D=%d）",
+                    self.session_id, frame.t0, rms,
+                    self.ref_track.buf.written_span() if self.ref_track else None,
+                    self.ref_track.delay_samples if self.ref_track else -1,
+                )
+            elif self.stats["ref_push_nonzero"] % 100 == 0:
+                logger.info(
+                    "[%s] 已送出 %d 个非零 farend 块（峰值 rms=%.4f）",
+                    self.session_id, self.stats["ref_push_nonzero"],
+                    self.stats.get("ref_rms_max", 0.0),
+                )
+
+    def _periodic_diag(self, frame: AudioFrame) -> None:
+        """每 5 秒打一条链路诊断 —— 排查"回声没消掉"时这是第一现场。
+
+        包含三件事：
+          · 参考轨送出情况（ref_push_nonzero / 总数）→ 参考有没有到 AEC
+          · 声学延迟 D → 远超 20ms 就说明云端 AEC 的有效窗口外
+          · 送出的 farend 近期 RMS → 是静音还是真有信号
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_diag_at", 0.0) < 5.0:
+            return
+        self._last_diag_at = now
+
+        total = self.stats.get("ref_push_total", 0)
+        nz = self.stats.get("ref_push_nonzero", 0)
+        rt = self.ref_track
+        d = rt.delay_samples if rt else -1
+        lo, hi = rt.buf.written_span() if rt else (None, None)
+        logger.info(
+            "[%s] 诊断: 音频块=%d ref推送=%d(非零 %d, %.0f%%) D=%d采样(%.0fms) "
+            "写入区间=[%s,%s] now=%d omni触发=%d",
+            self.session_id,
+            self.stats.get("audio_chunks_in", 0), total, nz,
+            (100.0 * nz / total) if total else 0.0,
+            d, (d / SR * 1000) if d >= 0 else -1,
+            lo, hi, self.clock.now(),
+            self.stats.get("omni_triggers", 0),
+        )
+
+    def _maybe_update_delay(self, frame: AudioFrame) -> None:
+        """在**播放窗口内**估计声学路径延迟 D 并喂给参考轨。
+
+        为什么必须做：AEC 服务把 nearend/farend 按**相同偏移**推入，即
+        假定两者已样本对齐；而扬声器→麦克风有物理延迟（数十到数百 ms）。
+        不补偿的话，参考与回声分量错位，消不掉。
+
+        ⚠️ 两个关键点：
+          · 只在播放窗口估计 —— 空闲时 ref 是静音，估出来是垃圾
+          · 用 **raw ref**（未补偿）与**原始 mic** 估计 —— 用补偿后的
+            信号会自我抵消（补偿多少就测不出多少）
+        """
+        if self.ref_track is None or self.delay_tracker is None:
+            return
+        if self._raw_mic_buf is None:
+            return
+        # 播放窗口判断：当前或未来 0.5s 内有参考
+        if not self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR)):
+            return
+        # 攒够 8192 采样（~0.5s）再估一次
+        self._raw_mic_buf.append(frame.data.reshape(-1))
+        self._raw_mic_len += frame.n_samples
+        if self._raw_mic_len < 8192:
+            return
+        mic = np.concatenate(self._raw_mic_buf)[-8192:]
+        # 与 mic 同一时间窗的 raw ref（未补偿）
+        raw = self.ref_track.read_raw(frame.t1 - 8192, 8192)
+        self._raw_mic_buf = []
+        self._raw_mic_len = 0
+        if raw.shape[0] < 8192:
+            return
+        est = self.delay_tracker.estimate(mic, raw)
+        if est is not None:
+            prev = self.ref_track.delay_samples
+            self.ref_track.delay_samples = self.delay_tracker.delay
+            if abs(self.ref_track.delay_samples - prev) >= 16:  # 变化 >1ms
+                logger.info(
+                    "声学延迟 D=%d 采样（%.0fms），本次估计 %d（%d 次样本）",
+                    self.ref_track.delay_samples,
+                    self.ref_track.delay_samples / SR * 1000,
+                    est, self.delay_tracker.estimates,
+                )
 
     def _ref_for(self, frame: AudioFrame) -> np.ndarray:
         """取该帧对应的 AEC 参考信号。
@@ -181,16 +294,23 @@ class OrchestratorSession:
     async def on_playback_receipt(self, response_id: str,
                                   phase: str, ctx_time: float,
                                   seq: int = 0) -> None:
-        """播放回执 —— 驱动 AEC 参考轨的时钟。"""
+        """播放回执。
+
+        ⚠️ 浏览器的 ``ctx_time``（AudioContext 秒）与我们的会话采样时钟
+        是**两个时钟域**。参考轨的落位由服务端按会话时钟自算（见
+        executor），这里只在**取消/结束**时用"从现在起"的语义截断 ——
+        那不需要跨域换算。
+
+        早期实现用 ``ctx_time`` 做绝对对齐，导致写入位置变成大负数、
+        参考轨读出来全是 0（AEC 的 farend 恒为静音）。不要退回那种做法。
+        """
         if self.closed or self.ref_track is None:
             return
-        if phase == "started" and self.ref_track._anchor_ctx is None:
-            # 首个回执建立锚点：ctx_time ↔ 当前采样位置
-            self.ref_track.set_anchor(ctx_time, self.clock.now())
-        elif phase in ("ended", "cancelled"):
-            # ⚠️ 取消/结束时必须截断 ref 尾部：否则 AEC 会拿着没播出的
+        if phase in ("ended", "cancelled"):
+            # 取消/结束时必须截断 ref 尾部：否则 AEC 会拿着没播出的
             # 音频当参考，主动误适配去追一个不存在的回声 —— 比不给更糟
-            n = self.ref_track.truncate(response_id, from_ctx_time=ctx_time)
+            n = self.ref_track.truncate(response_id,
+                                        from_sample=self.clock.now())
             if n:
                 logger.debug("截断 ref %d 采样（%s）", n, phase)
         self._post_downstream_playback(response_id, phase, ctx_time, seq)
@@ -290,8 +410,33 @@ class OrchestratorSession:
                     phase="final", text=fin["text"],
                     t_ms=int(self.clock.seconds() * 1000),
                 ))
+                # ---- ASR 断句触发（turn_trigger="asr"）----
+                # OmniLLM 一直在以 force_listen 累积视听上下文（"边听边看"），
+                # 这里补一个触发 push 让它开口。视觉上下文是**连续流入**的，
+                # 所以回复能带上截止到此刻的画面理解。
+                if (self.omni is not None
+                        and getattr(self.omni, "turn_trigger", "") == "asr"):
+                    self._trigger_omni(fin["text"])
 
+        # 接收循环（阻塞直到 is_final 或连接关闭）
         await self.asr.recv_loop(on_message)
+
+    def _trigger_omni(self, text: str) -> None:
+        """按 ASR 文本触发一次 OmniLLM 回复（异步，不阻塞 ASR 回调）。"""
+        if self._trigger_task is not None and not self._trigger_task.done():
+            # 上一次触发还没送出去 —— 排队即可（同一话轮内多次 final
+            # 通常意味着 VAD 切段，合并成一次触发更自然）
+            logger.debug("已有触发在途，合并本次 ASR final")
+            return
+        self.stats["omni_triggers"] = self.stats.get("omni_triggers", 0) + 1
+
+        async def _do():
+            try:
+                await self.omni.trigger_reply(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("触发 OmniLLM 回复失败: %s", exc)
+
+        self._trigger_task = asyncio.create_task(_do())
 
     def _send_display(self, msg) -> None:
         """投递纯 UI 消息（不参与控制流）。
@@ -327,6 +472,10 @@ class OrchestratorSession:
                 # 每帧的人脸观测 → UI 叠加显示（人脸框/置信度/唇动/
                 # 身份/唤醒）。**不进 downstream** —— 那是控制流，
                 # 每帧 25Hz 投递会把下游淹没。控制信号走 wake/lip/identity。
+                # 带上 G1 输入帧的**实际尺寸** —— 前端必须用它把框坐标
+                # 映射到视频显示区。写死分辨率会导致框错位（实测踩过）。
+                fs = getattr(self.face_worker.provider, "_frame_size", None) \
+                    if self.face_worker else None
                 self._last_face = {
                     "valid": bool(ev.valid),
                     "box": [round(v, 1) for v in ev.box] if ev.box else None,
@@ -335,6 +484,8 @@ class OrchestratorSession:
                     "lip": ev.lip_state,
                     "interacting": bool(ev.interacting),
                     "person_id": int(ev.person_id),
+                    "src_w": fs[0] if fs else None,
+                    "src_h": fs[1] if fs else None,
                 }
                 self._push_face_display()
             elif kind == "wake":
@@ -640,4 +791,19 @@ class OrchestratorSession:
             lat = self.aec.first_result_latency_ms()
             if lat is not None:
                 lines.append(f"  aec 首窗延迟: {lat:.0f}ms")
+        if self.ref_track is not None:
+            lo, hi = self.ref_track.buf.written_span()
+            t = self.clock.now()
+            probe = (self.ref_track.read(max(0, t - 1600), 1600)
+                     if t > 1600 else self.ref_track.read(0, 1600))
+            peak = float(np.abs(probe).max())
+            lines.append(
+                f"  参考轨: 写入区间=[{lo},{hi}] now={t} "
+                f"D={self.ref_track.delay_samples}采样"
+                f"({self.ref_track.delay_samples / SR * 1000:.0f}ms)"
+                f" 近期峰值={peak:.4f}"
+            )
+            if peak < 1e-6 and lo is not None and t > lo:
+                lines.append("    ⚠️ 参考轨近期为静音 —— AEC 的 farend 是零，"
+                             "回声不会被消除")
         return "\n".join(lines)

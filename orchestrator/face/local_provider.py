@@ -102,6 +102,8 @@ class LocalFaceProvider:
         self._lock = threading.Lock()
         self.frames_seen = 0
         self.identify_calls = 0
+        # G1 输入帧的实际尺寸（框坐标基于它做映射）——首次解出后缓存
+        self._frame_size = None
         # 记住当前 person_id，避免每帧都调 C
         self._cached_person_id = -1
 
@@ -111,6 +113,18 @@ class LocalFaceProvider:
         """处理一帧 JPEG。返回观测（无人脸时 valid=False）。"""
         ts_us = int(time.monotonic() * 1e6)
         rc, res = self.g1.feed_mjpeg(jpeg, ts_us)
+        # 记录**实际喂入**的帧尺寸 —— G1 的框坐标基于该尺寸，前端叠加
+        # 必须用它做映射，不能写死（写死会错位）。
+        if rc == 0 and self._frame_size is None:
+            import cv2  # 可选依赖；没有就用 PIL
+            try:
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    self._frame_size = (int(img.shape[1]), int(img.shape[0]))
+                    logger.info("G1 输入帧尺寸: %dx%d", *self._frame_size)
+            except Exception:  # noqa: BLE001
+                pass
         if rc != 0:
             if rc == -2:
                 logger.debug("JPEG 解码失败（%d 字节）", len(jpeg))

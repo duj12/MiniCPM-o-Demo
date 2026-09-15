@@ -117,6 +117,12 @@ class ActionExecutor:
             await session.send_to_client(TtsEnd(response_id=response_id))
             return
 
+        # ⚠️ 记录**送第一块音频时**的会话采样位置 —— 这是参考轨落位的
+        # 基准。浏览器会在收到首块后 delay 开始播放，所以播放起点 =
+        # 此刻 + playback_delay。用会话时钟自算，**不混用浏览器 ctx_time**
+        # （混用会导致写入位置变成大负数，参考轨读出来全是 0 —— 实测踩过）。
+        t_send = session.clock.now()
+
         # 分块发送（每块 0.5s，便于浏览器调度并尽早开始播放）
         chunk = TTS_SR // 2
         for i in range(0, len(pcm24), chunk):
@@ -128,13 +134,18 @@ class ActionExecutor:
 
         await session.send_to_client(TtsEnd(response_id=response_id))
 
-        # ⚠️ 关键：把同一份 PCM 落进参考轨，供 AEC 使用。
-        # 播放延迟 = playback_delay_ms，所以参考相对当前时钟在"未来"。
+        # 把同一份 PCM 落进参考轨，供 AEC 使用
         if session.ref_track is not None:
-            ctx_time = self._next_ctx_time(session)
-            session.ref_track.place(response_id, 0, pcm24.astype(np.int16), ctx_time)
-            logger.debug("ref 落位 response=%s ctx_time=%.3f len=%d",
-                         response_id, ctx_time, len(pcm24))
+            at_sample = t_send + int(
+                self.playback_delay_ms * session.clock.sr / 1000.0
+            )
+            session.ref_track.place(
+                response_id, 0, pcm24.astype(np.int16), at_sample
+            )
+            logger.debug(
+                "ref 落位 response=%s at_sample=%d（会话位置，+%dms 播放提前）len=%d",
+                response_id, at_sample, self.playback_delay_ms, len(pcm24),
+            )
 
         self.speaks_done += 1
         if session.metrics is not None:
@@ -142,15 +153,27 @@ class ActionExecutor:
         logger.info("TTS 完成 response=%s 文本 %d 字 音频 %.2fs",
                     response_id, len(act.text), len(pcm24) / TTS_SR)
 
-    def _next_ctx_time(self, session: "OrchestratorSession") -> float:
-        """计算本次播放的 AudioContext 时刻。
+    def ref_snapshot(self, session: "OrchestratorSession") -> dict:
+        """参考轨状态快照（排查用）。
 
-        真实场景由浏览器回执提供；这里按"现在 + 播放提前量"估算，
-        使参考轨落在未来（这正是我们要的：ref 写在 mic 之前，
-        read() 总能读到真数据）。
+        生产环境"回声没消掉"的第一件事就是看这里：``read_peak`` 为 0
+        说明 farend 是静音，AEC 什么都没得消。
         """
-        now_s = session.clock.seconds()
-        return now_s + self.playback_delay_ms / 1000.0
+        rt = session.ref_track
+        if rt is None:
+            return {"enabled": False}
+        lo, hi = rt.buf.written_span()
+        t = session.clock.now()
+        probe = rt.read(max(0, t - 1600), 1600) if t > 1600 else rt.read(0, 1600)
+        return {
+            "enabled": True,
+            "written_span": [lo, hi],
+            "now": t,
+            "delay_samples": rt.delay_samples,
+            "delay_ms": round(rt.delay_samples / rt.sr * 1000, 1),
+            "read_peak": round(float(np.abs(probe).max()), 4),
+            "active": rt.is_active(t),
+        }
 
     # ------------------------------------------------------------------ #
 

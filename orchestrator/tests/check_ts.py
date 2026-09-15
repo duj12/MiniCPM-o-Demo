@@ -50,13 +50,17 @@ def main() -> int:
                 "captureOmniFrame", "MobileChunk"):
         print(f"  {sym:22s} {src.count(sym)} 处")
 
-    # 关键开关必须是 false（云端 AEC 是权威，浏览器不得抢先）
-    for key in ("echoCancellation", "noiseSuppression", "autoGainControl"):
+    # 关键开关：三项全开 —— 浏览器为语音通话调优的标准组合。
+    # 实测云端 AEC 有效窗口 <20ms 而真机延迟 284ms，回声只能靠浏览器原生
+    # AEC 在设备侧消，故不再关闭任何一项。
+    expect = {"echoCancellation": "true", "noiseSuppression": "true",
+              "autoGainControl": "true"}
+    for key, want in expect.items():
         m = re.search(rf"{key}:\s*(\w+)", src)
         val = m.group(1) if m else "NOT FOUND"
-        ok = val == "false"
+        ok = val == want
         if not ok:
-            fails.append(f"{key} = {val}（应为 false）")
+            fails.append(f"{key} = {val}（应为 {want}）")
         print(f"  {key:22s} = {val}  {'OK' if ok else 'FAIL'}")
 
     # 分块必须是 100ms 量级而非 1 秒

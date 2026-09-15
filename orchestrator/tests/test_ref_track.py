@@ -35,14 +35,14 @@ def check(cond: bool, msg: str) -> None:
 def test_ref_track_placement() -> None:
     print("== RefTrack 落位 ==")
     rt = RefTrack()
-    rt.set_anchor(ctx_time=100.0, sample_pos=0)
+    
 
     # 一段 0.5s 的 24k 音频，在 ctx_time=100.2 播放
     n24 = 12000
     t = np.arange(n24, dtype=np.float32) / 24000.0
     pcm = (np.sin(2 * np.pi * 440 * t) * 30000).astype(np.int16)
 
-    chunk = rt.place("r1", 0, pcm, ctx_time=100.2)
+    chunk = rt.place("r1", 0, pcm, 3200)
     check(chunk.t0 == 3200, f"t0 = 0.2s * 16000 = 3200（得到 {chunk.t0}）")
     check(chunk.t1 - chunk.t0 == 8000, f"0.5s -> 8000 采样（得到 {chunk.t1-chunk.t0}）")
 
@@ -54,24 +54,29 @@ def test_ref_track_placement() -> None:
     before = rt.read(0, 3200)
     check(np.all(before == 0), "落位之前的区间为零")
 
-    # 声学延迟补偿：设 D=1600（100ms）后，落位点应前移
+    # 声学延迟补偿在 **read()** 里做（place 只记录原始落位）：
+    # ref[t] = raw[t - D]，即把原始轨后移 D，使其与 mic 里的回声对齐。
     rt2 = RefTrack()
-    rt2.set_anchor(100.0, 0)
     rt2.delay_samples = 1600
-    c2 = rt2.place("r1", 0, pcm, ctx_time=100.2)
-    check(c2.t0 == 3200 - 1600, f"扣除延迟后 t0 = 1600（得到 {c2.t0}）")
+    c2 = rt2.place("r1", 0, pcm, 3200)
+    check(c2.t0 == 3200, f"place 记录原始落位 = 3200（得到 {c2.t0}）")
+    # 补偿后：在 t_play + D 处能读到
+    check(np.abs(rt2.read(3200 + 1600, 800)).max() > 0.1,
+          "read(t_play+D) 有值 —— 补偿方向正确")
+    # 未补偿的 raw 在 t_play 处仍有值（延迟估计要用）
+    check(np.abs(rt2.read_raw(3200, 800)).max() > 0.1,
+          "read_raw(t_play) 有值 —— 供延迟估计使用")
 
 
 def test_ref_track_truncate() -> None:
     print("== RefTrack 截断（barge-in）==")
     rt = RefTrack()
-    rt.set_anchor(100.0, 0)
     n24 = 24000  # 1s
     pcm = (np.sin(2 * np.pi * 440 * np.arange(n24) / 24000.0) * 30000).astype(np.int16)
-    rt.place("r1", 0, pcm, ctx_time=100.0)  # 落在 [0, 16000)
+    rt.place("r1", 0, pcm, 0)  # 落在 [0, 16000)
 
     # 用户在 0.5s 处打断：此后的参考应清零
-    n_zeroed = rt.truncate("r1", from_ctx_time=100.5)
+    n_zeroed = rt.truncate("r1", from_sample=8000)
     check(n_zeroed == 8000, f"清零 8000 采样（得到 {n_zeroed}）")
 
     head = rt.read(0, 8000)
@@ -81,8 +86,8 @@ def test_ref_track_truncate() -> None:
 
     # 全清
     rt2 = RefTrack()
-    rt2.set_anchor(100.0, 0)
-    rt2.place("r2", 0, pcm, ctx_time=100.0)
+    
+    rt2.place("r2", 0, pcm, 0)
     rt2.truncate("r2")
     check(np.all(rt2.read(0, 16000) == 0), "truncate(None) 清空整个 response")
 
