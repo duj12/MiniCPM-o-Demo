@@ -36,6 +36,10 @@ class ActionExecutor:
     def __init__(self, playback_delay_ms: int = PLAYBACK_DELAY_MS) -> None:
         self.playback_delay_ms = playback_delay_ms
         self._current_response_id: Optional[str] = None
+        # 当前这句**预计播完**的会话采样位置。用来判断新回复要不要打断旧句：
+        # 它不能靠 playback.started/ended 判断 —— 那些只反映"音频送达"，
+        # 不反映"播完"（整段是排程播放的，送达时可能才刚起播）。
+        self._current_play_until: int = 0
         self._tts_seq = 0
         self.speaks_done = 0
         self.cancels_done = 0
@@ -84,6 +88,21 @@ class ActionExecutor:
 
     async def _speak_inner(self, act: Speak,
                            session: "OrchestratorSession") -> None:
+
+        # ⚠️ **新回复要打断仍在播放的旧句** —— 否则参考轨会乱。
+        #
+        # 真机现象：上一句还没播完就插话，新回复的回声**完全消不掉**、
+        # 被 ASR 整段识别。根因是四个缺陷叠加：
+        #   ① 前端 `PcmPlayer.stop()` 是空操作：gain 设 0 又立刻设回 1，
+        #      且已 `node.start()` 排程的 buffer **无法取消**，旧音频照播；
+        #   ② 前端收到 `tts.start` 时 `nextAt = max(nextAt, now+0.2)` ——
+        #      `nextAt` 还停在旧句末尾，于是新句被排到旧句**之后**；
+        #   ③ 服务端把新句落位在"当前时刻 + 提前量"，与②的实际排程不符；
+        #   ④ 旧句的排程音频还在播 → 实际播出的是旧句，参考轨写的却是新句。
+        #   → mic 里的回声来自旧句，farend 是新句，两者完全无关，消不掉。
+        #
+        # 所以打断必须**由服务端在开新句前主动做**，且四件事原子完成。
+        self._interrupt_current(session, reason="superseded")
 
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
@@ -147,6 +166,11 @@ class ActionExecutor:
                 response_id, at_sample, self.playback_delay_ms, len(pcm24),
             )
 
+        # 记录这句预计播完的位置（落位起点 + 音频长度）—— 见 _current_play_until
+        if session.ref_track is not None:
+            self._current_play_until = at_sample + int(
+                len(pcm24) * session.clock.sr / TTS_SR)
+
         self.speaks_done += 1
         if session.metrics is not None:
             session.metrics.inc("tts_audio_s", int(len(pcm24) / TTS_SR))
@@ -177,23 +201,69 @@ class ActionExecutor:
 
     # ------------------------------------------------------------------ #
 
+    def _interrupt_current(self, session: "OrchestratorSession",
+                           reason: str) -> Optional[str]:
+        """打断当前播报，并让参考轨与实际播出重新对齐。**同步、原子**。
+
+        返回被打断的 response_id（没有可打断的则 None）。
+
+        ⚠️ **截断点不能取"当前时刻"**，也别取"起播时刻" —— 两者都会错：
+
+        设本句的落位区间是 ``[started, end)``：
+          · 取"当前时刻" → 时钟还停在**句子开头之前**（`tts.end` 到达时
+            浏览器往往才刚起播），会留下整段没播的音频当参考 → AEC 去追
+            一个不存在的回声。
+          · 取"起播时刻" → 等于把**整句都清掉**（连已经播出去的那段也没
+            了），而那段是真的有回声的 → 有回声、没 farend，照样消不掉。
+
+        正确的是：**保留 ``[started, now)``，清掉 ``[max(now, started), end)``**。
+        即截断点 = ``max(now, started)``：
+          · 还没起播（now ≤ started）→ 从 started 清 → 整句清干净
+          · 已播到中途（now > started）→ 从 now 清 → 已播部分保留
+
+        参考轨清理由 `RefTrack.truncate` 保证**不误伤其他 response**
+        （它只清本 response 自己落位的区间）。
+        """
+        rid = self._current_response_id
+        if rid is None:
+            return None
+        now = session.clock.now()
+        started = (session.ref_track.started_at(rid)
+                   if session.ref_track is not None else None)
+        # 保留 [started, now)，清 [max(now, started), end)
+        from_sample = max(now, started) if started is not None else now
+
+        n = 0
+        if session.ref_track is not None:
+            n = session.ref_track.truncate(rid, from_sample=from_sample)
+        logger.info(
+            "打断 %s（%s）：ref 清 %d 采样（%.0fms），截断点=%d"
+            "（now=%d，起播=%s）",
+            rid, reason, n, n / 16000 * 1000, from_sample, now,
+            started if started is not None else "未知",
+        )
+        self._current_response_id = None
+        self._current_play_until = 0
+        self.cancels_done += 1
+        return rid
+
     async def _cancel(self, act: Cancel, session: "OrchestratorSession") -> None:
-        """中断播报。三件事原子做。"""
+        """中断播报（下游显式请求）。四件事原子做。"""
         rid = act.response_id or self._current_response_id
         if rid is None:
             return
-        # ① 通知浏览器停止并清空播放器
-        await session.send_to_client(TtsCancel(response_id=rid, reason=act.reason))
-        # ② 截断参考轨（未播出的部分）
-        if session.ref_track is not None:
-            n = session.ref_track.truncate(rid)
-            if n:
-                logger.info("取消 %s：截断 ref %d 采样（%.0fms）",
-                            rid, n, n / 16000 * 1000)
-        # ③ 清当前指针
-        if self._current_response_id == rid:
-            self._current_response_id = None
-        self.cancels_done += 1
+        # ① 通知浏览器停止并清空播放器，同时**重置排程指针** ——
+        #    否则下一个 tts.start 的 nextAt 还停在旧句末尾，新句会被排到
+        #    旧句之后（实测正是这个导致新回复的回声对不上）。
+        await session.send_to_client(TtsCancel(response_id=rid,
+                                               reason=act.reason))
+        # ② 截断参考轨（未播出的部分），并复位当前指针
+        if act.response_id and act.response_id != self._current_response_id:
+            # 指定了别的 response：只清那一段，不动当前句
+            if session.ref_track is not None:
+                session.ref_track.truncate(act.response_id)
+        else:
+            self._interrupt_current(session, reason=act.reason or "cancel")
 
     async def _send_to_omni(self, act: SendToOmni,
                             session: "OrchestratorSession") -> None:

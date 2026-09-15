@@ -130,6 +130,22 @@ class RefTrack:
         self._placed.setdefault(response_id, []).append(chunk)
         return chunk
 
+    def started_at(self, response_id: str) -> Optional[int]:
+        """该 response **最早**一个落位块的起点（会话采样）。
+
+        用于打断时确定"已经播到哪了"：`tts.end` 到达时浏览器往往才刚起播，
+        此时从"当前时刻"截断会把还没播、但即将播的那段也清掉 —— 而浏览器
+        其实会把它播出来（已 `node.start()` 排程的 buffer 无法取消）。
+        取 min(当前时刻, 起播点) 才是正确的截断位置。
+
+        ⚠️ 注意这里返回的是**预测**的起播点（落位时按约定的播放提前量算
+        的），不是浏览器的 `ctx_time` 回执 —— 两者跨时钟域，不能混用。
+        """
+        chunks = self._placed.get(response_id)
+        if not chunks:
+            return None
+        return min(c.t0 for c in chunks)
+
     def truncate(self, response_id: str,
                  from_sample: Optional[int] = None) -> int:
         """把某个 response **尚未播出**的参考清零。
@@ -138,22 +154,29 @@ class RefTrack:
         没有对应回声的参考信号，它会**主动误适配**去追这个不存在的回声 ——
         比不给参考更糟。
 
-        ``from_sample`` 为取消发生的**会话采样位置**（None = 整个 response）。
-        返回被清零的采样数。
+        ``from_sample`` 为取消的**截断点**（会话采样位置；None = 整个
+        response）。返回被清零的采样数。
+
+        ⚠️ **只清本 response 自己落位的区间**。`zero_range` 是无差别的，
+        若直接清 ``[from_sample, 本response末尾)``，会把**期间插入的别的
+        response**（如上一句还没播完、用户已插话、新一轮回复已落位）一起
+        清掉 —— 那些音频是**真的会播出来**的，参考轨一旦被清就是"有回声
+        但没有 farend"，AEC 全部失效。
+
+        所以这里按 chunk 逐个求交集，只清属于本 response 的那部分。
         """
         chunks = self._placed.pop(response_id, [])
         if not chunks:
             return 0
-        if from_sample is None:
-            lo = min(c.t0 for c in chunks)
-            hi = max(c.t1 for c in chunks)
-        else:
-            lo = from_sample
-            hi = max(c.t1 for c in chunks)
-        if hi <= lo:
-            return 0
-        self.buf.zero_range(lo, hi)
-        return hi - lo
+        n_zeroed = 0
+        for c in chunks:
+            lo = c.t0 if from_sample is None else max(c.t0, from_sample)
+            hi = c.t1
+            if hi <= lo:
+                continue
+            self.buf.zero_range(lo, hi)
+            n_zeroed += hi - lo
+        return n_zeroed
 
     # ------------------------------------------------------------------ #
 

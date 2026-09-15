@@ -168,6 +168,39 @@ AEC 的参考信号必须与**实际播出**的时刻对齐（不是音频到达
 | ref 写入区间 | 5.85s | **23.6s** |
 | ERLE | 8.3 dB | **31.6 dB** |
 
+#### ⚠️ 打断（barge-in）必须由服务端主动做，且要掐掉已排程的音频
+
+现象：上一句还没播完就插话，**新回复的回声完全消不掉**、被 ASR 整段识别。
+
+四个缺陷叠加：
+
+  ① 前端 `PcmPlayer.stop()` 是**空操作**（gain 设 0 又立刻设回 1），而
+     WebAudio 里 `node.start()` 排程过的 buffer **无法取消** → 旧句照播；
+  ② 前端 `beginResponse` 里 `nextAt = max(nextAt, now+0.2)`，而 `nextAt`
+     还停在**旧句末尾** → 新句被排到旧句之后；
+  ③ 服务端把新句落位在"当前时刻 + 提前量"，与②的实际排程不符；
+  ④ 新句开始时**没人打断旧句** —— `_current_response_id` 被直接覆盖，
+     旧句的落位留在轨上。
+
+→ mic 里的回声来自**旧句**，farend 写的是**新句**，两者无关，AEC 失效。
+
+修法：
+
+  · 前端 `stop()`：登记每个已排程的 `AudioBufferSourceNode`，逐个
+    `stop(0)` 掐断（这是 WebAudio 里唯一能取消已 start 源的办法），
+    并复位 `nextAt` 让下一句从零重排
+  · 服务端 `_speak_inner` 开新句前调 `_interrupt_current()`（同步、原子）
+  · **截断点 = `max(now, started)`**，即清 `[max(now,started), end)`、
+    保留 `[started, now)`：
+      - 还没起播（now ≤ started）→ 整句清干净
+      - 已播到中途（now > started）→ 保留已播部分（那段**真的**有回声）
+    ⚠️ 取 `now` 或取 `started` 都是错的：前者会留下没播的音频当参考，
+    后者会把已播部分也清掉（有回声、没 farend）。
+  · `RefTrack.truncate` 按 chunk 求交集，**只清本 response 自己的区间** ——
+    早先无差别清 `[from, 末尾)` 会误伤期间落位的其它 response
+
+回归护栏：`tests/test_bargein_ref.py`。
+
 ### ⚠️⚠️ 声学延迟 D 必须准到 ±5ms（算法 AEC 的生死线）
 
 实测（`tests/test_aec_live_fidelity.py`，真实 AEC 服务）：

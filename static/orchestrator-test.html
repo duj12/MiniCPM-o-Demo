@@ -131,6 +131,8 @@ class PcmPlayer {
     this.nextAt = 0;
     this.responseId = null;
     this.srcRate = 24000;       // 服务端 TTS 输出采样率
+    this._sources = [];         // 已排程的源，stop() 要逐个掐断
+    this._cancelled = false;    // 上一句是否被 cancel（决定下一句是否重排）
     this.gain = ctx.createGain();
     this.gain.gain.value = 1.0;
     this.gain.connect(ctx.destination);
@@ -147,6 +149,14 @@ class PcmPlayer {
   beginResponse(id, sr) {
     this.responseId = id;
     this.srcRate = sr || 24000;
+    // ⚠️ 若是被 cancel 打断后的新一句（`_cancelled` 已置），排程指针要
+    //    **从当前时刻重新开始**，不能沿用它停在旧句末尾的位置 —— 否则
+    //    新句被排到旧句之后，而服务端的参考轨是按"当前时刻 + 提前量"
+    //    落位的，两边对不上，回声消不掉（实测踩过）。
+    if (this._cancelled) {
+      this.nextAt = 0;
+      this._cancelled = false;
+    }
     // 起播留 200ms 提前量（与云端 config 的 playback_delay_ms 一致）
     this.nextAt = Math.max(this.nextAt, this.ctx.currentTime + 0.2);
   }
@@ -204,6 +214,14 @@ class PcmPlayer {
     node.connect(this.gain);
     const at = Math.max(this.nextAt, this.ctx.currentTime + 0.02);
     node.start(at);
+    // 登记已排程的源 —— stop() 要能逐个掐断（WebAudio 不能"取消 start"，
+    // 只能对源调 stop()）。播完的自己摘掉，避免数组无限增长。
+    if (!this._sources) this._sources = [];
+    this._sources.push(node);
+    node.onended = () => {
+      const i = this._sources.indexOf(node);
+      if (i >= 0) this._sources.splice(i, 1);
+    };
     this.nextAt = at + buf.duration;
     this.lastStartAt = at;      // 起播时刻（ctx 秒）—— 校准要上报锚点
     diag.scheduled += 1;
@@ -214,9 +232,34 @@ class PcmPlayer {
     return at;
   }
   endResponse() { /* 队列自然播完 */ }
+  /** 立刻停止播放并清空已排程的内容。
+   *
+   *  ⚠️ 早先这个函数是**空操作**：把 gain 设 0 又立刻设回 1（等于没做），
+   *  而且 `node.start(at)` 一旦调用，已排程的 buffer **必然会播** ——
+   *  WebAudio 没有"取消已 start 的源"的接口。结果就是"打断了但旧句还在
+   *  响"，新回复的参考轨与实际播出对不上，回声全部漏给 ASR。
+   *
+   *  正确的做法：
+   *    ① 记录每一个已排程的源，逐个 `stop(0)` 掐断（对已排程未播的源
+   *       也是有效的 —— stop 会取消它）
+   *    ② 把 gain 短暂置 0 兜住 stop(0) 可能残留的几十微秒
+   *    ③ 复位排程指针，让下一句从"现在"开始
+   */
   stop() {
-    try { this.gain.gain.value = 0; this.gain.gain.value = 1; } catch (e) {}
+    for (const n of (this._sources || [])) {
+      try { n.stop(0); } catch (e) { /* 已播完的源 stop 会抛，忽略 */ }
+      try { n.disconnect(); } catch (e) { /* ignore */ }
+    }
+    this._sources = [];
+    try {
+      const g = this.gain.gain;
+      g.cancelScheduledValues(this.ctx.currentTime);
+      g.setValueAtTime(0, this.ctx.currentTime);
+      g.setValueAtTime(1, this.ctx.currentTime + 0.03);
+    } catch (e) { /* ignore */ }
     this.nextAt = this.ctx.currentTime + 0.05;
+    this._cancelled = true;    // 告诉 beginResponse：下一句从零重排
+    diagUpdate();
   }
 }
 
