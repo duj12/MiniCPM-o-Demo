@@ -13,7 +13,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 from .interface import (
     AsrFinal,
@@ -28,9 +29,24 @@ from .interface import (
 
 logger = logging.getLogger(__name__)
 
-#: 流式回复的 stream_id。目前一轮对话同时只有一路 TTS 流，用固定值即可；
-#: 将来要多路并发（比如插话）时改成按 response_id 生成。
-OMNI_STREAM_ID = "omni"
+#: 句末标点 —— 见到就立刻把攒的文本发出去。分句由**服务端**做，这里攒批
+#: 只是为了让每次送进去的文本有足够上下文（见下面 _pick_flush 的说明）。
+_SENT_END = "。！？；!?;\n"
+
+#: 攒批上限与兜底时长。
+#:
+#: ⚠️ **为什么必须攒批**（这是实测踩出来的）：服务端的 STREAM_SPLITTER 会对
+#: **每次收到的文本**独立分句 —— 一次只喂 1~2 个字时，它就把每个字当成一句，
+#: 给每个字配上句末语调再补静音。实测同一段 30 字文本：
+#:
+#:     每次喂 1 字  → 28 个音频帧，总长 17.66s   ← 听感就是"一两个字往外蹦"
+#:     每次喂 8 字  →  4 个音频帧，总长  7.06s   ← 正常语速
+#:     每次喂 15 字 →  2 个音频帧，总长  6.76s
+#:
+#: 所以攒到句末标点（或够长）再发，音质与「整段合成」一致；同时第一个
+#: 短句仍然很早就发出去，首声延迟不受影响。
+_FLUSH_CHARS = 14
+_FLUSH_SECONDS = 0.30
 
 
 class PassthroughDownstream:
@@ -42,7 +58,9 @@ class PassthroughDownstream:
     """
 
     def __init__(self, mode: str = "asr", max_text_chars: int = 0,
-                 prefix: str = "", streaming: bool = False) -> None:
+                 prefix: str = "", streaming: bool = False,
+                 flush_chars: int = _FLUSH_CHARS,
+                 flush_seconds: float = _FLUSH_SECONDS) -> None:
         self.mode = mode
         # 0 = 不截断。默认不截断：OmniLLM 的回复常有几百字，截断会让
         # TTS 只念前半句（实测踩过）。需要限制时显式传值。
@@ -51,6 +69,17 @@ class PassthroughDownstream:
         # 只有 omni 模式有真正的流式文本来源（response.output.delta）；
         # asr 模式的 AsrFinal 本来就是一整句，走整段合成更简单。
         self.streaming = bool(streaming) and mode == "omni"
+        self.flush_chars = flush_chars
+        self.flush_seconds = flush_seconds
+        # ---- 流式攒批状态 ----
+        # ⚠️ `_stream_id` **必须每轮不同**。早先是个常量 "omni"，于是第二轮
+        # 的 delta 命中了还没收尾的第一轮流（执行器的 `_stream_id != act.stream_id`
+        # 判等失败），文本被追加进上一轮的流 → 第二轮永远不开新流、永远不播。
+        # 实测「两轮语音只出 1 次 tts.start」。
+        self._turn = 0
+        self._stream_id: Optional[str] = None
+        self._buf: List[str] = []
+        self._buf_started = 0.0
         self.speaks = 0
         self.seen: Dict[str, int] = {}
 
@@ -72,22 +101,20 @@ class PassthroughDownstream:
         k = getattr(ev, "kind", "?")
         self.seen[k] = self.seen.get(k, 0) + 1
 
-        # ---- 流式：模型每吐一段就发一个增量 Speak ----
+        # ---- 流式：攒够一句再发（不能每字一发，见 _FLUSH_CHARS 的说明）----
         if self.streaming and isinstance(ev, OmniDelta):
             if ev.delta_kind != "text" or not ev.text:
                 return []
-            self.speaks += 1
-            return [Speak(text=ev.text, stream_id=OMNI_STREAM_ID,
-                          is_final=False)]
+            return self._accumulate(ev.text)
 
         text = None
         if self.mode == "asr" and isinstance(ev, AsrFinal):
             text = ev.text
         elif self.mode == "omni" and isinstance(ev, OmniResponseDone):
             if self.streaming:
-                # 流式下文本已经逐段发过了，这里**只发收尾信号**，
+                # 流式下文本已经分句发过了，这里**只发收尾信号**，
                 # 不能再把全文重发一遍（会重复合成一遍）。
-                return [Speak(text="", stream_id=OMNI_STREAM_ID, is_final=True)]
+                return self._finish_stream()
             text = ev.text
 
         if text:
@@ -103,6 +130,68 @@ class PassthroughDownstream:
             logger.info("[downstream] %s: %s", k, ev)
 
         return []
+
+    # ------------------------------------------------------------------ #
+    #  流式攒批
+    # ------------------------------------------------------------------ #
+
+    def _accumulate(self, delta: str) -> List[DownstreamAction]:
+        """攒 delta，够一句（或够长/够久）才吐一个 Speak。
+
+        **攒批是必须的**：服务端 STREAM_SPLITTER 对每次收到的文本独立分句，
+        一次只喂 1~2 个字会被当成逐字成句 → 每个字都带句末语调，听感是
+        「一两个字往外蹦」。见 ``_FLUSH_CHARS`` 的实测数据。
+        """
+        if self._stream_id is None:
+            # 新的一轮：分配一个**新的** stream_id（旧的已结束）
+            self._turn += 1
+            self._stream_id = f"omni-{self._turn}"
+        if not self._buf:
+            self._buf_started = time.monotonic()
+        elif (time.monotonic() - self._buf_started) >= self.flush_seconds:
+            # ⚠️ 兜底超时要在**追加之前**判。否则本次 delta 会被并进积压里
+            # 一起发（本地已有的文本迟迟不吐，反而被迟到的 delta 拖着）。
+            # 正确语义：先把积压发出去，本次 delta 属于下一批。
+            acts = self._flush()
+            if delta:
+                self._buf.append(delta)
+                self._buf_started = time.monotonic()
+            return acts
+        self._buf.append(delta)
+        if not self._should_flush():
+            return []
+        return self._flush()
+
+    def _should_flush(self) -> bool:
+        text = "".join(self._buf)
+        if not text:
+            return False
+        # ① 句末标点 —— 首选：切在句子边界上，语调最自然
+        if text[-1] in _SENT_END:
+            return True
+        # ② 够长了 —— 长句中途也要发，否则首声会一直等
+        return len(text) >= self.flush_chars
+
+    def _flush(self) -> List[DownstreamAction]:
+        text = "".join(self._buf)
+        self._buf = []
+        self._buf_started = 0.0
+        if not text:
+            return []
+        self.speaks += 1
+        return [Speak(text=text, stream_id=self._stream_id or "",
+                      is_final=False)]
+
+    def _finish_stream(self) -> List[DownstreamAction]:
+        """本轮文本发完：把残留补发，再发收尾信号，然后作废 stream_id。"""
+        acts = self._flush()          # 尾巴上没到标点/不够长的部分
+        sid = self._stream_id
+        if sid is None:
+            # 本轮一个字都没收到（比如全被过滤）—— 没有流要收
+            return acts
+        self._stream_id = None        # 下一轮 delta 会拿到新的 id
+        acts.append(Speak(text="", stream_id=sid, is_final=True))
+        return acts
 
     async def on_session_end(self, reason: str) -> None:
         logger.info("[downstream] 会话结束（%s），累计 TTS %d 次，事件统计: %s",

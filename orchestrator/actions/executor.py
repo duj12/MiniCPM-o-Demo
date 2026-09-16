@@ -66,6 +66,8 @@ class ActionExecutor:
         self._stream_id: str = ""                 # 当前流的 stream_id
         self._stream_task: Optional[asyncio.Task] = None
         self._stream_text: list = []              # 累计全文（收尾时给 tts.end）
+        #: 当前流是否已发过结束信号。发过之后不能再 feed（见 _speak_stream）
+        self._stream_ended = False
 
     # ------------------------------------------------------------------ #
 
@@ -131,9 +133,19 @@ class ActionExecutor:
             if not ok:
                 return
         if act.text:
-            self._stream_text.append(act.text)
-            self._stream.feed(act.text)
-        if act.is_final:
+            # ⚠️ 已 end 的流**绝不能再喂** —— 喂了文本永远等不到对应的音频
+            # （服务端的输入序列已经结束），表现为这一轮的文本静默丢失。
+            # 正常路径下 stream_id 每轮唯一，不会走到这；这里是兜底，
+            # 防的是下游stream_id 复用/错配。
+            if self._stream_ended:
+                logger.warning(
+                    "流 %s 已收尾，丢弃迟到的文本（%d 字）—— 多半是 "
+                    "stream_id 被复用了", act.stream_id, len(act.text))
+            else:
+                self._stream_text.append(act.text)
+                self._stream.feed(act.text)
+        if act.is_final and not self._stream_ended:
+            self._stream_ended = True
             self._stream.end()
 
     async def _open_stream(self, act: Speak,
@@ -165,6 +177,7 @@ class ActionExecutor:
             return False
         self._stream = stream
         self._stream_id = act.stream_id
+        self._stream_ended = False
         self._speak_inflight += 1
         self._stream_task = asyncio.create_task(
             self._consume_stream(session, response_id, arm, stream))
@@ -229,6 +242,7 @@ class ActionExecutor:
         """结束当前流（收尾或打断），并等消费任务退出。"""
         st, self._stream = self._stream, None
         self._stream_id = ""
+        self._stream_ended = False
         if st is not None:
             st.end()          # 幂等；已 end 过就什么都不做
             await st.abort()  # 保证线程退出、音频不再投递
@@ -485,6 +499,7 @@ class ActionExecutor:
         if self._stream is not None:
             st, self._stream = self._stream, None
             self._stream_id = ""
+            self._stream_ended = False
             st.end()
             await st.abort()
             logger.debug("打断时已中止 TTS 流")
