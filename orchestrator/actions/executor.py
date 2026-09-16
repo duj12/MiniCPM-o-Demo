@@ -59,6 +59,13 @@ class ActionExecutor:
         self._speak_inflight = 0
         # 播放起点的墙钟锚（用于没有回执时的退化路径）
         self._playback_anchor_ctx: Optional[float] = None
+        # ---- 流式合成状态 ----
+        # 当前开着的 TTS 流与它的消费任务。同一时刻只允许一路：
+        # 新回复开始前会把旧的 abort 掉（见 _open_stream）。
+        self._stream = None                       # TtsStream | None
+        self._stream_id: str = ""                 # 当前流的 stream_id
+        self._stream_task: Optional[asyncio.Task] = None
+        self._stream_text: list = []              # 累计全文（收尾时给 tts.end）
 
     # ------------------------------------------------------------------ #
 
@@ -92,11 +99,153 @@ class ActionExecutor:
         if session.closed:
             logger.info("会话已关闭，跳过 TTS 合成（%d 字）", len(act.text or ""))
             return
+        # 流式增量：只把文本喂进流就返回。**绝不能在这里等合成** ——
+        # run_downstream 是串行 await 的，占住它会让后续 delta 进不来，
+        # 而本次合成正等着那些 delta → 自锁。
+        if act.stream_id:
+            await self._speak_stream(act, session)
+            return
         self._speak_inflight += 1
         try:
             await self._speak_inner(act, session)
         finally:
             self._speak_inflight -= 1
+
+    # ------------------------------------------------------------------ #
+    #  流式合成
+    # ------------------------------------------------------------------ #
+
+    async def _speak_stream(self, act: Speak,
+                            session: "OrchestratorSession") -> None:
+        """处理一个流式增量 Speak。**必须快速返回**（见上面的死锁说明）。"""
+        if not getattr(session.tts, "supports_streaming", False):
+            # 客户端不支持流式：退化成整段合成（每个增量各合成一次，
+            # 会有点碎，但不会静默丢失）
+            logger.warning("TTS 客户端不支持流式，增量文本退化为整段合成")
+            return
+        if self._stream is None or self._stream_id != act.stream_id:
+            if self._stream is not None:
+                # stream_id 变了（旧流没收尾就来了新的）：把旧的收干净
+                await self._close_stream(session, reason="superseded")
+            ok = await self._open_stream(act, session)
+            if not ok:
+                return
+        if act.text:
+            self._stream_text.append(act.text)
+            self._stream.feed(act.text)
+        if act.is_final:
+            self._stream.end()
+
+    async def _open_stream(self, act: Speak,
+                           session: "OrchestratorSession") -> bool:
+        """开一路新的 TTS 流，并起后台任务消费它的音频。"""
+        # 打断上一句：与整段合成同一条路径（浏览器掐断 + 参考轨截断）
+        await self._interrupt_current(session, reason="superseded")
+        # 上一句的流任务要等它退干净，否则旧音频会串进新的消费循环
+        await self._await_stream_task()
+
+        response_id = uuid.uuid4().hex[:8]
+        self._current_response_id = response_id
+        self._tts_seq = 0
+        self._stream_text = []
+
+        # ⚠️ 流式下此刻还不知道全文，text 只能给空 —— 字幕靠 tts.end 补
+        await session.send_to_client(TtsStart(
+            response_id=response_id, text="", sample_rate=TTS_SR,
+            lead_ms=self.playback_delay_ms,
+        ))
+        arm = self._arm(session, response_id)
+        stream = session.tts.open_stream(
+            tts_type=act.tts_type, speaker_id=act.speaker_id,
+            speaker_vector_b64=act.speaker_vector_b64,
+        )
+        if stream is None:
+            self._release_arm(session, response_id)
+            logger.warning("TTS 流式会话开启失败（服务已关停？）")
+            return False
+        self._stream = stream
+        self._stream_id = act.stream_id
+        self._speak_inflight += 1
+        self._stream_task = asyncio.create_task(
+            self._consume_stream(session, response_id, arm, stream))
+        session.stats["tts_streams"] = session.stats.get("tts_streams", 0) + 1
+        return True
+
+    async def _consume_stream(self, session: "OrchestratorSession",
+                              response_id: str, arm, stream) -> None:
+        """后台任务：收流式音频 → 下发浏览器 → **逐块**落位参考轨。
+
+        与整段合成的关键差异：参考轨不再是「整段一次 place」，而是每收到
+        一块就续着写。这是安全的 —— RefTrack 的 ``StatefulResampler`` 跨
+        ``place()`` 保持相位，逐块落位与整段落位**逐采样一致**（已实测）。
+        """
+        seq = 0
+        at_sample: Optional[int] = None
+        n_chunks = 0
+        t0 = time.monotonic()
+        try:
+            async for pcm24 in stream.audio_iter():
+                if session.closed:
+                    break
+                await session.send_to_client(
+                    TtsAudio.from_int16(pcm24, response_id, seq))
+                seq += 1
+                n_chunks += 1
+                if at_sample is None:
+                    # 第一块到达才要锚点 —— 浏览器的 armed 承诺是在第一块
+                    # 音频到达时给出的（见 PcmPlayer._armNow 的说明）
+                    at_sample = await self._resolve_play_at(
+                        session, response_id, arm)
+                if session.ref_track is not None and at_sample is not None:
+                    ch = session.ref_track.place(
+                        response_id, seq, pcm24, at_sample)
+                    # 用 place 返回的长度累加（重采样有取整，不能自己乘比例）
+                    at_sample = ch.t1
+                    self._current_play_until = ch.t1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("流式合成消费异常: %s", exc)
+        finally:
+            # 收尾：发 tts.end（带全文，字幕用），释放 inflight
+            try:
+                if not session.closed:
+                    await session.send_to_client(TtsEnd(
+                        response_id=response_id, text="".join(self._stream_text)))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("发送 tts.end 失败（忽略）: %s", exc)
+            self._speak_inflight -= 1
+            self.speaks_done += 1
+            logger.info(
+                "TTS 流式完成: %s 共 %d 块 / %d 字，耗时 %.0fms，首块 %.0fms%s",
+                response_id, n_chunks, len("".join(self._stream_text)),
+                (time.monotonic() - t0) * 1000,
+                stream.first_chunk_s * 1000,
+                f"，错误={stream.error}" if stream.error else "",
+            )
+
+    async def _close_stream(self, session: "OrchestratorSession",
+                            reason: str = "") -> None:
+        """结束当前流（收尾或打断），并等消费任务退出。"""
+        st, self._stream = self._stream, None
+        self._stream_id = ""
+        if st is not None:
+            st.end()          # 幂等；已 end 过就什么都不做
+            await st.abort()  # 保证线程退出、音频不再投递
+        await self._await_stream_task()
+        if reason:
+            logger.debug("TTS 流已结束（%s）", reason)
+
+    async def _await_stream_task(self) -> None:
+        """等消费任务退出。**不能直接 cancel** —— 那会跳过 tts.end 下发。"""
+        task, self._stream_task = self._stream_task, None
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+            logger.debug("流式消费任务未在 5s 内退出，已取消")
 
     async def _speak_inner(self, act: Speak,
                            session: "OrchestratorSession") -> None:
@@ -328,6 +477,18 @@ class ActionExecutor:
         参考轨清理由 `RefTrack.truncate` 保证**不误伤其他 response**
         （它只清本 response 自己落位的区间）。
         """
+        # ⓪ 流式：先把流掐掉，**再**做下面那些簿记。
+        #    顺序很重要 —— 流还在投音频的话，截断完之后它又会往轨上写，
+        #    参考轨就带着"已经不该播的音频"继续跑（AEC 追不存在的回声）。
+        #    这里不 await 消费任务退出（那是 _await_stream_task 的事，
+        #    由 _open_stream 在开新流前做）—— 只保证流立刻停止产出。
+        if self._stream is not None:
+            st, self._stream = self._stream, None
+            self._stream_id = ""
+            st.end()
+            await st.abort()
+            logger.debug("打断时已中止 TTS 流")
+
         rid = self._current_response_id
         if rid is None:
             return None

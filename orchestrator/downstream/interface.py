@@ -174,12 +174,23 @@ DownstreamEvent = Union[
 
 @dataclass(frozen=True)
 class Speak:
-    """请求 TTS 合成并播放。"""
+    """请求 TTS 合成并播放。
+
+    **流式模式**：``stream_id`` 非空时，同 id 的多次 Speak 属于**同一轮回复
+    的增量** —— 执行器把它们依次喂给同一个 TTS 流，边合成边播。
+    ``is_final=True`` 表示该轮文本已发完（此时 ``text`` 通常为空）。
+
+    非流式（默认 ``stream_id=""``、``is_final=True``）：整段合成 ``text``。
+    """
     text: str
     tts_type: str = "mltts"
     speaker_id: Optional[str] = None
     speaker_vector_b64: Optional[str] = None
     priority: int = 0
+    #: 非空 = 流式回复的标识；同一轮的所有增量共用它
+    stream_id: str = ""
+    #: 该轮文本是否已发完（流式收尾信号）
+    is_final: bool = True
     kind: Literal["speak"] = "speak"
 
 

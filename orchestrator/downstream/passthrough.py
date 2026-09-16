@@ -20,6 +20,7 @@ from .interface import (
     DownstreamAction,
     DownstreamEvent,
     Emit,
+    OmniDelta,
     OmniResponseDone,
     SessionContext,
     Speak,
@@ -27,25 +28,40 @@ from .interface import (
 
 logger = logging.getLogger(__name__)
 
+#: 流式回复的 stream_id。目前一轮对话同时只有一路 TTS 流，用固定值即可；
+#: 将来要多路并发（比如插话）时改成按 response_id 生成。
+OMNI_STREAM_ID = "omni"
+
 
 class PassthroughDownstream:
-    """把语音/模型输出直接转成 TTS 播报。无状态、无 LLM、确定性。"""
+    """把语音/模型输出直接转成 TTS 播报。无状态、无 LLM、确定性。
+
+    ``streaming`` 打开且 ``mode="omni"`` 时走**增量**路径：模型每吐一段文本
+    就发一个 :class:`Speak`（同一个 ``stream_id``），执行器据此边合成边播，
+    首声不必等整条回复产完。关掉则退回「整条回复一次 Speak」的整段合成。
+    """
 
     def __init__(self, mode: str = "asr", max_text_chars: int = 0,
-                 prefix: str = "") -> None:
+                 prefix: str = "", streaming: bool = False) -> None:
         self.mode = mode
         # 0 = 不截断。默认不截断：OmniLLM 的回复常有几百字，截断会让
         # TTS 只念前半句（实测踩过）。需要限制时显式传值。
         self.max_text_chars = max_text_chars
         self.prefix = prefix
+        # 只有 omni 模式有真正的流式文本来源（response.output.delta）；
+        # asr 模式的 AsrFinal 本来就是一整句，走整段合成更简单。
+        self.streaming = bool(streaming) and mode == "omni"
         self.speaks = 0
         self.seen: Dict[str, int] = {}
 
     def describe(self) -> Dict[str, Any]:
+        caps = ["asr.final", "omni.done"]
+        if self.streaming:
+            caps.append("omni.delta")
         return {
             "name": "PassthroughDownstream",
             "mode": self.mode,
-            "capabilities": ["asr.final", "omni.done"],
+            "capabilities": caps,
         }
 
     async def on_session_start(self, ctx: SessionContext) -> List[DownstreamAction]:
@@ -56,10 +72,22 @@ class PassthroughDownstream:
         k = getattr(ev, "kind", "?")
         self.seen[k] = self.seen.get(k, 0) + 1
 
+        # ---- 流式：模型每吐一段就发一个增量 Speak ----
+        if self.streaming and isinstance(ev, OmniDelta):
+            if ev.delta_kind != "text" or not ev.text:
+                return []
+            self.speaks += 1
+            return [Speak(text=ev.text, stream_id=OMNI_STREAM_ID,
+                          is_final=False)]
+
         text = None
         if self.mode == "asr" and isinstance(ev, AsrFinal):
             text = ev.text
         elif self.mode == "omni" and isinstance(ev, OmniResponseDone):
+            if self.streaming:
+                # 流式下文本已经逐段发过了，这里**只发收尾信号**，
+                # 不能再把全文重发一遍（会重复合成一遍）。
+                return [Speak(text="", stream_id=OMNI_STREAM_ID, is_final=True)]
             text = ev.text
 
         if text:

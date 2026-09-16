@@ -94,6 +94,10 @@ class Settings:
     # TTS 参数
     tts_type: str = "mltts"
     tts_speaker_id: str = "17"
+    # 流式合成：LLM 文本 delta 一到就喂 TTS，音频一出就播（首声快很多）。
+    # 关掉则退回「整条回复一次合成」。用 ORCH_TTS_STREAMING=0 回退。
+    tts_streaming: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_TTS_STREAMING", "1") not in ("0", "false", "False", ""))
 
     # OmniLLM
     omni_system_prompt: str = "你是一个实时视频对话助手。请一边观看用户传来的实时画面，一边倾听并用自然口语即时回复。"

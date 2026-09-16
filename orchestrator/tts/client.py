@@ -1,30 +1,40 @@
-"""TTS 服务客户端（gRPC，整段合成）。
+"""TTS 服务客户端（gRPC）。**两种模式**：
 
-**调用模式照抄 ``TTS/tests/grpc_client.py`` 的 ``inference()``。**
+  · :meth:`TtsClient.synthesize` —— **整段合成**（``inference``，unary-stream）。
+    LLM 整条回复产完后一次性合成。首帧实测 **508ms**，占总耗时 78%。
+  · :meth:`TtsClient.open_stream` —— **双向流式**（``stream_inference``，
+    stream-stream）。LLM 文本 delta 一到就喂，TTS 音频一出就下发，
+    首声降到「首个 delta + TTS 首帧」。实测首帧 **381ms**。
 
-**为什么用同步 stub + run_in_executor，不用 grpc.aio**：
-TTS 是整段合成，调用本身就要阻塞几百毫秒等全部 PCM 回来，期间没有别的
-活可干；而 ``protos/tts_pb2_grpc.py`` 生成的是**同步 stub**
-（``channel.unary_stream``），配 aio channel 依赖生成代码恰好兼容，比较脆。
+**为什么两者都用同步 stub + 专用线程，不用 grpc.aio**：
+``protos/tts_pb2_grpc.py`` 生成的是**同步 stub**（``channel.stream_stream``），
+配 aio channel 依赖生成代码恰好兼容，比较脆。整段合成阻塞几百毫秒本来就要
+丢线程池；流式这条路把**输入侧**（阻塞等 LLM 下一个 delta）放到专用线程，
+**输出侧**仍回到 asyncio 事件循环，所以两边都不卡 loop。
+
+**流式的分句是服务端做的** —— ``tts/grpc_server.py`` 的 ``split_stream_text``
+会把原始文本转给独立的 ``STREAM_SPLITTER`` 服务切句。所以客户端**不必分句、
+不必攒批**，来一个字发一个字即可。
 
 **实测结果**（见 ``orchestrator/tests/README.md``）：
 
-  - PCM = **int16 @ 24kHz**
-  - 首帧延迟 **508ms**，总耗时 649ms（RTF 0.144）—— 首帧占总耗时 78%
+  - PCM = **int16 @ 24kHz**（两种模式一致）
   - ``CHAR_TIME_MAP`` 提供字级时间戳 ``[[字符, 起始秒, 结束秒], ...]``
-  - ⚠️ 首帧占比高说明整段合成有优化空间；后续可切 ``stream_inference``
-    （按句 client-streaming）把首字延迟降到句级。接口按可切换设计。
+  - ⚠️ 流式下 ``sentence_index`` 实测**恒为 -1**，不能拿它做判断；
+    收尾只看 ``inference_end``
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import queue
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,12 +63,224 @@ class TtsResult:
         return len(self.pcm) / TTS_SR
 
 
+class TtsStream:
+    """一次**双向流式**合成会话（``stream_inference``）。
+
+    用法::
+
+        st = client.open_stream(loop)
+        st.feed("米家智能")          # 可以反复喂，来多少喂多少
+        st.feed("按摩椅。")
+        st.end()                     # 文本发完
+        async for pcm in st.audio_iter():   # int16 @24k，逐块
+            ...
+
+    **线程模型**：gRPC 是阻塞式的，跑在专用线程里；线程阻塞在「等下一个
+    delta」和「等服务端回包」上。音频回包经 ``call_soon_threadsafe`` 投回
+    asyncio 事件循环，所以调用方（asyncio 侧）始终不阻塞。
+
+    **分句由服务端做**，客户端不必攒批 —— 喂单个字也可以。
+
+    ⚠️ ``sentence_index`` 实测恒为 -1，收尾只能看 ``inference_end``。
+    """
+
+    #: 音频队列的结束哨兵（服务端 ``inference_end`` 或出错）
+    _SENTINEL = object()
+
+    def __init__(self, stub, loop: asyncio.AbstractEventLoop,
+                 tts_type: str, speaker_id: Optional[str],
+                 speaker_vector_b64: Optional[str] = None,
+                 timeout: float = 60.0, infer_id: str = "orch-stream") -> None:
+        self._stub = stub
+        self._loop = loop
+        self._timeout = timeout
+        self._infer_id = infer_id
+        self._tts_type = tts_type
+        self._speaker_id = speaker_id
+        self._speaker_vector_b64 = speaker_vector_b64
+
+        # 输入侧：asyncio 线程 put，gRPC 线程 get
+        self._req_q: "queue.Queue" = queue.Queue()
+        # 输出侧：gRPC 线程 call_soon_threadsafe put，asyncio 线程 get
+        self._audio_q: asyncio.Queue = asyncio.Queue()
+
+        self._sent_first = False      # is_first 只置第一条
+        self._ended = False           # end() 已调用
+        self._aborted = False
+        self._worker: Optional[threading.Thread] = None
+        self._error: Optional[str] = None
+        self._lock = threading.Lock()
+
+        # 统计
+        self.chunks_out = 0
+        self.samples_out = 0
+        self.char_time_map: Optional[list] = None
+        self.first_chunk_s: float = 0.0
+        self.started_at = time.perf_counter()
+
+        self._worker = threading.Thread(
+            target=self._run, name="tts-stream", daemon=True)
+        self._worker.start()
+
+    # ------------------------------------------------------------------ #
+
+    @property
+    def error(self) -> Optional[str]:
+        return self._error
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    def feed(self, text: str, is_last: bool = False) -> None:
+        """喂一段文本。线程安全，非阻塞。
+
+        ``is_last=True`` 等价于先 feed 再 :meth:`end`。
+        """
+        if self._aborted:
+            return
+        text = text or ""
+        if text or is_last:
+            self._req_q.put((text, is_last))
+
+    def end(self) -> None:
+        """文本发完，让服务端收尾（对端见到 ``is_last`` 会补 ``inference_end``）。"""
+        if self._ended or self._aborted:
+            return
+        self._ended = True
+        self._req_q.put(("", True))
+
+    async def audio_iter(self) -> AsyncIterator[np.ndarray]:
+        """逐块产出 int16 @24kHz PCM。服务端收尾或出错时结束。"""
+        while True:
+            item = await self._audio_q.get()
+            if item is self._SENTINEL:
+                return
+            yield item
+
+    async def abort(self, timeout: float = 3.0) -> None:
+        """打断：停止喂文本、让 RPC 尽快结束、等线程退出。
+
+        ⚠️ 必须在**新一句开始之前**把旧流收干净 —— 否则旧流的音频会继续
+        投进队列，被新的消费循环读到（串音）。
+        """
+        if self._aborted:
+            return
+        self._aborted = True
+        # 用哨兵唤醒阻塞在 get() 的生成器线程，让它退出循环
+        self._req_q.put(None)
+        await asyncio.to_thread(self._join, timeout)
+
+    def _join(self, timeout: float) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=timeout)
+
+    # ------------------------------------------------------------------ #
+
+    def _build_request(self, text: str, is_last: bool):
+        from protos import tts_pb2  # type: ignore
+
+        is_first = not self._sent_first
+        self._sent_first = True
+        kwargs = {}
+        if self._speaker_vector_b64:
+            import base64
+            kwargs["speaker_vector"] = base64.b64decode(self._speaker_vector_b64)
+        else:
+            kwargs["speaker_id"] = str(self._speaker_id)
+        return tts_pb2.Text(
+            text=text,
+            tts_type=self._tts_type,
+            is_first=is_first,
+            is_last=is_last,
+            return_sep=False,
+            flush_buffer=False,
+            secondary_style_id=getattr(
+                tts_pb2.Text.SECONDARY_STYLE_ID, "jiangpin"
+            ),
+            **kwargs,
+        )
+
+    def _request_iter(self):
+        """生成器线程侧：阻塞取文本，直到 end() / abort()。"""
+        while True:
+            item = self._req_q.get()
+            if item is None:        # abort 哨兵
+                return
+            text, is_last = item
+            try:
+                yield self._build_request(text, is_last)
+            except Exception as exc:  # noqa: BLE001
+                self._fail(f"构造请求失败: {exc}")
+                return
+            if is_last:
+                return
+
+    def _put_audio(self, pcm: np.ndarray) -> None:
+        """gRPC 线程 → asyncio 队列。"""
+        try:
+            self._loop.call_soon_threadsafe(self._audio_q.put_nowait, pcm)
+        except RuntimeError:
+            # loop 已关闭（会话收尾竞态）：丢弃即可
+            pass
+
+    def _finish(self) -> None:
+        try:
+            self._loop.call_soon_threadsafe(
+                self._audio_q.put_nowait, self._SENTINEL)
+        except RuntimeError:
+            pass
+
+    def _fail(self, msg: str) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = msg
+                logger.warning("TTS 流式会话出错: %s", msg)
+
+    def _run(self) -> None:
+        """专用线程：跑阻塞的 stream_inference，把音频投回 loop。"""
+        try:
+            t0 = time.perf_counter()
+            for r in self._stub.stream_inference(
+                self._request_iter(),
+                metadata=[("grpc-infer-id", self._infer_id)],
+                timeout=self._timeout,
+            ):
+                if self._aborted:
+                    break
+                if r.data_type == 0:            # AUDIO
+                    if not r.data:
+                        continue
+                    if self.first_chunk_s == 0.0:
+                        self.first_chunk_s = time.perf_counter() - t0
+                    pcm = np.frombuffer(r.data, dtype=np.int16)
+                    self.chunks_out += 1
+                    self.samples_out += pcm.size
+                    self._put_audio(pcm.copy())
+                elif r.data_type == 1:          # CHAR_TIME_MAP
+                    try:
+                        self.char_time_map = json.loads(r.data)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # ⚠️ sentence_index 实测恒为 -1，不能用来判断任何东西
+                if r.inference_end:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            if not self._aborted:
+                self._fail(f"{type(exc).__name__}: {exc}")
+        finally:
+            self._finish()
+
+
 class TtsClient:
     """一路 TTS 会话。
 
     ``synthesize`` 是协程，内部把阻塞的 gRPC 调用丢进线程池，
     不阻塞 asyncio loop。
     """
+
+    #: 支持 :meth:`open_stream`（执行器据此决定走不走流式）
+    supports_streaming = True
 
     def __init__(self, host: str, port: int, timeout: float = 60.0,
                  tts_type: str = "mltts", speaker_id: str = "17",
@@ -187,6 +409,51 @@ class TtsClient:
             res.total_s * 1000, res.n_frames,
         )
         return res.pcm
+
+    def open_stream(self, tts_type: Optional[str] = None,
+                    speaker_id: Optional[str] = None,
+                    speaker_vector_b64: Optional[str] = None,
+                    infer_id: str = "orch-stream") -> Optional["TtsStream"]:
+        """开一次**双向流式**合成会话（非阻塞，立即返回）。
+
+        调用方拿到 :class:`TtsStream` 后反复 ``feed()`` 文本、再从
+        ``audio_iter()`` 收音频。收尾/打断见该类的 ``end()`` / ``abort()``。
+
+        关停中（``_closing``/``closed``）返回 ``None`` —— 与 ``synthesize``
+        同一套竞态防护。流在飞期间也算 ``_inflight``，否则 ``close()`` 会
+        在流还没收干净时就关掉 channel。
+        """
+        if self.closed or self._closing:
+            logger.debug("TTS 已停止，拒绝开流式会话")
+            return None
+        stub = self._ensure_stub()
+        loop = asyncio.get_running_loop()
+        self._inflight += 1
+        try:
+            st = TtsStream(
+                stub, loop,
+                tts_type=tts_type or self.default_tts_type,
+                speaker_id=speaker_id or self.default_speaker_id,
+                speaker_vector_b64=speaker_vector_b64,
+                timeout=self.timeout,
+                infer_id=infer_id,
+            )
+        except Exception:
+            self._inflight -= 1
+            raise
+        self.calls += 1
+        # 流结束后自动减 inflight：包一层，不侵入 TtsStream 自身
+        orig_finish = st._finish
+
+        def _finish_counted() -> None:
+            try:
+                orig_finish()
+            finally:
+                self._inflight -= 1
+                self.total_audio_s += st.samples_out / TTS_SR
+
+        st._finish = _finish_counted  # type: ignore[method-assign]
+        return st
 
     async def synthesize_full(self, text: str, **kw) -> Optional[TtsResult]:
         """同 ``synthesize`` 但返回完整结果（含字级时间戳）。"""

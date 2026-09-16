@@ -738,6 +738,17 @@ function refreshStats() {
     `事件: ${evs}`;
 }
 
+/** 追加一行「播报」字幕（不截断，长回复要完整显示）。 */
+function addTtsLine(text) {
+  const log = $('ttslog');
+  if (log.textContent.startsWith('（等待')) log.textContent = '';
+  const d = document.createElement('div');
+  d.style.marginBottom = '6px';
+  d.innerHTML = '<b>播报</b> ' + text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
 /* ---------- 会话 ---------- */
 $('btnStart').onclick = async () => {
   try {
@@ -757,13 +768,14 @@ $('btnStart').onclick = async () => {
         } else if (m.type === 'tts.start') {
           // 完整显示，不截断 —— 早先限制 80 字，长回复的字幕被砍掉。
           // 用独立区域追加（ASR 的替换不会冲掉这里）。
-          const log = $('ttslog');
-          if (log.textContent.startsWith('（等待')) log.textContent = '';
-          const d = document.createElement('div');
-          d.style.marginBottom = '6px';
-          d.innerHTML = '<b>播报</b> ' + (m.text || '');
-          log.appendChild(d);
-          log.scrollTop = log.scrollHeight;
+          //
+          // ⚠️ **流式合成下 `tts.start` 的 text 是空的**（发出时还只有第一个
+          //    delta，早发正是流式的意义），字幕要等 `tts.end` 带全文来补。
+          //    所以这里文本为空就不建行，避免留一个空的「播报」。
+          if (m.text) addTtsLine(m.text);
+        } else if (m.type === 'tts.end') {
+          // 流式收尾：全文在这里才到（整段合成时 text 为空，不重复建行）
+          if (m.text) addTtsLine(m.text);
         } else if (m.type === 'face.state') {
           drawFace(m);
         } else if (m.type === 'session.stats') {

@@ -213,7 +213,13 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
     if mode == "none":
         sess.downstream = None
     else:
-        sess.downstream = PassthroughDownstream(mode=mode)
+        # 流式合成只在 omni 模式 + TTS 客户端支持时生效（见 PassthroughDownstream）
+        streaming = bool(getattr(cfg, "tts_streaming", False)) and \
+            mode == "omni" and \
+            bool(getattr(sess.tts, "supports_streaming", False))
+        sess.downstream = PassthroughDownstream(mode=mode, streaming=streaming)
+        if streaming:
+            logger.info("TTS 流式合成已启用（LLM 文本 delta 边出边合成）")
 
     # ---- action 执行器 ----
     from orchestrator.actions.executor import ActionExecutor

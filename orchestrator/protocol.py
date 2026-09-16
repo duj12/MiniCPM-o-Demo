@@ -174,6 +174,9 @@ class TtsAudio:
 @dataclass
 class TtsEnd:
     response_id: str
+    #: 本轮完整文本。**流式下这是唯一能拿到全文的地方** —— `tts.start` 发出时
+    #: 还只有第一个 delta（早发正是流式的意义），所以字幕要在 `tts.end` 补。
+    text: str = ""
     type: Literal["tts.end"] = "tts.end"
 
 

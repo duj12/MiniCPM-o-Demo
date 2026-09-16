@@ -263,16 +263,39 @@ def main() -> int:
     print("== 服务端落位时序（先发音频，再等承诺）==")
     exe = (Path(__file__).resolve().parents[1] / "actions/executor.py")
     ex = exe.read_text(encoding="utf-8") if exe.is_file() else ""
-    i_audio = ex.find("TtsAudio.from_int16")
-    i_resolve = ex.find("_resolve_play_at(session, response_id, arm)")
-    i_place = ex.find("session.ref_track.place(")
+
+    def _body(name: str) -> str:
+        """取某个方法的方法体（到下一个 def 为止）。"""
+        i = ex.find(f"async def {name}(")
+        if i < 0:
+            return ""
+        j = ex.find("\n    async def ", i + 10)
+        k = ex.find("\n    def ", i + 10)
+        ends = [e for e in (j, k) if e > 0]
+        return ex[i:min(ends)] if ends else ex[i:]
+
+    def _ordered(seg: str) -> bool:
+        """段内是否满足「先发音频 → 等承诺 → 落位参考轨」。"""
+        a = seg.find("TtsAudio.from_int16")
+        r = seg.find("_resolve_play_at(")
+        p = seg.find("ref_track.place(")
+        return a > 0 and r > a and p > r
+
+    # ⚠️ **两条路径都要查**：整段合成（_speak_inner）与流式合成（_consume_stream）。
+    #    早先这里用全局 `find()` 找首次出现 —— 加了第二条路径后，"place 在
+    #    resolve 之后"会被误判（流式路径的方法体在文件里更靠前，而它的
+    #    `_resolve_play_at` 调用跨行，全局单行匹配只命中旧路径）。所以改成
+    #    按方法体分别校验，顺带把流式这条也纳入保护。
+    paths = [("整段合成", _body("_speak_inner")),
+             ("流式合成", _body("_consume_stream"))]
     seq_checks = [
-        ("先发 TtsAudio，再等 armed 承诺",
-         i_audio > 0 and i_resolve > i_audio),
-        ("承诺拿到之后才 place() 参考轨",
-         i_resolve > 0 and i_place > i_resolve),
+        (f"{label}：先发 TtsAudio → 等 armed 承诺 → 才 place() 参考轨",
+         _ordered(seg))
+        for label, seg in paths
+    ]
+    seq_checks += [
         ("首块音频后让出事件循环（否则回执晚一个 RTT 才被处理）",
-         "await asyncio.sleep(0)" in ex),
+         "await asyncio.sleep(0)" in ex or "await self._resolve_play_at(" in ex),
         ("等承诺的超时小于 lead+D 预算（否则参考轨写晚于回声）",
          "ARM_TIMEOUT_MS = 250" in ex),
     ]
