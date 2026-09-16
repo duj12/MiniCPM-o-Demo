@@ -563,6 +563,9 @@ class FaceWindow:
         self._proc = None
         self._reader = None
         self._speaker: Optional[Speaker] = None
+        #: 主循环置位：TTS 正在播 → 暂停喂原片声（两个 Speaker 会抢设备）。
+        #: 由主循环按**播放进度**写，不是"收没收到 tts.end"。
+        self.src_paused = False
         self._src_audio: Optional[np.ndarray] = None
         self._win = "orchestrator-replay"
 
@@ -748,11 +751,21 @@ class FaceWindow:
             #    一次性写会让声音跑在画面前面（缓冲区攒满就停），
             #    与"边播边对齐"的意图矛盾。
             if self._speaker is not None and self._src_audio is not None:
-                per = int(SR / self.fps)
-                a = (n * per) % max(1, len(self._src_audio))
-                seg = self._src_audio[a:a + per]
-                if seg.size:
-                    self._speaker.play((seg * 32767.0).astype(np.int16))
+                # ⚠️ **TTS 在播时必须停喂原片声**。两者是**同一个** Speaker
+                #    对象（两个会抢输出设备），同时响就是"视频原声和 TTS
+                #    一起放"。主循环按播放进度置 `src_paused` 来让路。
+                #
+                # ⚠️ 让路**只停喂**，**不能调 `_speaker.stop()`** ——
+                #    那个会把**整个队列**清空，而队列里排着的是刚到的 TTS
+                #    音频（共用一个 Speaker），等于把正主也一起丢了。
+                #    实测：排 3 块后调 stop()，qsize 直接归 0。
+                #    队列里残留的原片声最多 ~几十 ms，播完自然就没了。
+                if not self.src_paused:
+                    per = int(SR / self.fps)
+                    a = (n * per) % max(1, len(self._src_audio))
+                    seg = self._src_audio[a:a + per]
+                    if seg.size:
+                        self._speaker.play((seg * 32767.0).astype(np.int16))
 
             self.frames += 1
             n += 1
@@ -1759,16 +1772,20 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             if window is not None and window.status is not None:
                 window.status.tts_remaining_s = tts_left
 
-            # ── 纯音频：TTS 在播时让路（**串行不重叠**）──
+            # ── 输入音频：TTS 在播时让路（**串行不重叠**）──
             # 两个 Speaker 同时开会抢输出设备（实测互相打架、谁都出不来声）。
-            # 注意这里**只切暂停状态**，真正喂音频在上面那个 100ms 块里
-            # （每 tick 喂会变成 12.5 倍速 → 卡顿）。
+            # **两条路径都要管**：
+            #   · 纯音频 → `src_speaker`，真正喂音频在下面那个 100ms 块里
+            #   · 视频   → 原片声由 `FaceWindow._run` 按帧喂，这里只置标志位
+            # ⚠️ 早先只做了纯音频那条，视频模式下主循环的 `src_speaker` 是
+            #    None、这段整个跳过 —— 原片声照喂，于是**TTS 和视频原声
+            #    一起放**（用户实测）。
+            # 只切标志位，**不 stop()** —— `stop()` 清的是整个队列，在
+            # 共用 Speaker 的场景会把刚排进去的 TTS 音频一起丢掉。
             if src_speaker is not None:
-                if tts_left > 0.05 and not src_speaker_paused[0]:
-                    src_speaker.stop()          # 丢弃积压，TTS 优先
-                    src_speaker_paused[0] = True
-                elif tts_left <= 0.05 and src_speaker_paused[0]:
-                    src_speaker_paused[0] = False
+                src_speaker_paused[0] = tts_left > 0.05
+            if window is not None:
+                window.src_paused = tts_left > 0.05
 
             # 插话：仅日志标记 —— 真正的打断由**服务端**新回复时的
             # `_interrupt_current` 驱动（它会发 tts.cancel），客户端据此停播。
@@ -1835,6 +1852,15 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         #    TTS 状态一直是空闲）。
         if window is not None and window.status is not None:
             window.status.tts_remaining_s = remain
+        # ⚠️ **TTS 真正在播的就是这一段**，所以"让路"也必须在这里做 ——
+        #    只在主循环里置标志位的话，主循环一退出标志就停在上次的值，
+        #    收尾期间原片声又会照放（TTS + 视频原声一起响）。
+        #    纯音频那条路径同理（它的喂音频在主循环里，这里主循环已退出，
+        #    所以不会真的出声，但标志位保持"暂停"以免退出瞬间漏一拍）。
+        if window is not None:
+            window.src_paused = remain > 0.05
+        if src_speaker is not None and remain > 0.05:
+            src_speaker_paused[0] = True
         if client.player.responses:
             got_any = True
             quiet_since = now
