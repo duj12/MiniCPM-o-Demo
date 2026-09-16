@@ -100,6 +100,11 @@ class OrchestratorSession:
         self._dump_ref: list = []
         self._dump_raw: list = []      # 未做 D 补偿的原始参考轨（测 D 用）
         self._dump_aec: list = []
+        # 视频帧转储：**原样存收到的 JPEG 字节**，不做任何转码 —— 发给
+        # Omni/face 的就是这些字节，存 mp4 反而有损、且丢掉逐帧时间对应。
+        # 每项 (t_ms, jpeg_bytes)，会话结束时写 .mjpeg + .tsv。
+        self._dump_face: list = []
+        self._dump_omni: list = []
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
@@ -188,10 +193,16 @@ class OrchestratorSession:
 
         # 送去清洗：有 AEC 走 AEC，否则直接扇出。
         # AEC 是**可选**的清洗环节，不是链路的一环 —— 缺它不影响正确性。
+        #
+        # ⚠️ **转储要在这里做，不能塞进 AEC 分支**。早先 `_dump_audio` 只在
+        #    `if self.aec is not None` 里调 —— 于是用**浏览器原生 AEC**
+        #    （前端不连云端 AEC，`self.aec is None`）时根本不转储，
+        #    跑完整场一个文件都没有。转储是排查手段，不该依赖 AEC 模式。
+        ref = self._ref_for(frame) if self.aec is not None else None
+        self._dump_audio(frame.data, ref, frame)
+
         if self.aec is not None:
-            ref = self._ref_for(frame)
             self._trace_ref(ref, frame)
-            self._dump_audio(frame.data, ref, frame)
             await self.aec.push(frame.data, ref)
         else:
             await self._fanout_direct(frame.data)
@@ -217,12 +228,18 @@ class OrchestratorSession:
         if self._dump_path is None:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
-        self._dump_ref.append(ref.reshape(-1).copy())
+        n = frame.n_samples
+        # `ref is None` = 没连云端 AEC（浏览器原生模式）—— 此时没有"喂给
+        # AEC 的 farend"这回事，但要**如实落盘成静音**，而不是跳过：
+        # 跳了会让 ref/raw 的长度和 mic 对不上，离线对齐就废了。
+        self._dump_ref.append(
+            ref.reshape(-1).copy() if ref is not None
+            else np.zeros(n, dtype=np.float32))
         if self.ref_track is not None:
             self._dump_raw.append(
                 self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
         else:
-            self._dump_raw.append(np.zeros(frame.n_samples, dtype=np.float32))
+            self._dump_raw.append(np.zeros(n, dtype=np.float32))
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
         if self._dump_path is None:
@@ -253,6 +270,41 @@ class OrchestratorSession:
                     np.clip(x * 32767.0, -32768, 32767).astype(np.int16).tobytes())
             logger.info("[%s] 音频转储 %s：%.1fs 峰值=%.5f",
                         self.session_id, path, x.size / SR, peak)
+
+    def flush_video_dump(self) -> None:
+        """会话结束时把视频帧写成 ``.mjpeg`` + ``.tsv``。
+
+        **为什么不是 mp4**：发给 Omni/face 的就是**收到的原始 JPEG 字节**，
+        中间没有任何转码。存 mp4 要重编码 —— 有损、而且丢掉"哪一帧对应哪个
+        时刻"的精确关系，出问题时没法逐帧复现。MJPEG 就是 JPEG 首尾相接，
+        `ffmpeg -i x.mjpeg out.mp4` 随时能转来看，但**验证要用原文件**。
+
+        格式对齐 G1 库自己 debug 的落盘方式（它也是 mjpeg + tsv），
+        以及 ``assets/video/test.mp4`` 那类素材。
+
+        ``.tsv`` 列：``frame_index`` / ``t_ms``（会话采样轴，毫秒）/ ``bytes``。
+        """
+        if self._dump_path is None:
+            return
+        from pathlib import Path
+        for name, frames in (("face", self._dump_face),
+                             ("omni", self._dump_omni)):
+            if not frames:
+                continue
+            mjpeg = Path(f"{self._dump_path}-{self.session_id}-{name}.mjpeg")
+            tsv = Path(f"{self._dump_path}-{self.session_id}-{name}.tsv")
+            mjpeg.parent.mkdir(parents=True, exist_ok=True)
+            with open(mjpeg, "wb") as f:
+                for _, jpeg in frames:
+                    f.write(jpeg)
+            with open(tsv, "w", encoding="utf-8") as f:
+                f.write("frame_index\tt_ms\tbytes\n")
+                for i, (t_ms, jpeg) in enumerate(frames):
+                    f.write(f"{i}\t{t_ms}\t{len(jpeg)}\n")
+            total = sum(len(j) for _, j in frames)
+            logger.info("[%s] 视频转储 %s：%d 帧 / %.1fMB（+ %s）",
+                        self.session_id, mjpeg, len(frames),
+                        total / 1e6, tsv.name)
 
     def _normalize_chunk(self, x: np.ndarray) -> np.ndarray:
         """把任意长度的块规整成 MIC_CHUNK 长度（必要时应改造为环形缓冲）。"""
@@ -603,6 +655,9 @@ class OrchestratorSession:
         if self.closed:
             return
         self.stats["video_face_frames"] += 1
+        if self._dump_path is not None:
+            # 原样存 —— 与喂给 face_worker 的是同一份字节
+            self._dump_face.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.face_worker is not None:
             # put_nowait：队列满则丢最旧帧（新帧对唇动状态更有价值）
             self.face_worker.offer(jpeg, self.clock.now())
@@ -612,6 +667,8 @@ class OrchestratorSession:
         if self.closed:
             return
         self.stats["video_omni_frames"] += 1
+        if self._dump_path is not None:
+            self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
 
@@ -1250,11 +1307,15 @@ class OrchestratorSession:
             return
         self.closed = True
         logger.info("会话 %s 关闭（%s）", self.session_id, reason)
-        # 音频转储落盘（默认关闭，无副作用）
+        # 音视频转储落盘（默认关闭，无副作用）
         try:
             self.flush_audio_dump()
         except Exception as exc:  # noqa: BLE001
             logger.warning("音频转储写入失败: %s", exc)
+        try:
+            self.flush_video_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("视频转储写入失败: %s", exc)
         if self.downstream is not None:
             try:
                 await self.downstream.on_session_end(reason)
