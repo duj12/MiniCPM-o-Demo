@@ -1829,6 +1829,12 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         # 调度表算不出来）
         if client.speaker is not None:
             remain = max(remain, client.speaker.pending_s())
+        # ⚠️ **必须在这里也更新状态栏**。主循环那条在"音频发完"时就退出了，
+        #    而 TTS 真正在播的几十秒**全在收尾这一段** —— 早先只更新主循环，
+        #    于是收尾期间状态栏一直显示"空闲"（用户实测：渲染到视频上的
+        #    TTS 状态一直是空闲）。
+        if window is not None and window.status is not None:
+            window.status.tts_remaining_s = remain
         if client.player.responses:
             got_any = True
             quiet_since = now

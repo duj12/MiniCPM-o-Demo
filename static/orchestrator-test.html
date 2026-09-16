@@ -139,7 +139,12 @@ function log(cls, msg) {
 const diag = {
   ctxState: '-', ctxRate: '-', frames: 0, bytes: 0,
   scheduled: 0, startedAt: '-', lastErr: '-', peak: 0,
+  // 已收到 tts.start、还没收到 tts.end（"连接中"用；判断是否在**出声**
+  // 要看 player.remaining()，见 diagUpdate）
+  ttsArmed: false,
 };
+// 当前播放器（onEvent 里建的），diagUpdate 要读它的播放进度
+let player = null;
 function diagUpdate() {
   const el = $('audiostat');
   if (!el) return;
@@ -149,10 +154,24 @@ function diagUpdate() {
     ? `　设备输出延迟 <b>${fmtLat(audioCtx.outputLatency)}</b>`
       + `（base ${fmtLat(audioCtx.baseLatency)}）`
     : '';
+  // ---- TTS 是否**正在出声** ----
+  // ⚠️ 判据是**播放进度**（player.remaining()），不是"收没收到 tts.end"：
+  //    tts.end 只表示音频**送**完了，流式下服务端一次性推完几十秒，
+  //    送到时往往才刚起播 —— 用它判断会在开播两秒后就显示"空闲"，
+  //    而耳朵里还在响。
+  let tts;
+  const rem = (player && player.remaining) ? player.remaining() : 0;
+  if (rem > 0.05) {
+    tts = `<b style="color:#4ade80">TTS 播放中</b> 剩余 ${rem.toFixed(1)}s`;
+  } else if (diag.ttsArmed) {
+    tts = `<b style="color:#fbbf24">TTS 连接中</b>`;   // 已 start，音频未到
+  } else {
+    tts = `TTS <b>空闲</b>`;
+  }
   el.innerHTML =
     `AudioContext: <b>${diag.ctxState}</b> @${diag.ctxRate}Hz${lat}　` +
     `TTS 帧 <b>${diag.frames}</b> / ${(diag.bytes/2/24000).toFixed(2)}s　` +
-    `已调度 <b>${diag.scheduled}</b>　峰值 ${diag.peak.toFixed(3)}<br>` +
+    `已调度 <b>${diag.scheduled}</b>　峰值 ${diag.peak.toFixed(3)}　${tts}<br>` +
     (diag.startedAt !== '-' ? `起播时刻 ${diag.startedAt}<br>` : '') +
     (diag.lastErr !== '-' ? `<span style="color:#fca5a5">错误: ${diag.lastErr}</span>` : '');
 }
@@ -224,6 +243,23 @@ class PcmPlayer {
       // now <= n._at：还没起播 → 不计
     }
     return Math.round(played * 16000);           // 换算到 16k 采样
+  }
+  /**
+   * 还有多少秒**没播完**（按已排程的源算）。
+   *
+   * ⚠️ 判「TTS 在不在播」**只能用它**，不能用「收没收到 tts.end」——
+   *    `tts.end` 只表示音频**送**完了，而流式下服务端是一次性把几十秒
+   *    推完的，送到时往往才刚起播。用它判断会在开播两秒后就显示「空闲」，
+   *    而耳朵里还在响（Python 客户端实测踩过这个坑）。
+   */
+  remaining() {
+    const now = this.ctx.currentTime;
+    let end = 0;
+    for (const n of (this._sources || [])) {
+      const e = n._at + n._dur;
+      if (e > end) end = e;
+    }
+    return Math.max(0, end - now);
   }
   /** 开始一个新 response：初始化状态 + 复位排程指针。
    *
@@ -728,6 +764,9 @@ function refreshStats() {
   // 每次刷新（每个音频块）都取一次设备延迟 —— outputLatency 在会话中途
   // 变化就是"D 跳变"的信号，记下来才能和 [音频会话] 日志对上时间
   trackLatencyShift();
+  // 顺带刷新 TTS 播放状态 —— 它是**随时间变化**的（剩余秒数在倒计时），
+  // 只在事件到达时刷新会一直停在旧值。这里 10Hz，够用且不费。
+  diagUpdate();
   const s = session.stats;
   const evs = Object.entries(evtCounts)
     .map(([k, v]) => k + '=' + v).join(' ');
@@ -799,7 +838,7 @@ $('btnStart').onclick = async () => {
     $('btnStart').disabled = true;
     running = true;
     await startCapture();
-    const player = new PcmPlayer(audioCtx);
+    player = new PcmPlayer(audioCtx);
     session = new OrchestratorSession({
       player,
       onEvent: (m) => {
@@ -817,6 +856,8 @@ $('btnStart').onclick = async () => {
           //    合成**之前**发的（这样那个往返才能藏在合成耗时里）。
           //    早先这里「文本为空就不建行」，结果流式下整轮回复要等到
           //    `tts.end` 才出现，看起来像"没有流式显示了"。
+          diag.ttsArmed = true;
+          diagUpdate();
           beginTtsLine(m.response_id, m.text);
         } else if (m.type === 'tts.delta') {
           // 流式文本增量：**边生成边显示**（这就是流式显示的意义）
@@ -824,6 +865,11 @@ $('btnStart').onclick = async () => {
         } else if (m.type === 'tts.end') {
           // 收尾：整段合成走这条（全文在这里一次性到）；流式下文字已经
           // 由 tts.delta 填完，这里 text 为空、只做收尾
+          //
+          // ⚠️ 这里**只**表示音频送完了，**不代表播完了** —— 状态显示
+          //    要等 player.remaining() 归零（见 diagUpdate）。
+          diag.ttsArmed = false;
+          diagUpdate();
           finishTtsLine(m.response_id, m.text);
         } else if (m.type === 'face.state') {
           drawFace(m);
