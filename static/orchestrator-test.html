@@ -738,15 +738,59 @@ function refreshStats() {
     `事件: ${evs}`;
 }
 
-/** 追加一行「播报」字幕（不截断，长回复要完整显示）。 */
-function addTtsLine(text) {
+/**
+ * 「播报」字幕 —— 每个 response 一行，**文本增量往里填**。
+ *
+ * 服务端流式合成时文字是**随 LLM 生成陆续到达**的（tts.delta），所以要能让
+ * 同一行不断变长，而不是每来一段就新起一行（那会碎成很多行）。
+ * 不截断：长回复要完整显示（早先限制 80 字，字幕被砍掉过）。
+ */
+const ttsLines = {};
+
+function _ttsLog() {
   const log = $('ttslog');
   if (log.textContent.startsWith('（等待')) log.textContent = '';
+  return log;
+}
+
+/** tts.start：开一行占位（text 通常为空，流式下文字稍后才到）。 */
+function beginTtsLine(rid, text) {
+  const log = _ttsLog();
   const d = document.createElement('div');
   d.style.marginBottom = '6px';
-  d.innerHTML = '<b>播报</b> ' + text;
+  const b = document.createElement('b');
+  b.textContent = '播报 ';
+  const span = document.createElement('span');
+  span.textContent = text || '';
+  d.appendChild(b);
+  d.appendChild(span);
   log.appendChild(d);
+  ttsLines[rid] = span;
   log.scrollTop = log.scrollHeight;
+}
+
+/** tts.delta：把增量接到本行末尾（边生成边显示）。 */
+function appendTtsLine(rid, text) {
+  let span = ttsLines[rid];
+  if (!span) {                    // 没收到 start（异常）→ 补建，别丢字
+    beginTtsLine(rid, '');
+    span = ttsLines[rid];
+  }
+  if (!span || !text) return;
+  span.textContent += text;
+  const log = $('ttslog');
+  log.scrollTop = log.scrollHeight;
+}
+
+/** tts.end：整段合成时在这里补全文；流式下 text 为空，只做收尾。 */
+function finishTtsLine(rid, text) {
+  const span = ttsLines[rid];
+  if (!span) {                    // 没有 start 就到了 end（整段合成旧路径）
+    if (text) beginTtsLine(rid, text);
+    return;
+  }
+  if (text && !span.textContent) span.textContent = text;
+  delete ttsLines[rid];
 }
 
 /* ---------- 会话 ---------- */
@@ -766,16 +810,21 @@ $('btnStart').onclick = async () => {
             (m.phase === 'partial' ? '<i>' : '') + (m.text || '') +
             (m.phase === 'partial' ? '</i>' : '') + asrStateTag(m.state);
         } else if (m.type === 'tts.start') {
-          // 完整显示，不截断 —— 早先限制 80 字，长回复的字幕被砍掉。
-          // 用独立区域追加（ASR 的替换不会冲掉这里）。
+          // 新一句播报。**开一行空的占位**，文本随后由 tts.delta 累积填入
+          // （整段合成时文字在 tts.end 一次性到，那时再填）。
           //
-          // ⚠️ **流式合成下 `tts.start` 的 text 是空的**（发出时还只有第一个
-          //    delta，早发正是流式的意义），字幕要等 `tts.end` 带全文来补。
-          //    所以这里文本为空就不建行，避免留一个空的「播报」。
-          if (m.text) addTtsLine(m.text);
+          // ⚠️ 流式合成下 `tts.start` 的 text 必然是空的 —— 它是在 TTS
+          //    合成**之前**发的（这样那个往返才能藏在合成耗时里）。
+          //    早先这里「文本为空就不建行」，结果流式下整轮回复要等到
+          //    `tts.end` 才出现，看起来像"没有流式显示了"。
+          beginTtsLine(m.response_id, m.text);
+        } else if (m.type === 'tts.delta') {
+          // 流式文本增量：**边生成边显示**（这就是流式显示的意义）
+          appendTtsLine(m.response_id, m.text);
         } else if (m.type === 'tts.end') {
-          // 流式收尾：全文在这里才到（整段合成时 text 为空，不重复建行）
-          if (m.text) addTtsLine(m.text);
+          // 收尾：整段合成走这条（全文在这里一次性到）；流式下文字已经
+          // 由 tts.delta 填完，这里 text 为空、只做收尾
+          finishTtsLine(m.response_id, m.text);
         } else if (m.type === 'face.state') {
           drawFace(m);
         } else if (m.type === 'session.stats') {

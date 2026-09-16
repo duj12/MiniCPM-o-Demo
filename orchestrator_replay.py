@@ -860,6 +860,8 @@ class StatusOverlay:
         self.erle = None
         self.ref_ratio = 0.0
         self.tts_playing = 0          # 还在播的 TTS 段数
+        # 本轮流式播报的文本累计（`tts.delta` 逐段来，收尾时清空）
+        self.tts_text: List[str] = []
         self.tts_played_s = 0.0
 
     # ------------------------------------------------------------------ #
@@ -873,6 +875,19 @@ class StatusOverlay:
     def add_tts(self, text: str) -> None:
         """追加语义：新播报加一行（与网页 `ttslog` 一致）。"""
         if text:
+            self.tts_lines.append(text)
+
+    def append_tts(self, text: str) -> None:
+        """把流式增量接到**当前这一行**末尾（与网页的 tts.delta 一致）。
+
+        与 `add_tts` 的区别：那个新起一行，这个续写本行 —— 流式下一个回复
+        会被切成很多段，每段一行会碎得没法看。
+        """
+        if not text:
+            return
+        if self.tts_lines:
+            self.tts_lines[-1] += text
+        else:
             self.tts_lines.append(text)
             del self.tts_lines[:-self.max_tts_lines]
 
@@ -1276,11 +1291,18 @@ class OrchestratorReplayClient:
             rid = m["response_id"]
             self.player.begin_response(rid, m.get("text", ""),
                                        int(m.get("lead_ms") or self.lead_ms))
+            # ⚠️ 流式下 `tts.start` 的 text **必然是空的** —— 它是在 TTS
+            # 合成之前发的。早先这里无条件 `add_tts(text)`，于是每轮都先压
+            # 一行空的「播报」，真正的文字被挤到后面。现在只有非空才建行。
             if self.status is not None:
-                self.status.add_tts(m.get("text", ""))    # 追加语义（新起一行）
+                if m.get("text"):
+                    self.status.add_tts(m["text"])        # 追加语义（新起一行）
                 self.status.tts_playing += 1
             if self.verbose:
-                print(f"\n  [tts.start {rid}] {m.get('text','')[:60]}")
+                if m.get("text"):
+                    print(f"\n  [tts.start {rid}] {m['text'][:60]}")
+                else:
+                    print(f"\n  [tts.start {rid}]（流式，文本随后到） ", end="", flush=True)
 
         elif t == "tts.audio":
             rid = m["response_id"]
@@ -1304,8 +1326,31 @@ class OrchestratorReplayClient:
                 # started 只用于服务端比对承诺是否兑现（告警，不修正）
                 await self.send_playback(rid, "started", start_ctx=at)
 
+        elif t == "tts.delta":
+            # 流式文本增量。`tts.start` 是在 TTS 合成**之前**发的，那时
+            # 还没有文本，所以整段合成能打印的那一行打印不出东西 ——
+            # 文字只能从这里、或者收尾的 `tts.end` 拿。
+            txt = m.get("text", "")
+            if txt:
+                self.tts_text.append(txt)
+                if self.status is not None:
+                    self.status.append_tts(txt)
+                if self.verbose:
+                    print(txt, end="", flush=True)
+
         elif t == "tts.end":
             rid = m["response_id"]
+            # 整段合成（或流式收尾）在 `tts.end` 带全文；流式下文字已经由
+            # `tts.delta` 逐段打印过，这里 text 可能为空。
+            text = m.get("text") or ""
+            if text and not self.tts_text:
+                if self.status is not None:
+                    self.status.add_tts(text)
+                print(f"\n  [tts.end {rid}] {text[:80]}")
+            elif self.tts_text:
+                if self.verbose:
+                    print(f"   [{rid} 播报完成 {len(''.join(self.tts_text))} 字]")
+            self.tts_text = []
             self.player.end_response()
             if self.status is not None and self.status.tts_playing > 0:
                 self.status.tts_playing -= 1

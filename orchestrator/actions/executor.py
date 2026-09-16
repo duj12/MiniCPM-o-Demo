@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from ..protocol import TtsAudio, TtsCancel, TtsEnd, TtsStart
+from ..protocol import TtsAudio, TtsCancel, TtsDelta, TtsEnd, TtsStart
 from ..downstream.interface import Cancel, Emit, SendToOmni, Speak
 
 if TYPE_CHECKING:
@@ -143,6 +143,15 @@ class ActionExecutor:
                     "stream_id 被复用了", act.stream_id, len(act.text))
             else:
                 self._stream_text.append(act.text)
+                # 先推给 UI，再喂 TTS —— 字幕要**跟着 LLM 生成**走，
+                # 而不是等 `tts.end`（那样整轮说完才显示，等于没有流式）
+                rid = self._current_response_id
+                if rid:
+                    try:
+                        await session.send_to_client(
+                            TtsDelta(response_id=rid, text=act.text))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("发送 tts.delta 失败（忽略）: %s", exc)
                 self._stream.feed(act.text)
         if act.is_final and not self._stream_ended:
             self._stream_ended = True

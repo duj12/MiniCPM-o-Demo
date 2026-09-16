@@ -67,11 +67,17 @@ def main() -> int:
     check(len(acts) == 1, "逐字喂到句末标点 → 只吐 1 个 Speak（不是 5 个）")
     check(acts and acts[0].text == "你好世界。", "攒出的文本是完整的句子")
 
-    # 不到标点但够长 → 也要吐（否则长句首声一直等）
+    # 不到标点但够长 → 也要吐（否则长句首声一直等）。
+    # 用构造参数显式测边界，不去依赖默认值 —— 默认值会随调参变。
     d = PassthroughDownstream(mode="omni", streaming=True, flush_chars=14)
     acts = asyncio.run(feed_deltas([delta(c) for c in "一二三四五六七八九十甲乙丙丁"]))
     check(len(acts) == 1 and acts[0].text == "一二三四五六七八九十甲乙丙丁",
           f"无标点但够 {d.flush_chars} 字 → 也吐出去")
+
+    # 默认上限是 50（实测 265 字/秒下 ~190ms 就攒够，远快于兜底超时）
+    from orchestrator.downstream.passthrough import _FLUSH_CHARS, _FLUSH_SECONDS
+    check(_FLUSH_CHARS == 50, f"默认攒批上限 = {_FLUSH_CHARS}（期望 50）")
+    check(_FLUSH_SECONDS >= 0.3, f"兜底超时 = {_FLUSH_SECONDS}s（要能容忍 ~190ms 的停顿）")
 
     # 逗号**不是**句末，不该在那儿切（切了语调会怪）
     d = PassthroughDownstream(mode="omni", streaming=True)

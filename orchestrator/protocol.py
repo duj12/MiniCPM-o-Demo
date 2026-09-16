@@ -172,10 +172,26 @@ class TtsAudio:
 
 
 @dataclass
+class TtsDelta:
+    """流式合成时的**文本增量**（仅供 UI 字幕）。
+
+    TTS 是在 LLM 还在生成时就开跑的，所以 ``tts.start`` 出去时还没有文本。
+    这条消息让前端**边生成边显示**，而不是等整轮说完才一次性冒出来
+    （早先就是那样，看起来像"没有流式显示"）。
+
+    ⚠️ 它**不驱动播放** —— 播放完全由 ``tts.audio`` 决定。字幕比音频先到
+    是正常的（文本先产生，音频要等合成）。
+    """
+    response_id: str
+    text: str = ""
+    type: Literal["tts.delta"] = "tts.delta"
+
+
+@dataclass
 class TtsEnd:
     response_id: str
-    #: 本轮完整文本。**流式下这是唯一能拿到全文的地方** —— `tts.start` 发出时
-    #: 还只有第一个 delta（早发正是流式的意义），所以字幕要在 `tts.end` 补。
+    #: 本轮完整文本。整段合成时字幕在这里一次性到；流式下文字已经由
+    #: `tts.delta` 填过，这里可能为空（仅作收尾）。
     text: str = ""
     type: Literal["tts.end"] = "tts.end"
 
