@@ -1227,7 +1227,19 @@ class OrchestratorReplayClient:
 
     async def connect(self, identity: Optional[dict] = None) -> dict:
         import websockets
-        self.ws = await websockets.connect(self.url, max_size=64 * 1024 * 1024)
+        # ⚠️ 服务端已经上 HTTPS（wss），而证书是**自签**的 —— Python 的
+        #    ssl 默认会校验并直接抛 CERTIFICATE_VERIFY_FAILED。
+        #    这里对 wss 关掉校验，等价于浏览器里点"继续访问"。
+        #    （本工具是局域网自用，不做公网部署；真要严格校验就给它
+        #      配 --ssl-cafile 指向我们的 cert.pem。）
+        ssl_ctx = None
+        if self.url.startswith("wss://"):
+            import ssl as _ssl
+            ssl_ctx = _ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = _ssl.CERT_NONE
+        self.ws = await websockets.connect(
+            self.url, max_size=64 * 1024 * 1024, ssl=ssl_ctx)
         await self.ws.send(json.dumps({
             "type": "session.start",
             "identity": identity or {"page": "orchestrator-replay"},
@@ -1702,10 +1714,15 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     _tts_ok = client.speaker is not None and client.speaker.ok
     _src_ok = ((window is not None and window._speaker is not None)
                or (src_speaker is not None and src_speaker.ok))
-    print(f"  输入音频  ：{'开' if _src_ok else '关'}"
-          + ("" if play_src else "（--no-play-audio）"))
-    print(f"  TTS 声音  ：{'开' if _tts_ok else '关'}"
-          + ("" if play_tts else "（--no-play-tts）"))
+    # 关掉的原因可能是 --mute（一次关两个）也可能是各自的 --no-play-*，
+    # 提示别写死其中一个 —— 用 --mute 时会显示成"（--no-play-audio）"，
+    # 让人以为参数没生效。
+    _how = ("--mute" if not args.play_all
+            else "--no-play-audio" if not args.play_audio else "")
+    _how_t = ("--mute" if not args.play_all
+              else "--no-play-tts" if not args.play_tts else "")
+    print(f"  输入音频  ：{'开' if _src_ok else '关'}" + (f"（{_how}）" if _how else ""))
+    print(f"  TTS 声音  ：{'开' if _tts_ok else '关'}" + (f"（{_how_t}）" if _how_t else ""))
     if play_tts and not _tts_ok:
         err = client.speaker.err if client.speaker else "未启用"
         print(f"    ⚠️ TTS 放不出来：{err}")
@@ -2010,7 +2027,9 @@ async def main_async(args) -> int:
         face_frames = extract_frames(args.video, args.face_fps, FACE_MAX_W, FACE_MAX_H, 5)
         omni_frames = extract_frames(args.video, args.omni_fps, OMNI_MAX_W, OMNI_MAX_H, 5)
 
-    url = f"ws://{args.host}:{args.port}/v1/orchestrator"
+    # 默认 wss（服务端现在跑 HTTPS）。要连老式明文服务用 --ws。
+    scheme = "ws" if args.ws else "wss"
+    url = f"{scheme}://{args.host}:{args.port}/v1/orchestrator"
     print(f"连接 {url}")
     clock = VirtualClock()
 
@@ -2125,9 +2144,14 @@ def main() -> None:
     p.add_argument("--video", default="", help="视频文件（与 --audio 二选一）")
     p.add_argument("--host", default="127.0.0.1", help="编排服务地址（默认本机）")
     p.add_argument("--port", type=int, default=8100, help="编排服务端口（默认 8100）")
-    p.add_argument("--aec-mode", default="service",
+    p.add_argument("--ws", action="store_true",
+                   help="用明文 ws:// 连接（默认 wss://，与新服务端一致）。"
+                        "wss 下**不校验自签证书**，等价于浏览器点『继续访问』")
+    p.add_argument("--aec-mode", default="browser",
                    choices=["service", "browser", "off"],
-                   help="回声消除模式（service=算法服务 AEC，默认）")
+                   help="回声消除模式（默认 browser=浏览器原生 AEC）。"
+                        "⚠️ 本工具**不模拟声学回声**，AEC 模式对回放结果"
+                        "基本没影响，只影响发给服务端的会话配置")
     p.add_argument("--max-audio-s", type=float, default=None,
                    help="限制音频时长（秒），默认整段")
     p.add_argument("--audio-seconds", type=float, default=0.0,
