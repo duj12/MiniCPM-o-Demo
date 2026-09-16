@@ -872,7 +872,13 @@ class StatusOverlay:
         self.delay_ms = 0.0
         self.erle = None
         self.ref_ratio = 0.0
-        self.tts_playing = 0          # 还在播的 TTS 段数
+        self.tts_playing = 0          # 已开始、还没收到 tts.end 的段数
+        #: TTS **还要播多久**（秒），由主循环每帧写入。
+        #: ⚠️ 不能用 `tts_playing` 判断"在不在播"：`tts.end` 只表示音频
+        #: **送**完了，而流式下服务端是一次性把几十秒推完的 —— 实测
+        #: tts.start 在 8.8s、tts.end 在 11.0s，但音频还要响三十多秒。
+        #: 所以状态栏必须看**播放进度**，否则开播两秒后就显示"空闲"。
+        self.tts_remaining_s = 0.0
         # 本轮流式播报的文本累计（`tts.delta` 逐段来，收尾时清空）
         self.tts_text: List[str] = []
         self.tts_played_s = 0.0
@@ -952,7 +958,14 @@ class StatusOverlay:
         # if self.erle is not None:
         #     st.append(f"ERLE {self.erle:.1f}dB")
         # st.append(f"ferend {self.ref_ratio*100:.0f}%")
-        st.append(f"TTS {'播报中' if self.tts_playing else '空闲'}")
+        # ⚠️ 看**播放进度**不看到没到 tts.end —— 后者只表示音频送完了
+        #    （见 tts_remaining_s 的说明），用它会在开播两秒后就显示"空闲"
+        if self.tts_remaining_s > 0.05:
+            st.append(f"TTS 播报中 {self.tts_remaining_s:.0f}s")
+        elif self.tts_playing:
+            st.append("TTS 连接中")       # 已 start、音频还没到
+        else:
+            st.append("TTS 空闲")
         # ASR 五个状态量里的四个档位（transcript 就是下面那行字幕）
         s = self.asr_state
         if s:
@@ -1736,17 +1749,25 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                 await client.send_video_omni(omni_frames[oi % len(omni_frames)])
                 oi += 1
 
+            # TTS **还要播多久** —— 状态栏与"让路"判据都用它。
+            # ⚠️ 判"在不在播"必须看**播放进度**（remaining_s），不能看
+            #    `tts_playing`（到没到 tts.end）也不能看 `pending_s()`
+            #    （队列深度）：流式下服务端一次性把几十秒音频推完，
+            #    tts.end 在开播两秒就到了，队列也会立刻排空 —— 两个都
+            #    会误判成"空闲"，于是状态栏一直"空闲"、输入音频也不再让路。
+            tts_left = client.player.remaining_s()
+            if window is not None and window.status is not None:
+                window.status.tts_remaining_s = tts_left
+
             # ── 纯音频：TTS 在播时让路（**串行不重叠**）──
             # 两个 Speaker 同时开会抢输出设备（实测互相打架、谁都出不来声）。
             # 注意这里**只切暂停状态**，真正喂音频在上面那个 100ms 块里
             # （每 tick 喂会变成 12.5 倍速 → 卡顿）。
             if src_speaker is not None:
-                tts_busy = (client.speaker is not None
-                            and client.speaker.pending_s() > 0)
-                if tts_busy and not src_speaker_paused[0]:
+                if tts_left > 0.05 and not src_speaker_paused[0]:
                     src_speaker.stop()          # 丢弃积压，TTS 优先
                     src_speaker_paused[0] = True
-                elif not tts_busy and src_speaker_paused[0]:
+                elif tts_left <= 0.05 and src_speaker_paused[0]:
                     src_speaker_paused[0] = False
 
             # 插话：仅日志标记 —— 真正的打断由**服务端**新回复时的
