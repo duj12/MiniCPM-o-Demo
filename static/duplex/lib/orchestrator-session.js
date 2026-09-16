@@ -36,6 +36,11 @@
 
       /** TTS 播放器（由外部注入，需实现 playChunk/stop） */
       this.player = opts.player || null;
+      /** AudioContext 代号（页面建 context 时生成）—— 服务端据此丢弃
+       *  换 context 之前的锚点（那时 currentTime 会归零）。 */
+      this.epoch = opts.epoch || 0;
+      /** 服务端下发的播放提前量（session.ready.lead_ms）—— 唯一真源 */
+      this.leadMs = 200;
       /** 回执发送节流：每个 response 只在起播时报一次 started */
       this._playbackStarted = {};
       /** 统计 */
@@ -121,6 +126,7 @@
           if (msg.type === 'session.ready') {
             self.sessionId = msg.session_id;
             self.ready = true;
+            if (msg.lead_ms) self.leadMs = msg.lead_ms;
             if (!settled) {
               settled = true;
               clearTimeout(timer);
@@ -159,22 +165,37 @@
     _handle(msg) {
       const t = msg.type;
       if (t === 'tts.start') {
-        if (this.player && this.player.beginResponse) {
-          this.player.beginResponse(msg.response_id, msg.sample_rate);
-        }
         this._playbackStarted[msg.response_id] = false;
+        // 这里**只做初始化，不承诺起播时刻** —— 承诺要等第一块音频到达
+        // （见下面的 `armed` 回执）。tts.start 是在 TTS 合成**之前**发的，
+        // 那时算的"现在 + 提前量"到音频真到时早就过期了。
+        if (this.player && this.player.beginResponse) {
+          this.player.beginResponse(msg.response_id, msg.sample_rate,
+                                    msg.lead_ms || this.leadMs);
+        }
       } else if (t === 'tts.audio') {
         this.stats.ttsFrames += 1;
         const raw = atob(msg.audio_base64 || '');
         this.stats.ttsBytes += raw.length;
         if (this.player) {
-          const ok = this.player.playBase64
-            ? this.player.playBase64(msg.audio_base64, msg.sample_rate)
-            : null;
-          // 一旦起播就回报一次 started（驱动云端 AEC 的参考时钟）
+          let at = 0;
+          if (this.player.playBase64) {
+            // playBase64 返回**本句承诺的起播时刻**（首块音频到达时才
+            // 计算，所以必然在未来、兑现得了）
+            at = this.player.playBase64(msg.audio_base64, msg.sample_rate);
+          }
           if (!this._playbackStarted[msg.response_id]) {
             this._playbackStarted[msg.response_id] = true;
-            this._sendPlayback(msg.response_id, 'started', 0);
+            // ① armed：**承诺**起播时刻，服务端据此精确落位参考轨。
+            //    这才是服务端等着的那个值（它在 place() 之前等这个）。
+            if (at > 0) {
+              this._sendPlayback(msg.response_id, 'armed', 0,
+                                 { start_ctx: at });
+            }
+            // ② started：**实际排程时刻**，服务端只用来比对承诺是否兑现
+            //    （告警，不修正参考轨）。
+            this._sendPlayback(msg.response_id, 'started', 0,
+                               { start_ctx: this._firstAt() });
           }
         }
       } else if (t === 'tts.end') {
@@ -184,16 +205,39 @@
         this._sendPlayback(msg.response_id, 'ended', 0);
       } else if (t === 'tts.cancel') {
         if (this.player && this.player.stop) this.player.stop();
-        // 取消必须立即回执 —— 云端据此截断 AEC 参考轨
-        this._sendPlayback(msg.response_id, 'cancelled', 0);
+        // 取消立即回执，带上**实际播出了多少采样**与**实际停下的时刻** ——
+        // 云端据此把参考轨截到"真正播出过"的位置。
+        // ⚠️ 早先这里写死传 0（`sample_offset` 字段一直是断的），服务端
+        //    只能拿"当前时刻"猜，打断后新句往往已经开始落位 → 猜错就切到
+        //    新句上。用观测值就不存在这个问题。
+        const played = (this.player && this.player._playedOnStop) ||
+                       (this.player && this.player.playedSamples
+                        ? this.player.playedSamples() : 0);
+        this._sendPlayback(msg.response_id, 'cancelled', played || 0, {
+          start_ctx: this._firstAt(),
+          stop_ctx: this.player && this.player.now ? this.player.now() : 0,
+        });
       }
       this._emit(msg);
     }
 
-    /** 发送播放回执。ctx_time 用 AudioContext 当前时间。 */
-    _sendPlayback(responseId, phase, sampleOffset) {
+    /** 本句**实际排程**的起播时刻（ctx 秒）；播放器没提供时返回 0。 */
+    _firstAt() {
+      const p = this.player;
+      if (!p) return 0;
+      return p._firstAt || p.lastStartAt || 0;
+    }
+
+    /** 发送播放回执。
+     *
+     *  ``ctx_time`` 保留为"当前时刻"（旧字段，服务端已不再读它）。
+     *  真正驱动参考轨的是 ``extra.start_ctx`` / ``extra.stop_ctx``
+     *  —— 它们是浏览器时钟上的时刻，服务端会用锚点映射精确换算。
+     */
+    _sendPlayback(responseId, phase, sampleOffset, extra) {
       const ctxTime =
         this.player && this.player.now ? this.player.now() : 0;
+      const e = extra || {};
       this._send({
         type: 'playback',
         response_id: responseId,
@@ -201,12 +245,21 @@
         ctx_time: ctxTime,
         seq: 0,
         sample_offset: sampleOffset || 0,
+        start_ctx: e.start_ctx || 0,
+        stop_ctx: e.stop_ctx || 0,
+        epoch: this.epoch || 0,
       });
     }
 
     // ------------------------------------------------------------------ //
 
-    /** 送一个采集块。音频为 Float32Array（16kHz 单声道）。 */
+    /** 送一个采集块。音频为 Float32Array（16kHz 单声道）。
+     *
+     *  ``chunk.ctxTime`` 是本块**首采样**在 AudioContext 上的时刻 ——
+     *  服务端靠它拟合「浏览器时钟 ↔ 会话采样」的精确映射，参考轨才能落在
+     *  实际播出时刻上（见 capture-processor.js 的说明）。缺了它服务端只能
+     *  退回预测落位，回声对齐会不准。
+     */
     sendChunk(chunk) {
       if (!this.ready || this.closed) return;
       const audio = chunk.audio;
@@ -216,6 +269,8 @@
         type: 'audio',
         audio_base64: arrayBufferToBase64(buf),
         t_ms: 0,
+        ctx_time: chunk.ctxTime || 0,
+        epoch: this.epoch || 0,
       });
       this.stats.audioSent += 1;
 

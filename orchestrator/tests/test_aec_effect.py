@@ -11,21 +11,10 @@
 +0.7~+1.5 dB，AEC 并不会吞掉近端语音。
 
 本脚本保留作历史记录，不建议再据此下结论。
-"""
-
-实验设计：
-  1. 取一段真实语音 ``speech``
-  2. 构造 far（扬声器信号）与 mic = far 经延迟 D 衰减 + speech（近端）
-  3. 送进 AEC 服务（nearend=mic, farend=far）
-  4. 对比输出与输入的 ERLE，以及**近端语音是否被保留**
-
-两个必看的量：
-  · **ERLE**：回声被消掉多少 dB。太低（<6dB）说明 AEC 没干活。
-  · **近端保真**：近端语音的能量是否还在。如果 ERLE 很高但近端也没了，
-    那是「过度抑制」——听感上同样不可用。
 
     python -m orchestrator.tests.test_aec_effect --wav assets/ref_audio/ref_minicpm_signature.wav
 """
+
 from __future__ import annotations
 
 import argparse
@@ -39,7 +28,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from orchestrator.aec.client import DEFAULT_CHUNK, SR, AecClient  # noqa: E402
-from orchestrator.audio.ref_track import AcousticDelayTracker  # noqa: E402
+from orchestrator.tools.delay_estimate import AcousticDelayTracker  # noqa: E402
 
 DEFAULT_URL = "ws://192.168.88.253:30255/ws/asr_frontend"
 

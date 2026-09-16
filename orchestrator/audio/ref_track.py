@@ -2,22 +2,35 @@
 
 回答一个问题：**此刻从扬声器出来的是什么，在麦克风时钟上？**
 
-## 时间基准（曾经踩过的坑）
+## 时间基准（两代踩坑史，务必读完再改）
 
-参考轨的**所有位置一律用会话采样时钟**（``SampleClock`` 的计数），
-**绝不混用浏览器的 AudioContext 时间**。
+参考轨的**所有位置一律用会话采样时钟**（``SampleClock`` 的计数）。浏览器
+的 ``AudioContext`` 时间是**另一个时钟域**，只能经由
+``SampleClock.ctx_to_sample()`` 换算后使用，绝不直接当采样位置。
 
-早期实现把 ``clock.seconds()``（会话时钟秒）当成浏览器的 ``ctx_time``
-传给 ``place()``，而 ``ctx_to_sample()`` 会去减 ``_anchor_ctx``（浏览器
-时钟）—— 两个时钟域相减得到约 -1.3e7 的写入位置，``read()`` 因区间
-不相交而**恒返回 0**。结果：AEC 的 farend 一直是静音，回声完全不消，
-用户自己的 TTS 播报被 ASR 识别成说话。
+**第一代坑**：把 ``clock.seconds()``（会话时钟秒）当成浏览器的 ``ctx_time``
+传给 ``place()``，两个时钟域相减得到约 -1.3e7 的写入位置，``read()`` 因区间
+不相交而**恒返回 0**。结果：AEC 的 farend 一直是静音，回声完全不消。
+→ 教训：跨时钟域必须显式换算，不能想当然。
 
-现在的做法：播放起点由**服务端自己算** —— 送完音频时的会话位置 +
-播放提前量（``playback_delay_ms``）。这比用浏览器回执换算更稳，因为
-回执要跨两个时钟域且有网络往返；而播放提前量是我们在配置里约定的常量。
-浏览器回执仍用于**取消/结束时的截断**（那只需"从现在起"的语义，不依赖
-绝对对齐）。
+**第二代坑（本次修复）**：为绕开跨域换算，改成由服务端**预测**播放起点 ——
+「送音频时的 ``clock.now()`` + 播放提前量」。但 ``clock.now()`` 只由浏览器
+送来的 100ms mic 块推进，**比真实时刻慢 0~100ms 且逐块抖动**（浏览器主线程
+同时在跑 25fps 抓帧）；而浏览器是收到 ``tts.audio`` 后 ``ctx.currentTime +
+提前量`` 起播。两边隔着一整个网络往返 + 浏览器处理耗时 + mic 在途积压，
+且这个误差**逐句变化** —— 固定常量 D 吸收不了变化量，于是「第一句碰巧对上、
+后面就散掉」。
+→ 教训：**预测跨时钟域的时刻是不可行的**，要把时刻从浏览器那边问出来。
+
+**现在的做法**：浏览器在 ``tts.start`` 之后**承诺**起播时刻
+（``playback{phase:'armed', start_ctx}``，此时音频还没到，往返藏在 TTS 合成
+的 508ms 首帧延迟里，零额外代价），服务端用 ``ctx_to_sample()`` 把它换算成
+会话采样位置再 ``place()``。``ctx_to_sample`` 靠每个 mic 块自带的
+``ctx_time`` 拟合，是一条**精确**映射（两个时钟域数的是同一路 16kHz 流）。
+
+副作用（好的那种）：网络、浏览器主线程抖动、mic 在途积压**全部从 D 里剔除**，
+D 退化成「扬声器→麦克风的物理延迟 + 设备音频 I/O 缓冲」—— 每台设备一个
+**固定常量**，离线测一次即可（``tests/measure_delay.py``）。
 
 ## 声学延迟补偿
 
@@ -46,6 +59,30 @@ logger = logging.getLogger(__name__)
 
 # TTS 服务的输出采样率（实测确认：24kHz int16）
 TTS_SR = 24000
+
+
+def _subtract(lo: int, hi: int, spans: List[tuple]) -> List[tuple]:
+    """从区间 ``[lo, hi)`` 中挖掉 ``spans`` 覆盖的部分，返回剩余子区间。
+
+    用于"只清自己的区间、不碰别人的" —— 打断后的二次校正（``resize``）
+    必须避免清掉期间落位的其它 response（新句的音频是真会播出来的，
+    清掉就是"有回声、没 farend"）。
+    """
+    pieces = [(lo, hi)]
+    for s0, s1 in spans:
+        nxt: List[tuple] = []
+        for a, b in pieces:
+            if s1 <= a or s0 >= b:          # 不相交
+                nxt.append((a, b))
+                continue
+            if a < s0:                      # 左边残留
+                nxt.append((a, s0))
+            if s1 < b:                      # 右边残留
+                nxt.append((s1, b))
+        pieces = nxt
+        if not pieces:
+            break
+    return pieces
 
 
 @dataclass
@@ -78,10 +115,16 @@ class RefTrack:
         self._rs = (StatefulResampler(tts_sr, sr) if tts_sr != sr
                     else PassthroughResampler())
 
-        # 声学路径延迟（采样数）。由 AcousticDelayTracker 更新。
+        # 声学路径延迟（采样数）—— **每台设备一个固定常量**，离线测一次
+        # （`tests/measure_delay.py`，用 `ORCH_DUMP_AUDIO` 的 dump 算），
+        # 经 ORCH_AEC_DEFAULT_DELAY_MS 或 DelayStore 注入。运行时不再自适应：
+        # 实测该估计器在真机上收敛不了，且一旦被噪声假峰钉死就会**永久失效**。
         self.delay_samples = 0
         # 已落位的区间（按 response 分组），供 truncate 用
         self._placed: Dict[str, List[PlaybackChunk]] = {}
+        # 落位跨度（不在 _placed 里也能查）—— 供 resize() 二次校正用
+        self._span_start: Dict[str, int] = {}
+        self._span_end: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
 
@@ -107,8 +150,12 @@ class RefTrack:
         """把一段 TTS PCM 落位到轨上。
 
         ``at_sample``：**会话采样时钟**上"开始出声"的位置。
-        由调用方按 ``clock.now() + playback_delay_samples`` 计算，
-        **不要**传浏览器的 ``ctx_time``。
+
+        ⚠️ 它必须来自 ``clock.ctx_to_sample(浏览器承诺的 start_ctx)``，
+        而**不是** ``clock.now() + 提前量`` —— 后者的误差（网络往返 +
+        浏览器主线程抖动 + mic 在途积压）逐句变化，常量 D 吸收不了，
+        正是"回声第一句好、后面失效"的根因。只有当浏览器没上报锚点时
+        （旧客户端 / context 被挂起）才退回预测，且要标 `anchor_source`。
 
         ⚠️ **量纲统一到 [-1, 1]**：TTS 服务返回的是 int16 PCM
         （实测幅度 ±18000，见 tests/README.md），而麦克风（nearend）是
@@ -128,6 +175,13 @@ class RefTrack:
             t0=at_sample, t1=at_sample + x16.shape[0], at_sample=at_sample,
         )
         self._placed.setdefault(response_id, []).append(chunk)
+        # 记住落位跨度 —— `resize()` 要在 `truncate()` 把区间从 _placed
+        # 移除**之后**仍能定位并二次校正（打断 → 收到回执 → 按实测播出量
+        # 重新对齐）。参考轨是 30s 环形缓冲，这段时间内数据不会过期。
+        lo, hi = self._span_start.get(response_id), self._span_end.get(response_id)
+        self._span_start[response_id] = at_sample if lo is None else min(lo, at_sample)
+        end = at_sample + x16.shape[0]
+        self._span_end[response_id] = end if hi is None else max(hi, end)
         return chunk
 
     def started_at(self, response_id: str) -> Optional[int]:
@@ -138,13 +192,74 @@ class RefTrack:
         其实会把它播出来（已 `node.start()` 排程的 buffer 无法取消）。
         取 min(当前时刻, 起播点) 才是正确的截断位置。
 
-        ⚠️ 注意这里返回的是**预测**的起播点（落位时按约定的播放提前量算
-        的），不是浏览器的 `ctx_time` 回执 —— 两者跨时钟域，不能混用。
+        落位时刻现在是**精确**的（来自浏览器的 armed 承诺），所以这个起点
+        就是"确实开始出声"的位置；只有降级到预测路径时才带预测误差。
         """
         chunks = self._placed.get(response_id)
         if not chunks:
             return None
         return min(c.t0 for c in chunks)
+
+    def resize(self, response_id: str, keep_samples: int) -> int:
+        """把某 response 落位内容的**有效长度**截到 ``keep_samples``。
+
+        与 ``truncate`` 的区别：不要求该 response 还在 ``_placed`` 里 ——
+        用于打断一次之后，**再用前端实测的播出量校正**（见
+        ``session.on_playback_receipt`` 的 `sample_offset` 分支）。
+
+        动机（用户指出的关键点）：参考轨应当严格跟随**实际播出**。打断
+        那一刻我们只有**预测**（`clock.now()`），真实播出量要等浏览器的
+        回执；回执到达时参考轨已经被截过一次（区间也从 ``_placed`` 移除
+        了），所以需要记下落位起点、按"起点 + 实测播出量"重新对齐。
+
+        参考轨是 30s 环形缓冲、写入区间不会过期，所以这里可以安全地
+        二次校正。返回被清零的采样数。
+        """
+        lo = self._span_start.get(response_id)
+        hi = self._span_end.get(response_id)
+        if lo is None or hi is None:
+            return 0
+        # ⚠️ 上界必须用**本 response 自己的** span_end，不能退回全局
+        # `written_span()` —— 那会一路清到轨上最新写入的位置，把**期间
+        # 落位的其它 response（新句）一起清掉**。实测踩过：新句 3.0s → 0。
+        cut = lo + max(0, int(keep_samples))
+        if hi <= cut:
+            return 0
+        # ⚠️ 逐 chunk 清，且**跳过被其它 response 占用的区间** ——
+        # 打断后新句往往紧跟着落位，两者在时间轴上可能重叠（真机里新句
+        # 通常排在旧句之后，但调度抖动/时钟推进慢时就会压上）。无差别清
+        # `[cut, span_end)` 会把新句一起清掉（实测：新句 3.0s → 0）。
+        cleared = 0
+        spans = self._other_spans(response_id)
+        for c in self._placed.get(response_id, []):
+            for lo_c, hi_c in _subtract(c.t0, c.t1, spans):
+                s0, s1 = max(lo_c, cut), hi_c
+                if s1 <= s0:
+                    continue
+                self.buf.zero_range(s0, s1)
+                cleared += s1 - s0
+        # 该 response 已被 truncate 移除（_placed 里没有）时，退化到
+        # "只清本 response 自己的记录区间"
+        if not self._placed.get(response_id):
+            for lo_c, hi_c in _subtract(lo, min(hi, self._span_end.get(response_id, hi)),
+                                        spans):
+                s0, s1 = max(lo_c, cut), hi_c
+                if s1 <= s0:
+                    continue
+                self.buf.zero_range(s0, s1)
+                cleared += s1 - s0
+        self._span_end[response_id] = min(hi, cut)
+        return cleared
+
+    def _other_spans(self, exclude: str) -> List[tuple]:
+        """其它 response 占用的区间（供避免误伤）。"""
+        out = []
+        for rid, chunks in self._placed.items():
+            if rid == exclude:
+                continue
+            for c in chunks:
+                out.append((c.t0, c.t1))
+        return out
 
     def truncate(self, response_id: str,
                  from_sample: Optional[int] = None) -> int:
@@ -208,157 +323,6 @@ class RefTrack:
     def reset(self) -> None:
         self._rs.reset()
         self._placed.clear()
+        self._span_start.clear()
+        self._span_end.clear()
         self.delay_samples = 0
-
-
-class AcousticDelayTracker:
-    """估计扬声器→麦克风的声学路径延迟 D（GCC-PHAT）。
-
-    ⚠️ 必须由我方处理：AEC 服务把 nearend/farend 按**相同偏移**推入，
-    即假定两者已样本对齐。仓库里的 ``GCCPHATDelayEstimator`` 从未被流式
-    路径 import，且它依赖的 ``xmov_aec/config/aec_config.py`` 在仓库里
-    **不存在**（死代码），故此处重新实现。
-
-    约定：``mic[t] ≈ ref[t - d]`` 时返回 d，即 **ref 领先 mic** d 个采样
-    （mic 是 ref 的延迟副本）。
-    """
-
-    def __init__(self, sr: int = SR, max_delay_ms: float = 300.0,
-                 median_window: int = 15) -> None:
-        self.sr = sr
-        self.max_delay = int(sr * max_delay_ms / 1000.0)
-        self._history: List[int] = []
-        self._median_window = median_window
-        self.delay = 0
-        self.estimates = 0
-        # 最近一次 estimate() 的失败原因 / 置信度 —— 供调用方分级记日志。
-        # ⚠️ 没有这两个字段时，"估不出来"是完全静默的：下面的形状校验
-        # 曾经因为契约不符而**每次直接 return None**，整条自适应延迟路径
-        # 因此从未生效，却没有任何日志能看出来（潜伏了很久）。
-        self.last_reason: Optional[str] = None
-        self.last_ratio: float = 0.0
-
-    def estimate(self, mic: np.ndarray, ref_earlier: np.ndarray,
-                 offset: int = 0, min_ratio: float = 1.5) -> Optional[int]:
-        """估计 mic 中回声的延迟 D_path（采样）。
-
-        **信号约定**（很关键，错了会恒报 0）：
-
-          · ``mic[j]`` 对应绝对时间 ``T0 + j``
-          · ``ref_earlier[i]`` 对应绝对时间 ``T0 - offset + i``
-            —— 参考窗必须**覆盖更早的时间**，因为 mic 里的回声来自
-            ``D_path`` 之前的播放
-
-        返回的 ``D_path`` 满足
-        ``mic[j] ≈ ref_earlier[j + offset - D_path]``。
-        ``offset == D_path`` 时两者恰好对齐。
-
-        **两种窗口几何**（由 ``offset`` 选择，都可以，但含义不同）：
-
-          · ``offset > 0``（**生产链路用这个**）：参考窗比 mic 多出
-            ``offset`` 个采样，显式覆盖 mic 窗之前的时间。此时
-            ``D_path ∈ [0, offset]``。互相关搜 ``k ∈ [-offset, 0]``。
-            ⚠️ 早先这里写的是 ``mic.shape != ref_earlier.shape``（要求
-            等长），而调用方按这个几何传的是 ``N`` 与 ``N + offset`` ——
-            于是**每次调用都在形状校验处返回 None**，自适应延迟估计整条
-            路径从未生效过。
-
-          · ``offset == 0``：等长窗口（离线分析：手上只有一段录音）。
-            此时依赖"回声落在窗口内部"的部分重叠，``D_path ∈ [0, search]``。
-            互相关搜 ``k ∈ [0, search]``。
-        """
-        self.last_reason = None
-        self.last_ratio = 0.0
-        offset = int(offset)
-        n_mic = int(mic.shape[0])
-
-        if ref_earlier.shape[0] != n_mic + offset:
-            self.last_reason = (
-                f"形状不符：mic={n_mic} ref={ref_earlier.shape[0]}，"
-                f"期望 ref=mic+offset={n_mic + offset}"
-            )
-            return None
-        if n_mic < 2048:
-            self.last_reason = f"mic 窗过短（{n_mic} < 2048）"
-            return None
-        if float(np.sqrt(np.mean(ref_earlier ** 2))) < 1e-4:
-            self.last_reason = "参考窗近似静音 —— 不在播放窗口内"
-            return None
-        if float(np.sqrt(np.mean(mic ** 2))) < 1e-5:
-            self.last_reason = "麦克风近似静音"
-            return None
-
-        # ⚠️ 线性互相关不能循环卷绕：需要 n_fft ≥ len(mic) + len(ref) - 1。
-        # 早先按 2*len(mic) 算，在 ref 变长（= mic + offset）后会卷绕 ——
-        # 真峰被折到错误的 lag 上，表现为测出的延迟离谱但置信度不低。
-        n_fft = 1
-        while n_fft < n_mic + ref_earlier.shape[0]:
-            n_fft <<= 1
-
-        X = np.fft.rfft(mic, n_fft)
-        Y = np.fft.rfft(ref_earlier, n_fft)
-        # GCC-PHAT：只保留相位，对幅度差异不敏感
-        R = X * np.conj(Y)
-        mag = np.abs(R)
-        mag[mag < 1e-10] = 1e-10
-        cc = np.fft.irfft(R / mag, n_fft)
-
-        # cc[k] = Σ_j mic[j]·ref[j-k]，即峰值在 k 处表示
-        # mic[j] ≈ ref[j-k]。代入上面的约定得 **D = k + offset**。
-        if offset > 0:
-            search = min(offset, self.max_delay, n_fft // 2 - 1)
-            if search < 1:
-                self.last_reason = f"搜索窗为空（offset={offset}, n_fft={n_fft}）"
-                return None
-            # D ∈ [0, offset] → k ∈ [-search, 0]：只搜负 lag（含 k=0，
-            # 它对应端点 D == offset）。正 lag 是 mic 领先 ref，在这个
-            # 几何下非物理，搜它只会引入假峰。
-            cand = np.concatenate([
-                np.abs(cc[n_fft - search:]),        # k = -search .. -1
-                np.abs(cc[:1]),                     # k = 0
-            ])
-            d_max = offset
-        else:
-            search = min(self.max_delay, n_fft // 2 - 1)
-            if search < 1:
-                self.last_reason = f"搜索窗为空（n_fft={n_fft}）"
-                return None
-            cand = np.abs(cc[: search + 1])        # k = 0 .. search
-            d_max = search
-
-        peak_i = int(np.argmax(cand))
-        k = peak_i - (search if offset > 0 else 0)
-
-        tmp = cand.copy()
-        lo = max(0, peak_i - 2)
-        tmp[lo:peak_i + 3] = 0
-        ratio = float(cand[peak_i] / tmp.max()) if tmp.max() > 0 else 0.0
-        self.last_ratio = ratio
-        # 置信度：峰值须显著高于次峰
-        if tmp.max() > 0 and cand[peak_i] < min_ratio * tmp.max():
-            self.last_reason = f"相关峰不明显（峰比 {ratio:.2f} < {min_ratio}）"
-            return None
-
-        d_path = k + offset
-        if d_path < 0 or d_path > d_max:
-            self.last_reason = f"估计值 {d_path} 超出物理范围 [0, {d_max}]"
-            return None
-        if d_path > self.max_delay:
-            logger.warning(
-                "声学延迟估计 %d 采样（%.0fms）超出 max_delay=%d —— "
-                "可能是选错峰，仍会采纳但请留意",
-                d_path, d_path / self.sr * 1000, self.max_delay,
-            )
-        self._history.append(d_path)
-        if len(self._history) > self._median_window:
-            self._history.pop(0)
-        self.estimates += 1
-        self.delay = int(np.median(self._history))
-        return d_path
-
-    def reset(self) -> None:
-        self._history.clear()
-        self.delay = 0
-        self.estimates = 0
-        self.last_reason = None
-        self.last_ratio = 0.0

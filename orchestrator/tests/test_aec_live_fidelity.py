@@ -21,7 +21,8 @@ nearend/farend 是否样本级对齐**。
 
 1. **扫 D**：ERLE 随 D 的变化曲线 —— 把"错位 = 失效"从推断变成数字。
    预期 D 对齐时 9~11dB，错位 166ms（250 默认值 vs 84ms 真值）掉到 1~2dB。
-2. **自动收敛**：跑**修好的** ``AcousticDelayTracker``，断言它从同一批
+2. **延迟可估**：跑 ``tools/delay_estimate.py`` 的 ``AcousticDelayTracker``，
+   断言它从同一批
    信号里恢复出最优 D —— 证明线上能自己找到这个值，不必靠猜。
 3. **与 golden 对比**：同一对 (far, near)，一路走"离线完美对齐"（golden），
    一路走上面的线上语义重建，断言两者 ERLE 接近，并把 wav 落盘供试听。
@@ -46,10 +47,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from orchestrator.aec.client import DEFAULT_CHUNK, SR, AecClient  # noqa: E402
-from orchestrator.audio.ref_track import (  # noqa: E402
-    AcousticDelayTracker,
-    RefTrack,
-)
+from orchestrator.audio.ref_track import RefTrack  # noqa: E402
+# 估计器已从实时路径迁到 tools/（离线测 D 用）。这里仍然拿**线上重建的
+# 信号**验证它 —— 只不过"验证对象"从"运行时自适应"变成了"离线工具"。
+from orchestrator.tools.delay_estimate import AcousticDelayTracker  # noqa: E402
 
 DEFAULT_URL = "ws://192.168.88.253:30255/ws/asr_frontend"
 PLAYBACK_DELAY_MS = 200        # 与 config.playback_delay_ms / 前端 nextAt 一致
@@ -353,7 +354,7 @@ async def main_async(args) -> int:
     tracker = AcousticDelayTracker(sr=SR, max_delay_ms=args.max_delay_ms)
     dmax = int(tracker.max_delay)
     WINDOW = SR
-    # 与 session._maybe_update_delay 完全相同的取窗方式
+    # 与 measure_delay.py 相同的取窗方式（1s 窗 + 前移一个 dmax 的参考）
     t = dmax + WINDOW
     while t + WINDOW <= len(mic_a):
         m = mic_a[t - WINDOW:t]

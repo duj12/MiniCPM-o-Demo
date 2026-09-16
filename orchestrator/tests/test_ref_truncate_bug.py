@@ -24,8 +24,18 @@
 于是"当前位置"远在整段音频之前 → 整段被清掉，只剩到达那一刻的一小截。
 
 **播放是排程好的**（WebAudio 按 nextAt 连续排），``ended`` 只表示"音频
-已全部交给播放器"，**不代表已经播完**。只有 ``cancelled`` 才是真的没播、
-必须立刻清（否则 AEC 会追一个不存在的回声，比不给参考更糟）。
+已全部交给播放器"，**不代表已经播完**。
+
+## 结论：**回执一律不截断参考轨**
+
+`ended` 之后又发现 `cancelled` 也截同样有害：回执绕一圈回来时**新句往往
+已经开始落位**，此时再按 ``clock.now()`` 切一刀会把**新句**的参考切掉一截
+（实测新句 3.0s → 1.98s），新回复的回声又对不上。
+
+截断是**服务端在动作发生那一刻**的职责 —— 见
+``ActionExecutor._interrupt_current``，它用 ``max(now, started)`` 精确区分
+"还没起播"（整句清干净）与"已播到中途"（保留已播部分）。
+回执只用于驱动 downstream 事件。
 
     python -m orchestrator.tests.test_ref_truncate_bug
 """
@@ -95,16 +105,28 @@ async def test_ended_keeps_reference() -> None:
           "早先这里只剩 0.6s")
 
 
-async def test_cancelled_still_truncates() -> None:
-    print("== playback.cancelled 仍必须截断（barge-in 关键）==")
+async def test_cancelled_receipt_does_not_truncate() -> None:
+    """`cancelled` 回执也**不得**截断参考轨。
+
+    ⚠️ 这条断言与早先相反，是**故意**改的。回执里按 `clock.now()` 截断
+    踩过两次：
+      · `ended` 也截 → 整段参考被清（本文件的主 bug）
+      · `cancelled` 也截 → 回执绕一圈回来时**新句往往已开始落位**，
+        再切一刀会把新句的参考切掉一截（实测 3.0s → 1.98s）
+
+    截断是**服务端在动作发生那一刻**的职责，见
+    `ActionExecutor._interrupt_current`（用 `max(now, started)` 精确区分
+    "还没起播"与"已播到中途"）。回执只用于驱动 downstream 事件。
+    """
+    print("== 回执一律不截断参考轨 ==")
     s = _make_session()
     _place_long_tts(s, 5.85, 137600)
     s.clock.advance(1600)
     await s.on_playback_receipt("r1", "cancelled", 0.0, 0)
     kept = _nonzero_seconds(s)
-    check(kept < 0.5,
-          f"cancelled 之后参考被截断（剩 {kept:.2f}s < 0.5s）—— "
-          "否则 AEC 会追一个不存在的回声")
+    check(kept > 5.0,
+          f"cancelled 回执未截断参考（保留 {kept:.2f}s）—— "
+          "截断由 executor 在动作发生那一刻完成，不等网络回执")
 
 
 async def main_async() -> int:
@@ -113,7 +135,7 @@ async def main_async() -> int:
     print("-" * 70)
     await test_ended_keeps_reference()
     print()
-    await test_cancelled_still_truncates()
+    await test_cancelled_receipt_does_not_truncate()
     print("=" * 70)
     if _failures:
         print(f"FAILED: {len(_failures)} 项")

@@ -95,6 +95,83 @@ def test_track_buffer() -> None:
     check(np.allclose(got, np.arange(70, 120)), "超长写入保留尾部")
 
 
+def test_ctx_anchor_mapping() -> None:
+    """浏览器 ctx 时钟 → 会话采样 的仿射映射。
+
+    这是本次 AEC 修复的**数学核心**：参考轨必须落在这条映射换算出来的
+    位置，而不是"收到音频的时刻 + 提前量"。后者含网络往返与浏览器主线程
+    抖动，**逐句变化**，固定常量 D 吸收不了 —— 表现为"第一句回声消得掉、
+    后面就失效"。
+    """
+    print("== ctx → 会话采样 锚点映射 ==")
+
+    # ① 精确映射（理想设备）：sample = (ctx - 100) * 16000
+    c = SampleClock()
+    C0 = 100.0
+    for i in range(8):
+        c.record_anchor(C0 + i * 0.1, i * 1600)
+    got = c.ctx_to_sample(C0 + 5.0 + 0.3)          # → 5.3s * 16000 = 84800
+    check(got == 84800, f"精确映射换算（得到 {got}，期望 84800）")
+    check(c.anchor_residual_ms() < 0.1,
+          f"残差 ≈0（{c.anchor_residual_ms():.4f} ms）")
+
+    # ② 块间隔 100ms **不是**量化误差来源 —— 锚点是精确的对应点对，
+    #    换算任意时刻都准。这条是它和"用锚点估算当前偏移"的本质区别。
+    #    构造一个"半块相位"的锚点序列，仍应精确。
+    c2 = SampleClock()
+    for i in range(8):
+        c2.record_anchor(C0 + 0.037 + i * 0.1, i * 1600)
+    got2 = c2.ctx_to_sample(C0 + 0.037 + 4 * 0.1 + 0.05)
+    check(abs(got2 - (4 * 1600 + 800)) <= 1,
+          f"带块相位仍精确（得到 {got2}，期望 {4*1600+800}）")
+
+    # ③ 设备时钟漂移 100ppm：拟合斜率必须吃下它。
+    #    若"假定斜率=16000、只取偏移中位数"，连续两次播放相隔 15s 会偏
+    #    ≈2.4 采样（0.15ms）—— 直观上很小，但容忍窗只有 ±5ms，且它是
+    #    单边累积的（不是随机误差，不会互相抵消）。
+    c3 = SampleClock()
+    a_true = SR * (1 + 100e-6)
+    for i in range(32):
+        ctx = C0 + i * 0.1
+        c3.record_anchor(ctx, round(a_true * (ctx - C0)))
+    far = c3.ctx_to_sample(C0 + 15.0)
+    check(far is not None and abs(far - round(a_true * 15.0)) <= 1,
+          f"100ppm 漂移下 15s 处仍准（得到 {far}，期望 {round(a_true*15)}）")
+
+    # ④ 斜率离谱（context 换了 / 采样率变了）→ 必须**拒绝**而不是硬算
+    c4 = SampleClock()
+    for i in range(8):
+        c4.record_anchor(C0 + i * 0.1, i * 1600 * 3)   # 3 倍速率
+    check(c4.ctx_to_sample(C0 + 1.0) is None,
+          "斜率离谱时返回 None（不拿错误映射去落位）")
+
+    # ⑤ 锚点不足（<3）→ None
+    c5 = SampleClock()
+    c5.record_anchor(C0, 0)
+    c5.record_anchor(C0 + 0.1, 1600)
+    check(c5.ctx_to_sample(C0 + 0.2) is None, "锚点不足 3 个时返回 None")
+
+    # ⑥ epoch 切换：换 context 后 currentTime 归零，旧锚点必须作废
+    c6 = SampleClock()
+    for i in range(8):
+        c6.record_anchor(C0 + i * 0.1, i * 1600, epoch=1)
+    check(c6.ctx_to_sample(C0 + 1.0, epoch=2) is None,
+          "异 epoch 的换算被拒绝")
+    # 新 context 从 0 开始。⚠️ 恰为 0 的那**一个**块会被哨兵值规则丢掉，
+    # 所以这里从第 1 块起算 —— 32 块窗口里少一个无影响。
+    for i in range(1, 9):
+        c6.record_anchor(0.0 + i * 0.1, i * 1600, epoch=2)
+    check(c6.anchor_count() == 8, f"换 epoch 后旧锚点被清空（{c6.anchor_count()} 个）")
+    got6 = c6.ctx_to_sample(0.5, epoch=2)
+    check(got6 == 8000, f"新 epoch 映射正确（得到 {got6}，期望 8000）")
+
+    # ⑦ ctx_time <= 0 的锚点被忽略（未上报时前端传 0）
+    c7 = SampleClock()
+    for i in range(8):
+        c7.record_anchor(0.0, i * 1600)
+    check(c7.anchor_count() == 0, "ctx_time=0 的锚点被忽略（未上报场景）")
+
+
 def test_resampler() -> None:
     print("== StatefulResampler (24000 -> 16000) ==")
     n = 24000
@@ -137,6 +214,7 @@ def test_resampler() -> None:
 def main() -> None:
     test_clock()
     test_track_buffer()
+    test_ctx_anchor_mapping()
     test_resampler()
     print()
     if _failures:

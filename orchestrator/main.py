@@ -199,10 +199,13 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                                  tts_type=cfg.tts_type,
                                  speaker_id=cfg.tts_speaker_id)
 
-    # ---- 参考轨 + 延迟估计 ----
-    from orchestrator.audio.ref_track import AcousticDelayTracker, RefTrack
+    # ---- 参考轨 ----
+    # ⚠️ 这里**不再**装配 AcousticDelayTracker。D 是每台设备离线测一次的
+    # 固定常量（见 config.aec_default_delay_ms 与 tests/measure_delay.py），
+    # 运行时自适应已证实会在真机上被噪声假峰钉死并永久失效。
+    # 估计器本身还在（orchestrator/tools/delay_estimate.py），供离线工具用。
+    from orchestrator.audio.ref_track import RefTrack
     sess.ref_track = RefTrack()
-    sess.delay_tracker = AcousticDelayTracker()
 
     # ---- downstream（本阶段用桩）----
     from orchestrator.downstream.passthrough import PassthroughDownstream
@@ -328,6 +331,11 @@ async def handle_client(ws, cfg: Settings) -> None:
         sess = await build_session(sid, cfg, send_to_client, hello)
         identity = hello.get("identity", {}) or {}
         sess.config["identity"] = identity
+        # 客户端能力位。有 ``playback_anchor`` 才会等浏览器的 armed 承诺
+        # （精确落位）；没有则完全走原来的预测路径，零回归。
+        sess.client_caps = set(hello.get("caps") or [])
+        logger.info("[%s] 客户端能力: %s", sid,
+                    sorted(sess.client_caps) or "（无 —— 参考轨将用预测落位）")
         # 前端可覆盖 AEC 模式（用户在 UI 上选）。
         # build_session 时还不知道用户的选择（hello 在这之后才读到），
         # 所以若模式从 browser 变成 service，这里补建 AEC 客户端。
@@ -450,7 +458,11 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
     t = msg.get("type")
     if t == "audio":
         x = decode_audio_b64(msg.get("audio_base64", ""))
-        await sess.on_audio(x, msg.get("t_ms", 0))
+        # ctx_time/epoch 是浏览器 AudioContext 的锚点 —— 参考轨靠它做
+        # 跨时钟域换算，缺了就只能退回预测落位（误差逐句变化）。
+        await sess.on_audio(x, msg.get("t_ms", 0),
+                            float(msg.get("ctx_time") or 0.0),
+                            int(msg.get("epoch") or 0))
     elif t == "video_face":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))
@@ -460,9 +472,16 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
         raw = base64.b64decode(msg.get("frame_base64", ""))
         await sess.on_video_omni(raw, msg.get("t_ms", 0))
     elif t == "playback":
+        # ⚠️ `sample_offset` 必须传下去 —— 它是前端报的「**实际播出**了
+        # 多少采样」，是参考轨唯一可靠的观测值。早先这里漏传，服务端只能
+        # 拿 `clock.now()` 猜，打断后新句往往已开始落位 → 猜错就切到新句。
         await sess.on_playback_receipt(
             msg.get("response_id", ""), msg.get("phase", "started"),
             float(msg.get("ctx_time", 0.0)), int(msg.get("seq", 0)),
+            int(msg.get("sample_offset") or 0),
+            start_ctx=float(msg.get("start_ctx") or 0.0),
+            stop_ctx=float(msg.get("stop_ctx") or 0.0),
+            epoch=int(msg.get("epoch") or 0),
         )
     elif t == "calibrate":
         await sess.start_calibration()

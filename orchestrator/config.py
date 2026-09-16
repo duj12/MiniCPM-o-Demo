@@ -62,19 +62,28 @@ class Settings:
     aec_mode: str = field(default_factory=lambda: os.environ.get(
         "ORCH_AEC_MODE", "service"))
 
-    # 声学延迟（毫秒）的冷启动默认值。没有历史记录时用它，
-    # 会话内测得真实值后会自适应更新并持久化（见 delay_store.py）。
+    # 声学延迟 D（毫秒）—— **每台设备一个固定常量**，离线测一次。
     #
-    # 250 是历史默认值。曾经改成 0（理由是"参考轨落位已含 200ms 播放
-    # 提前量，D 应当只是纯声学延迟"），但那只是**推断**，且真机上自适应
-    # 估计一次都没成功过（峰比恒 ≈1.0，mic 与参考轨完全不相关），无从
-    # 验证哪个更接近真值。在没有实测依据前先用回 250 —— 这个值至少是
-    # 之前被当作"能用"的那个。
+    # 为什么是常量而不是运行时自适应：AEC 的容忍窗只有 ±5ms，而自适应
+    # 估计器在真机（iPhone）上收敛不了（峰比恒 ≈1.0）；更糟的是它一旦被
+    # 单个噪声峰钉死在错值上就**永久失效** —— 表现为"长回复好好地说着，
+    # 突然就无法打断、开始识别自己说的话了"。
+    #
+    # 现在 D 的语义变干净了：参考轨的落位时刻来自浏览器的 armed 承诺
+    # （精确），所以 D **只剩**「扬声器→麦克风的物理延迟 + 设备音频 I/O
+    # 缓冲」这一小块 —— 网络往返、浏览器主线程抖动、mic 在途积压全部不再
+    # 计入。这是一个真正的设备常量。
+    #
+    # 测法：开着 ORCH_DUMP_AUDIO 跑一轮真实会话，然后
+    #     python -m orchestrator.tests.measure_delay \
+    #         --mic <前缀>-<sid>-mic.wav --raw <前缀>-<sid>-raw.wav \
+    #         --verify-url ws://192.168.88.253:30255/ws/asr_frontend
+    # 结果写进 ORCH_AEC_DEFAULT_DELAY_MS（或按设备存进 DelayStore）。
+    #
+    # ⚠️ 250 是**未测量时的占位值**，不是可用值 —— 它会让算法 AEC 基本
+    #    不生效（实测抑制 0.3dB）。请以实测值为准。
     aec_default_delay_ms: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_AEC_DEFAULT_DELAY_MS", "250")))
-    # 延迟自适应开关（关闭则固定用 default_delay_ms）
-    aec_adaptive_delay: bool = field(default_factory=lambda: os.environ.get(
-        "ORCH_AEC_ADAPTIVE", "1") not in ("0", "false", ""))
     # 延迟记录持久化路径
     delay_store_path: Optional[str] = field(default_factory=lambda:
         os.environ.get("ORCH_DELAY_STORE"))

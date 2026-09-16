@@ -52,11 +52,14 @@ class OrchestratorSession:
         self.omni = None
         self.tts = None
         self.ref_track = None
-        self.delay_tracker = None
         self.face_worker = None
         self.downstream = None
         self.executor = None
         self.send_to_client = None   # Callable[[Any], Awaitable[None]]
+        # 客户端能力位（session.start 的 caps）。有 ``playback_anchor`` 才
+        # 会等浏览器的 armed 承诺 —— 旧客户端/存量测试没有这一位，因此
+        # 完全走原来的预测路径，零回归。
+        self.client_caps: set = set()
 
         # 音频扇出队列（AEC 输出 → ASR / OmniLLM）
         self._aec_out_q: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -90,14 +93,12 @@ class OrchestratorSession:
         self.metrics = SessionMetrics(session_id)
         self._mark_audio_t0: Optional[float] = None
 
-        # 声学延迟估计用的原始 mic 累积缓冲（**AEC 之前**的信号才有回声）
-        self._raw_mic_buf: Optional[list] = []
-        self._raw_mic_len = 0
         # 音频转储（仅在 ORCH_DUMP_AUDIO 设置时开启；默认零开销）
         import os as _os
         self._dump_path = _os.environ.get("ORCH_DUMP_AUDIO") or None
         self._dump_mic: list = []
         self._dump_ref: list = []
+        self._dump_raw: list = []      # 未做 D 补偿的原始参考轨（测 D 用）
         self._dump_aec: list = []
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
@@ -111,9 +112,15 @@ class OrchestratorSession:
         # （0 是 falsy），让 config 里显式设的 0 失效。
         _dd = config.get("aec_default_delay_ms")
         self.delay_default_ms = float(250.0 if _dd is None else _dd)
-        self.delay_adaptive = bool(config.get("aec_adaptive_delay", True))
         self.delay_source = "default"
         self._last_stats_push = 0.0
+        # 参考轨落位锚点：response_id → 浏览器**承诺**的起播会话采样位置。
+        # 浏览器在 tts.start 之后立刻回 ``playback{phase:'armed'}``，
+        # 执行器等这个值来 place()。等不到就退回预测（见 _resolve_play_at）。
+        self._armed: Dict[str, int] = {}
+        self._armed_evt: Dict[str, asyncio.Event] = {}
+        self.anchor_source = "none"      # ack | predicted | none
+        self.anchor_delta_ms = 0.0
         # 播放提前量（前端起播预留的时间）—— 校准时要从中扣除
         _pd = config.get("playback_delay_ms")
         self.playback_delay_ms = int(200 if _pd is None else _pd)
@@ -141,11 +148,16 @@ class OrchestratorSession:
     #  浏览器侧输入
     # ------------------------------------------------------------------ #
 
-    async def on_audio(self, x: np.ndarray, t_ms: int = 0) -> None:
+    async def on_audio(self, x: np.ndarray, t_ms: int = 0,
+                       ctx_time: float = 0.0, epoch: int = 0) -> None:
         """收到一段麦克风音频（float32 (1,T)，16kHz）。
 
         mic ingest 是**唯一**推进时钟的地方。时钟因此跟踪真实音频流，
         所有其他流都在它上面表达。
+
+        ``ctx_time`` 是本块首采样在浏览器 ``AudioContext`` 上的时刻 ——
+        登记成锚点后，服务端就能把浏览器承诺的起播时刻精确换算到会话
+        采样轴上（见 ``SampleClock.record_anchor``）。
         """
         if self.closed:
             return
@@ -153,6 +165,8 @@ class OrchestratorSession:
             # 容忍非标准块：重采样/补齐，但绝不崩
             x = self._normalize_chunk(x)
         frame = self.clock.frame_of(x)
+        if ctx_time > 0:
+            self.clock.record_anchor(ctx_time, frame.t0, epoch)
         self.stats["audio_chunks_in"] += 1
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
@@ -166,8 +180,6 @@ class OrchestratorSession:
 
         # 校准中：优先喂校准器（它要的是原始 mic，且需要连续采集）
         self._feed_calibration(frame)
-        # 声学延迟自适应估计（用原始 mic + raw ref，只在播放窗口内做）
-        self._maybe_update_delay(frame)
         # ERLE 测量窗口维护（开窗/收窗）
         self._update_erle_window(frame)
         # 周期性链路诊断（每 5s）+ 状态推送（每 2s，供 UI 显示延迟）
@@ -179,12 +191,13 @@ class OrchestratorSession:
         if self.aec is not None:
             ref = self._ref_for(frame)
             self._trace_ref(ref, frame)
-            self._dump_audio(frame.data, ref)
+            self._dump_audio(frame.data, ref, frame)
             await self.aec.push(frame.data, ref)
         else:
             await self._fanout_direct(frame.data)
 
-    def _dump_audio(self, mic: np.ndarray, ref: np.ndarray) -> None:
+    def _dump_audio(self, mic: np.ndarray, ref: np.ndarray,
+                    frame: AudioFrame) -> None:
         """把 mic / farend 落盘（仅在开启转储时）。
 
         「回声消不掉」这个问题的**唯一确诊手段**：拿到 mic 与 farend 的
@@ -194,13 +207,22 @@ class OrchestratorSession:
         结论）—— 必须看波形。
 
         开启：环境变量 ``ORCH_DUMP_AUDIO=/path/prefix``（会话结束时写成
-        ``<prefix>-<sid>-mic.wav`` / ``-ref.wav`` / ``-aec.wav``）。
+        ``<prefix>-<sid>-mic.wav`` / ``-ref.wav`` / ``-raw.wav`` / ``-aec.wav``）。
         默认关闭，零开销 —— 实时路径上不该有额外 I/O。
+
+        ⚠️ ``-ref.wav`` 是**已按 D 补偿过**的（它就是喂给 AEC 的那一份），
+        拿它去测 D 只能得到残差。测 D 必须用 ``-raw.wav``（未补偿的原始轨）
+        —— 见 ``tests/measure_delay.py``。
         """
         if self._dump_path is None:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
         self._dump_ref.append(ref.reshape(-1).copy())
+        if self.ref_track is not None:
+            self._dump_raw.append(
+                self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
+        else:
+            self._dump_raw.append(np.zeros(frame.n_samples, dtype=np.float32))
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
         if self._dump_path is None:
@@ -216,7 +238,7 @@ class OrchestratorSession:
         base = Path(self._dump_path)
         base.parent.mkdir(parents=True, exist_ok=True)
         for name, chunks in (("mic", self._dump_mic), ("ref", self._dump_ref),
-                             ("aec", self._dump_aec)):
+                             ("raw", self._dump_raw), ("aec", self._dump_aec)):
             if not chunks:
                 continue
             x = np.concatenate(chunks)
@@ -293,10 +315,15 @@ class OrchestratorSession:
     # ------------------------------------------------------------------ #
 
     def apply_delay_seed(self, client_key: str, store=None) -> float:
-        """用该设备的历史延迟作为初值（冷启动即准，不必从头收敛）。
+        """用该设备的**离线实测**延迟作为初值。
+
+        D 是每台设备一个固定常量（见 ``config.aec_default_delay_ms`` 的
+        说明），不再运行时自适应，所以这里就是"取历史记录，没有则用配置
+        默认值"，没有收敛过程。
 
         返回采用的延迟（ms）。``source`` 记在 ``self.delay_source``：
-        ``stored``（有历史记录）/ ``default``（用配置默认值）。
+        ``stored``（有历史记录）/ ``default``（配置默认值 —— **未实测，
+        AEC 大概率不生效**，UI 会显著提示）。
         """
         self._client_key = client_key or "default"
         self._delay_store = store
@@ -307,8 +334,12 @@ class OrchestratorSession:
         if self.ref_track is not None:
             self.ref_track.delay_samples = int(ms * SR / 1000.0)
         logger.info(
-            "[%s] 声学延迟初值 %.0fms（来源=%s，client=%s）",
+            "[%s] 声学延迟 %.0fms（来源=%s，client=%s）"
+            "%s",
             self.session_id, ms, source, self._client_key,
+            "" if source == "stored" else
+            " ⚠️ 该设备尚未离线实测 D —— 算法 AEC 大概率不生效，"
+            "请跑 tests/measure_delay.py",
         )
         return ms
 
@@ -409,10 +440,11 @@ class OrchestratorSession:
         self._cal = None
 
     def set_delay_ms(self, ms: float) -> None:
-        """手动设置声学延迟（调试/对比用）。
+        """手动设置声学延迟 D（**离线测完之后写回**用）。
 
-        用途：不确定该用哪个 D 时，逐个试并观察 ``session.stats`` 里的
-        ERLE —— 抑制最强的那个就是对的。比推理可靠。
+        正常情况下 D 来自 ``ORCH_AEC_DEFAULT_DELAY_MS`` 或 DelayStore，
+        不需要走这里。保留它是为了：离线脚本还没把值写进配置时，可以先
+        在会话里临时试一个数并观察 ERLE —— 抑制最强的那个就是对的。
         """
         if self.ref_track is None:
             return
@@ -444,31 +476,29 @@ class OrchestratorSession:
         total = self.stats.get("ref_push_total", 0)
         nz = self.stats.get("ref_push_nonzero", 0)
         d_ms = self.current_delay_ms()
-        suggested = self.delay_default_ms
-        # 已实测到就用实测值作为"建议设置"
-        if self.stats.get("delay_measured"):
-            suggested = d_ms
+        erle = self.current_erle_db()
         self._send_display(SessionStats(
             aec_mode=self.aec_mode,
             delay_ms=round(d_ms, 1),
             delay_source=self.delay_source,
             delay_measured=bool(self.stats.get("delay_measured")),
             delay_samples=self.ref_track.delay_samples if self.ref_track else 0,
-            suggested_delay_ms=round(suggested, 1),
             aec_active=(self.aec_mode == "service" and self.aec is not None),
             ref_nonzero_ratio=round(nz / total, 3) if total else 0.0,
-            erle_db=(round(self.current_erle_db(), 1)
-                     if self.current_erle_db() is not None else None),
-            delay_estimates=int(self.stats.get("delay_estimates", 0)),
-            delay_estimate_fails=int(self.stats.get("delay_estimate_fails", 0)),
+            erle_db=round(erle, 1) if erle is not None else None,
+            anchor_source=self.anchor_source,
+            anchor_delta_ms=round(self.anchor_delta_ms, 2),
+            anchor_residual_ms=round(self.clock.anchor_residual_ms(), 2),
         ))
 
     def _periodic_diag(self, frame: AudioFrame) -> None:
         """每 5 秒打一条链路诊断 —— 排查"回声没消掉"时这是第一现场。
 
-        包含三件事：
+        包含四件事：
           · 参考轨送出情况（ref_push_nonzero / 总数）→ 参考有没有到 AEC
-          · 声学延迟 D → 远超 20ms 就说明云端 AEC 的有效窗口外
+          · 声学延迟 D → 远超 20ms 说明设备没测过或测错了
+          · **落位锚点来源** → ack（浏览器承诺，准）还是 predicted（服务端
+            猜，误差逐句变化，是回声消不掉的根因）
           · 送出的 farend 近期 RMS → 是静音还是真有信号
         """
         now = time.monotonic()
@@ -484,11 +514,14 @@ class OrchestratorSession:
         erle = self.current_erle_db()
         logger.info(
             "[%s] 诊断: 音频块=%d ref推送=%d(非零 %d, %.0f%%) D=%d采样(%.0fms) "
+            "锚点=%s(偏差 %.1fms, 残差 %.1fms, %d 个) "
             "ERLE=%s 写入区间=[%s,%s] now=%d omni触发=%d",
             self.session_id,
             self.stats.get("audio_chunks_in", 0), total, nz,
             (100.0 * nz / total) if total else 0.0,
             d, (d / SR * 1000) if d >= 0 else -1,
+            self.anchor_source, self.anchor_delta_ms,
+            self.clock.anchor_residual_ms(), self.clock.anchor_count(),
             f"{erle:.1f}dB" if erle is not None else "n/a",
             lo, hi, self.clock.now(),
             self.stats.get("omni_triggers", 0),
@@ -553,111 +586,6 @@ class OrchestratorSession:
             return None
         return float(np.median(self._erle_windows[-5:]))
 
-    def _maybe_update_delay(self, frame: AudioFrame) -> None:
-        """在**播放窗口内**估计声学路径延迟 D 并喂给参考轨。
-
-        为什么必须做：AEC 服务把 nearend/farend 按**相同偏移**推入，即
-        假定两者已样本对齐；而扬声器→麦克风有物理延迟（数十到数百 ms）。
-        不补偿的话，参考与回声分量错位，消不掉。
-
-        ⚠️ 两个关键点：
-          · 只在播放窗口估计 —— 空闲时 ref 是静音，估出来是垃圾
-          · 用 **raw ref**（未补偿）与**原始 mic** 估计 —— 用补偿后的
-            信号会自我抵消（补偿多少就测不出多少）
-        """
-        if self.ref_track is None or self.delay_tracker is None:
-            return
-        if self._raw_mic_buf is None:
-            return
-        # 关闭自适应时直接返回：不做互相关（省 CPU），固定用 seed 值。
-        # 早先这个判断放在 estimate() **之后** —— 算完了再丢，纯浪费。
-        if not self.delay_adaptive:
-            return
-        # 播放窗口判断：当前或未来有参考在播。
-        # ⚠️ 不在播放窗口时要**清掉半截缓冲**：窗口是按"攒满 1s"触发的，
-        # 若一次播报短于 1s，残留的半个窗口会被带到**下一次播报**里，
-        # 拼出一段横跨两次播报、含静音间隙的假窗口 —— 互相关会在上面
-        # 选错峰。清了才是"每窗素材都来自同一次连续播报"。
-        if not self.ref_track.is_active(frame.t0, lookahead=int(0.5 * SR)):
-            if self._raw_mic_buf:
-                self._raw_mic_buf = []
-                self._raw_mic_len = 0
-            return
-
-        # ⚠️ 窗口长度必须 **大于可能的最大延迟**，否则互相关搜不到：
-        # mic 里的回声来自 D 之前的播放，若只读"当前窗"的 raw，两者
-        # 没有重叠片段，argmax 会落在噪声上 —— 表现为恒报 0ms。
-        # 取 WINDOW（1s）覆盖 0~1s 的延迟范围。
-        WINDOW = SR
-        self._raw_mic_buf.append(frame.data.reshape(-1))
-        self._raw_mic_len += frame.n_samples
-        if self._raw_mic_len < WINDOW:
-            return
-        mic = np.concatenate(self._raw_mic_buf)[-WINDOW:]
-
-        # raw ref 要往前多读一个"最大延迟"的长度：
-        # mic 窗 [t-W, t) 里的回声，其源在 raw 的 [t-W-D, t-D)。
-        # 读 [t-W-Dmax, t) 这一整段，让互相关自己找偏移。
-        #
-        # ⚠️ 参考窗比 mic 长 dmax 个采样，所以必须把 dmax 作为 ``offset``
-        # 传给 estimate()。早先没传 —— 而 estimate() 当时要求两者等长，
-        # 于是**每次调用都在形状校验处返回 None**，自适应延迟从未生效。
-        dmax = int(self.delay_tracker.max_delay)
-        raw = self.ref_track.read_raw(frame.t1 - WINDOW - dmax, WINDOW + dmax)
-        self._raw_mic_buf = []
-        self._raw_mic_len = 0
-        if raw.shape[0] != mic.shape[0] + dmax:
-            # 这条断言本可以早点点破上面那个 bug —— 保留它，别再让契约
-            # 不符静默通过
-            logger.warning(
-                "[%s] 延迟估计窗口契约不符：mic=%d raw=%d（期望 raw=mic+%d）",
-                self.session_id, mic.shape[0], raw.shape[0], dmax,
-            )
-            return
-        est = self.delay_tracker.estimate(mic, raw, offset=dmax)
-        if est is None:
-            # 「估不出来」必须可见 —— 早先这里是静默 return，导致延迟估计
-            # 整条路径失效而无人察觉。限流到每 5s 一条，避免刷屏。
-            self.stats["delay_estimate_fails"] = \
-                self.stats.get("delay_estimate_fails", 0) + 1
-            now = time.monotonic()
-            if now - getattr(self, "_last_delay_fail_log", 0.0) >= 5.0:
-                self._last_delay_fail_log = now
-                logger.info(
-                    "[%s] 声学延迟估计未产出（%s；累计失败 %d 次）—— "
-                    "参考非零占比 %.0f%%，当前 D=%.0fms",
-                    self.session_id,
-                    self.delay_tracker.last_reason or "未知原因",
-                    self.stats["delay_estimate_fails"],
-                    100.0 * self.stats.get("ref_push_nonzero", 0)
-                    / max(1, self.stats.get("ref_push_total", 0)),
-                    self.current_delay_ms(),
-                )
-            return
-        self.stats["delay_estimates"] = \
-            self.stats.get("delay_estimates", 0) + 1
-        prev = self.ref_track.delay_samples
-        self.ref_track.delay_samples = self.delay_tracker.delay
-        self.stats["delay_measured"] = 1
-        self.delay_source = "measured"
-        changed = abs(self.ref_track.delay_samples - prev) >= 16  # >1ms
-        if changed:
-            logger.info(
-                "[%s] 声学延迟自适应: %d → %d 采样（%.0fms），"
-                "本次估计 %d（累计 %d 次样本）",
-                self.session_id, prev, self.ref_track.delay_samples,
-                self.ref_track.delay_samples / SR * 1000,
-                est, self.delay_tracker.estimates,
-            )
-            self.push_stats(force=True)
-            # 持久化：下次同一设备冷启动就用这个值，不必重新收敛
-            if self._delay_store is not None and self.delay_tracker.estimates >= 3:
-                self._delay_store.put(
-                    self._client_key,
-                    self.ref_track.delay_samples / SR * 1000.0,
-                    n_samples=self.delay_tracker.estimates,
-                )
-
     def _ref_for(self, frame: AudioFrame) -> np.ndarray:
         """取该帧对应的 AEC 参考信号。
 
@@ -689,45 +617,154 @@ class OrchestratorSession:
 
     async def on_playback_receipt(self, response_id: str,
                                   phase: str, ctx_time: float,
-                                  seq: int = 0) -> None:
+                                  seq: int = 0,
+                                  sample_offset: int = 0,
+                                  *, start_ctx: float = 0.0,
+                                  stop_ctx: float = 0.0,
+                                  epoch: int = 0) -> None:
         """播放回执。
 
         ⚠️ 浏览器的 ``ctx_time``（AudioContext 秒）与我们的会话采样时钟
-        是**两个时钟域**。参考轨的落位由服务端按会话时钟自算（见
-        executor），这里只在**取消/结束**时用"从现在起"的语义截断 ——
-        那不需要跨域换算。
+        是**两个时钟域**，绝不能直接混用。换算必须走
+        ``clock.ctx_to_sample()``（它靠 mic 块自带的锚点拟合，是精确的）。
 
-        早期实现用 ``ctx_time`` 做绝对对齐，导致写入位置变成大负数、
+        早期实现直接把 ``ctx_time`` 当采样位置用，导致写入位置变成大负数、
         参考轨读出来全是 0（AEC 的 farend 恒为静音）。不要退回那种做法。
         """
         if self.closed or self.ref_track is None:
             return
-        # ⚠️ **只有 cancelled 才截断，ended 绝不能截**。
+
+        if phase == "armed":
+            # 浏览器**承诺**的起播时刻 —— 执行器正等着它去 place() 参考轨。
+            self._note_armed(response_id, start_ctx, epoch)
+            self._post_downstream_playback(response_id, phase, ctx_time, seq)
+            return
+
+        if (phase == "started" and start_ctx > 0.0
+                and response_id in self._armed):
+            # 校验：实际排程时刻 vs 承诺。**只告警，不修正** ——
+            # 此时参考轨已按承诺落位、AEC 已在读它，重新对齐意味着
+            # 一段"位置错的参考"要被回滚，而 realign 需要保留每句的
+            # 重采样结果并理清它与 truncate/resize 的交互，代价远大于收益。
+            # 几毫秒的偏差损失几个 dB 抑制，但"截断重写"一旦时机错位就是
+            # 整段回声漏进 ASR（正是我们要修的故障）。
+            actual = self.clock.ctx_to_sample(start_ctx, epoch)
+            if actual is not None:
+                delta = actual - self._armed[response_id]
+                self.anchor_delta_ms = delta / SR * 1000.0
+                if abs(delta) > int(0.005 * SR):
+                    logger.warning(
+                        "[%s] 起播承诺未兑现：response=%s 承诺与实测差 "
+                        "%.1fms —— 参考轨会有同等错位（容忍窗仅 ±5ms）",
+                        self.session_id, response_id, delta / SR * 1000.0,
+                    )
+            self._post_downstream_playback(response_id, phase, ctx_time, seq)
+            return
+        # ⚠️ **回执一律不截断参考轨**（`started` / `ended` / `cancelled` 都不）。
         #
-        # 曾经 ended 也调 truncate(from_sample=clock.now())，理由是"没播出的
-        # 音频不该留在参考轨上"。但那个语义是**错的**：
-        #   · truncate 清的是「从**当前会话时刻**往后」的区间，它假定音频
-        #     已经播到那儿了
-        #   · 实际 `tts.end` 到达时浏览器**才刚开始播**（还有 200ms 提前量），
-        #     而 TTS 是**整段一次性送完**的
-        #   → 于是整段参考被清掉，只剩到达那一刻之前的一小截。
+        # 这是踩过两次的地方，两次都是"在回执里按 clock.now() 截断"惹的祸：
         #
-        # 真机实测（s-6d21f3ab5f3c）：TTS 报 5.85s、ref 写入区间也正是
-        # 5.85s，但实际非零只有 **0.6s**（日志 `非零 6/152 = 4%`）——
-        # 参考轨只剩 10%，AEC 等于没有参考，回声自然消不掉。
+        # ① `ended` 也截（早先的 bug）：`tts.end` 到达时浏览器**才刚开始播**
+        #    （TTS 是整段一次性送完的，还有 200ms 提前量），于是"当前时刻"
+        #    远在整段音频之前 → **整段参考被清掉**。真机实测：TTS 报 5.85s、
+        #    ref 写入区间也正好 5.85s，但非零只有 0.6s（`非零 6/152 = 4%`）。
         #
-        # 播放是**排程好**的（WebAudio 按 nextAt 连续排），`ended` 只表示
-        # "音频已全部交给播放器"，不代表"已经播完了"。没用上的那部分由
-        # 后续播报覆盖或被环形缓冲自然淘汰，不需要主动清。
+        # ② `cancelled` 也截（本轮）：服务端在打断时已经**精确**截断过了
+        #    （见 `ActionExecutor._interrupt_current`，它用
+        #    `max(now, started)` 区分"还没起播"与"已播到中途"）。等浏览器的
+        #    回执绕一圈回来时，**新句往往已经开始落位** —— 此时再按
+        #    `clock.now()` 截一刀，会**把新句的参考切掉一截**
+        #    （实测：新句 3.0s → 1.98s），新回复的回声又对不上了。
         #
-        # cancelled 则不同：那是**真的没播**，必须立刻清 —— 否则 AEC 会
-        # 拿着不存在的回声去适配，比不给参考更糟。
+        # ⚠️ 唯一的例外：`cancelled` 带回 `sample_offset`（前端报的
+        # **实际播出**采样数）时，用**观测值**校正参考轨。
+        #
+        # 为什么这个例外是安全的（而"按 clock.now() 截断"不安全）：
+        # 它**锚在本 response 自己的落位起点上**，与"会话现在跑到哪了"
+        # 无关 —— 所以新句有没有开始落位都不影响它，不会误伤。
+        #
+        # 服务端的 `_interrupt_current` 已按预测做过一次截断；这里用真实
+        # 观测值再校一次，把"预测与实际"的偏差抹平（这正是用户指出的：
+        # 只要参考轨严格跟随**实际播出**，打断后它自然就是对的）。
         if phase == "cancelled":
-            n = self.ref_track.truncate(response_id,
-                                        from_sample=self.clock.now())
-            if n:
-                logger.debug("取消 %s：截断 ref %d 采样", response_id, n)
+            # 两个**独立**的实测观测：前端报的实际播出采样数（sample_offset）
+            # 与"实际停下的 ctx 时刻 - 落位起点"（stop_ctx）。取**保守**的
+            # 那个（更小 = 保留更少）。`resize` 只能缩短，所以取小是安全的；
+            # 取大则会留下没播出去的音频当参考，AEC 去追一个不存在的回声。
+            keep = int(sample_offset) if sample_offset > 0 else 0
+            if stop_ctx > 0.0 and self._armed.get(response_id) is not None:
+                span_start = self.ref_track.started_at(response_id)
+                stop_at = self.clock.ctx_to_sample(stop_ctx, epoch)
+                if span_start is not None and stop_at is not None:
+                    by_ctx = max(0, stop_at - span_start)
+                    keep = min(keep, by_ctx) if keep > 0 else by_ctx
+            if keep > 0:
+                n = self.ref_track.resize(response_id, keep)
+                if n:
+                    logger.info(
+                        "按前端**实测**播出量校正 %s：保留 %.2fs，"
+                        "清掉其后 %d 采样（%.2fs）—— 预测!=实际 时以此为准",
+                        response_id, keep / SR, n, n / SR,
+                    )
         self._post_downstream_playback(response_id, phase, ctx_time, seq)
+
+    # ------------------------------------------------------------------ #
+    #  播放锚点（armed 承诺）
+    # ------------------------------------------------------------------ #
+
+    class _ArmedEvent:
+        """一个可被 set 多次的等待点（armed 可能比执行器的等待先到）。"""
+        __slots__ = ("evt", "value")
+
+        def __init__(self) -> None:
+            self.evt = asyncio.Event()
+            self.value: Optional[int] = None
+
+        def put(self, value: Optional[int]) -> None:
+            self.value = value
+            self.evt.set()
+
+    def _note_armed(self, response_id: str, start_ctx: float,
+                    epoch: int = 0) -> None:
+        """记录浏览器承诺的起播时刻，唤醒等待中的执行器。
+
+        ⚠️ 换算不出来（锚点还不够、context 换了）也要唤醒 —— 否则执行器
+        会一直干等到超时，白白给每句话加 500ms 延迟。此时 value 为 None，
+        执行器退回预测路径。
+        """
+        at: Optional[int] = None
+        if start_ctx > 0.0:
+            at = self.clock.ctx_to_sample(start_ctx, epoch)
+        if at is not None:
+            self._armed[response_id] = at
+            self.anchor_source = "ack"
+        wait = self._armed_evt.get(response_id)
+        if wait is not None:
+            wait.put(at)
+
+    def arm_waiter(self, response_id: str) -> "_ArmedEvent":
+        """为某个 response 注册等待点（执行器在发 tts.start 之后调用）。"""
+        w = self._ArmedEvent()
+        if response_id in self._armed:
+            # 回执先到了（本地回环/极快网络）—— 直接给值，别让它等超时
+            w.put(self._armed[response_id])
+        self._armed_evt[response_id] = w
+        return w
+
+    def release_waiter(self, response_id: str) -> None:
+        self._armed_evt.pop(response_id, None)
+
+    async def wait_armed(self, response_id: str,
+                         timeout: float) -> Optional[int]:
+        """等浏览器承诺的起播时刻；超时或换算不出返回 None（→ 预测回退）。"""
+        w = self._armed_evt.get(response_id)
+        if w is None:
+            return None
+        try:
+            await asyncio.wait_for(w.evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        return w.value
 
     def _post_downstream_playback(self, response_id: str, phase: str,
                                   ctx_time: float, seq: int) -> None:

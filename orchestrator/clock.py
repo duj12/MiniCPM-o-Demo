@@ -15,12 +15,37 @@ TTS 参考）都在这个时间轴上**表达**，而不是各自计时。
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Deque, NamedTuple, Optional, Tuple
 
 import numpy as np  # noqa: F401  (类型注解与调用方都用到)
 
 SR = 16000  # 全链路统一采样率
+
+# 锚点窗口：最近 N 个 mic 块参与仿射拟合。100ms/块 → 32 块 ≈ 3.2s。
+# 窗口越长越稳（噪声平均掉），越短越能跟上设备时钟的斜率变化。3.2s 是折中：
+# 实测两次播放间隔约 15s，10ppm 的斜率误差在这段时间里累积 ≈2.4 采样
+# （0.15ms），拟合窗口只要覆盖到「斜率变化的量级」就够，不需要更长。
+ANCHOR_WINDOW = 32
+# 拟合斜率的合理范围：与标称采样率的相对偏差。设备 ctx 采样率与真实播放
+# 时钟的偏差通常是几十 ppm；2e-3（2000ppm）之外一定是选错了点或 context 换了。
+ANCHOR_SLOPE_TOL = 2e-3
+# 拟合残差上限（ms）。超过说明锚点根本不在一条直线上 —— 不能用。
+ANCHOR_RESIDUAL_MS = 20.0
+
+
+class Anchor(NamedTuple):
+    """一个 mic 块的「浏览器时钟 ↔ 会话采样」对应点。
+
+    ``ctx``    —— 该块**首采样**在浏览器 AudioContext 上的时刻（秒）
+    ``sample`` —— 该块首采样在会话时钟上的采样索引
+    ``wall``   —— 服务端收到它的墙钟（仅诊断用）
+    """
+
+    ctx: float
+    sample: int
+    wall: float
 
 
 @dataclass(frozen=True)
@@ -50,11 +75,11 @@ class SampleClock:
 
     只有 mic ingest 调用 ``advance()``。其他组件只读 ``now()``。
 
-    同时记录墙钟锚点，用于把浏览器回执里的 ``ctx_time``（AudioContext 秒）
-    换算到会话采样轴。
+    同时维护**浏览器 AudioContext 时钟 → 会话采样轴**的仿射映射
+    （见 ``record_anchor`` / ``ctx_to_sample``），这是参考轨精确落位的依据。
     """
 
-    __slots__ = ("sr", "_t", "_t_wall0")
+    __slots__ = ("sr", "_t", "_t_wall0", "_anchors", "_epoch", "_fit")
 
     def __init__(self, sr: int = SR) -> None:
         self.sr = sr
@@ -63,6 +88,10 @@ class SampleClock:
         # （连接外部服务、握手），那段时间不该算进漂移。改为在**第一块
         # 音频**到达时锚定（见 start()）。
         self._t_wall0: Optional[float] = None
+        # ctx ↔ 会话采样的锚点（见 record_anchor）。_fit 是懒计算的缓存。
+        self._anchors: Deque[Anchor] = deque(maxlen=ANCHOR_WINDOW)
+        self._epoch: Optional[int] = None
+        self._fit: Optional[Tuple[float, float]] = None
 
     def start(self) -> None:
         """锚定墙钟起点（收到第一块音频时调用）。"""
@@ -112,6 +141,138 @@ class SampleClock:
             raise ValueError("gap 必须为正")
         data = np.zeros((1, gap_samples), dtype=np.float32)
         return self.frame_of(data)
+
+    # ------------------------------------------------------------------ #
+    #  浏览器时钟 → 会话采样 的仿射映射
+    # ------------------------------------------------------------------ #
+
+    def record_anchor(self, ctx_time: float, sample: int,
+                      epoch: int = 0) -> None:
+        """登记一个对应点：会话采样 ``sample`` 对应浏览器 ctx 时刻 ``ctx_time``。
+
+        为什么需要它：参考轨必须落在**浏览器实际播出**的时刻上，而播出时刻
+        只有浏览器自己知道（`AudioContext.currentTime`）。服务端曾经用
+        "送音频时的 clock.now() + 提前量"来**预测**，但 clock.now() 只由
+        浏览器送来的 100ms mic 块推进 —— 它比真实时刻慢 0~100ms 且**逐块
+        抖动**（浏览器主线程同时在跑 25fps 抓帧）。预测误差因此逐句变化，
+        固定常量 D 吸收不了 → 回声消不掉。
+
+        这里改成**测量**：每个 mic 块在发送时报出「本块首采样的 ctx 时刻」。
+        两个时钟域数的是**同一路 16kHz 流**，所以 (ctx, sample) 是一对
+        **精确**的对应点 —— 映射本身没有量化误差，100ms 的块间隔只影响
+        "斜率变化后多快重新收敛"，不影响精度。这正是它和"用锚点估算当前
+        偏移"的本质区别：后者会被量化到 ±100ms，在 AEC 需要的 ±5ms 面前
+        是死路。
+
+        ``epoch`` 是浏览器 AudioContext 的代号（页面建 context 时生成）。
+        异 epoch 的锚点一律丢弃 —— 页面刷新/context 重建后 ``currentTime``
+        会归零，混用会让拟合彻底跑偏。
+
+        ⚠️ ``ctx_time <= 0`` 被当作"本次没上报"的哨兵值丢弃。副作用是
+        context 刚建好、``currentTime`` 恰好为 0 的那**一个**块会被丢掉 ——
+        窗口有 32 块（3.2s），少一个无影响，不值得为它引入 None/可选类型。
+        """
+        if not (ctx_time > 0.0):
+            return
+        if self._epoch is None:
+            self._epoch = epoch
+        elif epoch != self._epoch:
+            # 换了 context：旧锚点的时间轴已经无效，全部作废
+            self.clear_anchors()
+            self._epoch = epoch
+        self._anchors.append(Anchor(ctx=float(ctx_time), sample=int(sample),
+                                    wall=time.monotonic()))
+        self._fit = None
+
+    def clear_anchors(self) -> None:
+        self._anchors.clear()
+        self._fit = None
+
+    def _ensure_fit(self) -> Optional[Tuple[float, float]]:
+        """拟合 ``sample ≈ a·ctx + b``，返回 (a, b)；不可信时返回 None。
+
+        用**最小二乘**而不是"假定斜率 = sr、只取偏移的中位数"：设备时钟有
+        几十 ppm 的漂移，固定斜率会让 b 随会话推进单边偏移（10ppm × 15s
+        ≈ 2.4 采样，已经吃掉 ±5ms 容忍窗的一半）。拟合出的斜率还兼职做
+        "context 换了 / 采样率变了" 的检测。
+
+        斜率或残差不过门时退回固定斜率 + 偏移中位数；仍不过门则返回 None
+        （调用方退回预测路径，而不是拿一个错误的映射去落位）。
+        """
+        if self._fit is not None:
+            return self._fit
+        n = len(self._anchors)
+        if n < 3:
+            return None
+        cs = [a.ctx for a in self._anchors]
+        ss = [float(a.sample) for a in self._anchors]
+        mc = sum(cs) / n
+        ms = sum(ss) / n
+        var = sum((c - mc) ** 2 for c in cs)
+        fit: Optional[Tuple[float, float]] = None
+        if var > 1e-12:
+            cov = sum((c - mc) * (s - ms) for c, s in zip(cs, ss))
+            a = cov / var
+            if abs(a - self.sr) / self.sr <= ANCHOR_SLOPE_TOL:
+                fit = (a, ms - a * mc)
+        if fit is None or self._residual_ms(fit) > ANCHOR_RESIDUAL_MS:
+            # 退回固定斜率 + 偏移中位数（对离群点稳健）
+            offs = sorted(s - self.sr * c for c, s in zip(cs, ss))
+            med = offs[len(offs) // 2]
+            alt = (float(self.sr), med)
+            if self._residual_ms(alt) > ANCHOR_RESIDUAL_MS:
+                return None
+            fit = alt
+        self._fit = fit
+        return fit
+
+    def _residual_ms(self, fit: Tuple[float, float]) -> float:
+        a, b = fit
+        n = len(self._anchors)
+        if n == 0:
+            return float("inf")
+        acc = 0.0
+        for an in self._anchors:
+            d = (a * an.ctx + b) - an.sample
+            acc += d * d
+        return (acc / n) ** 0.5 / self.sr * 1000.0
+
+    def ctx_to_sample(self, ctx_time: float,
+                      epoch: int = 0) -> Optional[int]:
+        """把浏览器 ``ctx_time`` 换算成会话采样位置；不可信时返回 None。"""
+        if epoch and self._epoch is not None and epoch != self._epoch:
+            return None
+        fit = self._ensure_fit()
+        if fit is None:
+            return None
+        a, b = fit
+        return int(round(a * ctx_time + b))
+
+    def ctx_now_estimate(self) -> Optional[float]:
+        """估算浏览器**此刻**的 AudioContext 时刻。
+
+        用最近一个锚点加上之后的墙钟增量。精度受墙钟与音频钟的相对漂移
+        限制（几十 ppm，秒级只有毫秒量级），比 `now()` 那种"已 ingest 的
+        采样数"准得多 —— 后者系统性落后真实播放位置 100~300ms。
+
+        用途：打断时估计"已经播到哪了"。**必须配合一个余量使用**（见
+        ``ActionExecutor._interrupt_current``）：估算值再准也不该拿去做
+        精确截断，因为参考轨一旦清少了就补不回来。
+        """
+        if not self._anchors:
+            return None
+        last = self._anchors[-1]
+        return last.ctx + (time.monotonic() - last.wall)
+
+    def anchor_residual_ms(self) -> float:
+        """当前映射的拟合残差（ms）；还没有可用映射时返回 -1。"""
+        fit = self._ensure_fit()
+        if fit is None:
+            return -1.0
+        return self._residual_ms(fit)
+
+    def anchor_count(self) -> int:
+        return len(self._anchors)
 
 
 class TrackBuffer:

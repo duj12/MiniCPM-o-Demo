@@ -50,15 +50,25 @@ class ClientHello:
 
 @dataclass
 class AudioChunk:
-    """麦克风音频。``audio_base64`` 是 float32 raw（小端）base64。"""
+    """麦克风音频。``audio_base64`` 是 float32 raw（小端）base64。
+
+    ``ctx_time`` 是本块**首采样**在浏览器 ``AudioContext`` 上的时刻（秒），
+    ``epoch`` 是该 AudioContext 的代号。两者一起让服务端能建立
+    「浏览器时钟 → 会话采样」的精确映射（见 ``SampleClock.record_anchor``），
+    参考轨据此落在**实际播出**的时刻上，而不是靠预测。
+    """
     audio_base64: str
     t_ms: int = 0
+    ctx_time: float = 0.0
+    epoch: int = 0
     type: Literal["audio"] = "audio"
 
     @staticmethod
-    def from_float32(x: np.ndarray, t_ms: int = 0) -> "AudioChunk":
+    def from_float32(x: np.ndarray, t_ms: int = 0,
+                     ctx_time: float = 0.0, epoch: int = 0) -> "AudioChunk":
         buf = np.ascontiguousarray(x, dtype=np.float32).tobytes()
-        return AudioChunk(audio_base64=base64.b64encode(buf).decode(), t_ms=t_ms)
+        return AudioChunk(audio_base64=base64.b64encode(buf).decode(),
+                          t_ms=t_ms, ctx_time=ctx_time, epoch=epoch)
 
 
 @dataclass
@@ -79,12 +89,31 @@ class VideoOmni:
 
 @dataclass
 class PlaybackReceiptMsg:
-    """播放回执 —— 驱动 AEC 参考轨的时钟。"""
+    """播放回执 —— 驱动 AEC 参考轨的时钟。
+
+    四个 phase 的分工（``armed`` 是本次新增，也是最关键的一个）：
+
+      · ``armed``     —— **承诺**。浏览器收到 ``tts.start`` 后立刻回一个
+                        ``start_ctx``（它打算起播的时刻），此时音频还没到。
+                        服务端据此**精确落位**参考轨，而不是靠
+                        ``clock.now() + 提前量`` 去猜 —— 猜的误差含网络往返
+                        与浏览器主线程抖动，**逐句变化**，固定常量 D 吸收
+                        不了（这正是"第一句好、后面失效"的根因）。
+      · ``started``   —— **校验**。实际排程时刻。服务端只比对偏差并告警，
+                        **不据此修正参考轨**（见 ``on_playback_receipt``）。
+      · ``ended``     —— 音频已全部交给播放器。**不代表播完**，绝不能截断。
+      · ``cancelled`` —— 打断。带 ``sample_offset``（实测播出采样数）与
+                        ``stop_ctx``，服务端据此把参考轨校到"真正播出过"。
+    """
     response_id: str
-    phase: Literal["started", "ended", "cancelled"]
-    ctx_time: float = 0.0
+    phase: Literal["armed", "started", "ended", "cancelled"]
+    ctx_time: float = 0.0        # 兼容保留：服务端已不再读它
     seq: int = 0
     sample_offset: int = 0
+    # 以下均为关键字参数带默认值 —— 位置传参的存量调用必须继续可用
+    start_ctx: float = 0.0       # armed: 承诺起播时刻；started: 实际排程时刻
+    stop_ctx: float = 0.0        # cancelled: 实际停下的 ctx 时刻
+    epoch: int = 0
     type: Literal["playback"] = "playback"
 
 
@@ -111,6 +140,10 @@ class CalibrateRequest:
 class SessionReady:
     session_id: str
     sample_rate: int = SR
+    # 播放提前量的**唯一真源**。浏览器在 tts.start 之后 ``lead_ms`` 起播并
+    # 把该时刻回执给服务端，两边必须用同一个数 —— 所以由服务端下发，
+    # 前端不自己写死常量（写死过一次，两边漂了）。
+    lead_ms: int = 200
     type: Literal["session.ready"] = "session.ready"
 
 
@@ -119,6 +152,7 @@ class TtsStart:
     response_id: str
     text: str = ""
     sample_rate: int = 24000
+    lead_ms: int = 200          # 见 SessionReady.lead_ms
     type: Literal["tts.start"] = "tts.start"
 
 
@@ -177,25 +211,31 @@ class FaceDisplay:
 class SessionStats:
     """服务端定期推送的链路状态（供 UI 显示与排障）。
 
-    重点是**声学延迟**：用算法服务 AEC 时，参考轨要按它做预对齐，
-    用户需要能看到"当前测到多少、是否已收敛"。
+    两组关键数字：
+
+      · **声学延迟 D** —— 参考轨按它做预对齐。它是**每台设备一个固定常量**
+        （离线测一次，见 ``tests/measure_delay.py``），不再运行时自适应。
+      · **落位锚点** —— 参考轨的播出时刻是"浏览器回报"还是"服务端预测"。
+        预测路径含网络与浏览器抖动、**逐句变化**，是回声消不掉的根因，
+        所以这一项必须显眼。
     """
     aec_mode: str = "browser"          # browser | service | off
     delay_ms: float = 0.0              # 当前使用的声学延迟
-    delay_source: str = "default"      # stored | default | measured
+    delay_source: str = "default"      # stored | default | manual | client
     delay_measured: bool = False       # 是否已实测到（而非用默认值）
     delay_samples: int = 0
-    suggested_delay_ms: float = 0.0    # 建议值（通常 = playback_delay + 声学）
     aec_active: bool = False           # 云端 AEC 是否在工作
     ref_nonzero_ratio: float = 0.0     # 送出的 farend 非零占比
     # 播放期间实测的回声抑制比（dB）。含近端故绝对值偏低，
     # 但**调 D 前后的相对变化**能直接判断配置对不对。
     erle_db: Optional[float] = None
-    # 延迟自适应估计的成功 / 失败次数。失败次数 >0 且持续增长说明参考
-    # 没送到或不在播放窗口 —— 早先这条路径完全静默，导致整条自适应
-    # 延迟估计失效而无人察觉。
-    delay_estimates: int = 0
-    delay_estimate_fails: int = 0
+    # 落位锚点来源：ack（浏览器承诺，准）| predicted（服务端猜，不准）| none
+    anchor_source: str = "none"
+    # 最近一次「实际起播 - 承诺起播」的偏差（ms）。>5ms 就说明承诺没兑现，
+    # 值得查（但**不据此修正参考轨** —— 见 on_playback_receipt）。
+    anchor_delta_ms: float = 0.0
+    # ctx→会话采样 仿射拟合的残差（ms），-1 表示锚点还不够拟合。
+    anchor_residual_ms: float = -1.0
     type: Literal["session.stats"] = "session.stats"
 
 

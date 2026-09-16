@@ -106,13 +106,25 @@ export G1_FACE_DEBUG=0     # ⚠️ 必须！否则 create 就写最多约 4GB �
 ### 客户端 → 服务端
 
 ```json
-{"type":"session.start","identity":{...},"seeded_delay_samples":0}
-{"type":"audio","audio_base64":"...","t_ms":0}        // float32 raw, 16kHz
+{"type":"session.start","identity":{...},"seeded_delay_samples":0,
+ "caps":["playback_anchor"]}                          // ← 能力位，缺了会退回预测落位
+{"type":"audio","audio_base64":"...","t_ms":0,
+ "ctx_time":812.4,"epoch":12345}                      // float32 16kHz + 本块首采样的 ctx 时刻
 {"type":"video_face","frame_base64":"...","t_ms":0}   // 25fps 小图
 {"type":"video_omni","frame_base64":"...","t_ms":0}   // 1fps 大图
-{"type":"playback","response_id":"r1","phase":"started","ctx_time":812.4,"seq":0}
+{"type":"playback","response_id":"r1","phase":"armed","start_ctx":812.6}      // 承诺起播时刻
+{"type":"playback","response_id":"r1","phase":"started","start_ctx":812.6}    // 实际排程时刻
+{"type":"playback","response_id":"r1","phase":"ended"}
+{"type":"playback","response_id":"r1","phase":"cancelled",
+ "sample_offset":48000,"stop_ctx":815.9}              // 实测播出量 + 实际停下时刻
 {"type":"session.stop"}
 ```
+
+`ctx_time` / `epoch` / `start_ctx` / `stop_ctx` 都是**浏览器 AudioContext
+时钟**上的量，服务端只经 `SampleClock.ctx_to_sample()` 换算后使用，
+**绝不直接当会话采样位置**（早期那么做过，写入位置变成大负数、参考轨
+读出来全是 0）。`epoch` 是 context 代号：换了 context 后 `currentTime`
+归零，异 epoch 的锚点会被全部作废。
 
 **音频在线保持 float32**（与采集层一致）：云端 AEC 与 OmniLLM 都要
 float32，只有 ASR 要 int16 —— 服务端转一次优于浏览器转了再转回来。
@@ -121,8 +133,8 @@ float32，只有 ASR 要 int16 —— 服务端转一次优于浏览器转了再
 ### 服务端 → 客户端
 
 ```json
-{"type":"session.ready","session_id":"...","sample_rate":16000}
-{"type":"tts.start","response_id":"r1","text":"...","sample_rate":24000}
+{"type":"session.ready","session_id":"...","sample_rate":16000,"lead_ms":200}
+{"type":"tts.start","response_id":"r1","text":"...","sample_rate":24000,"lead_ms":200}
 {"type":"tts.audio","response_id":"r1","seq":0,"audio_base64":"..."}  // int16 PCM 24k
 {"type":"tts.end","response_id":"r1"}
 {"type":"tts.cancel","response_id":"r1","reason":"bargein"}
@@ -131,13 +143,68 @@ float32，只有 ASR 要 int16 —— 服务端转一次优于浏览器转了再
 {"type":"error","code":"...","message":"..."}
 ```
 
-### ⚠️ 播放回执是 AEC 的关键一环
+### ⚠️⚠️ 参考轨的播出时刻必须由浏览器**承诺**（本轮修复的核心）
 
-AEC 的参考信号必须与**实际播出**的时刻对齐（不是音频到达 orchestrator
-的时刻 —— 中间隔着发送、抖动缓冲、播放器 200ms 提前量）。浏览器必须在
-起播时报 `playback.started`、取消时立即报 `playback.cancelled` ——
-后者让云端 `truncate()` 参考轨，否则 AEC 会拿着没播出的音频当参考，
-**主动误适配去追一个不存在的回声，比不给参考更糟**。
+这是「第一句能消回声、后面就失效」的根因，也是本模块最重要的一条契约。
+
+AEC 的参考信号必须与**实际播出**的时刻对齐到毫秒级。曾经的做法是服务端
+**预测**：「送完音频时的 `clock.now()` + 播放提前量」。这个预测有两层误差：
+
+  ① `clock.now()` 由浏览器送来的 100ms mic 块推进，**比真实时刻慢
+     0~100ms 且逐块抖动**（浏览器主线程同时在跑 25fps 抓帧）；
+  ② 浏览器是收到 `tts.audio` 之后 `ctx.currentTime + 提前量` 才起播，
+     中间还隔着网络往返与浏览器处理耗时。
+
+**关键在于这个误差不是常量，而是逐句变化的** —— `test_duplex_sim.py`
+实测：同一次会话里，第二句播报的预测误差比第一句**大出 888ms**。而
+AEC 的容忍窗只有 ±5ms，固定常量 D 只能吸收"恒定的偏差"，吸收不了"变化的
+偏差"，于是会话刚开场时碰巧对上、之后就一路散掉。
+
+**现在的做法**：让浏览器**承诺**播出时刻，而不是让服务端猜。
+
+```
+① 服务端发 tts.start（含 lead_ms）
+② 浏览器：at = ctx.currentTime + lead      ← 承诺，此时音频还没到
+   立刻回 playback{phase:'armed', start_ctx: at}
+③ 服务端：T_play = clock.ctx_to_sample(at) ← 精确换算，然后才 place() 参考轨
+④ 浏览器按 at 排程播放
+⑤ 浏览器回 playback{phase:'started', start_ctx: 实际排程时刻}
+   服务端只比对偏差并告警，**不据此修正参考轨**
+```
+
+②的往返**完全藏在 TTS 合成的 508ms 首帧延迟里**（`tts.start` 在合成之前
+发出），零额外延迟。③的换算靠每个 mic 块自带的 `ctx_time` 拟合出
+「浏览器时钟 ↔ 会话采样」的仿射映射 —— 两个时钟域数的是同一路 16kHz 流，
+所以这条映射是**精确**的（实测残差 < 0.1ms）。
+
+**副产品**：网络往返、浏览器主线程抖动、mic 在途积压**全部从 D 里剔除**，
+D 退化成「扬声器→麦克风的物理延迟 + 设备音频 I/O 缓冲」—— 每台设备一个
+**固定常量**，离线测一次即可（见下文）。
+
+#### 为什么是「承诺」而不是「事后上报 + 修正」
+
+事后修正需要在参考轨上提供 `realign()`：重采样器是有状态的、不能重放，
+得额外保留每句的 x16、记下 truncate 的切口、理清 realign×truncate×resize
+的交互 —— 那是本仓库 bug 历史最重的文件。而且修正到达之前，AEC 拿到的是
+**位置错的参考**，它会主动误适配（比不给参考更糟）。用承诺协议把这类状态
+直接设计掉。
+
+#### `started` 只告警、不修正
+
+`started` 带回真实排程时刻，服务端算出偏差，超过 5ms 就 `logger.warning`
+并在 `session.stats.anchor_delta_ms` 里露出。**不据此重写参考轨**：几毫秒
+的对齐误差损失几个 dB 抑制，而"截断重写"一旦时机错位就是整段回声漏进
+ASR（正是我们要修的故障）。
+
+#### 降级路径必须可见
+
+客户端没声明 `playback_anchor` 能力位（旧前端）或承诺超时（500ms）时，
+服务端退回预测落位，并把 `anchor_source` 标成 `"predicted"`。页面上的
+「落位锚点」会显著地显示成红色 —— **它不是个可以忽略的细节**，看到
+"服务端预测"就意味着回声对齐已经不可信了。
+
+回归护栏：`tests/test_duplex_sim.py`（`--anchor armed` vs `--anchor legacy`
+的对照）、`tests/test_bargein_ref.py`、`tests/test_clock.py`。
 
 #### ⚠️⚠️ 但 `ended` **绝不能**截断参考轨（真机头号故障）
 
@@ -190,12 +257,17 @@ AEC 的参考信号必须与**实际播出**的时刻对齐（不是音频到达
     `stop(0)` 掐断（这是 WebAudio 里唯一能取消已 start 源的办法），
     并复位 `nextAt` 让下一句从零重排
   · 服务端 `_speak_inner` 开新句前调 `_interrupt_current()`（同步、原子）
-  · **截断点 = `max(now, started)`**，即清 `[max(now,started), end)`、
-    保留 `[started, now)`：
-      - 还没起播（now ≤ started）→ 整句清干净
-      - 已播到中途（now > started）→ 保留已播部分（那段**真的**有回声）
-    ⚠️ 取 `now` 或取 `started` 都是错的：前者会留下没播的音频当参考，
-    后者会把已播部分也清掉（有回声、没 farend）。
+  · **截断点 =「已经播到哪」的偏小估计 + 300ms 余量**：
+      - 还没起播 → 从 `started` 起清 → 整句清干净
+      - 已播到中途 → 保留 `[started, cut)`
+      - ⚠️ **偏差方向不能搞反**：`resize`（前端回执到达后的精确校正）
+        **只能缩短**参考轨。所以临时截断必须**少清** —— 留多了由
+        `resize` 精确剪掉，**留少了永远补不回来**，那就是"有回声、没
+        farend"，AEC 直接失效。
+      - 估计用 `clock.ctx_now_estimate()`（按锚点算浏览器此刻的播出位置），
+        不是 `clock.now()` —— 后者是"已 ingest 的采样数"，系统性落后
+        100~300ms。实测：用 `clock.now()` 时打断后的参考轨比实际播出量
+        **少 6421 采样（401ms）**，那段回声完全没有参考。
   · `RefTrack.truncate` 按 chunk 求交集，**只清本 response 自己的区间** ——
     早先无差别清 `[from, 末尾)` 会误伤期间落位的其它 response
 
@@ -213,15 +285,46 @@ AEC 的参考信号必须与**实际播出**的时刻对齐（不是音频到达
 
 **容忍窗只有约 ±5ms** —— 差 6ms 就从 12.6dB 掉到 2.5dB。所以：
 
-- 默认值 `aec_default_delay_ms` 是 **0**（"假定浏览器按约定提前量起播"），
-  不是 250。250 是把**全程往返**当成了参考轨要补的残差 —— 而
-  `RefTrack.place()` 的落位已含 200ms 提前量，D 只需补剩下的声学延迟。
 - 服务端**不做**时延对齐（`SD_AEC` 是硬编码的 ONNX 模型；仓库里的
   `GCCPHATDelayEstimator`/`LinearAEC` 在流式路径中是死代码，唯一"对齐"
   是 alpha predictor 里 k=10 帧 ≈100ms 的学习式 lookback）。
   **所以调用方必须自己保证样本级预对齐** —— 这正是 `RefTrack` 的职责。
-- 前端会显示 D 的三态（未测量 / 收敛中 / 已收敛）。**显示"未测量"时
-  算法 AEC 基本不会生效**，别把它当成一个正常数字。
+
+#### D 现在是**每台设备一个固定常量**，离线测一次
+
+落位时刻由浏览器承诺之后（见上文），D 里**只剩**「扬声器→麦克风的物理
+延迟 + 设备音频 I/O 缓冲」这一小块：网络往返、浏览器主线程抖动、mic 在途
+积压都不再计入。既然是个设备常量，就没有理由在运行时去猜。
+
+**运行时自适应已废弃**（`AcousticDelayTracker` 从实时路径撤下，搬到
+`orchestrator/tools/delay_estimate.py`）。原因是它在真机上收敛不了，且
+失败模式很糟：回声弱时 GCC-PHAT 找不到真峰，偶尔噪声凑出一个假峰就被
+**立刻采纳**，D 从此钉死在错值上、回声再也消不掉 —— 日志实录
+「声学延迟自适应: 4000 → 1 采样（0ms）」，此后表现为"长回复好好地说着，
+突然就无法打断、开始识别自己说的话了"。
+
+测法：
+
+```bash
+# ① 开着四路转储跑一轮真实会话（算法服务 AEC、外放、别戴耳机）
+ORCH_DUMP_AUDIO=/tmp/orchdump/s python -m orchestrator.main --port 8100
+
+# ② 用 dump 算 D，并让真实 AEC 在 D±10ms 上验证它
+python -m orchestrator.tests.measure_delay \
+    --mic /tmp/orchdump/s-xxxx-mic.wav \
+    --raw /tmp/orchdump/s-xxxx-raw.wav \
+    --verify-url ws://192.168.88.253:30255/ws/asr_frontend
+
+# ③ 把打印出来的 ORCH_AEC_DEFAULT_DELAY_MS 写进服务端环境变量
+```
+
+⚠️ 必须用 `-raw.wav`（**未补偿**的原始参考轨）。`-ref.wav` 是喂给 AEC 的
+那一份（已按 D 补偿），拿它互相关只能得到**残差**。
+⚠️ dump 必须是本次改动之后重新采的 —— 改动前落位误差是变化的，单个 D
+吸收不了，脚本会报出很大的散度（这本身就是有用的诊断）。
+
+前端会显示 D 的来源（已实测 / 默认值）。**显示"默认值（未实测）"时算法
+AEC 基本不会生效**，别把它当成一个正常数字。
 
 ### farend 量纲（应当归一化，但别高估其影响）
 
@@ -302,20 +405,20 @@ class Downstream(Protocol):
 ORCH_DUMP_AUDIO=/data/.../orchdump/s python -m orchestrator.main ...
 ```
 
-会话结束时写三个 wav（默认关闭，实时路径零开销）：
+会话结束时写四个 wav（默认关闭，实时路径零开销）：
 
 | 文件 | 内容 | 用它能判断 |
 |---|---|---|
 | `<前缀>-<sid>-mic.wav` | 浏览器送来的**原始麦克风**（AEC 之前） | 里面有没有回声 |
-| `<前缀>-<sid>-ref.wav` | 我们算的 **farend**（以为在播什么） | 与实际播报是否一致、长度对不对 |
+| `<前缀>-<sid>-ref.wav` | 我们算的 **farend**（以为在播什么，**已按 D 补偿**） | 与实际播报是否一致、长度对不对 |
+| `<前缀>-<sid>-raw.wav` | **未补偿**的原始参考轨 | 离线测 D（`tests/measure_delay.py` 用它） |
 | `<前缀>-<sid>-aec.wav` | **AEC 输出**（ASR 听的就是这个） | 回声消掉多少 |
 
-三个波形一比即可定论。真机故障就是这样定位的：`ref.wav` 只有 0.6s 有
-内容而 TTS 报了 5.85s → 直接指向 `truncate` bug（见上文）。
+波形一比即可定论。真机故障就是这样定位的：`ref.wav` 只有 0.6s 有内容而
+TTS 报了 5.85s → 直接指向 `truncate` bug（见上文）。
 
-前端侧也有对应的「导出诊断」（环境/约束/D/ERLE/日志）与
-「导出校准录音」（校准通道的 mic + 播放信号，配
-`tests/analyze_calib_wav.py` 可区分"没播出来/太轻/被设备侧消掉"三种失败）。
+⚠️ 测 D 必须用 `-raw.wav`：`-ref.wav` 已按当时的 D 补偿过，拿它互相关只能
+得到残差，不是绝对 D。
 
 ### 收尾时序（易踩）
 
@@ -353,10 +456,25 @@ python -m orchestrator.tests.test_face --so <libsdk_stream.so> --models <models>
   --mjpeg <camera_original.mjpeg> --tsv <camera_capture_timestamps.tsv>
 
 # 单元测试（无外部依赖）
-python -m orchestrator.tests.test_clock
-python -m orchestrator.tests.test_ref_track    # 含 D 恢复 + 量纲回归护栏
+python -m orchestrator.tests.test_clock         # 含 ctx↔会话采样 锚点映射
+python -m orchestrator.tests.test_ref_track     # 含 D 恢复 + 量纲回归护栏
+python -m orchestrator.tests.test_bargein_ref   # 打断 + armed 承诺落位
+python -m orchestrator.tests.check_html         # 前端结构 + 锚点协议发送端
 
-# 校准（无外部依赖 / 或走真实端点）
+# ⭐⭐ 全双工仿真：**证明**参考轨对齐了（本轮修复的核心验证）
+#    armed 应当逐句恒定、legacy 应当抖到几百毫秒 —— 对照着看才说明问题
+python -m orchestrator.tests.test_duplex_sim --scenario turn --anchor armed  --mock-tts --no-asr
+python -m orchestrator.tests.test_duplex_sim --scenario turn --anchor legacy --mock-tts --no-asr
+python -m orchestrator.tests.test_duplex_sim --scenario barge --anchor armed --mock-tts --no-asr
+# 接真服务（验证 ASR 不混入 TTS 内容，需真实语音）
+python -m orchestrator.tests.test_duplex_sim --scenario turn --anchor armed \
+  --wav-a assets/ref_audio/ref_minicpm_signature.wav \
+  --wav-b assets/ref_audio/ref_en_dlc_1.wav --d-true-ms 84
+
+# 离线测 D（用 ORCH_DUMP_AUDIO 的 dump；--verify-url 会用真实 AEC 复核）
+python -m orchestrator.tests.measure_delay --mic <-mic.wav> --raw <-raw.wav>
+
+# 主动校准通道（**已从验证页移除**，服务端端点保留给离线工具/诊断用）
 python -m orchestrator.tests.test_calibrate        # 算法：已知延迟的合成回声
 python -m orchestrator.tests.test_calibrate_e2e    # 端点：模拟浏览器走全流程
 
@@ -403,6 +521,10 @@ orchestrator/
     signals.py         数据契约
     local_provider.py  G1 + FaceService 组合
   downstream/          下游接口契约 + 确定性桩
-  actions/executor.py  执行 action（TTS 合成、播放、取消）
+  actions/executor.py  执行 action（TTS 合成、播放、取消、armed 承诺落位）
+  tools/
+    delay_estimate.py  声学延迟估计（GCC-PHAT）—— **离线**，实时路径已不用
   tests/               验证脚本与实测记录
+    test_duplex_sim.py 全双工仿真（假浏览器 + 合成回声；armed vs legacy 对照）
+    measure_delay.py   离线测 D（用 ORCH_DUMP_AUDIO 的 mic/raw dump）
 ```

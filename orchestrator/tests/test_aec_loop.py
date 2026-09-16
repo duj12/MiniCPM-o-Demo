@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from orchestrator.aec.client import DEFAULT_CHUNK, SR, AecClient  # noqa: E402
-from orchestrator.audio.ref_track import AcousticDelayTracker  # noqa: E402
+from orchestrator.tools.delay_estimate import AcousticDelayTracker  # noqa: E402
 
 DEFAULT_URL = "ws://192.168.88.253:30255/ws/asr_frontend"
 

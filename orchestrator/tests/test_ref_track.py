@@ -2,7 +2,8 @@
 """阶段 1 单元测试：TTS 参考轨 + 声学延迟估计。
 
 核心验证（对应计划里阶段 1 的验收项 ②）：
-  **构造已知延迟 D 的合成回声，``AcousticDelayTracker`` 应恢复出 D ±1 采样。**
+  **构造已知延迟 D 的合成回声，``AcousticDelayTracker``（离线工具）应
+  恢复出 D ±1 采样。**
 
     python -m orchestrator.tests.test_ref_track
 """
@@ -15,11 +16,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from orchestrator.audio.ref_track import (  # noqa: E402
-    AcousticDelayTracker,
-    RefTrack,
-)
+from orchestrator.audio.ref_track import RefTrack  # noqa: E402
 from orchestrator.clock import SR  # noqa: E402
+# ⚠️ 估计器已从实时路径撤下（真机上它会被噪声假峰钉死并永久失效），
+# 现在住在 tools/ 里供**离线**测 D 用。这些断言转而为离线工具守门。
+from orchestrator.tools.delay_estimate import AcousticDelayTracker  # noqa: E402
 
 _failures: list[str] = []
 
@@ -160,7 +161,7 @@ def test_delay_tracker() -> None:
 def test_delay_tracker_production_window() -> None:
     """生产链路的窗口几何：``ref`` 比 ``mic`` 长 ``offset``（回归护栏）。
 
-    ⚠️ 这正是线上 `_maybe_update_delay` 的调用形态（读
+    ⚠️ 这正是离线测 D 工具（tests/measure_delay.py）的调用形态（读
     ``WINDOW + dmax`` 个参考采样喂 ``WINDOW`` 个 mic 采样）。早先
     ``estimate()`` 要求两者**等长**，于是每次调用都在形状校验处 return
     None —— 自适应延迟估计整条路径从未生效，``D`` 永远停在 seed 值。
@@ -172,7 +173,7 @@ def test_delay_tracker_production_window() -> None:
     print("== 声学延迟估计（生产窗口几何 ref = mic + offset）==")
     rng = np.random.default_rng(11)
 
-    WINDOW = SR              # 1s，与 session._maybe_update_delay 一致
+    WINDOW = SR              # 1s，与 measure_delay.py 的默认窗口一致
     OFFSET = int(0.3 * SR)   # 4800 = 默认 max_delay（300ms）
 
     # D ∈ {20, 84, 284} ms —— 20ms 是模型容忍窗量级，284ms 是报告里的
@@ -213,6 +214,70 @@ def test_delay_tracker_production_window() -> None:
           f"形状不符被拒绝且给出原因（{tr.last_reason}）")
 
 
+def test_delay_tracker_not_hijacked_by_noise() -> None:
+    """噪声峰**不得**劫持 delay —— 真机踩过的坑（回归护栏）。
+
+    ⚠️ 真机实录（会话 `s-4c77038e818f`，长回复播到一半突然失效）：
+
+        「声学延迟自适应: 4000 → 1 采样（0ms），本次估计 1
+          （累计 1 次样本）」    ← 此前已连续失败 76 次
+
+    回声弱（mic RMS ≈0.0012，比 ref 小两个数量级）时 GCC-PHAT 找不到真峰，
+    峰比长期在 1.0~1.3 徘徊；偶尔一个噪声凑出的假峰刚好过 1.5 的线，就被
+    **立刻采纳**并把 D 钉死成 0（或任何假值），此后回声再也消不掉 ——
+    表现为"回复很长时，突然无法打断、开始识别自己说的话"。
+
+    正确行为：孤立估计不许改 delay，必须攒够**互相一致**的多个估计。
+    """
+    print("== 噪声不得劫持 delay（真机 s-4c77038e818f 回归）==")
+    rng = np.random.default_rng(1)
+    W = SR
+    OFF = int(0.3 * SR)
+
+    # 场景 A：mic 里**没有**回声（纯噪声）—— delay 必须纹丝不动
+    tr = AcousticDelayTracker(sr=SR, max_delay_ms=300.0)
+    tr.delay = 4000
+    for _ in range(30):
+        m = rng.standard_normal(W).astype(np.float32) * 0.002
+        r = rng.standard_normal(W + OFF).astype(np.float32) * 0.05
+        tr.estimate(m, r, offset=OFF)
+    check(tr.delay == 4000,
+          f"纯噪声下 delay 保持 4000 不变（得到 {tr.delay}）—— "
+          "早先会被单个假峰改掉")
+
+    # 场景 B：回声**极弱**（比 ref 小 250 倍，真机量级）—— 应仍然收敛到真值
+    tr = AcousticDelayTracker(sr=SR, max_delay_ms=300.0)
+    tr.delay = 4000
+    true_d = 4544                        # 284ms，报告里的真机值
+    full = rng.standard_normal(W * 12).astype(np.float32) * 0.3
+    conv = None
+    for i in range(10):
+        t0 = i * W
+        r = full[t0:t0 + W + OFF]
+        m = (full[t0 + OFF - true_d: t0 + OFF - true_d + W].copy() * 0.004
+             + rng.standard_normal(W).astype(np.float32) * 0.0012)
+        tr.estimate(m, r, offset=OFF)
+        if tr.delay != 4000 and conv is None:
+            conv = i + 1
+    check(conv is not None and conv <= 3 and abs(tr.delay - true_d) <= 2,
+          f"弱回声（1/250）仍在 {conv} 次内收敛到 {tr.delay}"
+          f"（真值 {true_d}）")
+
+    # 场景 C：混杂 —— 真信号中夹入若干纯噪声窗，最终应回到真值
+    tr = AcousticDelayTracker(sr=SR, max_delay_ms=300.0)
+    tr.delay = 4000
+    for i in range(24):
+        t0 = (i % 8) * W
+        r = full[t0:t0 + W + OFF]
+        if i % 4 == 3:                   # 每 4 个窗插一个纯噪声窗
+            m = rng.standard_normal(W).astype(np.float32) * 0.002
+        else:
+            m = full[t0 + OFF - true_d: t0 + OFF - true_d + W].copy() * 0.01
+        tr.estimate(m, r, offset=OFF)
+    check(abs(tr.delay - true_d) <= 2,
+          f"夹杂噪声后仍收敛到真值（{tr.delay} vs {true_d}）")
+
+
 def test_delay_tracker_rejects_silence() -> None:
     print("== 延迟估计器拒绝无效输入 ==")
     tr = AcousticDelayTracker(sr=SR)
@@ -239,6 +304,7 @@ def main() -> None:
     test_ref_track_truncate()
     test_delay_tracker()
     test_delay_tracker_production_window()
+    test_delay_tracker_not_hijacked_by_noise()
     test_delay_tracker_rejects_silence()
     print()
     if _failures:
