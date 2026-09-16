@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import ssl
 import sys
 import time
@@ -586,6 +587,15 @@ def main() -> None:
     p.add_argument("--mock-tts", action="store_true",
                    help="用本地正弦代替 TTS 服务（离线验证链路）")
     p.add_argument("--log-level", default="info")
+    # ---- HTTPS ----
+    # ⚠️ 浏览器只在**安全上下文**里给 `getUserMedia`（麦克风/摄像头）：
+    #    https:// 或 localhost。用 http:// + 局域网 IP 打开时，
+    #    `navigator.mediaDevices` 直接是 undefined，页面根本采不到音视频。
+    #    所以要用真设备采集就必须走 HTTPS。
+    p.add_argument("--ssl-cert", default="",
+                   help="HTTPS 证书（.pem）。与 --ssl-key 一起给才生效")
+    p.add_argument("--ssl-key", default="",
+                   help="HTTPS 私钥（.pem）")
     args = p.parse_args()
 
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
@@ -614,7 +624,26 @@ def main() -> None:
     app = create_app(cfg)
 
     import uvicorn
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=args.log_level)
+    ssl_kw = {}
+    if args.ssl_cert or args.ssl_key:
+        if not (args.ssl_cert and args.ssl_key):
+            p.error("--ssl-cert 与 --ssl-key 必须成对给出")
+        for path in (args.ssl_cert, args.ssl_key):
+            if not os.path.isfile(path):
+                p.error(f"证书文件不存在: {path}")
+        ssl_kw = {"ssl_certfile": args.ssl_cert, "ssl_keyfile": args.ssl_key}
+        logger.info("HTTPS 已启用：https://%s:%s（ws 自动升级为 wss）",
+                    cfg.host, cfg.port)
+    else:
+        # ⚠️ 明确提醒：http + 非 localhost 时浏览器**不给麦克风/摄像头**，
+        #    而这正是本服务最常见的用法（局域网里用另一台机器打开页面）。
+        logger.warning(
+            "未启用 HTTPS —— 从别的机器用 http://%s:%s 打开时，"
+            "浏览器不会给麦克风/摄像头权限（需 --ssl-cert/--ssl-key）",
+            cfg.host, cfg.port)
+
+    uvicorn.run(app, host=cfg.host, port=cfg.port,
+                log_level=args.log_level, **ssl_kw)
 
 
 if __name__ == "__main__":

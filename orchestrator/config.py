@@ -59,8 +59,12 @@ class Settings:
     #   "off"     —— 都不做。
     # 默认 service：音频端点用云端算法 AEC（需延迟校准，见 /v1/calibrate）。
     # 若该服务不可用或延迟过大，前端可切到 browser。
+    # ⚠️ 默认 **browser**（浏览器原生 AEC）：开箱可用，不依赖离线实测的 D。
+    #    算法服务 AEC 需要外放 + 每台设备离线测一次 D（见 run_orch.sh），
+    #    当作默认值会让"刚跑起来"的会话回声消不掉 —— 实测 D=250 这种占位值
+    #    抑制只有 0.3dB，等于不工作。
     aec_mode: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_AEC_MODE", "service"))
+        "ORCH_AEC_MODE", "browser"))
 
     # 声学延迟 D（毫秒）—— **每台设备一个固定常量**，离线测一次。
     #

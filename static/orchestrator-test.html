@@ -47,15 +47,21 @@
       <canvas id="overlay"></canvas>
     </div>
     <canvas id="cv" style="display:none"></canvas>
+    <!-- 摄像头不可用时的**明确提示**（降级为纯音频也要说清楚，
+         不能只留一个黑框让人猜） -->
+    <div class="stats" id="camstate"></div>
     <div class="stats" id="faceinfo">人脸：等待中…</div>
     <div style="margin-top:12px">
       <label style="display:block;margin-bottom:8px">
         回声消除：
-        <!-- 默认 service（与后端 ORCH_AEC_MODE 默认一致）。
+        <!-- 默认 **browser**（浏览器原生 AEC）：开箱即用、不依赖任何
+             服务端配置与离线测出的 D，网络延迟也不影响它。
+             要试算法服务 AEC（需外放 + 离线实测 D）再手动切。
+             ⚠️ 顺序别调回 service 在前 —— 列表第一项就是浏览器默认选中的。
              选了会记住（localStorage），刷新后保持上次的选择。 -->
         <select id="aecMode">
-          <option value="service">算法服务 AEC</option>
-          <option value="browser">浏览器原生 AEC（不受网络延迟影响）</option>
+          <option value="browser">浏览器原生 AEC（默认；不受网络延迟影响）</option>
+          <option value="service">算法服务 AEC（需外放 + 实测 D）</option>
           <option value="off">不做回声消除</option>
         </select>
       </label>
@@ -432,7 +438,9 @@ const AEC_MODE_KEY = 'orch_aec_mode';
 
 function selectedAecMode() {
   const el = $('aecMode');
-  return el ? el.value : 'service';
+  // 兜底也用 browser（与 <select> 的第一项一致）—— 早先是 'service'，
+  // 而算法 AEC 需要外放 + 离线实测的 D，默认值不该要求这些前提。
+  return el ? el.value : 'browser';
 }
 
 /** 恢复上次选择（刷新后保持），并绑定变更持久化。 */
@@ -441,7 +449,14 @@ function initAecMode() {
   if (!el) return;
   try {
     const saved = localStorage.getItem(AEC_MODE_KEY);
-    if (saved) el.value = saved;
+    // ⚠️ 旧版本默认是 service，老用户 localStorage 里普遍存着它 ——
+    //    直接沿用会让"改默认值"对这些人完全无效。这里把它当**没选过**
+    //    处理，回到新的 browser 默认；用户之后手动选择仍会被记住。
+    if (saved && saved !== 'service') {
+      el.value = saved;
+    } else if (saved === 'service') {
+      localStorage.removeItem(AEC_MODE_KEY);
+    }
   } catch (e) { /* ignore */ }
   // onchange 在别处已绑（切换逻辑），这里只加持久化
   el.addEventListener('change', () => {
@@ -531,6 +546,44 @@ function renderDelay(s) {
 }
 
 /* ---------- 采集 ---------- */
+/**
+ * 有没有可用的摄像头。
+ *
+ * ⚠️ 用 `enumerateDevices()` **先问再开**，不要直接 getUserMedia 然后
+ *    拿异常兜底 —— 没摄像头时那个异常是 "Requested device not found"，
+ *    与"被占用/被拒绝"混在一起，提示不明确。
+ * ⚠️ `enumerateDevices` 在**未授权前**可能不返回 label，但 `kind` 是有的，
+ *    所以这里只看有没有 videoinput，不看 label。
+ */
+async function hasVideoInput() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return false;
+    }
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    return devs.some(d => d.kind === 'videoinput');
+  } catch (e) {
+    return false;   // 问不出来就当作没有，走降级（比让会话崩溃好）
+  }
+}
+
+/** 在页面上标明摄像头状态（降级原因要看得见，不能静默）。 */
+function setCamState(state, msg) {
+  const el = $('camstate');
+  if (el) {
+    const color = state === 'ok' ? '#4ade80'
+                : state === 'none' ? '#fbbf24' : '#fca5a5';
+    el.innerHTML = msg
+      ? `<span style="color:${color}">${msg}</span>` : '';
+  }
+  // 没摄像头时把视频区换成一句说明，避免用户对着黑框猜
+  const box = $('cam');
+  if (box && state !== 'ok') {
+    box.style.display = state === 'none' ? 'none' : '';
+  }
+  diag.camState = state;
+}
+
 async function startCapture() {
   // 回声消除模式由用户在页面上选（见 #aecMode）——**二选一，不能同时开**：
   //   browser —— 浏览器原生 AEC（设备侧工作，不受网络延迟影响）
@@ -572,10 +625,33 @@ async function startCapture() {
     log('e', '⚠️ 浏览器**拒绝**了 echoCancellation —— 此设备/浏览器上'
            + '原生 AEC 不可用，回声不会被消除');
   }
-  videoStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-  });
-  $('cam').srcObject = videoStream;
+  // ---- 摄像头：**拿不到也要能跑** ----
+  // ⚠️ 早先这里是无保护的 await：没有摄像头时直接抛
+  //    "Requested device not found" → 整个 startCapture 中断 → 会话根本
+  //    起不来。但这套链路里**只有 face 需要视频**，OmniLLM 和后面所有
+  //    服务纯音频也能用 —— 不该因为没摄像头就完全不可用。
+  //    现在降级为纯音频，并在页面上明确说明降级原因。
+  try {
+    const camOk = await hasVideoInput();
+    if (!camOk) {
+      log('e', '⚠️ 未检测到摄像头 —— **降级为纯音频**（OmniLLM 仍可对话；'
+             + '人脸检测/唇动不可用）');
+      setCamState('none', '未检测到摄像头（纯音频模式）');
+      videoStream = null;
+    } else {
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      $('cam').srcObject = videoStream;
+      setCamState('ok', '');
+    }
+  } catch (e) {
+    // 设备存在但被占用 / 被拒绝（权限）—— 同样降级，别把会话带崩
+    log('e', `⚠️ 摄像头打开失败（${e.name || ''}: ${e.message || e}）—— `
+           + '降级为纯音频（人脸检测/唇动不可用）');
+    setCamState('error', `摄像头不可用（${e.name || 'Error'}）—— 纯音频模式`);
+    videoStream = null;
+  }
 
   // ⚠️ 采集与播放共用一个 AudioContext（16kHz）。某些移动浏览器不支持
   // 16kHz 的 AudioContext，会退到设备默认率 —— 这没关系，播放器会手动
