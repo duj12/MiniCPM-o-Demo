@@ -1709,6 +1709,15 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                     # 尾静音：让 ASR 的 VAD 闭合最后一段
                     chunk = np.zeros(MIC_CHUNK, dtype=np.float32)
                 await client.send_audio(chunk.astype(np.float32))
+                # ── 纯音频：把**同一块**输入音频也放出来 ──
+                # ⚠️ 必须**跟着 100ms 的块节奏**（外层这个 `if`），不能放在
+                #    每 tick 都执行的地方 —— 主循环 TICK_S 只有 4ms，那样等于
+                #    按 12.5 倍速灌音频，队列瞬间填满 → `play()` 开始丢最旧的，
+                #    听感就是**卡顿/断续**（实测 3.75s 丢 111 帧、队列顶到 64）。
+                #    这里喂的正好是本块 100ms，与真实时间 1:1。
+                if src_speaker is not None and not src_speaker_paused[0]:
+                    src_speaker.play(
+                        (chunk * 32767.0).astype(np.int16))
                 idx += 1
 
             # ── 人脸：24fps（约 41.7ms 一帧）──
@@ -1727,25 +1736,18 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                 await client.send_video_omni(omni_frames[oi % len(omni_frames)])
                 oi += 1
 
-            # ── 纯音频：把输入音频也放出来 ──
-            # ⚠️ **串行不重叠**：TTS 在播时暂停输入音频。两个 Speaker 同时开
-            #    会抢输出设备（实测互相打架、谁都出不来声）。而回放时输入
-            #    音频是以 10 倍速灌完的，本来也追不上 TTS —— 重叠没有意义。
+            # ── 纯音频：TTS 在播时让路（**串行不重叠**）──
+            # 两个 Speaker 同时开会抢输出设备（实测互相打架、谁都出不来声）。
+            # 注意这里**只切暂停状态**，真正喂音频在上面那个 100ms 块里
+            # （每 tick 喂会变成 12.5 倍速 → 卡顿）。
             if src_speaker is not None:
                 tts_busy = (client.speaker is not None
                             and client.speaker.pending_s() > 0)
-                if tts_busy:
-                    if not src_speaker_paused[0]:
-                        src_speaker.stop()          # 丢弃积压，TTS 优先
-                        src_speaker_paused[0] = True
-                else:
-                    if src_speaker_paused[0]:
-                        src_speaker_paused[0] = False
-                    per = int(SR / 20.0)            # 每 tick 喂 50ms
-                    a = (idx * MIC_CHUNK) % max(1, len(audio))
-                    seg = audio[a:a + per]
-                    if seg.size:
-                        src_speaker.play((seg * 32767.0).astype(np.int16))
+                if tts_busy and not src_speaker_paused[0]:
+                    src_speaker.stop()          # 丢弃积压，TTS 优先
+                    src_speaker_paused[0] = True
+                elif not tts_busy and src_speaker_paused[0]:
+                    src_speaker_paused[0] = False
 
             # 插话：仅日志标记 —— 真正的打断由**服务端**新回复时的
             # `_interrupt_current` 驱动（它会发 tts.cancel），客户端据此停播。
