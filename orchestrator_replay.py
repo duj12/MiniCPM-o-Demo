@@ -930,12 +930,15 @@ class StatusOverlay:
                 self.ovl._text(img, ln, (pad, y0 + pad + lh * (i + 1) - 4), col)
 
         # ---- 右上角：状态栏 ----
+        # ⚠️ 锚点 / ERLE / ferend 这三项（回声对齐诊断）已按需求**注释掉** ——
+        #    要复看时把下面三行取消注释、并恢复 `st` 里的对应项即可。
         st = [f"AEC {self.aec_mode}",
               f"D {self.delay_ms:.0f}ms",
-              f"锚点 {self.anchor}"]
-        if self.erle is not None:
-            st.append(f"ERLE {self.erle:.1f}dB")
-        st.append(f"ferend {self.ref_ratio*100:.0f}%")
+              # f"锚点 {self.anchor}",
+              ]
+        # if self.erle is not None:
+        #     st.append(f"ERLE {self.erle:.1f}dB")
+        # st.append(f"ferend {self.ref_ratio*100:.0f}%")
         st.append(f"TTS {'播报中' if self.tts_playing else '空闲'}")
         # ASR 五个状态量里的四个档位（transcript 就是下面那行字幕）
         s = self.asr_state
@@ -950,9 +953,9 @@ class StatusOverlay:
         self._bar(img, pad, lh * len(st) + pad, 0.5)
         for i, ln in enumerate(st):
             col = (140, 255, 180)
-            if ln.startswith("锚点") and self.anchor != "ack":
-                # ⚠️ 不是 ack 就变色 —— 参考轨的播出时刻是猜的，AEC 对不齐
-                col = (120, 120, 255)
+            # 锚点不是 ack 时变色告警 —— 已随锚点项一起注释掉
+            # if ln.startswith("锚点") and self.anchor != "ack":
+            #     col = (120, 120, 255)
             self.ovl._text(img, ln, (W - bw + pad, pad + lh * i + lh - 6), col)
 
         # ---- 左上角：TTS 播报记录（追加语义）----
@@ -1400,7 +1403,12 @@ class OrchestratorReplayClient:
             if self.status is not None:
                 self.status.set_stats(m)
             src = m.get("anchor_source")
-            # ⚠️ 只记**播报已经发生过**之后的锚点状态。
+            # ⚠️ 回声对齐诊断（锚点状态记录 + 异常告警 + [stats] 那行）已按
+            #    需求**注释掉** —— 这行 `[stats]` 每 2s 刷一次，会把 ASR 的
+            #    流式输出冲掉。要复看时取消注释即可（`_last_stats` /
+            #    `anchor_sources` 仍然在记，结尾汇总要用）。
+            #
+            # 只记**播报已经发生过**之后的锚点状态。
             #    `session.stats` 是每 2s 推一次的快照，会话刚开始、还没播报时
             #    它必然报 `none` —— 那是"还没轮到"，不是"用的是预测"。
             #    真机踩过这个歧义：只看最后一次 stats 会误判成没走 ack。
@@ -1409,14 +1417,14 @@ class OrchestratorReplayClient:
                     self.anchor_sources.append(src)
                 # 这条是 AEC 对齐的命门：predicted = 服务端在**猜**播出时刻，
                 # 误差逐句变化、固定 D 吸收不了。看到它就要查为什么没 ack。
-                if src != "ack":
-                    print(f"\n  ⚠️ 落位锚点 = {src}"
-                          f"（不是 ack —— 参考轨用于对齐的播出时刻不可信）")
-            if self.verbose:
-                erle = m.get("erle_db")
-                print(f"\r  [stats] D={m.get('delay_ms')}ms "
-                      f"锚点={src}(偏差{m.get('anchor_delta_ms')}ms) "
-                      f"ERLE={erle}dB ref非零={m.get('ref_nonzero_ratio')}", end="")
+                # if src != "ack":
+                #     print(f"\n  ⚠️ 落位锚点 = {src}"
+                #           f"（不是 ack —— 参考轨用于对齐的播出时刻不可信）")
+            # if self.verbose:
+            #     erle = m.get("erle_db")
+            #     print(f"\r  [stats] D={m.get('delay_ms')}ms "
+            #           f"锚点={src}(偏差{m.get('anchor_delta_ms')}ms) "
+            #           f"ERLE={erle}dB ref非零={m.get('ref_nonzero_ratio')}", end="")
 
         elif t == "face.state":
             self.face_states += 1
@@ -1856,25 +1864,30 @@ def print_summary(client: OrchestratorReplayClient, wall: float) -> None:
           f"{len(client.asr_finals)} 个最终结果")
     for t in client.asr_finals:
         _print_wrapped(t, indent="      · ", hang="        ")
-    if client.anchor_sources:
-        # ⚠️ 这是 AEC 对齐的判据：ack = 用浏览器承诺的播出时刻（准）；
-        #    predicted = 服务端在猜（误差逐句变化，固定 D 吸收不了）
-        print(f"  落位锚点      : {' → '.join(client.anchor_sources)}")
-        if "predicted" in client.anchor_sources:
-            print("    ⚠️ 出现过 predicted —— 参考轨落位不可信，AEC 对齐会漂")
-    elif rs and client.armed_sent:
-        # 我们**自己发过** armed 承诺 —— 发起侧才是权威。
-        # 服务端的 session.stats 是每 2s 一次的快照，短会话里采不到播报那一刻，
-        # 只看它会误判成"没走 ack"。
-        print(f"  落位锚点      : 已发出 {len(client.armed_sent)} 次 armed 承诺"
-              f"（服务端 {client._last_stats.get('anchor_source', '?') if client._last_stats else '?'}）"
-              f"—— 服务端日志里看『落位于 …（来源=ack）』确认")
+    # ⚠️ 落位锚点汇总（AEC 对齐诊断）已按需求注释掉。`anchor_sources` 与
+    #    `armed_sent` 仍在正常记录，要复看时取消注释即可。
+    # if client.anchor_sources:
+    #     # 这是 AEC 对齐的判据：ack = 用浏览器承诺的播出时刻（准）；
+    #     # predicted = 服务端在猜（误差逐句变化，固定 D 吸收不了）
+    #     print(f"  落位锚点      : {' → '.join(client.anchor_sources)}")
+    #     if "predicted" in client.anchor_sources:
+    #         print("    ⚠️ 出现过 predicted —— 参考轨落位不可信，AEC 对齐会漂")
+    # elif rs and client.armed_sent:
+    #     # 我们**自己发过** armed 承诺 —— 发起侧才是权威。
+    #     # 服务端的 session.stats 是每 2s 一次的快照，短会话里采不到播报那一刻，
+    #     # 只看它会误判成"没走 ack"。
+    #     print(f"  落位锚点      : 已发出 {len(client.armed_sent)} 次 armed 承诺"
+    #           f"（服务端 {client._last_stats.get('anchor_source', '?') if client._last_stats else '?'}）"
+    #           f"—— 服务端日志里看『落位于 …（来源=ack）』确认")
     if client.face_states:
         print(f"  人脸状态      : {client.face_states} 条")
     if client._last_stats:
         s = client._last_stats
+        # ERLE 属于回声对齐诊断，已随其余几项一起注释掉
+        # print(f"  最终配置      : D={s.get('delay_ms')}ms"
+        #       f"（来源 {s.get('delay_source')}）ERLE={s.get('erle_db')}dB")
         print(f"  最终配置      : D={s.get('delay_ms')}ms"
-              f"（来源 {s.get('delay_source')}）ERLE={s.get('erle_db')}dB")
+              f"（来源 {s.get('delay_source')}）")
     if client.errors:
         print(f"  错误          : {client.errors}")
     print(f"  墙钟          : {wall:.1f}s")
@@ -2045,7 +2058,12 @@ def main() -> None:
                    help="强制用 ASCII 标签（cv2.putText 画不了中文）")
     p.add_argument("--overlay-font", default="",
                    help="指定中文 TTF/TTC 字体路径（默认自动探测）")
-    p.add_argument("--verbose", action="store_true", help="逐事件打印")
+    # 默认打开 —— 这个工具的价值在于看协议/时序，静默跑没意义。
+    # 要安静输出用 --no-verbose。
+    p.add_argument("--verbose", dest="verbose", action="store_true",
+                   default=True, help="逐事件打印（默认开）")
+    p.add_argument("--no-verbose", dest="verbose", action="store_false",
+                   help="关掉逐事件打印")
     args = p.parse_args()
 
     if not args.audio and not args.video:
