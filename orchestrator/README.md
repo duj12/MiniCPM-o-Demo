@@ -46,23 +46,77 @@ pip install websockets fastapi uvicorn numpy
 pip install grpcio protobuf
 ```
 
-### 启动
+---
+
+## 启动服务
+
+### 生产：用 `orchestrator/run_orch.sh`
+
+**推荐用脚本，不要手工 `nohup`** —— 人脸相关的环境变量漏一个，
+表现就是"人脸模块突然没了"（`face=False`），很难查。
+
+```bash
+cd MiniCPM-o-Demo
+setsid nohup bash orchestrator/run_orch.sh </dev/null >orch.log 2>&1 &
+```
+
+⚠️ **从哪个目录跑都行** —— 脚本按自身位置推导 `REPO` 与 `CODE`
+（`CODE` = 与 `MiniCPM-o-Demo` 同级，`board-face-and-cloud-infer` /
+`faceidentification` 都在那里）。
+
+脚本集中管理了：算法 AEC 的延迟 D、音视频转储、人脸模块、HTTPS 证书。
+每个变量都可用环境变量覆盖（如 `ORCH_PORT=9000 bash orchestrator/run_orch.sh`），
+`ORCH_PY` 可换 Python 解释器。
+
+看启动结果：
+
+```bash
+tail -5 orch.log
+# 期望：能力: aec=True asr=True omni=True tts=True face=True downstream=omni
+#       HTTPS 已启用：https://0.0.0.0:8100
+```
+
+### 开发/调试：直接起
 
 ```bash
 cd MiniCPM-o-Demo
 python -m orchestrator.main --port 8100
 ```
 
-打开 `http://<host>:8100/` 是自带的验证页（授权摄像头麦克风即可跑通全链路）。
-
-### 常用参数
+### 参数
 
 | 参数 | 说明 |
 |---|---|
-| `--port` | 监听端口（默认 8100） |
-| `--downstream-mode` | 桩模式：`asr`（ASR 最终结果→TTS）/ `omni`（OmniLLM 回复→TTS）/ `echo` / `none` |
+| `--host` / `--port` | 监听地址/端口（默认 `0.0.0.0:8100`） |
+| `--downstream-mode` | 桩模式：`asr` / `omni`（默认）/ `echo` / `none` |
+| `--ssl-cert` / `--ssl-key` | 启用 HTTPS（**成对给**）。见下面「为什么必须 HTTPS」 |
 | `--no-aec` / `--no-asr` / `--no-omni` / `--no-tts` | 分开关闭各组件（便于定位问题） |
 | `--mock-tts` | 用本地正弦代替 TTS 服务（离线验证链路） |
+
+### ⚠️ 为什么必须 HTTPS
+
+浏览器只在**安全上下文**（`https://` 或 `localhost`）里给 `getUserMedia`
+（麦克风/摄像头）。用 `http://<局域网IP>:8100` 打开时 `navigator.mediaDevices`
+**直接是 undefined** —— 页面看着正常，就是采不到任何音视频。
+
+自签证书（`certs/cert.pem`）的 **SAN 里必须包含你实际访问用的地址**，
+否则浏览器不认（**Edge/Chrome 只看 SAN，完全忽略 CN**）：
+
+```
+X509v3 Subject Alternative Name:
+    IP Address:192.168.89.106, IP Address:127.0.0.1, DNS:localhost, DNS:ubuntu
+```
+
+换机器/换 IP 就要重新签（`openssl req -x509 -config ...`，`v3_req` 里带
+`subjectAltName`），或者直接用 `mkcert`。首次访问浏览器会拦一次，
+点「继续访问」即可。
+
+**Tailscale**：它是以明文回源 `http://127.0.0.1:8100` 的，8100 改 HTTPS
+之后要同步改回源，否则那条路会断：
+
+```bash
+sudo tailscale serve --bg --https=443 https+insecure://localhost:8100
+```
 
 ### 环境变量
 
@@ -87,6 +141,31 @@ export ORCH_FACE_DB="$CODE/faceidentification/data/face_db.npz"
 export G1_FACE_DEBUG=0     # ⚠️ 必须！否则 create 就写最多约 4GB 视频
 ```
 
+### 音视频转储（排障必备）
+
+```bash
+export ORCH_DUMP_AUDIO="$CODE/orchdump/s"
+```
+
+设了就会在**会话结束时**把输入落盘（不设 = 零开销）：
+
+| 文件 | 内容 |
+|---|---|
+| `s-<sid>-mic.wav` | 原始麦克风（**含回声**） |
+| `s-<sid>-ref.wav` | 已按 D 补偿的参考轨（喂给 AEC 的那份） |
+| `s-<sid>-raw.wav` | **未补偿**的原始参考轨（测 D 必须用这个） |
+| `s-<sid>-aec.wav` | AEC 输出 |
+| `s-<sid>-face.mjpeg` + `.tsv` | 25fps 人脸帧，**原样存的 JPEG** |
+| `s-<sid>-omni.mjpeg` + `.tsv` | 1fps Omni 帧 |
+
+`<sid>` 就是网页状态栏显示的**会话 id** —— 网页上看到哪个，就去
+`orchdump/` 里找哪个。
+
+⚠️ **会话进行中不会有文件**，是 `close()` 时才写。
+⚠️ 视频存的是 **MJPEG 不是 mp4**：发给 Omni/face 的就是原始 JPEG 字节，
+转 mp4 要重编码（有损）且丢掉逐帧时间对应，没法复现问题。要看的话自己转：
+`ffmpeg -i s-x-face.mjpeg out.mp4`。
+
 ---
 
 ## HTTP 接口
@@ -98,6 +177,76 @@ export G1_FACE_DEBUG=0     # ⚠️ 必须！否则 create 就写最多约 4GB �
 | `GET /stats` | 各活跃会话的原始统计 |
 | `GET /metrics` | 全局指标 + 最近会话快照（可接 Prometheus） |
 | `WS /v1/orchestrator` | 会话主通道 |
+
+---
+
+## 客户端怎么用
+
+有两种：**网页**（真人对着麦克风说话）和**离线回放**（喂预录音视频，
+可重复、可断言）。排查问题建议两个都用 —— 网页复现、回放复验。
+
+### ① 网页（`static/orchestrator-test.html`）
+
+浏览器打开 `https://<host>:8100/`（**必须 https**，见上面「为什么必须 HTTPS」），
+授权麦克风和摄像头，点「开始会话」。
+
+页面上的东西：
+
+| 区域 | 看什么 |
+|---|---|
+| ASR 字幕 | 流式转写 + 五个状态量 `[说/抢/信/完]` |
+| 播报记录 | TTS 文本，**边生成边显示**（流式合成） |
+| 音频面板 | `AudioContext` 状态、**TTS 播放中/剩余 Ns**、设备输出延迟 |
+| 计数器 | `TTS 帧 / 已调度 / 峰值` —— 判断"有没有声音" |
+| 会话 id | **和 `orchdump/` 的文件名对应**，排障时记下它 |
+
+几个开关：
+
+- **回声消除**：默认**浏览器原生 AEC**（开箱可用）。要试算法服务 AEC
+  需选它 + **外放 + 离线实测 D**，否则回声消不掉（占位值 D=250 实测
+  抑制只有 0.3dB，等于不工作）
+- **没有摄像头也能用**：自动降级为纯音频（页面会明确提示），
+  OmniLLM 照常对话，只是人脸检测/唇动不可用
+
+### ② 离线回放（`orchestrator_replay.py`）
+
+用 Python 扮演浏览器，把预录音视频按**真实实时节奏**喂给编排服务，
+并处理回来的 TTS / ASR / 人脸状态。适合回归验证与复现。
+
+```bash
+# 最简：位置参数，按扩展名自动判断音频/视频
+python orchestrator_replay.py assets/ref_audio/ref_minicpm_signature.wav \
+    --host 192.168.89.106
+
+# 视频（自动抽帧：人脸 320×240 @24fps、Omni 1280×720 @1fps）
+python orchestrator_replay.py assets/video/turnbased/121.mp4 --host 192.168.89.106
+```
+
+（`assets/video/` 下还有几段更长的，如 `test.mp4` 约 7 分钟 —— 适合跑
+「长时间多轮对话」这类场景。）
+
+**默认全开**：播放输入音频、播放 TTS、开窗显示、verbose。通常不用加参数。
+
+| 想要 | 加什么 |
+|---|---|
+| 静音 | `--mute` |
+| 不开窗 | `--no-show` |
+| 只播 TTS / 只播输入音频 | `--no-play-audio` / `--no-play-tts` |
+| 连老式明文服务 | `--ws`（默认 `wss://`，且**不校验自签证书**） |
+| 存服务端回来的 TTS | `--save-tts /tmp/tts` |
+| 存带叠加层的视频 | `--save-video out.mp4` |
+| 模拟插话 | `--bargein-at 5,12`（在第 5、12 秒打断） |
+| 换个播放设备 | `--audio-device <名字或编号>` |
+| 安静输出 | `--no-verbose` |
+
+⚠️ **`--replay-speed` 不要乱调**：服务端按实时流设计，加速会让 AEC/ASR
+表现失真。默认 1.0 是**慢放**（音频按 100ms/块真实节奏发）。
+
+⚠️ **本工具不模拟声学回声** —— mic 通道就是文件里的干净音频，TTS 播报
+不会被"回采"进输入通道。所以它测不了 AEC 的消除效果（要测回声闭环用
+`tests/test_duplex_sim.py`，它会合成 `mic = 干净人声 + gain × 喇叭[t−D]`）。
+
+跑完会打印汇总：TTS 段数与总时长、ASR 部分/最终结果、最终配置、墙钟。
 
 ---
 
