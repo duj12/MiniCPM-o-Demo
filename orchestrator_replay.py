@@ -1644,7 +1644,21 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     #    另外还要留一个"一直没有 TTS"的兜底（比如这轮模型没回复）。
     got_any = False
     quiet_since = time.monotonic()
-    while time.monotonic() - t_stop < args.drain_s and not client.closed:
+    # ⚠️ **不能是固定的墙钟上限**。早先写成 `while now - t_stop < drain_s`，
+    #    60s 的长回复会在第 30s 被硬切 —— 与刚修好的"没播完就关"是同一类
+    #    问题，只是触发条件是"回复比 drain_s 长"。
+    #    正确语义：`drain_s` 是**没有进展时的静默容忍**，不是总时长上限。
+    #    只要它还在播（或音频还在陆续到达），就一直等下去；真卡住了才退。
+    #    另加一个很宽的总上限（drain_s × 6）兜住"服务端挂了但连接没断"。
+    hard_limit = max(60.0, args.drain_s * 6.0)
+    progress_at = time.monotonic()
+    last_remain = None
+    # ⚠️ **不能把 `client.closed` 当终止条件**。服务端 drain 完会**主动断开**
+    #    （日志实测：client_stop 后 17s 关闭），但此时播放器队列里可能还排着
+    #    十几秒没播的音频 —— 一断就退出会**把话掐断**，正是要修的症状。
+    #    连接断了只是"没有新音频了"，本地把已收到的放完仍然要做。
+    while True:
+        now = time.monotonic()
         remain = client.playback_remaining_s()
         # 真出声时还要算上**队列里排着没播的**（Speaker 是异步消费的，
         # 调度表算不出来）
@@ -1652,21 +1666,34 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             remain = max(remain, client.speaker.pending_s())
         if client.player.responses:
             got_any = True
-            quiet_since = time.monotonic()
+            quiet_since = now
         # 收工条件：**音频已全部送达**（tts.end 齐）**且**播放器已放完。
         # 只看剩余时长会在首批音频到达前误判（见 all_ended 的说明）。
         if got_any and client.player.all_ended() and remain <= 0.05:
             break
-        if not got_any and time.monotonic() - quiet_since > 8.0:
+        # "有进展" = 剩余时长变了，或音频条数变了 —— 都说明还在推进
+        n_resp = len(client.player.responses)
+        key = (round(remain, 1), n_resp)
+        if key != last_remain:
+            last_remain = key
+            progress_at = now
+        # 静默超时：drain_s 内毫无进展 → 认为结束了
+        if now - progress_at > args.drain_s:
+            print(f"    （{args.drain_s:.0f}s 无进展 —— 收工；"
+                  f"收到 {n_resp} 段，剩余 {remain:.1f}s）")
+            break
+        if not got_any and now - quiet_since > 8.0:
             # 8s 内一段 TTS 都没来 —— 这轮大概没有回复，不必再等
             print("    （8s 内没有 TTS 到达 —— 本轮可能无回复，收工）")
             break
-        now = time.monotonic()
+        if now - t_stop > hard_limit:
+            print(f"  ⚠️ 收尾总时长超过 {hard_limit:.0f}s，强制退出")
+            break
         if now - last_report > 2.0:
             last_report = now
             if remain > 0.05:
                 print(f"    还在播：剩余 {remain:.1f}s"
-                      f"（已收到 {len(client.player.responses)} 段）", flush=True)
+                      f"（已收到 {n_resp} 段）", flush=True)
         # ⚠️ 收尾期间也要驱动窗口 —— 否则等待的这几秒里窗口**无响应**
         #    （Windows 会画上"未响应"），而且最后一帧停在旧画面。
         if window is not None and window.show:
@@ -1816,6 +1843,10 @@ async def main_async(args) -> int:
         if not window.ok:
             print(f"  ⚠️ 回放窗口/录像不可用：{window.err}")
             window = None
+        elif not window.out_path:
+            # 说清楚：开了窗但**不会存文件**。早先不提示，用户跑完去找
+            # 视频找不到（"帧"那个计数只表示渲染过，不代表落盘）。
+            print("  （只显示、不存文件；要存成 mp4 加 --save-video 路径.mp4）")
 
     t0 = time.monotonic()
     try:
@@ -1830,10 +1861,15 @@ async def main_async(args) -> int:
         if window is not None:
             window.close()
             if window.frames:
-                print(f"  已写 {window.frames} 帧"
-                      + (f"，丢弃 {window.dropped} 帧（编码跟不上）"
-                         if window.dropped else "")
-                      + (f" → {window.out_path}" if window.out_path else ""))
+                # ⚠️ 措辞要分清「渲染」与「落盘」：早先这里一律打"已写 N 帧"，
+                #    而没传 --save-video 时根本**没写文件** —— 只显示在窗口上。
+                #    用户据此去找文件，自然找不到。
+                dst = (f" → {window.out_path}") if window.out_path else \
+                    "（未落盘：没传 --save-video，只显示在窗口上）"
+                print(f"  渲染 {window.frames} 帧" + dst
+                      + (f"；丢弃 {window.dropped} 帧（渲染跟不上，"
+                         f"只影响显示/录像，**不影响发给服务端的帧**）"
+                         if window.dropped else ""))
         if speaker is not None:
             speaker.close()
         await client.close(save=True)
@@ -1863,9 +1899,10 @@ def main() -> None:
                         "加速可能让 AEC/ASR 表现失真）")
     p.add_argument("--tail-silence-s", type=float, default=2.0,
                    help="音频发完后补发的尾静音（秒），让 VAD 闭合最后一段")
-    p.add_argument("--drain-s", type=float, default=30.0,
-                   help="收尾等待上限（秒，默认 30）。等的是「回复生成完 + "
-                        "TTS 播完」—— 长回复可能要十几秒，太小会把话掐断")
+    p.add_argument("--drain-s", type=float, default=300.0,
+                   help="收尾时「多久没有进展」才放弃（秒，默认 300）。"
+                        "⚠️ 它**不是总时长上限** —— 只要 TTS 还在播就继续等，"
+                        "所以长回复不会被掐断（另有 drain_s×6 的硬上限兜底）")
     p.add_argument("--bargein-at", default="",
                    help="在这些秒数模拟插话（逗号分隔），如 5,12")
     p.add_argument("--face-fps", type=float, default=DEFAULT_FACE_FPS,
