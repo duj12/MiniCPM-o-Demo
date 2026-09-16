@@ -107,6 +107,19 @@ def b64bytes(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
 
+def _has_display() -> bool:
+    """当前环境有没有可用的显示器/GUI 会话。
+
+    ⚠️ 这个检查**必须在开窗前**做 —— cv2 的 GUI 后端在无显示器时**不是
+    抛异常，而是直接 abort（SIGABRT 把整个进程带走）**，`try/except`
+    根本拦不住。`--show` 现在默认开，没这个检查的话在无头机上一跑就 core dump。
+    """
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY")
+                or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def screen_size() -> Optional[Tuple[int, int]]:
     """屏幕像素尺寸；取不到返回 None。
 
@@ -1634,6 +1647,7 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                      face_frames: List[bytes], omni_frames: List[bytes],
                      args, window: Optional["FaceWindow"] = None,
                      src_speaker: Optional["Speaker"] = None,
+                     play_tts: bool = True, play_src: bool = True,
                      ) -> OrchestratorReplayClient:
     """按**真实实时节奏**回放：音频 100ms/块，人脸 24fps，Omni 1fps。
 
@@ -1658,20 +1672,18 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
               f"@{args.omni_fps:.0f}fps（{OMNI_MAX_W}×{OMNI_MAX_H}）")
     else:
         print("  视频：无（纯音频）")
-    if args.play_audio:
-        if window is not None and window._speaker is not None:
-            print("  原片声音：开（窗口播放）")
-            if client.speaker is not None:
-                print("  TTS 声音 ：开（与原片声音混音）")
-            else:
-                print("  TTS 声音 ：关（避免与原片声音抢音频设备；"
-                      "要同时放用 --play-tts）")
-        elif client.speaker and client.speaker.ok:
-            print(f"  本地播放：开"
-                  + (f"（设备 {args.audio_device}）" if args.audio_device else ""))
-        else:
-            print("  本地播放：失败"
-                  f"（{(client.speaker.err if client.speaker else '未启用')}）")
+    # 两个开关分别报，别再含糊地说"本地播放"
+    _tts_ok = client.speaker is not None and client.speaker.ok
+    _src_ok = ((window is not None and window._speaker is not None)
+               or (src_speaker is not None and src_speaker.ok))
+    print(f"  输入音频  ：{'开' if _src_ok else '关'}"
+          + ("" if play_src else "（--no-play-audio）"))
+    print(f"  TTS 声音  ：{'开' if _tts_ok else '关'}"
+          + ("" if play_tts else "（--no-play-tts）"))
+    if play_tts and not _tts_ok:
+        err = client.speaker.err if client.speaker else "未启用"
+        print(f"    ⚠️ TTS 放不出来：{err}")
+        print("       pip install sounddevice（Linux 还需 libportaudio2）")
     print(f"  AEC 模式 = {args.aec_mode}　"
           f"{'（含 ' + str(len(barge_at)) + ' 次插话）' if barge_at else ''}")
 
@@ -1936,25 +1948,25 @@ async def main_async(args) -> int:
     print(f"连接 {url}")
     clock = VirtualClock()
 
+    # ---- 播放开关：默认全开，`--mute` 一次关掉 ----
+    play_tts = args.play_all and args.play_tts
+    play_src = args.play_all and args.play_audio
+
     speaker: Optional[Speaker] = None
-    # ⚠️ 两个 Speaker 会**抢同一个输出设备**（主 TTS 一个、窗口原片音轨一个），
-    #    实测互相打架：谁都出不来声。所以开窗放原片声时，主 TTS 默认静音 ——
-    #    要用 `--play-tts` 显式要求（此时两者会混在一起，能区分但会重叠）。
-    want_tts_audio = args.play_audio and (not args.show or args.play_tts)
-    if want_tts_audio:
+    if play_tts:
         speaker = Speaker(device=args.audio_device)
         if not speaker.ok:
-            print(f"  ⚠️ 本地播放不可用：{speaker.err}")
+            print(f"  ⚠️ TTS 播放不可用：{speaker.err}")
             print("     装依赖：pip install sounddevice"
                   "（Linux 还需 libportaudio2）")
             speaker = None
 
     # 纯音频输入**没有窗口**，原片声没地方放（原来只有 FaceWindow 会播它）。
     # 这里补一个 16k 的 Speaker 专放输入音频。
-    # ⚠️ **只在没有 --video 时创建** —— 有视频时仍走 FaceWindow 那条老路径，
-    #    一行不改（两个 Speaker 会抢输出设备，实测互相打架）。
+    # ⚠️ **只在没有 --video 时创建** —— 有视频时仍走 FaceWindow 那条老路径
+    #    （两个 Speaker 会抢输出设备，实测互相打架）。
     src_speaker: Optional[Speaker] = None
-    if args.play_audio and not args.video:
+    if play_src and not args.video:
         src_speaker = Speaker(device=args.audio_device, sample_rate=SR)
         if not src_speaker.ok:
             print(f"  ⚠️ 输入音频播放不可用：{src_speaker.err}")
@@ -1966,7 +1978,13 @@ async def main_async(args) -> int:
         speaker=speaker, face_log_every=args.face_log_every)
 
     window: Optional[FaceWindow] = None
-    if args.video and (args.show or args.save_video):
+    # ⚠️ `--show` 现在默认开，所以**必须**先确认有显示器：cv2 在无头机上
+    #    不是抛异常而是直接 abort，把整个进程带走（try/except 拦不住）。
+    want_show = args.show
+    if want_show and not _has_display():
+        print("  ⚠️ 没检测到显示器 —— 自动不开窗（继续跑，只是看不到画面）")
+        want_show = False
+    if args.video and (want_show or args.save_video):
         ovl = FaceOverlay(font_path=args.overlay_font,
                           scale=args.overlay_scale,
                           force_ascii=args.overlay_ascii)
@@ -1979,7 +1997,7 @@ async def main_async(args) -> int:
         status = StatusOverlay(ovl, scale=args.overlay_scale)
         client.status = status
         window = FaceWindow(args.video, args.save_video, args.face_fps,
-                            show=args.show, overlay=ovl, crf=args.video_crf,
+                            show=want_show, overlay=ovl, crf=args.video_crf,
                             preset=args.video_preset,
                             play_audio=not args.no_source_audio,
                             mux_audio=not args.no_source_audio,
@@ -1998,7 +2016,8 @@ async def main_async(args) -> int:
     try:
         await client.connect()
         await run_replay(client, audio, face_frames, omni_frames, args, window,
-                         src_speaker=src_speaker)
+                         src_speaker=src_speaker,
+                         play_tts=play_tts, play_src=play_src)
     except KeyboardInterrupt:
         print("\n  [中断]")
     except Exception as exc:  # noqa: BLE001
@@ -2032,8 +2051,12 @@ def main() -> None:
         description="编排服务离线音视频回放客户端",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("## 用法")[-1] if __doc__ else "")
-    p.add_argument("--audio", default="", help="音频文件（wav/flac/...）。与 --video 二选一")
-    p.add_argument("--video", default="", help="视频文件（抽音轨 + 抽帧）。与 --audio 二选一")
+    # 位置参数：直接给文件，按扩展名自动判断音频/视频 —— 省掉 --audio/--video
+    p.add_argument("source", nargs="?", default="",
+                   help="输入文件（wav/flac/mp4...）。按扩展名自动判断"
+                        "音频还是视频 —— 等价于 --audio/--video")
+    p.add_argument("--audio", default="", help="音频文件（与 --video 二选一）")
+    p.add_argument("--video", default="", help="视频文件（与 --audio 二选一）")
     p.add_argument("--host", default="127.0.0.1", help="编排服务地址（默认本机）")
     p.add_argument("--port", type=int, default=8100, help="编排服务端口（默认 8100）")
     p.add_argument("--aec-mode", default="service",
@@ -2059,12 +2082,20 @@ def main() -> None:
     p.add_argument("--omni-fps", type=float, default=DEFAULT_OMNI_FPS,
                    help=f"Omni 帧抽帧率（默认 {DEFAULT_OMNI_FPS:.0f}）")
     p.add_argument("--save-tts", default="", help="把服务端回来的 TTS 存成 wav 的目录")
-    p.add_argument("--play-tts", action="store_true",
-                   help="开窗放原片声时**同时**放 TTS（默认 TTS 静音，"
-                        "因为两个播放流会抢同一个音频设备）")
-    p.add_argument("--play-audio", action="store_true",
-                   help="把 TTS 真正放出来（需 sounddevice + 声卡）。"
-                        "⚠️ 本工具不模拟声学回声，外放不会污染 mic 通道")
+    # ⚠️ 命名容易混，记住这两条就够：
+    #   `--play-tts`   = 放 **TTS（机器人回复）**
+    #   `--play-audio` = 放 **输入音频**（你喂进去那段原片声）
+    #   两者都默认开；静音用 `--mute`。
+    p.add_argument("--play-tts", dest="play_tts", action="store_true",
+                   default=True, help="播放 TTS 回复（默认开）")
+    p.add_argument("--no-play-tts", dest="play_tts", action="store_false",
+                   help="不放 TTS")
+    p.add_argument("--play-audio", dest="play_audio", action="store_true",
+                   default=True, help="播放输入音频（默认开）")
+    p.add_argument("--no-play-audio", dest="play_audio",
+                   action="store_false", help="不放输入音频")
+    p.add_argument("--mute", dest="play_all", action="store_false",
+                   default=True, help="静音（等价于 --no-play-tts --no-play-audio）")
     p.add_argument("--audio-device", default=None,
                    help="播放设备名/编号（sounddevice 的 device 参数）")
     p.add_argument("--face-log-every", type=int, default=5,
@@ -2077,9 +2108,11 @@ def main() -> None:
                    help="窗口显示缩放（0=按屏幕自动适应，默认；"
                         "窗口内按 f 可在适应/1:1 间切换）。"
                         "只影响显示，录像仍是全分辨率")
-    p.add_argument("--show", action="store_true",
-                   help="开窗口同步显示视频 + 人脸框/唇动（需 opencv-python；"
-                        "无显示器时自动跳过）")
+    p.add_argument("--show", dest="show", action="store_true", default=True,
+                   help="开窗口显示（默认开；纯音频时窗口里只有字幕。"
+                        "需 opencv-python；无显示器时自动跳过）")
+    p.add_argument("--no-show", dest="show", action="store_false",
+                   help="不开窗")
     p.add_argument("--save-video", default="",
                    help="把带叠加层的视频存成 mp4（需 opencv-python + ffmpeg）")
     p.add_argument("--video-crf", type=int, default=20,
@@ -2103,8 +2136,17 @@ def main() -> None:
                    help="关掉逐事件打印")
     args = p.parse_args()
 
+    # 位置参数按扩展名分流到 --audio / --video
+    if args.source:
+        if args.audio or args.video:
+            p.error("给了位置参数就不要再给 --audio/--video")
+        ext = os.path.splitext(args.source)[1].lower()
+        if ext in (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts"):
+            args.video = args.source
+        else:
+            args.audio = args.source
     if not args.audio and not args.video:
-        p.error("需要 --audio 或 --video 之一")
+        p.error("需要一个输入文件（位置参数），或 --audio / --video 之一")
     if args.audio and args.video:
         p.error("--audio 与 --video 二选一（视频会自动抽音轨）")
 
