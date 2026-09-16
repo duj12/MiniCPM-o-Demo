@@ -1162,6 +1162,10 @@ class OrchestratorReplayClient:
         # 统计
         self.asr_partials = 0
         self.asr_finals: List[str] = []
+        # 本轮 TTS 播报的文本累计（流式下由 `tts.delta` 逐段拼起来，
+        # 收尾/打断时清空）。与 StatusOverlay.tts_text 是**两样东西** ——
+        # 那个是画到视频帧上的多轮累积，这个是本轮原文。
+        self.tts_text: List[str] = []
         self.face_states = 0
         self.face_frames_sent = 0
         self.omni_frames_sent = 0
