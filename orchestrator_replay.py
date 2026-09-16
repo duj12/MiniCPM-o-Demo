@@ -1632,7 +1632,8 @@ def extract_frames(path: str, fps: float, max_w: int, max_h: int,
 
 async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                      face_frames: List[bytes], omni_frames: List[bytes],
-                     args, window: Optional["FaceWindow"] = None
+                     args, window: Optional["FaceWindow"] = None,
+                     src_speaker: Optional["Speaker"] = None,
                      ) -> OrchestratorReplayClient:
     """按**真实实时节奏**回放：音频 100ms/块，人脸 24fps，Omni 1fps。
 
@@ -1678,6 +1679,8 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     t0 = time.monotonic()
     idx = fi = oi = 0
     barge_seen: set = set()
+    # 纯音频的输入音频播放是否因 TTS 在播而暂停（串行不重叠，见循环内说明）
+    src_speaker_paused = [False]
 
     try:
         while idx < total_chunks and not client.closed:
@@ -1711,6 +1714,26 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             while omni_frames and oi * omni_dt <= now_v:
                 await client.send_video_omni(omni_frames[oi % len(omni_frames)])
                 oi += 1
+
+            # ── 纯音频：把输入音频也放出来 ──
+            # ⚠️ **串行不重叠**：TTS 在播时暂停输入音频。两个 Speaker 同时开
+            #    会抢输出设备（实测互相打架、谁都出不来声）。而回放时输入
+            #    音频是以 10 倍速灌完的，本来也追不上 TTS —— 重叠没有意义。
+            if src_speaker is not None:
+                tts_busy = (client.speaker is not None
+                            and client.speaker.pending_s() > 0)
+                if tts_busy:
+                    if not src_speaker_paused[0]:
+                        src_speaker.stop()          # 丢弃积压，TTS 优先
+                        src_speaker_paused[0] = True
+                else:
+                    if src_speaker_paused[0]:
+                        src_speaker_paused[0] = False
+                    per = int(SR / 20.0)            # 每 tick 喂 50ms
+                    a = (idx * MIC_CHUNK) % max(1, len(audio))
+                    seg = audio[a:a + per]
+                    if seg.size:
+                        src_speaker.play((seg * 32767.0).astype(np.int16))
 
             # 插话：仅日志标记 —— 真正的打断由**服务端**新回复时的
             # `_interrupt_current` 驱动（它会发 tts.cancel），客户端据此停播。
@@ -1926,6 +1949,17 @@ async def main_async(args) -> int:
                   "（Linux 还需 libportaudio2）")
             speaker = None
 
+    # 纯音频输入**没有窗口**，原片声没地方放（原来只有 FaceWindow 会播它）。
+    # 这里补一个 16k 的 Speaker 专放输入音频。
+    # ⚠️ **只在没有 --video 时创建** —— 有视频时仍走 FaceWindow 那条老路径，
+    #    一行不改（两个 Speaker 会抢输出设备，实测互相打架）。
+    src_speaker: Optional[Speaker] = None
+    if args.play_audio and not args.video:
+        src_speaker = Speaker(device=args.audio_device, sample_rate=SR)
+        if not src_speaker.ok:
+            print(f"  ⚠️ 输入音频播放不可用：{src_speaker.err}")
+            src_speaker = None
+
     client = OrchestratorReplayClient(
         url, clock, aec_mode=args.aec_mode,
         save_tts_dir=args.save_tts, verbose=args.verbose,
@@ -1963,7 +1997,8 @@ async def main_async(args) -> int:
     t0 = time.monotonic()
     try:
         await client.connect()
-        await run_replay(client, audio, face_frames, omni_frames, args, window)
+        await run_replay(client, audio, face_frames, omni_frames, args, window,
+                         src_speaker=src_speaker)
     except KeyboardInterrupt:
         print("\n  [中断]")
     except Exception as exc:  # noqa: BLE001
@@ -1984,6 +2019,8 @@ async def main_async(args) -> int:
                          if window.dropped else ""))
         if speaker is not None:
             speaker.close()
+        if src_speaker is not None:
+            src_speaker.close()
         await client.close(save=True)
 
     print_summary(client, time.monotonic() - t0)
