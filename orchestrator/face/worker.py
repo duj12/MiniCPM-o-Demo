@@ -45,6 +45,7 @@ class FaceWorker:
                  on_lip: Callable[[LipEvent], None],
                  on_identity: Optional[Callable[[IdentityEvent], None]] = None,
                  on_obs: Optional[Callable[[FaceObservation], None]] = None,
+                 on_state: Optional[Callable[[dict], None]] = None,
                  queue_maxsize: int = 3,
                  lip_immediate_edge: bool = True) -> None:
         self.provider = provider
@@ -54,6 +55,9 @@ class FaceWorker:
         # on_obs：每帧的原始观测，**仅供 UI 叠加显示**。
         # 不进 downstream（那是控制流，25Hz 会把下游淹没）。
         self.on_obs = on_obs
+        # on_state：G1 的每帧 state，**只在刷新时发**（≈208ms 一次，不是每帧）。
+        # 与 on_obs 的区别就是这一点 —— 想要"每帧都有"的东西请用 on_obs。
+        self.on_state = on_state
         self.lip_immediate_edge = lip_immediate_edge
 
         self._q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=queue_maxsize)
@@ -71,6 +75,8 @@ class FaceWorker:
         self._lip_buf: List[FaceObservation] = []
         self._lip_win_start: Optional[int] = None
         self._last_speaking = False
+        # 上次发出去的 state_seq，用来判断 state 是否刷新
+        self._last_state_seq = -1
 
     # ------------------------------------------------------------------ #
 
@@ -147,6 +153,14 @@ class FaceWorker:
         # ---- UI 叠加（每帧，仅显示用）----
         if self.on_obs is not None:
             self._safe(self.on_obs, obs)
+
+        # ---- 每帧 state（**只在刷新时发**）----
+        # G1 的 state 心跳绑在 landmark 上（≈208ms），其余帧沿用上次快照、
+        # `state_seq` 不变。用 seq 去重，避免把同一份 state 重复推 5 次。
+        if (self.on_state is not None and obs.state is not None
+                and obs.state_seq != self._last_state_seq):
+            self._last_state_seq = obs.state_seq
+            self._safe(self.on_state, obs.state)
 
         # ---- 唤醒 ----
         if obs.interacting and not self._was_interacting:

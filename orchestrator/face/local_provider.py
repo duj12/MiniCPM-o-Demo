@@ -106,6 +106,11 @@ class LocalFaceProvider:
         self._frame_size = None
         # 记住当前 person_id，避免每帧都调 C
         self._cached_person_id = -1
+        # 最近一次识别结果 {uid, name, similarity}；每帧 state 的身份三元组用它填。
+        # 换人 / 人走时清掉（见 process 里的 track 变化检测）。
+        self._last_identity: Optional[dict] = None
+        # 上一帧的 track_id，用来检测换人
+        self._last_track_id: Optional[int] = None
 
     # ------------------------------------------------------------------ #
 
@@ -132,7 +137,17 @@ class LocalFaceProvider:
                 logger.warning("g1_face_feed_mjpeg 返回 %d", rc)
             return None
         self.frames_seen += 1
-        obs = to_observation(res, t, person_id=self._cached_person_id)
+        # 换人（track_id 变）就把身份清掉 —— 否则会把上一个人的名字挂到新目标上。
+        tid = int(res.state.track_id)
+        tid = tid if tid >= 0 else None
+        if tid != self._last_track_id:
+            self._last_track_id = tid
+            self._last_identity = None
+            self._cached_person_id = -1
+        # ⚠️ C 侧每帧都把 state 里的身份三元组清空（规范做法是识别层写回），
+        # 所以这里用**本仓库自己的**识别结果填 —— 最近一次成功的识别。
+        obs = to_observation(res, t, person_id=self._cached_person_id,
+                             identity=self._last_identity)
         return obs
 
     def poll_identity(self, t: int) -> Optional[IdentityEvent]:
@@ -164,11 +179,15 @@ class LocalFaceProvider:
 
         if result is None:
             logger.info("身份识别：不在库或拒识（%d 帧）", n)
+            # 失败不留旧名字：清掉缓存，避免把上一个人的身份挂到新目标上
+            self._last_identity = None
             return IdentityEvent(t=t, person_id=-1, is_enrolled=False)
 
         uid = result.get("uid")
         name = result.get("name")
         sim = float(result.get("similarity", 0.0))
+        # 供每帧 state 填身份三元组（C 侧清空，由这里补）
+        self._last_identity = {"uid": uid, "name": name, "similarity": sim}
         pid = self.id_map.get_or_create(uid) if uid else -1
         # 回填给 G1，后续帧的 on_face.person_id 就能看到
         rc = self.g1.set_person_id(pid, int(ts[-1]) if ts else 0)

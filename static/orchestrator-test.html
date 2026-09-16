@@ -99,6 +99,31 @@ let videoStream = null, running = false, frameCounter = 0;
 /** 采集侧 AudioContext 的代号 —— 服务端据此丢弃换 context 前的锚点 */
 let audioEpoch = 0;
 
+/**
+ * 把 ASR 消息里的 `state` 渲染成一行小标签。
+ *
+ * 五个量都是离散档位（HIGH/MEDIUM/LOW/NONE），由服务端 AsrStateTracker 归纳：
+ *   说 = user_speaking_confidence   用户正在出声的把握
+ *   抢 = barge_in_confidence        抢话轮的把握（按本轮已识别字数爬档）
+ *   信 = asr_confidence             本轮转写置信度
+ *   完 = turn_complete_confidence   本轮已说完的把握
+ * `transcript` 不在这里显示 —— 它就是 asrline 上那行文本。
+ */
+function asrStateTag(s) {
+  if (!s) return '';
+  const c = (v) => ({
+    HIGH: '#4caf50', MEDIUM: '#ffb300', LOW: '#ff7043', NONE: '#666',
+  }[v] || '#666');
+  const item = (label, v) =>
+    `<span style="color:${c(v)}">${label}:${v || '-'}</span>`;
+  return ' <small style="opacity:.85">[' +
+    [item('说', s.user_speaking_confidence),
+     item('抢', s.barge_in_confidence),
+     item('信', s.asr_confidence),
+     item('完', s.turn_complete_confidence)].join(' ') +
+    ']</small>';
+}
+
 function log(cls, msg) {
   const d = document.createElement('div');
   d.className = cls;
@@ -631,6 +656,9 @@ function drawFace(m) {
   const t = (m.tracks && m.tracks[0]) || null;
   const id = m.identity || null;
   const wake = m.wake || null;
+  // G1 每帧 state（≈208ms 刷新一次，不是每帧都有）；state_seq 变了才是新的
+  const fs = m.state || null;
+  if (fs) evtCounts['face.state_seq'] = fs.state_seq;
 
   // 源分辨率优先用服务端下发的；缺失时退回采集分辨率
   const srcW = (t && t.src_w) || 320;
@@ -679,7 +707,16 @@ function drawFace(m) {
         ? (id.enrolled
             ? `<b>${id.name || '?'}</b>  uid=${id.uid}  sim=${id.similarity}`
             : `不在库（sim=${id.similarity}）`)
-        : '尚未识别');
+        : '尚未识别') +
+      (fs
+        ? `<br><small>state#${fs.state_seq}  ` +
+          `[脸<${fs.face_present_confidence}> 唇<${fs.lip_speaking_confidence}>` +
+          ` 身份<${fs.identity_confidence}>]  ` +
+          `track=${fs.track_id ?? '-'}  dwell=${fs.dwell_ms}ms  ` +
+          `面积=${(fs.bbox_area_ratio * 100).toFixed(1)}%  ` +
+          (fs.display_name ? `称呼=${fs.display_name}` : '') +
+          `</small>`
+        : '');
   }
   if (t) evtCounts['face.state'] = (evtCounts['face.state'] || 0) + 1;
 }
@@ -716,7 +753,7 @@ $('btnStart').onclick = async () => {
           // 服务端已把增量片段拼成累积文本，这里**替换**显示即可
           $('asrline').innerHTML = '<b>ASR</b> ' +
             (m.phase === 'partial' ? '<i>' : '') + (m.text || '') +
-            (m.phase === 'partial' ? '</i>' : '');
+            (m.phase === 'partial' ? '</i>' : '') + asrStateTag(m.state);
         } else if (m.type === 'tts.start') {
           // 完整显示，不截断 —— 早先限制 80 字，长回复的字幕被砍掉。
           // 用独立区域追加（ASR 的替换不会冲掉这里）。

@@ -186,10 +186,15 @@ class TtsCancel:
 
 @dataclass
 class AsrDisplay:
-    """ASR 文本（仅 UI 显示，控制流走 downstream 接口）。"""
+    """ASR 文本（仅 UI 显示，控制流走 downstream 接口）。
+
+    ``state`` 是五个离散状态量的快照（用户是否在说 / 抢话把握 / 转写 /
+    转写置信 / 本轮说完把握），见 ``asr/client.py`` 的 ``AsrState``。
+    """
     phase: Literal["partial", "final"]
     text: str
     t_ms: int = 0
+    state: Optional[dict] = None
     type: Literal["asr"] = "asr"
 
 
@@ -204,6 +209,11 @@ class FaceDisplay:
     tracks: List[Dict[str, Any]] = field(default_factory=list)
     identity: Optional[Dict[str, Any]] = None
     wake: Optional[Dict[str, Any]] = None
+    #: G1 的每帧 state 快照（≈208ms 刷新一次，见 asr 侧的 state 是同一类东西）。
+    #: 字段：face_present_confidence / lip_speaking_confidence / track_id /
+    #: dwell_ms / bbox_area_ratio / identity_id / identity_confidence /
+    #: display_name / slot / state_seq / frame_index
+    state: Optional[Dict[str, Any]] = None
     type: Literal["face.state"] = "face.state"
 
 

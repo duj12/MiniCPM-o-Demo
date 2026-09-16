@@ -25,7 +25,12 @@ except ImportError:  # Python < 3.8（本地开发机 3.7）
 
 @dataclass
 class FaceObservation:
-    """单帧的人脸观测（由 G1 库每帧同步返回）。"""
+    """单帧的人脸观测（由 G1 库每帧同步返回）。
+
+    ⚠️ ``state`` / ``state_seq`` 不是每帧都变：G1 的 state 心跳绑在 landmark 上
+    （``lip_detect_every=5``，≈208ms），离散状态变化时才提前刷新。判断「本次是否
+    新 state」要用 ``state_seq`` 有没有变，而不是帧号。
+    """
 
     t: int                                  # 会话采样轴时刻
     valid: bool = False
@@ -36,6 +41,13 @@ class FaceObservation:
     interacting: bool = False               # 唤醒达标
     person_id: int = -1                     # 未识别为 -1
     is_repeat: bool = False                 # 库为凑 24fps 补槽
+    # G1 每帧 state 快照（见 g1.py 的 to_observation）。字段：
+    # face_present_confidence / lip_speaking_confidence / track_id / dwell_ms /
+    # bbox_area_ratio / identity_id / identity_confidence / display_name /
+    # slot / state_seq / frame_index
+    state: Optional[dict] = None
+    #: 刷新计数。**变了才是新 state**（只在刷新时 +1，跨 reset 保持单调）。
+    state_seq: int = -1
 
 
 @dataclass

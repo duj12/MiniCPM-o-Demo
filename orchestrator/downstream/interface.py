@@ -31,6 +31,9 @@ class AsrPartial:
     text: str
     confidence: Optional[float] = None   # 实测 2pass-online 的 confidence 可能为 None
     segment_id: int = 0
+    # 五个离散状态量（user_speaking / barge_in / transcript / asr_confidence /
+    # turn_complete_confidence），由 AsrStateTracker 归纳，见 asr/client.py。
+    state: Optional[Dict[str, str]] = None
     kind: Literal["asr.partial"] = "asr.partial"
 
 
@@ -45,6 +48,8 @@ class AsrFinal:
     token_times_ms: List[tuple] = field(default_factory=list)  # [[start_ms, end_ms, ch, prob], ...]
     speaker_id: Optional[str] = None
     is_final: bool = False        # True = 整条流结束
+    # 同 AsrPartial.state —— 五个离散状态量的快照
+    state: Optional[Dict[str, str]] = None
     kind: Literal["asr.final"] = "asr.final"
 
 

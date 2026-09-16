@@ -815,46 +815,66 @@ class OrchestratorSession:
         """
         if self.asr is None:
             return
-        from .asr.client import parse_confidence, parse_final, parse_turnsense
+        from .asr.client import (
+            extract_turnsense, parse_confidence, parse_final,
+        )
         from .downstream.interface import (
             AsrFinal, AsrPartial, AsrTurnSense,
         )
         from .protocol import AsrDisplay
 
+        def _post_turnsense(ts: dict) -> None:
+            self.post_downstream(AsrTurnSense(
+                t=self.clock.now(),
+                label=ts["label"] or "invalid",
+                probabilities=ts["probabilities"],
+                segment_start_ms=ts["segment_start_ms"],
+                segment_end_ms=ts["segment_end_ms"],
+                speech_duration_s=ts["speech_duration_s"],
+            ))
+
         def on_message(msg: dict) -> None:
             mode = str(msg.get("mode") or "")
+            # state 由 AsrClient.recv_loop 在本回调之前归纳好，这里直接取。
+            st = self.asr.state.to_dict() if self.asr else None
+
             if mode == "turnsense":
-                ts = parse_turnsense(msg)
-                self.post_downstream(AsrTurnSense(
-                    t=self.clock.now(),
-                    label=ts["label"] or "invalid",
-                    probabilities=ts["probabilities"],
-                    segment_start_ms=ts["segment_start_ms"],
-                    segment_end_ms=ts["segment_end_ms"],
-                    speech_duration_s=ts["speech_duration_s"],
-                ))
+                ts = extract_turnsense(msg)
+                if ts is not None:
+                    _post_turnsense(ts)
                 return
 
             if mode == "2pass-online":
                 delta = msg.get("text", "")
-                if delta:
-                    # ⚠️ 2pass-online 是**增量片段**（"今天" / "吃饭" / "了吗"），
-                    # 不是累积文本 —— 官方客户端也是自己 += 拼起来显示的
-                    # （funasr_wss_client.py: `text_print_2pass_online += text`）。
-                    # 必须自己累积，否则 UI 上只剩最后一个词。
-                    self._asr_online_text += delta
-                    self.post_downstream(AsrPartial(
-                        t=self.clock.now(), text=self._asr_online_text,
-                        confidence=parse_confidence(msg),
-                        segment_id=self.asr.partials,
-                    ))
-                    self._send_display(AsrDisplay(
-                        phase="partial", text=self._asr_online_text,
-                        t_ms=int(self.clock.seconds() * 1000),
-                    ))
+                # ⚠️ 2pass-online 是**增量片段**（"今天" / "吃饭" / "了吗"），
+                # 不是累积文本 —— 官方客户端也是自己 += 拼起来显示的
+                # （funasr_wss_client.py: `text_print_2pass_online += text`）。
+                # 必须自己累积，否则 UI 上只剩最后一个词。
+                #
+                # ⚠️ 空文本帧**也要下发**：低置信度被服务端过滤掉时文本就是空的，
+                # 那恰恰是「用户在出声但没识别出来」的信号，state 里能看出来。
+                # 早先这里有 `if delta:` 守卫，把这类帧整条丢了。
+                self._asr_online_text += delta
+                self.post_downstream(AsrPartial(
+                    t=self.clock.now(), text=self._asr_online_text,
+                    confidence=parse_confidence(msg),
+                    segment_id=self.asr.partials,
+                    state=st,
+                ))
+                self._send_display(AsrDisplay(
+                    phase="partial", text=self._asr_online_text,
+                    t_ms=int(self.clock.seconds() * 1000),
+                    state=st,
+                ))
                 return
 
-            # 2pass-offline（最终结果）
+            # 2pass-offline（最终结果）。⚠️ turnsense 也可能**嵌在这条消息里**
+            # （流结束的收尾帧走这条路径，没有独立的 mode=turnsense 消息）——
+            # 早先只认独立消息，漏掉了它。
+            embedded_ts = extract_turnsense(msg)
+            if embedded_ts is not None:
+                _post_turnsense(embedded_ts)
+
             fin = parse_final(msg)
             t0 = self.asr.ms_to_sample(fin["start_ms"])
             t1 = self.asr.ms_to_sample(fin["end_ms"])
@@ -866,6 +886,7 @@ class OrchestratorSession:
                 tokens=fin["tokens"],
                 token_times_ms=fin["token_times"],
                 is_final=fin["is_final"],
+                state=st,
             ))
             # 最终结果到达：用它覆盖流式累积文本，并**清空缓冲**为下一段
             # 做准备（服务端也是这么做的：text_print_2pass_online = ""）
@@ -874,6 +895,7 @@ class OrchestratorSession:
                 self._send_display(AsrDisplay(
                     phase="final", text=fin["text"],
                     t_ms=int(self.clock.seconds() * 1000),
+                    state=st,
                 ))
                 # ---- ASR 断句触发（turn_trigger="asr"）----
                 # OmniLLM 一直在以 force_listen 累积视听上下文（"边听边看"），
@@ -952,6 +974,10 @@ class OrchestratorSession:
                     "src_w": fs[0] if fs else None,
                     "src_h": fs[1] if fs else None,
                 }
+                # G1 每帧 state 快照（≈208ms 一次）。挂在观测上随 face.state
+                # 一起发 —— 前端不必为它单开一条通道。
+                if ev.state is not None:
+                    self._last_face_state = ev.state
                 self._push_face_display()
             elif kind == "wake":
                 self.post_downstream(FaceWake(
@@ -1000,6 +1026,7 @@ class OrchestratorSession:
             tracks=[self._last_face] if getattr(self, "_last_face", None) else [],
             identity=getattr(self, "_last_identity", None),
             wake=getattr(self, "_last_wake", None),
+            state=getattr(self, "_last_face_state", None),
         ))
 
     def _face_cb(self, kind: str):

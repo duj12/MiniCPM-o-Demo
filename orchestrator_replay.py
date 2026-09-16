@@ -849,6 +849,8 @@ class StatusOverlay:
         # ASR 是替换语义 —— 只留当前这一条
         self.asr_text = ""
         self.asr_partial = False
+        # ASR 的五个状态量快照（说/抢/信/完），见 asr/client.py 的 AsrState
+        self.asr_state: dict = {}
         # TTS 是追加语义 —— 保留最近的几条
         self.tts_lines: List[str] = []
         # 状态栏
@@ -862,10 +864,11 @@ class StatusOverlay:
 
     # ------------------------------------------------------------------ #
 
-    def set_asr(self, text: str, partial: bool) -> None:
-        """替换语义：流式刷新同一行。"""
+    def set_asr(self, text: str, partial: bool, state: dict = None) -> None:
+        """替换语义：流式刷新同一行。``state`` 是服务端归纳的五个状态量。"""
         self.asr_text = text or ""
         self.asr_partial = partial
+        self.asr_state = state or {}
 
     def add_tts(self, text: str) -> None:
         """追加语义：新播报加一行（与网页 `ttslog` 一致）。"""
@@ -919,6 +922,15 @@ class StatusOverlay:
             st.append(f"ERLE {self.erle:.1f}dB")
         st.append(f"ferend {self.ref_ratio*100:.0f}%")
         st.append(f"TTS {'播报中' if self.tts_playing else '空闲'}")
+        # ASR 五个状态量里的四个档位（transcript 就是下面那行字幕）
+        s = self.asr_state
+        if s:
+            st.append("说{} 抢{} 信{} 完{}".format(
+                s.get("user_speaking_confidence", "-"),
+                s.get("barge_in_confidence", "-"),
+                s.get("asr_confidence", "-"),
+                s.get("turn_complete_confidence", "-"),
+            ))
         bw = int(round(210 * k))
         self._bar(img, pad, lh * len(st) + pad, 0.5)
         for i, ln in enumerate(st):
@@ -1080,6 +1092,26 @@ class VirtualPlayer:
         now = self.clock.now()
         end = max((s["at"] + s["dur"] for s in self._sources), default=0.0)
         return max(0.0, end - now)
+
+
+def _fmt_asr_state(state: dict) -> str:
+    """把 ASR 消息里的 ``state`` 排成一行短标签（控制台/日志用）。
+
+    四个档位量（``transcript`` 就是那行字幕本身，不重复显示）：
+
+      说 = user_speaking_confidence   用户正在出声的把握
+      抢 = barge_in_confidence        抢话轮的把握（按本轮已识别字数爬档）
+      信 = asr_confidence             本轮转写置信度
+      完 = turn_complete_confidence   本轮已说完的把握
+    """
+    if not state:
+        return ""
+    return "[说{} 抢{} 信{} 完{}]".format(
+        state.get("user_speaking_confidence", "-"),
+        state.get("barge_in_confidence", "-"),
+        state.get("asr_confidence", "-"),
+        state.get("turn_complete_confidence", "-"),
+    )
 
 
 # ============================================================================
@@ -1299,18 +1331,20 @@ class OrchestratorReplayClient:
 
         elif t == "asr":
             txt = m.get("text", "")
+            state = m.get("state") or {}
+            tag = _fmt_asr_state(state)
             if m.get("phase") == "partial":
                 self.asr_partials += 1
                 # 替换语义：流式刷新同一行（与网页 `$('asrline')` 一致）
                 if self.status is not None:
-                    self.status.set_asr(txt, True)
+                    self.status.set_asr(txt, True, state)
                 if self.verbose:
-                    print(f"\r  [ASR] {txt[:60]}", end="", flush=True)
+                    print(f"\r  [ASR] {txt[:60]} {tag}", end="", flush=True)
             else:
                 self.asr_finals.append(txt)
                 if self.status is not None:
-                    self.status.set_asr(txt, False)
-                print(f"\n  [ASR final] {txt}")
+                    self.status.set_asr(txt, False, state)
+                print(f"\n  [ASR final] {txt} {tag}")
 
         elif t == "session.stats":
             self._last_stats = m
@@ -1408,6 +1442,22 @@ class OrchestratorReplayClient:
         wake = m.get("wake")
         if wake:
             parts.append(f"最近唤醒={wake.get('phase')}/{wake.get('dwell_ms')}ms")
+        fs = m.get("state")
+        if fs:
+            # G1 每帧 state（≈208ms 刷新一次）。几个档位与 ASR 侧同口径：
+            # 脸 = face_present_confidence、唇 = lip_speaking_confidence、
+            # 身份 = identity_confidence。
+            parts.append(
+                "state#%s[脸<%s> 唇<%s> 身份<%s> track=%s dwell=%sms 面积=%.1f%%%s]"
+                % (fs.get("state_seq"),
+                   fs.get("face_present_confidence"),
+                   fs.get("lip_speaking_confidence"),
+                   fs.get("identity_confidence"),
+                   fs.get("track_id") if fs.get("track_id") is not None else "-",
+                   fs.get("dwell_ms"),
+                   float(fs.get("bbox_area_ratio") or 0.0) * 100,
+                   (" 称呼=" + fs["display_name"]) if fs.get("display_name") else "")
+            )
         return "  ".join(str(p) for p in parts)
 
     # ------------------------------ 收尾 ------------------------------ #
