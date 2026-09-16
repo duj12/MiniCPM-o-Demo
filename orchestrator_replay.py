@@ -177,8 +177,13 @@ class Speaker:
         self.sample_rate = sample_rate
         self.ok = False
         self.err = ""
+        self.dropped = 0
         self._stream = None
         self._sd = None
+        # 后台消费队列：`write` 阻塞（按实时速度），绝不能放在事件循环里
+        self._q: "queue.Queue" = queue.Queue(maxsize=64)
+        self._stop = threading.Event()
+        self._worker_t: Optional[threading.Thread] = None
         try:
             import sounddevice as sd
             self._sd = sd
@@ -186,25 +191,73 @@ class Speaker:
                 samplerate=sample_rate, channels=1, dtype="float32",
                 device=device, blocksize=0)
             self._stream.start()
+            self._worker_t = threading.Thread(target=self._worker, daemon=True)
+            self._worker_t.start()
             self.ok = True
         except Exception as exc:  # noqa: BLE001
             self.err = f"{type(exc).__name__}: {exc}"
 
     def play(self, pcm24: np.ndarray) -> None:
-        """播一块 24k int16 PCM。"""
-        if not self.ok or self._stream is None:
+        """**非阻塞**投递一块 24k int16 PCM 去播放。
+
+        ⚠️ **绝不能在事件循环里同步 `stream.write`**。它是**阻塞**的，
+        按实时速度消耗音频 —— 36s 的回复会把 asyncio 事件循环堵满 36s，
+        后果是：
+          · 时钟 / 所有异步任务被拖慢（TTS 听感"延迟非常大"）
+          · 接收循环收不到后续的 tts.* 事件，"剩余时长"卡死不动
+          · 收尾判断误判 → **没播完就关连接**
+        所以这里只入队，真正的 write 交给后台线程按自己的节奏消费。
+        """
+        if not self.ok:
             return
         try:
-            self._stream.write(np.ascontiguousarray(
+            self._q.put_nowait(np.ascontiguousarray(
                 pcm24, dtype=np.int16).astype(np.float32) / 32768.0)
-        except Exception as exc:  # noqa: BLE001
-            self.err = f"{type(exc).__name__}: {exc}"
-            self.ok = False
+        except queue.Full:
+            self.dropped += 1
+            # 队列满 = 播放追不上，丢最旧的（新的更重要）
+            try:
+                self._q.get_nowait()
+                self._q.put_nowait(np.ascontiguousarray(
+                    pcm24, dtype=np.int16).astype(np.float32) / 32768.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                x = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if x is None:
+                break
+            if self._stream is None:
+                break
+            try:
+                self._stream.write(x)
+            except Exception as exc:  # noqa: BLE001
+                self.err = f"{type(exc).__name__}: {exc}"
+                self.ok = False
+                break
+
+    def pending_s(self) -> float:
+        """还有多少秒的音频**没放完**（队列里排着的）。"""
+        try:
+            n = self._q.qsize()
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return n * 0.5            # 每块 0.5s（服务端 TTS 的分块大小）
 
     def stop(self) -> None:
         """打断：丢掉还没播出去的缓冲。"""
         if not self.ok or self._stream is None:
             return
+        # 清空待播队列 —— 打断后旧句的剩余部分不该再响
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
         try:
             self._stream.abort()      # abort 会丢弃缓冲（stop 是播完再停）
             self._stream.start()
@@ -212,6 +265,13 @@ class Speaker:
             self.ok = False
 
     def close(self) -> None:
+        self._stop.set()
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._worker_t is not None:
+            self._worker_t.join(timeout=3.0)
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -998,6 +1058,29 @@ class VirtualPlayer:
         if self.cur is not None:
             self.cur.ended = True
 
+    def all_ended(self) -> bool:
+        """所有已开始的 response 都收到 ``tts.end`` 了吗。
+
+        ⚠️ 收尾判断**不能**只看 `remaining_s()`：`tts.start` 到达时
+        response 已入列、但音频还没来（`_sources` 为空），此时剩余是 0 ——
+        只看剩余会在**第一块音频到达前**就判定"播完了"（实测 TTS 0 段）。
+        必须同时要求"音频已经送完"（tts.end）。
+        """
+        return bool(self.responses) and all(r.ended or r.cancelled
+                                            for r in self.responses)
+
+    def remaining_s(self) -> float:
+        """**还要播多久**（秒）。0 = 已经在播完了。
+
+        ⚠️ `tts.end` 只表示"音频**送**完了"，**不代表播完了** —— 整段是
+        排程播放的，送到时可能才刚起播。收尾时若只看 tts.end 就关连接，
+        会**把还在播的回复掐断**（真机实测：最后一句没放完就退出了）。
+        这里按调度表算真实剩余时长 —— 它是"什么时候可以收工"的唯一依据。
+        """
+        now = self.clock.now()
+        end = max((s["at"] + s["dur"] for s in self._sources), default=0.0)
+        return max(0.0, end - now)
+
 
 # ============================================================================
 # 编排服务客户端
@@ -1038,6 +1121,8 @@ class OrchestratorReplayClient:
         # 叠加层用：只留**最新一条** face.state，逐帧重画 —— 与浏览器 canvas
         # 在两条 face.state 之间保持上一次形状的行为一致。
         self.armed_sent: List[Tuple[str, float]] = []
+        # 字幕/状态栏（开窗时由 main 注入；不注入就是 None，一切照常）
+        self.status: Optional["StatusOverlay"] = None
         self.face_latest: Optional[dict] = None
         self.face_latest_at = 0.0
         self.face_src_wh: Optional[Tuple[int, int]] = None
@@ -1138,7 +1223,19 @@ class OrchestratorReplayClient:
                 msg = json.loads(raw)
             except Exception:  # noqa: BLE001
                 continue
-            await self._handle(msg)
+            # ⚠️ 单条消息处理失败**不能**让整个接收循环死掉。
+            #    踩过：`_handle` 里访问了一个没定义的属性，抛 AttributeError
+            #    直接把 receive_loop 干掉 —— 表现为**什么都收不到**（没 ASR、
+            #    没 TTS），而错误只在 asyncio 的 "Task exception was never
+            #    retrieved" 里一闪而过，极难定位。
+            try:
+                await self._handle(msg)
+            except Exception as exc:  # noqa: BLE001
+                self.errors.append(f"处理 {msg.get('type')} 出错: "
+                                   f"{type(exc).__name__}: {exc}")
+                if self.verbose:
+                    print(f"\n  ⚠️ 处理 {msg.get('type')} 失败: "
+                          f"{type(exc).__name__}: {exc}")
         self.closed = True
 
     async def _handle(self, m: dict) -> None:
@@ -1255,6 +1352,10 @@ class OrchestratorReplayClient:
         elif t == "error":
             self.errors.append(f"{m.get('code')}: {m.get('message')}")
             print(f"\n  [ERROR] {m.get('code')}: {m.get('message')}")
+
+    def playback_remaining_s(self) -> float:
+        """TTS 还要播多久（秒）。收尾用它判断能否关连接。"""
+        return self.player.remaining_s()
 
     def latest_face(self, hold_s: float = 0.4,
                     speed: float = 1.0) -> Optional[dict]:
@@ -1522,11 +1623,59 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     except Exception:  # noqa: BLE001
         pass
 
-    print(f"\n  [收尾] 音频发完，等剩余回复（{args.drain_s:.0f}s）...")
-    await client.request_stop()
-    deadline = time.monotonic() + args.drain_s
-    while time.monotonic() < deadline and not client.closed:
-        await asyncio.sleep(0.2)
+    # ---- 收尾：等 TTS **真正播完**，不是等固定秒数 ----
+    #
+    # ⚠️ 这里踩过两个坑，本质是同一个：
+    #   ① **不能一发 `session.stop` 就走** —— 服务端的 drain 会等 ASR/OmniLLM
+    #      收尾，这一轮回复可能十几秒，TTS 音频还在陆续推过来。提前关连接
+    #      会把后面的音频全丢掉，听感是"话说一半没了"。
+    #   ② **不能只看 `tts.end`** —— 它只表示"音频**送**完了"，而整段是排程
+    #      播放的，送到时可能才刚起播。要按**调度表**算"还要播多久"。
+    # 所以：先等服务端把话说完（收到 tts.end 且输入已消费），再等播放器把
+    # 缓冲放完，最后才关。
+    print(f"\n  [收尾] 音频已发完，等回复生成 + 播放完毕"
+          f"（最长 {args.drain_s:.0f}s）...")
+    await client.request_stop()          # 让服务端开始 drain（它要等 ASR/OmniLLM）
+    t_stop = time.monotonic()
+    last_report = 0.0
+    # ⚠️ 退出条件是「**收到过** TTS 且它已经播完」，不能只看剩余时长 ——
+    #    服务端还在生成回复时 responses 本来就是空的、剩余也是 0，
+    #    只看剩余会在**第一段 TTS 到达之前**就退出（实测 TTS 0 段）。
+    #    另外还要留一个"一直没有 TTS"的兜底（比如这轮模型没回复）。
+    got_any = False
+    quiet_since = time.monotonic()
+    while time.monotonic() - t_stop < args.drain_s and not client.closed:
+        remain = client.playback_remaining_s()
+        # 真出声时还要算上**队列里排着没播的**（Speaker 是异步消费的，
+        # 调度表算不出来）
+        if client.speaker is not None:
+            remain = max(remain, client.speaker.pending_s())
+        if client.player.responses:
+            got_any = True
+            quiet_since = time.monotonic()
+        # 收工条件：**音频已全部送达**（tts.end 齐）**且**播放器已放完。
+        # 只看剩余时长会在首批音频到达前误判（见 all_ended 的说明）。
+        if got_any and client.player.all_ended() and remain <= 0.05:
+            break
+        if not got_any and time.monotonic() - quiet_since > 8.0:
+            # 8s 内一段 TTS 都没来 —— 这轮大概没有回复，不必再等
+            print("    （8s 内没有 TTS 到达 —— 本轮可能无回复，收工）")
+            break
+        now = time.monotonic()
+        if now - last_report > 2.0:
+            last_report = now
+            if remain > 0.05:
+                print(f"    还在播：剩余 {remain:.1f}s"
+                      f"（已收到 {len(client.player.responses)} 段）", flush=True)
+        # ⚠️ 收尾期间也要驱动窗口 —— 否则等待的这几秒里窗口**无响应**
+        #    （Windows 会画上"未响应"），而且最后一帧停在旧画面。
+        if window is not None and window.show:
+            window.render()
+        await asyncio.sleep(0.05)
+
+    remain = client.playback_remaining_s()
+    if remain > 0.05:
+        print(f"  ⚠️ 收尾超时，仍有 {remain:.1f}s 未播完（可调大 --drain-s）")
 
     if not recv_task.done():
         recv_task.cancel()
@@ -1537,6 +1686,34 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     return client
 
 
+def _print_wrapped(text: str, indent: str = "    ",
+                   hang: str = "") -> None:
+    """按终端宽度折行打印全文（中文按 2 列宽算）。
+
+    不截断 —— ASR/TTS 文本是核对链路正确性的主要依据，截断了就得去翻
+    原始日志。
+    """
+    if not text:
+        return
+    try:
+        import shutil
+        cols = max(40, shutil.get_terminal_size((100, 24)).columns - 2)
+    except Exception:  # noqa: BLE001
+        cols = 98
+    pad = len(indent)
+    line, width = "", 0
+    for ch in text:
+        w = 2 if ord(ch) > 0x2E80 else 1        # 中日韩字符按 2 列
+        if width + w > cols - pad:
+            print(indent + line)
+            indent, pad = (hang or indent), len(hang or indent)
+            line, width = "", 0
+        line += ch
+        width += w
+    if line:
+        print(indent + line)
+
+
 def print_summary(client: OrchestratorReplayClient, wall: float) -> None:
     print("\n" + "=" * 66)
     print("结果")
@@ -1545,11 +1722,14 @@ def print_summary(client: OrchestratorReplayClient, wall: float) -> None:
     print(f"  TTS 回复      : {len(rs)} 段，共 {sum(r.seconds for r in rs):.1f}s")
     for i, r in enumerate(rs):
         mark = "（被打断）" if r.cancelled else ""
-        print(f"    #{i+1} {r.rid}  {r.seconds:5.2f}s{mark}  {r.text[:44]}")
+        print(f"    #{i+1} {r.rid}  {r.seconds:5.2f}s{mark}")
+        # ⚠️ **不截断**：早先写死 text[:44] / t[:70]，长回复与长 ASR 只看到
+        #    开头一截，没法核对内容。这里按终端宽度折行显示全文。
+        _print_wrapped(r.text, indent="        ")
     print(f"  ASR           : {client.asr_partials} 个部分结果 / "
           f"{len(client.asr_finals)} 个最终结果")
     for t in client.asr_finals:
-        print(f"    · {t[:70]}")
+        _print_wrapped(t, indent="      · ", hang="        ")
     if client.anchor_sources:
         # ⚠️ 这是 AEC 对齐的判据：ack = 用浏览器承诺的播出时刻（准）；
         #    predicted = 服务端在猜（误差逐句变化，固定 D 吸收不了）
@@ -1683,8 +1863,9 @@ def main() -> None:
                         "加速可能让 AEC/ASR 表现失真）")
     p.add_argument("--tail-silence-s", type=float, default=2.0,
                    help="音频发完后补发的尾静音（秒），让 VAD 闭合最后一段")
-    p.add_argument("--drain-s", type=float, default=8.0,
-                   help="收尾等待（秒）")
+    p.add_argument("--drain-s", type=float, default=30.0,
+                   help="收尾等待上限（秒，默认 30）。等的是「回复生成完 + "
+                        "TTS 播完」—— 长回复可能要十几秒，太小会把话掐断")
     p.add_argument("--bargein-at", default="",
                    help="在这些秒数模拟插话（逗号分隔），如 5,12")
     p.add_argument("--face-fps", type=float, default=DEFAULT_FACE_FPS,
