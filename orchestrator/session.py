@@ -919,7 +919,16 @@ class OrchestratorSession:
 
         async def _do():
             try:
-                await self.omni.trigger_reply(text)
+                ok = await self.omni.trigger_reply(text)
+                if not ok:
+                    # ⚠️ **必须报出来**。早先这里忽略返回值，于是连接断掉后
+                    #    ASR 照常识别、触发却静默失败 —— 用户看到的现象是
+                    #    "能识别但永远不回复"，很难定位（真机实测）。
+                    self.stats["omni_trigger_failed"] = \
+                        self.stats.get("omni_trigger_failed", 0) + 1
+                    logger.warning(
+                        "[%s] ASR 触发未能送出（OmniLLM 连接可能已断）—— "
+                        "本轮不会有回复", self.session_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("触发 OmniLLM 回复失败: %s", exc)
 

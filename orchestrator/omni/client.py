@@ -69,6 +69,11 @@ class OmniClient:
         self.backend: Optional[str] = None
         self.session_id: Optional[str] = None
         self.closed = False
+        #: 连接**意外断开**（不是我们主动 close）。与 `closed` 区分开：
+        #: `closed` = 会话收尾主动关的；`dead` = 对端断了、需要重连或降级。
+        self.dead = False
+        #: 连续发送失败计数（用于"第一次告警 + 判定断线"，避免刷屏）
+        self._send_errors = 0
 
         # 待发送的视频帧（1fps）。用最新的替换旧的 —— 旧画面没有价值。
         self._pending_frame: Optional[str] = None
@@ -123,7 +128,7 @@ class OmniClient:
 
     async def push_audio(self, seg: np.ndarray) -> None:
         """送一段 AEC 清洗后的音频。内部按 1s 聚合。"""
-        if self.closed or self.client is None:
+        if self.closed or self.dead or self.client is None:
             return
         self._audio_buf.append(np.asarray(seg, dtype=np.float32).reshape(-1))
         self._audio_len += self._audio_buf[-1].size
@@ -160,8 +165,19 @@ class OmniClient:
                 force_listen=True,
             )
             self.audio_sent_s += audio.size / 16000.0
+            self._send_errors = 0
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Omni send_input 失败: %s", exc)
+            # ⚠️ 只在**第一次**失败时告警，之后静默 —— 否则连接一断就
+            #    每秒刷一条，把日志冲垮，反而看不出"什么时候断的"
+            #    （真机日志实测：一次会话里刷了 43 条同样的 warning）。
+            self._send_errors += 1
+            if self._send_errors == 1:
+                logger.warning("Omni send_input 失败（后续同类失败不再重复告警）: %s", exc)
+            # 触发源那条路要能立刻知道"送不出去"，别再假装成功
+            if self._send_errors >= 3 and not self.dead:
+                self.dead = True
+                logger.warning("Omni 连续 %d 次发送失败 —— 标记连接已断",
+                               self._send_errors)
 
     async def trigger_reply(self, text: str = "") -> bool:
         """主动触发一次回复（``turn_trigger="asr"`` 时用）。
@@ -173,7 +189,12 @@ class OmniClient:
         ``text`` 非空时同时注入文本（给模型一个明确的话轮边界提示）。
         返回是否成功送出。
         """
-        if self.closed or self.client is None:
+        if self.closed or self.dead or self.client is None:
+            # ⚠️ 连接已断就**别再发了** —— 发出去必然失败，只会刷日志，
+            #    而且给调用方一个"已触发"的假象（真正的症状是"识别到了
+            #    但永远等不到回复"）。返回 False 让编排服务知道没送出去。
+            if self.dead:
+                logger.warning("OmniLLM 连接已断，触发被跳过（不回复）")
             return False
         try:
             await self.client.send_input(text=text, force_listen=False)
@@ -187,7 +208,7 @@ class OmniClient:
 
     async def send_text(self, text: str, force_listen: bool = False) -> None:
         """直接注入文本输入（下游 SendToOmni 用）。"""
-        if self.closed or self.client is None:
+        if self.closed or self.dead or self.client is None:
             return
         await self.client.send_input(text=text, force_listen=force_listen)
 
@@ -208,7 +229,21 @@ class OmniClient:
             return orig(ev)
 
         self.client.handle_event = hooked  # type: ignore[assignment]
-        await self.client.receive_loop()
+        try:
+            await self.client.receive_loop()
+        finally:
+            # ⚠️ **连接断了必须记下来**。早先这里什么都不做：`self.closed`
+            #    仍是 False，`send_input` 也不检查连接 —— 于是往一条死连接上
+            #    每秒发一次音频，异常只打个 warning，**永远不恢复**。
+            #    真机现象：长会话跑几十分钟后，ASR 照常识别、但 OmniLLM
+            #    再也不回复（日志里一秒一条 "send_input 失败"）。
+            #    这里置位后，`send_input`/`trigger_reply` 会立刻短路，
+            #    由编排服务决定是重连还是收尾。
+            if not self.closed:
+                self.dead = True
+                logger.warning(
+                    "OmniLLM 接收循环已退出（连接断开）—— "
+                    "后续 send_input/触发将直接短路，不会静默堆积")
 
     def _emit(self, ev: dict) -> None:
         if self.on_event is None:
