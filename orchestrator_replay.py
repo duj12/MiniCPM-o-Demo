@@ -1865,6 +1865,17 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             if remain > 0.05:
                 print(f"    还在播：剩余 {remain:.1f}s"
                       f"（已收到 {n_resp} 段）", flush=True)
+        # ⚠️ 收尾期间也要**持续投帧**，光调 render() 不够：
+        #    `_run` 是从 `window.push()` 的队列里取活干的，队列空就不产新帧
+        #    —— 而主循环在**视频发完**时就停了（`fi*face_dt <= now_v` 不再
+        #    成立），偏偏 TTS 是在这之后才播的。于是状态栏停在最后一帧，
+        #    「TTS 播放中」永远不出现。
+        #    这里按 24fps 继续投，让字幕/状态栏跟着收尾阶段的进展走。
+        if window is not None and (window.show or window.out_path):
+            # 本循环 20Hz（sleep 0.05），每轮投一帧即 ~20fps —— 与主循环的
+            # 24fps 同量级，够用；再高只会把只有 8 格的渲染队列塞满、白丢帧。
+            window.push(client.latest_face(
+                args.face_hold_ms / 1000.0, speed), client.face_src_wh)
         # ⚠️ 收尾期间也要驱动窗口 —— 否则等待的这几秒里窗口**无响应**
         #    （Windows 会画上"未响应"），而且最后一帧停在旧画面。
         if window is not None and window.show:
