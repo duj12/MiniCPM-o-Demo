@@ -153,16 +153,31 @@ def main() -> int:
     check(s.transcript == "明天", "新一段从空开始（不残留上一段）")
 
     # ---------------- asr_confidence ----------------
-    print("\n[asr_confidence] 流式用 online 阈值、最终用 offline 阈值")
+    # 三档：>=0.8 HIGH / 0.6~0.8 MEDIUM / <0.6 LOW；无信号 NONE。
+    # ⚠️ 早先只有两档、且流式拿 0.6 当 HIGH 线 —— 0.6~0.8 的低质量临时结果
+    #    也被显示成 HIGH，说话时满屏"高置信"看不出哪些能信。
+    print("\n[asr_confidence] 三档（0.8 / 0.6 两条线），流式与离线同一套口径")
+    for conf, want in ((0.95, "HIGH"), (0.80, "HIGH"),
+                       (0.79, "MEDIUM"), (0.70, "MEDIUM"), (0.60, "MEDIUM"),
+                       (0.59, "LOW"), (0.30, "LOW")):
+        tr = AsrStateTracker()
+        s = tr.update(online("今天的", conf=conf))
+        check(s.asr_confidence == want,
+              f"流式 conf={conf} -> {want}（实际 {s.asr_confidence}）")
+
+    for conf, want in ((0.95, "HIGH"), (0.80, "HIGH"), (0.79, "MEDIUM"),
+                       (0.60, "MEDIUM"), (0.59, "LOW")):
+        tr = AsrStateTracker()
+        tr.update(online("今天的", conf=0.9))
+        s = tr.update(offline("今天的天气", conf=conf))
+        check(s.asr_confidence == want,
+              f"离线 conf={conf} -> {want}（实际 {s.asr_confidence}）")
+
+    # 流式文本被服务端过滤（返回了结果但文本空）→ LOW，不是 NONE
     tr = AsrStateTracker()
-    s = tr.update(online("今天的", conf=0.89))
-    check(s.asr_confidence == "HIGH", "流式 confidence 0.89 ≥ 0.6 -> HIGH")
-    s = tr.update(online("今天的说", conf=0.45))
-    check(s.asr_confidence == "LOW", "流式 confidence 0.45 < 0.6 -> LOW")
-    s = tr.update(offline("今天的说出去看的风景", conf=0.956))
-    check(s.asr_confidence == "HIGH", "最终结果换成 offline 阈值（0.956 ≥ 0.8）")
-    s = tr.update(offline("噪声", conf=0.5))
-    check(s.asr_confidence == "LOW", "offline confidence 0.5 < 0.8 -> LOW")
+    s = tr.update(online("", conf=0.4))
+    check(s.asr_confidence == "LOW", "流式文本被过滤 -> LOW（有信号，只是被丢）")
+
     tr2 = AsrStateTracker()
     check(tr2.state.asr_confidence == "NONE", "没有任何信号 -> NONE")
 

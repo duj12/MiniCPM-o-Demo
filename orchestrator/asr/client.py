@@ -447,8 +447,7 @@ class AsrStateTracker:
             # 不是累积文本，必须自己拼。
             self._transcript += delta
             self._barge_frames += 1
-            self._asr_conf = self._grade(parse_online_confidence(msg),
-                                         self.config.online_confidence_threshold)
+            self._asr_conf = self._grade(parse_online_confidence(msg))
         else:
             # 空文本帧：要么是低置信度被服务端过滤掉，要么是纯噪声段。
             # 有置信度且偏低 ⇒ LOW；否则没有出声证据 ⇒ NONE。
@@ -471,8 +470,9 @@ class AsrStateTracker:
         # 本轮出现过 VAD 切分，之后新段里的流式帧标 MEDIUM
         self._vad_split_seen = True
         self._mark_closed()
-        self._asr_conf = self._grade(parse_confidence(msg),
-                                     self.config.confidence_threshold)
+        # 离线也走同一套三档（用离线自带的 confidence.avg）—— 与流式口径
+        # 一致，用户不用记"流式看这个线、离线看那个线"
+        self._asr_conf = self._grade(parse_confidence(msg))
 
     # ------------------------------------------------------------------ #
 
@@ -491,12 +491,26 @@ class AsrStateTracker:
             return True
         return (self._now_ms() or 0.0) < self._hold_until_ms
 
-    @staticmethod
-    def _grade(conf: Optional[float], threshold: float) -> str:
-        """浮点置信度 → 档位。无信号时 ``NONE``。"""
+    def _grade(self, conf: Optional[float]) -> str:
+        """浮点置信度 → **三档**（``HIGH`` / ``MEDIUM`` / ``LOW``），无信号 ``NONE``。
+
+        阈值用配置里现有的两个，不新增参数：
+
+            conf >= confidence_threshold(0.8)          → HIGH
+            >= online_confidence_threshold(0.6)        → MEDIUM
+            <  online_confidence_threshold             → LOW
+
+        ⚠️ 早先只有两档（HIGH/LOW，且流式拿 0.6 当 HIGH 线）—— 于是
+        **0.6~0.8 的临时结果也被显示成 HIGH**，说话时满屏"高置信"的低质量
+        结果，看不出哪些能信。加一档 MEDIUM 正好落在这个区间。
+        """
         if conf is None:
             return NONE
-        return HIGH if conf >= threshold else LOW
+        if conf >= self.config.confidence_threshold:
+            return HIGH
+        if conf >= self.config.online_confidence_threshold:
+            return MEDIUM
+        return LOW
 
     def _user_speaking(self) -> str:
         """用户是否在出声（声学）。
