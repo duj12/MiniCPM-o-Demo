@@ -56,6 +56,42 @@ class AsrConfig:
     confidence_threshold: float = 0.8
     online_confidence_threshold: float = 0.6
 
+    #: 允许客户端在 ``session.start`` 里覆盖的字段 → 类型转换。
+    #:
+    #: ⚠️ **白名单**，不是"客户端传什么就改什么" —— ASR 首帧里还有
+    #: ``mode`` / ``chunk_size`` / ``wav_format`` 这类改了会直接让识别
+    #: 跑不起来的字段，不该开放给前端随手改。
+    #: 这里只放**调参性质**的：影响切句敏感度与过滤强度。
+    CLIENT_OVERRIDABLE = {
+        "vad_tail_sil": int,
+        "turnsense_incomplete_wait_ms": int,
+        "confidence_threshold": float,
+        "online_confidence_threshold": float,
+    }
+
+    def apply_overrides(self, overrides: Optional[dict]) -> list:
+        """按白名单应用客户端覆盖，返回实际生效的 ``[(字段, 值)]``。
+
+        值不合法（转不成目标类型 / 为 None）时**跳过该字段**并保留默认，
+        绝不因为前端传了个垃圾就让整个会话起不来。
+        """
+        applied = []
+        for key, cast in self.CLIENT_OVERRIDABLE.items():
+            if not overrides or key not in overrides:
+                continue
+            raw = overrides[key]
+            if raw is None or raw == "":
+                continue
+            try:
+                val = cast(raw)
+            except (TypeError, ValueError):
+                logger.warning("ASR 参数 %s=%r 非法，用默认值 %r",
+                               key, raw, getattr(self, key))
+                continue
+            setattr(self, key, val)
+            applied.append((key, val))
+        return applied
+
     def to_json(self, wav_name: str) -> str:
         return json.dumps({
             "mode": self.mode,

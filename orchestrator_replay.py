@@ -1183,7 +1183,9 @@ class OrchestratorReplayClient:
                  save_tts_dir: str = "",
                  verbose: bool = False,
                  speaker: Optional[Speaker] = None,
-                 face_log_every: int = 5) -> None:
+                 face_log_every: int = 5,
+                 asr_params: Optional[dict] = None,
+                 system_prompt: str = "") -> None:
         self.url = url
         self.clock = clock
         self.aec_mode = aec_mode
@@ -1191,6 +1193,11 @@ class OrchestratorReplayClient:
         self.verbose = verbose
         self.speaker = speaker
         self.face_log_every = max(1, face_log_every)
+        # 会话开始时一次性发走的参数（中途改无效，与网页端一致）：
+        #   asr_params    —— ASR 调参，受服务端白名单限制
+        #   system_prompt —— OmniLLM 系统提示词，覆盖服务端默认
+        self.asr_params: dict = dict(asr_params or {})
+        self.system_prompt = system_prompt
 
         self.ws = None
         self.session_id: Optional[str] = None
@@ -1240,15 +1247,21 @@ class OrchestratorReplayClient:
             ssl_ctx.verify_mode = _ssl.CERT_NONE
         self.ws = await websockets.connect(
             self.url, max_size=64 * 1024 * 1024, ssl=ssl_ctx)
-        await self.ws.send(json.dumps({
+        payload = {
             "type": "session.start",
             "identity": identity or {"page": "orchestrator-replay"},
             "aec_mode": self.aec_mode,
             # ⚠️ 能力位：没有它服务端就不等 armed 承诺，参考轨退回预测落位
             "caps": ["playback_anchor"],
             "seeded_delay_samples": 0,
-            "system_prompt": "",
-        }, ensure_ascii=False))
+        }
+        # 高级参数：**只在有值时发**（空串 = 服务端用默认值）。
+        # ASR 那几项受服务端白名单限制，见 AsrConfig.CLIENT_OVERRIDABLE。
+        if self.asr_params:
+            payload["asr"] = dict(self.asr_params)
+        if self.system_prompt:
+            payload["system_prompt"] = self.system_prompt
+        await self.ws.send(json.dumps(payload, ensure_ascii=False))
         # 等 session.ready
         while True:
             msg = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=20))
@@ -2057,10 +2070,25 @@ async def main_async(args) -> int:
             print(f"  ⚠️ 输入音频播放不可用：{src_speaker.err}")
             src_speaker = None
 
+    # 只把**命令行显式给了**的 ASR 参数发出去（None = 不发，用服务端默认）
+    asr_params = {}
+    for attr, field in (("asr_vad_tail_sil", "vad_tail_sil"),
+                        ("asr_turnsense_wait", "turnsense_incomplete_wait_ms"),
+                        ("asr_online_conf", "online_confidence_threshold"),
+                        ("asr_offline_conf", "confidence_threshold")):
+        val = getattr(args, attr)
+        if val is not None:
+            asr_params[field] = val
+
     client = OrchestratorReplayClient(
         url, clock, aec_mode=args.aec_mode,
         save_tts_dir=args.save_tts, verbose=args.verbose,
-        speaker=speaker, face_log_every=args.face_log_every)
+        speaker=speaker, face_log_every=args.face_log_every,
+        asr_params=asr_params, system_prompt=args.system_prompt)
+    if asr_params:
+        print(f"  ASR 参数覆盖：{asr_params}")
+    if args.system_prompt:
+        print(f"  系统提示词覆盖（{len(args.system_prompt)} 字）")
 
     window: Optional[FaceWindow] = None
     # ⚠️ `--show` 现在默认开，所以**必须**先确认有显示器：cv2 在无头机上
@@ -2147,6 +2175,18 @@ def main() -> None:
     p.add_argument("--ws", action="store_true",
                    help="用明文 ws:// 连接（默认 wss://，与新服务端一致）。"
                         "wss 下**不校验自签证书**，等价于浏览器点『继续访问』")
+    # ---- 高级参数（会话开始时一次性发走，中途改无效）----
+    p.add_argument("--asr-vad-tail-sil", type=int, default=None,
+                   help="ASR: VAD 尾部静音 ms。句尾静音超过它就切句，"
+                        "调大更不容易断开（默认用服务端 $ORCH_ASR_VAD_TAIL_SIL 或内置值）")
+    p.add_argument("--asr-turnsense-wait", type=int, default=None,
+                   help="ASR: TurnSense 判 incomplete 后最多再等多久 ms")
+    p.add_argument("--asr-online-conf", type=float, default=None,
+                   help="ASR: 流式置信度阈值，低于它丢弃。调低更容易出字")
+    p.add_argument("--asr-offline-conf", type=float, default=None,
+                   help="ASR: 离线（最终）置信度阈值。调低更容易触发回复")
+    p.add_argument("--system-prompt", default="",
+                   help="OmniLLM 系统提示词，覆盖服务端默认（空=用服务端默认）")
     p.add_argument("--aec-mode", default="browser",
                    choices=["service", "browser", "off"],
                    help="回声消除模式（默认 browser=浏览器原生 AEC）。"

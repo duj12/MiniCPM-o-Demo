@@ -68,6 +68,67 @@
       <button id="btnStart" class="primary">开始会话</button>
       <button id="btnStop" class="danger">停止</button>
     </div>
+
+    <!-- 高级参数：会话开始前可调，**开始后改无效**（首帧就发给服务端了）。
+         值会记住（localStorage），刷新后保持。 -->
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;color:#aaa;font-size:13px">
+        高级参数（ASR 切句 / 过滤 + Omni 系统提示词）
+      </summary>
+      <div style="margin-top:10px;font-size:13px">
+        <div style="color:#888;font-size:12px;margin-bottom:8px">
+          改完点「开始会话」生效。<b>会话中途改无效</b>（参数在首帧发给服务端）。
+        </div>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="width:200px;color:#bbb">VAD 尾部静音 vad_tail_sil</span>
+          <input id="p_vad_tail_sil" type="number" min="0" step="50"
+                 style="width:90px"> <span style="color:#666">ms</span>
+        </label>
+        <div style="color:#666;font-size:11px;margin:-4px 0 8px 208px">
+          句尾静音超过它就切句。调大 → 更不容易断开（适合说话停顿多的场景）
+        </div>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="width:200px;color:#bbb">TurnSense 等待 turnsense_incomplete_wait_ms</span>
+          <input id="p_turnsense_wait" type="number" min="0" step="100"
+                 style="width:90px"> <span style="color:#666">ms</span>
+        </label>
+        <div style="color:#666;font-size:11px;margin:-4px 0 8px 208px">
+          ＂话没说完＂时最多再等多久才强制出最终结果
+        </div>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="width:200px;color:#bbb">流式置信度阈值 online_confidence</span>
+          <input id="p_online_conf" type="number" min="0" max="1" step="0.05"
+                 style="width:90px">
+        </label>
+        <div style="color:#666;font-size:11px;margin:-4px 0 8px 208px">
+          流式结果低于它就丢弃。<b>调低 → 更容易出字</b>（识别到就能看到）
+        </div>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="width:200px;color:#bbb">离线置信度阈值 confidence_threshold</span>
+          <input id="p_offline_conf" type="number" min="0" max="1" step="0.05"
+                 style="width:90px">
+        </label>
+        <div style="color:#666;font-size:11px;margin:-4px 0 8px 208px">
+          最终结果低于它就丢弃。<b>调低 → 更容易触发回复</b>
+        </div>
+
+        <label style="display:block;margin-top:10px">
+          <span style="color:#bbb">Omni 系统提示词</span>
+          <textarea id="p_sys_prompt" rows="4"
+            style="width:100%;margin-top:4px;background:#1a1a1a;color:#e6e6e6;
+                   border:1px solid #333;border-radius:6px;padding:8px;
+                   font-family:inherit;font-size:12px;resize:vertical"
+            placeholder="留空 = 用服务端默认"></textarea>
+        </label>
+        <div style="color:#666;font-size:11px;margin-top:4px">
+          留空则用服务端 <code>ORCH_OMNI_SYSTEM_PROMPT</code> / 内置默认值
+        </div>
+      </div>
+    </details>
     <div style="margin-top:8px;font-size:12px;color:#888">
       算法服务 AEC 需要 <b>外放</b>（戴耳机没有回声路径）。「延迟」面板显示
       当前 D 与落位锚点来源；「音频」面板显示<b>设备输出延迟</b> ——
@@ -435,6 +496,66 @@ class PcmPlayer {
 
 /* ---------- AEC 模式 / 延迟显示 ---------- */
 const AEC_MODE_KEY = 'orch_aec_mode';
+
+/* ---------- 高级参数（ASR 调参 + Omni 系统提示词） ----------
+ *
+ * 这些值随 `session.start` 一起发给服务端，**只在会话开始时生效**：
+ * ASR 的那几个是首帧 JSON 的一部分，系统提示词在 OmniClient 构造时用掉。
+ * 所以「会话中途改」没有任何效果 —— 页面上也写明了。
+ *
+ * 全部留空 = 全用服务端默认值（不会发这些字段）。
+ */
+const ADV_KEY = 'orch_adv_params';
+
+//: id → 发给服务端的字段名。
+//: ⚠️ ASR 的四项对应 `AsrConfig.CLIENT_OVERRIDABLE` 白名单 —— 服务端只认
+//:    这几个，多发别的会被忽略（那是防止前端改坏 mode/chunk_size 之类）。
+const ADV_ASR_FIELDS = {
+  p_vad_tail_sil: 'vad_tail_sil',
+  p_turnsense_wait: 'turnsense_incomplete_wait_ms',
+  p_online_conf: 'online_confidence_threshold',
+  p_offline_conf: 'confidence_threshold',
+};
+
+/** 读出高级参数。**空值不发**（让服务端用默认），不是发空串。 */
+function collectAdvParams() {
+  const asr = {};
+  for (const [id, field] of Object.entries(ADV_ASR_FIELDS)) {
+    const v = ($(id) && $(id).value || '').trim();
+    if (v !== '') asr[field] = Number(v);
+  }
+  const prompt = ($('p_sys_prompt') && $('p_sys_prompt').value || '').trim();
+  return { asr, systemPrompt: prompt };
+}
+
+function saveAdvParams() {
+  try {
+    const { asr, systemPrompt } = collectAdvParams();
+    localStorage.setItem(ADV_KEY, JSON.stringify({ asr, systemPrompt }));
+  } catch (e) { /* ignore */ }
+}
+
+function restoreAdvParams() {
+  try {
+    const raw = localStorage.getItem(ADV_KEY);
+    if (!raw) return;
+    const { asr = {}, systemPrompt = '' } = JSON.parse(raw);
+    for (const [id, field] of Object.entries(ADV_ASR_FIELDS)) {
+      if (asr[field] !== undefined && $(id)) $(id).value = asr[field];
+    }
+    if (systemPrompt && $('p_sys_prompt')) $('p_sys_prompt').value = systemPrompt;
+  } catch (e) { /* ignore */ }
+}
+
+function initAdvParams() {
+  restoreAdvParams();
+  for (const id of Object.keys(ADV_ASR_FIELDS)) {
+    if ($(id)) $(id).addEventListener('change', saveAdvParams);
+  }
+  if ($('p_sys_prompt')) {
+    $('p_sys_prompt').addEventListener('change', saveAdvParams);
+  }
+}
 
 function selectedAecMode() {
   const el = $('aecMode');
@@ -973,14 +1094,23 @@ $('btnStart').onclick = async () => {
       onError: (e) => log('e', 'WS 错误'),
     });
     const aecMode = selectedAecMode();
-    await session.start({
+    // 高级参数：只在**有值**时才放进 payload（空 = 服务端用默认）
+    const { asr: advAsr, systemPrompt: advPrompt } = collectAdvParams();
+    const startPayload = {
       identity: { page: 'orchestrator-test', device_id: deviceKey() },
       aec_mode: aecMode,
       // 能力位：本前端会在 tts.start 后立刻**承诺**起播时刻，服务端据此
       // 精确落位参考轨。没有这一位的客户端会让服务端退回预测落位。
       caps: ['playback_anchor'],
-    });
+    };
+    if (Object.keys(advAsr).length) startPayload.asr = advAsr;
+    if (advPrompt) startPayload.system_prompt = advPrompt;
+    await session.start(startPayload);
     log('v', `会话已建立（回声消除=${aecMode}）`);
+    if (Object.keys(advAsr).length) {
+      log('k', 'ASR 参数覆盖：' + JSON.stringify(advAsr));
+    }
+    if (advPrompt) log('k', `系统提示词覆盖（${advPrompt.length} 字）`);
     if (aecMode === 'service') {
       log('m', '已选算法服务 AEC —— 请外放（别戴耳机）。'
              + '「延迟」面板的「落位锚点」应显示"浏览器承诺（精确）"');
@@ -1050,6 +1180,7 @@ $('btnStop').onclick = async () => {
 };
 
 initAecMode();
+initAdvParams();
 log('k', `就绪。当前回声消除模式：${selectedAecMode()}`
        + `（选算法服务请外放，别戴耳机）`);
 

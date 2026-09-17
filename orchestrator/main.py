@@ -151,8 +151,18 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
 
     # ---- ASR ----
     if cfg.enable_asr:
-        from orchestrator.asr.client import AsrClient
-        sess.asr = AsrClient(cfg.asr_url, wav_name=sid)
+        from orchestrator.asr.client import AsrClient, AsrConfig
+        # 客户端可在 session.start 里覆盖几个**调参性质**的字段
+        # （vad_tail_sil / turnsense_incomplete_wait_ms / 两个置信度阈值），
+        # 便于在页面上直接试不同切句敏感度，不用改代码重启。
+        # 白名单见 AsrConfig.CLIENT_OVERRIDABLE —— 像 mode / chunk_size
+        # 这种改了会让识别跑不起来的字段不开放。
+        asr_cfg = AsrConfig()
+        if hello:
+            applied = asr_cfg.apply_overrides(hello.get("asr"))
+            if applied:
+                logger.info("[%s] ASR 参数被客户端覆盖: %s", sid, applied)
+        sess.asr = AsrClient(cfg.asr_url, config=asr_cfg, wav_name=sid)
 
     # ---- OmniLLM ----
     if cfg.enable_omni:
@@ -183,8 +193,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                     text=ev.get("text", "") or "",
                 ))
 
+        # ⚠️ 客户端传来的 system_prompt **优先于** config 默认值。
+        #    早先这里只读 cfg，而 `hello["system_prompt"]` 那条路是个
+        #    `pass` 空实现 —— 前端传了也没用。而且顺序本身也是错的：
+        #    OmniClient 在这里创建，之后再想覆盖已经来不及了。
+        omni_prompt = cfg.omni_system_prompt
+        if hello and (hello.get("system_prompt") or "").strip():
+            omni_prompt = str(hello["system_prompt"]).strip()
+            logger.info("[%s] OmniLLM 系统提示词被客户端覆盖（%d 字）",
+                        sid, len(omni_prompt))
         sess.omni = OmniClient(
-            cfg.omni_url, system_prompt=cfg.omni_system_prompt,
+            cfg.omni_url, system_prompt=omni_prompt,
             on_event=on_omni_event, verify_ssl=cfg.verify_ssl,
             turn_trigger=cfg.omni_turn_trigger,
         )
@@ -367,8 +386,8 @@ async def handle_client(ws, cfg: Settings) -> None:
         else:
             sess.apply_delay_seed(client_key, DELAY_STORE)
 
-        if cfg.omni_system_prompt and hello.get("system_prompt"):
-            pass  # 已在 build_session 里设置；如需覆盖可在此处理
+        # system_prompt / asr 参数的客户端覆盖在 `build_session` 里就处理了
+        # （必须在创建 OmniClient / AsrClient **之前**）—— 这里不再重复。
 
         # 连接外部服务
         if sess.aec is not None:
