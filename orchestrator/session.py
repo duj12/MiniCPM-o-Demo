@@ -1089,6 +1089,8 @@ class OrchestratorSession:
         self._last_face_push = now
         from .protocol import FaceDisplay
         self._send_display(FaceDisplay(
+            # 与会话采样轴对齐（0 = 首块音频）—— 与 AsrDisplay.t_ms 同一口径
+            t_ms=int(self.clock.seconds() * 1000),
             tracks=[self._last_face] if getattr(self, "_last_face", None) else [],
             identity=getattr(self, "_last_identity", None),
             wake=getattr(self, "_last_wake", None),

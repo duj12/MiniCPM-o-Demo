@@ -218,6 +218,9 @@ class AsrDisplay:
     """
     phase: Literal["partial", "final"]
     text: str
+    #: 本条消息在**会话采样轴**上的毫秒位置（0 = 首块音频到达时）。
+    #: 与 `FaceDisplay.t_ms` 同一个口径 —— 两条流共用一根时间轴，
+    #: 出问题时才能离线对齐（配合 orchdump 的转储一起看）。
     t_ms: int = 0
     state: Optional[dict] = None
     type: Literal["asr"] = "asr"
@@ -230,7 +233,12 @@ class FaceDisplay:
     ``tracks[0]`` 是主说话人：``{valid, box, score, speaking, lip,
     interacting, person_id}``。``identity`` 是最近一次识别结果
     （在库里才有 name/uid）。``wake`` 是最近一次唤醒事件。
+
+    ``t_ms`` 与 ``AsrDisplay.t_ms`` **同一个口径**：会话采样轴毫秒，
+    0 = 收到第一块音频的那一刻。两条流带上同一个轴，离线比对/对齐才可能。
     """
+    #: 本条消息在**会话采样轴**上的毫秒位置（0 = 首块音频到达时）
+    t_ms: int = 0
     tracks: List[Dict[str, Any]] = field(default_factory=list)
     identity: Optional[Dict[str, Any]] = None
     wake: Optional[Dict[str, Any]] = None

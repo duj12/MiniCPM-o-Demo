@@ -1479,6 +1479,8 @@ class OrchestratorReplayClient:
         elif t == "asr":
             txt = m.get("text", "")
             state = m.get("state") or {}
+            # 会话采样轴毫秒（0 = 首块音频）—— 与 face/ASR/音频转储同一根轴
+            tms = m.get("t_ms")
             tag = _fmt_asr_state(state)
             if m.get("phase") == "partial":
                 self.asr_partials += 1
@@ -1486,12 +1488,13 @@ class OrchestratorReplayClient:
                 if self.status is not None:
                     self.status.set_asr(txt, True, state)
                 if self.verbose:
-                    print(f"\r  [ASR] {txt[:60]} {tag}", end="", flush=True)
+                    print(f"\r  [{tms}ms ASR] {txt[:60]} {tag}",
+                          end="", flush=True)
             else:
                 self.asr_finals.append(txt)
                 if self.status is not None:
                     self.status.set_asr(txt, False, state)
-                print(f"\n  [ASR final] {txt} {tag}")
+                print(f"\n  [{tms}ms ASR final] {txt} {tag}")
 
         elif t == "session.stats":
             self._last_stats = m
@@ -1573,13 +1576,16 @@ class OrchestratorReplayClient:
         ``tracks[0]`` 是主说话人（box 是**服务端实际收到的帧尺寸**坐标系下的
         框，所以一并打出 src_w/src_h —— 曾因写死分辨率导致框错位）。
         """
+        # 会话采样轴毫秒（0 = 首块音频）—— 与 ASR 那行同一根轴，可并排看
+        tms = m.get("t_ms")
+        head = f"[{tms}ms face #{n}]" if tms is not None else f"[face #{n}]"
         tr = (m.get("tracks") or [None])[0]
         if not tr or not tr.get("valid"):
-            return f"[face #{n}] 未检测到人脸"
+            return f"{head} 未检测到人脸"
         box = tr.get("box")
         box_s = ("[%d,%d,%d,%d]" % tuple(int(v) for v in box)) if box else "-"
         parts = [
-            f"[face #{n}]",
+            head,
             f"置信={tr.get('score')}",
             f"框={box_s}",
             f"唇动={'说话中' if tr.get('speaking') else tr.get('lip')}",

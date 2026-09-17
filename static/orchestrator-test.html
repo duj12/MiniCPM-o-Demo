@@ -950,10 +950,12 @@ function drawFace(m) {
 
   // 文本面板
   const fi = $('faceinfo');
+  // t_ms = 会话采样轴毫秒（0 = 首块音频到达）—— 与 ASR 那行同一根轴
+  const at = (m.t_ms != null) ? `<small>${m.t_ms}ms </small>` : '';
   if (!t || !t.valid) {
-    fi.textContent = '人脸：未检测到';
+    fi.innerHTML = `${at}人脸：未检测到`;
   } else {
-    fi.innerHTML =
+    fi.innerHTML = at +
       `人脸：<b>检测到</b>  置信度 <b>${t.score.toFixed(3)}</b>  ` +
       `唇动 <b>${t.speaking ? '说话中' : (t.lip || 'SILENT')}</b>  ` +
       `唤醒 <b>${t.interacting ? '是' : '否'}</b>` +
@@ -1065,7 +1067,10 @@ $('btnStart').onclick = async () => {
         evtCounts[m.type] = (evtCounts[m.type] || 0) + 1;
         if (m.type === 'asr') {
           // 服务端已把增量片段拼成累积文本，这里**替换**显示即可
-          $('asrline').innerHTML = '<b>ASR</b> ' +
+          // t_ms = 会话采样轴毫秒（0 = 首块音频到达）。与「人脸」那行同一
+          // 根轴，两行并排看就知道"同一时刻"发生了什么。
+          const at = (m.t_ms != null) ? `${m.t_ms}ms ` : '';
+          $('asrline').innerHTML = `<b>ASR</b> <small>${at}</small>` +
             (m.phase === 'partial' ? '<i>' : '') + (m.text || '') +
             (m.phase === 'partial' ? '</i>' : '') + asrStateTag(m.state);
         } else if (m.type === 'tts.start') {
