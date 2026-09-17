@@ -557,6 +557,29 @@ function initAdvParams() {
   }
 }
 
+/**
+ * 用服务端下发的默认值**回填**输入框（`session.ready` 的 `defaults`）。
+ *
+ * ⚠️ **不覆盖用户已填的**：用户改过就保留（那是 localStorage 存着的），
+ *    否则每次连会话都把人家的设置冲掉。只想"看一眼默认是什么"的话，
+ *    清空输入框即可（清空 = 不发该字段 = 服务端用默认）。
+ *
+ * 这样默认值只有**一个真源**（服务端 config / 环境变量），客户端不自己
+ * 写死一份 —— 服务端改了措辞，用户下次连接就能看到新的。
+ */
+function applyServerDefaults(defaults) {
+  if (!defaults) return;
+  const asr = defaults.asr || {};
+  for (const [id, field] of Object.entries(ADV_ASR_FIELDS)) {
+    const el = $(id);
+    if (el && !el.value && asr[field] !== undefined) el.value = asr[field];
+  }
+  const pe = $('p_sys_prompt');
+  if (pe && !pe.value && defaults.system_prompt) {
+    pe.value = defaults.system_prompt;
+  }
+}
+
 function selectedAecMode() {
   const el = $('aecMode');
   // 兜底也用 browser（与 <select> 的第一项一致）—— 早先是 'service'，
@@ -1105,7 +1128,12 @@ $('btnStart').onclick = async () => {
     };
     if (Object.keys(advAsr).length) startPayload.asr = advAsr;
     if (advPrompt) startPayload.system_prompt = advPrompt;
-    await session.start(startPayload);
+    const ready = await session.start(startPayload);
+    // 用服务端下发的**当前默认值**回填输入框 —— 默认值只应有一个真源
+    // （服务端 config / 环境变量），客户端不自己写死一份。
+    // ⚠️ 首次连接时输入框本来是空的，这里填上；用户改过（localStorage
+    //    有存档）就不覆盖，免得把用户的设置冲掉。
+    applyServerDefaults(ready && ready.defaults);
     log('v', `会话已建立（回声消除=${aecMode}）`);
     if (Object.keys(advAsr).length) {
       log('k', 'ASR 参数覆盖：' + JSON.stringify(advAsr));

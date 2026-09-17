@@ -1151,6 +1151,31 @@ class VirtualPlayer:
         return max(0.0, end - now)
 
 
+def _print_effective_params(client, asr_params: dict,
+                            system_prompt: str) -> None:
+    """打印**本会话实际生效**的参数（连上之后才知道服务端默认值）。
+
+    ⚠️ 不能只在连接前打印"我覆盖了什么" —— 没覆盖的项用户看不到它实际
+    是多少，容易"以为在用默认，其实服务端早就改过"。这里把服务端下发的
+    默认值一并列出来，并标明哪些是本会话覆盖过的。
+    """
+    d = getattr(client, "server_defaults", None) or {}
+    srv_asr = d.get("asr") or {}
+    if not srv_asr and not asr_params and not d.get("system_prompt"):
+        return
+    print("  ── 本会话参数 ──")
+    for k in sorted(set(srv_asr) | set(asr_params)):
+        val = asr_params.get(k, srv_asr.get(k))
+        mark = "  ← 本会话覆盖" if k in asr_params else ""
+        print(f"    {k:<32} = {val}{mark}")
+    if system_prompt:
+        print(f"    system_prompt{'':<20} = {system_prompt[:40]}…"
+              f"（{len(system_prompt)} 字）  ← 本会话覆盖")
+    elif d.get("system_prompt"):
+        sp = d["system_prompt"]
+        print(f"    system_prompt{'':<20} = {sp[:40]}…（{len(sp)} 字，服务端默认）")
+
+
 def _fmt_asr_state(state: dict) -> str:
     """把 ASR 消息里的 ``state`` 排成一行短标签（控制台/日志用）。
 
@@ -1202,6 +1227,9 @@ class OrchestratorReplayClient:
         self.ws = None
         self.session_id: Optional[str] = None
         self.lead_ms = 200
+        #: 服务端在 session.ready 里下发的当前默认值（ASR 调参 + 提示词）。
+        #: 只作展示/核对用 —— 我们没显式覆盖的项，生效的就是它。
+        self.server_defaults: dict = {}
         self.closed = False
         self.error: Optional[str] = None
 
@@ -1268,6 +1296,9 @@ class OrchestratorReplayClient:
             if msg.get("type") == "session.ready":
                 self.session_id = msg.get("session_id")
                 self.lead_ms = int(msg.get("lead_ms") or 200)
+                # 服务端下发的**当前默认值** —— 我们没显式覆盖的项，实际
+                # 用的就是这些。打出来免得"以为在用默认，其实不是"。
+                self.server_defaults = msg.get("defaults") or {}
                 if self.verbose:
                     print(f"  会话建立 id={self.session_id} "
                           f"sample_rate={msg.get('sample_rate')} lead_ms={self.lead_ms}")
@@ -2128,6 +2159,7 @@ async def main_async(args) -> int:
     t0 = time.monotonic()
     try:
         await client.connect()
+        _print_effective_params(client, asr_params, args.system_prompt)
         await run_replay(client, audio, face_frames, omni_frames, args, window,
                          src_speaker=src_speaker,
                          play_tts=play_tts, play_src=play_src)

@@ -144,6 +144,12 @@ class SessionReady:
     # 把该时刻回执给服务端，两边必须用同一个数 —— 所以由服务端下发，
     # 前端不自己写死常量（写死过一次，两边漂了）。
     lead_ms: int = 200
+    #: 服务端当前的默认值，下发给前端**预填输入框**用。
+    #: ⚠️ 下发而不是两边各写一份：默认值只应有**一个真源**
+    #: （config.py / 环境变量）。客户端写死会漂 —— 服务端改了措辞，
+    #: 客户端还是旧的，用户看到的"默认"就不是真的默认了。
+    #: `defaults.asr` 同理，让用户能看到当前 ASR 调参的实际数值。
+    defaults: Optional[Dict[str, Any]] = None
     type: Literal["session.ready"] = "session.ready"
 
 

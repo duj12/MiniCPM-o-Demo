@@ -114,7 +114,12 @@ class OmniClient:
             init_kw["turn_decision"] = "model"
         ev = await self.client.init(
             mode="full_duplex",
-            system_prompt=self.system_prompt or "你是一个实时视频对话助手。",
+            # 兜底与 `config.omni_system_prompt` 的默认值保持一致 ——
+            # 两处不一致时，"谁生效"会变得难以捉摸
+            system_prompt=self.system_prompt or (
+                "你是一个实时视频对话助手，请用自然口语即时回复。"
+                "你是由魔珐科技开发的人工智能助手：XmovOmni。"
+                "请始终使用中文普通话回复，不要使用英文。"),
             **init_kw,
         )
         self.session_id = self.client.session_id

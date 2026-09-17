@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -409,7 +409,21 @@ async def handle_client(ws, cfg: Settings) -> None:
         REGISTRY.add(sid, sess)
         from orchestrator.metrics import GLOBAL
         GLOBAL.on_start()
-        await send_to_client(SessionReady(session_id=sid))
+        # 下发当前默认值供前端**预填输入框** —— 默认值只有一个真源
+        # （config / 环境变量），客户端不自己写死。
+        # ⚠️ 这里报的是**本会话实际生效**的值（含客户端刚覆盖的部分），
+        #    这样"输入框里显示什么 = 真的在用什么"。
+        _defaults: Dict[str, Any] = {
+            "system_prompt": (sess.omni.system_prompt
+                              if sess.omni is not None else ""),
+        }
+        if sess.asr is not None:
+            from orchestrator.asr.client import AsrConfig as _AsrConfig
+            _defaults["asr"] = {
+                k: getattr(sess.asr.config, k)
+                for k in _AsrConfig.CLIENT_OVERRIDABLE
+            }
+        await send_to_client(SessionReady(session_id=sid, defaults=_defaults))
 
         # ---- 后台任务 ----
         # 注意：不用 create_task(name=...)，那是 Python 3.8+ 的 API
