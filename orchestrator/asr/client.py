@@ -366,8 +366,16 @@ class AsrStateTracker:
         self._seg_open = False
         # 当前段的累积转写（online 增量拼接 / offline 整段替换）
         self._transcript = ""
-        # 本轮抢话档位：累计「带新文本的流式帧」数
+        # 本轮抢话档位：累计「带新文本的流式帧」数。
+        # ⚠️ **offline 时归零**（下一句从 LOW 重新爬，见 `_on_offline`）。
         self._barge_frames = 0
+        #: **本段**是否出过声（有过带文本的流式帧）。
+        #: 与 `_barge_frames` 分开：那个管「抢话档位」且每句归零；这个管
+        #: 「用户确实发过声」这个事实，供 `_user_speaking()` 在段关闭后的
+        #: hold 窗口里用（那时该报 LOW 而不是 NONE）。
+        #: ⚠️ 早先两者共用一个变量，offline 归零后 `说` 会直接从
+        #: HIGH 掉到 NONE（跳过了本该有的 LOW）。
+        self._spoke_this_segment = False
         # 段是否已关闭？（下一段第一条流式帧到达时清空转写）
         self._segment_closed = False
         # **本段已拍板** —— 收到 offline 结果，或 turnsense 判 complete。
@@ -385,7 +393,25 @@ class AsrStateTracker:
 
     @property
     def state(self) -> AsrState:
-        """当前状态快照（不推进状态机）。"""
+        """当前状态快照。
+
+        ⚠️ **读的时候会顺手清**：一句说完（收到 offline）并过了 hold 窗口
+        之后，四个状态量全部归 ``NONE``、``transcript`` 清空。
+
+        为什么需要这一步：状态机是**纯事件驱动**的 —— 所有字段都只在
+        "收到下一条消息"时被覆盖。可一句话说完就**不再有消息**了，于是
+        最后那组值会**永远挂着**（实测：静音 3.5s 后 `抢`/`信`/`完` 还是
+        旧值，只有 `说` 会掉到 NONE）。表现就是"早就不说话了，状态栏还写
+        着置信度 HIGH"。
+
+        为什么放在**读快照**时而不是加定时器：清空的本质是"这轮结束了"，
+        而没人读的时候清不清都无所谓 —— 省掉一个后台定时任务。
+
+        ⚠️ **不会影响"offline 后立刻来新一句"**：新消息一进来就自己在
+        `_on_online` / `_on_offline` 里把该覆盖的覆盖掉（新 transcript、
+        barge 重新计数），这条清理路径只在**没有新消息**时才起作用。
+        """
+        self._maybe_clear_expired()
         return AsrState(
             user_speaking_confidence=self._user_speaking(),
             barge_in_confidence=self._barge_in(),
@@ -394,11 +420,38 @@ class AsrStateTracker:
             turn_complete_confidence=self._turn_complete_conf(),
         )
 
+    def _maybe_clear_expired(self) -> None:
+        """过了 hold 窗口且当前没有开着的段 ⇒ 整轮状态清零。
+
+        条件收紧到"**不在说话**"：`_seg_open` 为真说明用户正在出声（新一句
+        已经开始了），此时绝不能清 —— 那会把刚爬起来的 barge 计数打断。
+        """
+        if self._seg_open:
+            return
+        if self._hold_until_ms is None:
+            return
+        now = self._now_ms()
+        if now is None or now < self._hold_until_ms:
+            return
+        self._clear_all()
+
+    def _clear_all(self) -> None:
+        """四个状态量 + 转写全部回到初始（= 没收到过任何东西）。"""
+        self._transcript = ""
+        self._asr_conf = NONE
+        self._turn_complete = False
+        self._segment_done = False
+        self._vad_split_seen = False
+        self._barge_frames = 0
+        self._spoke_this_segment = False
+        self._segment_closed = False
+        self._hold_until_ms = None
+        # `_hold_until_ms` 置 None 之后 `_user_speaking()` 直接返回 NONE，
+        # 不再依赖 hold 判定 —— 否则刚清完又会被判成"还在窗口内"
+
     def reset_turn(self) -> None:
         """话轮结束：清空本轮累计（``barge_in`` 计数、段切分标记）。"""
-        self._barge_frames = 0
-        self._vad_split_seen = False
-        self._segment_done = False
+        self._clear_all()
 
     # ------------------------------------------------------------------ #
 
@@ -437,6 +490,7 @@ class AsrStateTracker:
         if self._segment_closed:
             self._transcript = ""
             self._segment_closed = False
+            self._spoke_this_segment = False   # 新的一段，重新计
             # 新的一段还没拍板。注意 `_vad_split_seen` **不清** —— 它按整轮
             # 累计，正是它把「切分之后的流式帧」标成 MEDIUM。
             self._segment_done = False
@@ -447,7 +501,10 @@ class AsrStateTracker:
             # 不是累积文本，必须自己拼。
             self._transcript += delta
             self._barge_frames += 1
+            self._spoke_this_segment = True
             self._asr_conf = self._grade(parse_online_confidence(msg))
+            # 注意：**不在这里**把 `_barge_frames` 清掉 —— 计数已经在
+            # `_on_offline` 归零过了（每句都是从 0 重新爬）。
         else:
             # 空文本帧：要么是低置信度被服务端过滤掉，要么是纯噪声段。
             # 有置信度且偏低 ⇒ LOW；否则没有出声证据 ⇒ NONE。
@@ -467,12 +524,26 @@ class AsrStateTracker:
         self._segment_closed = True
         # offline 是服务端对本段**拍板**的结果 —— turn_complete 到顶。
         self._segment_done = True
-        # 本轮出现过 VAD 切分，之后新段里的流式帧标 MEDIUM
+        # 本轮出现过 VAD 切分（收到过 offline）。**按整轮累计、不清零** ——
+        # 它服务于 `turn_complete`：有它才把"切分之后那段"的流式帧标成
+        # MEDIUM（而不是 LOW）。
+        # ⚠️ 与 barge 的"每句重新爬"是**两套语义**，别混：barge 在下面归零，
+        #    这个不归零。早先改 barge 时误删过这一行，导致切分后的段掉成 LOW。
         self._vad_split_seen = True
         self._mark_closed()
         # 离线也走同一套三档（用离线自带的 confidence.avg）—— 与流式口径
         # 一致，用户不用记"流式看这个线、离线看那个线"
         self._asr_conf = self._grade(parse_confidence(msg))
+
+        # ⚠️ **offline 之后 barge 计数必须归零** —— 下一句从 LOW 重新爬。
+        #
+        # 早先这里不清，计数就会**跨句累积**：句1 加 1、句2 加 1、句3 就
+        # 到 HIGH —— 表现是"每句话刚开始临时结果就已经是 HIGH"（实测复现）。
+        # 归零只能在这里做，不能指望 `_clear_all`：那是**懒触发**的
+        # （只在读 `state` 且 hold 过期时跑），静音期间根本不会执行。
+        self._barge_frames = 0
+        # `_spoke_this_segment` **不清** —— hold 窗口里要靠它把
+        # `user_speaking` 报成 LOW（而不是 NONE）。它在下段第一帧才重置。
 
     # ------------------------------------------------------------------ #
 
@@ -486,10 +557,18 @@ class AsrStateTracker:
             return None
 
     def _within_hold(self) -> bool:
+        # ⚠️ `None` = **没有"段刚关闭"这回事**（从未说过话，或已被
+        #    `_clear_all` 清干净）⇒ 不在窗口内。
+        #    早先这里返回 True（当时想表达"取不到时钟就保守点"），但
+        #    `_hold_until_ms` 为 None 的两种情况都不是"还在 hold"——
+        #    结果清空之后 `_user_speaking()` 又会走进 hold 分支。
         if self._hold_until_ms is None:
-            # 取不到时钟 ⇒ 保守认为还在窗口内（宁可多报 LOW 也不要漏）
+            return False
+        now = self._now_ms()
+        if now is None:
+            # 真取不到时钟时才保守（宁可多报一会儿 LOW，也别漏）
             return True
-        return (self._now_ms() or 0.0) < self._hold_until_ms
+        return now < self._hold_until_ms
 
     def _grade(self, conf: Optional[float]) -> str:
         """浮点置信度 → **三档**（``HIGH`` / ``MEDIUM`` / ``LOW``），无信号 ``NONE``。
@@ -523,8 +602,10 @@ class AsrStateTracker:
         if self._seg_open:
             return HIGH if self._transcript else MEDIUM
         if self._within_hold():
-            # 段已关闭但还在 hold 窗口内：本轮有过文本说明确实出过声
-            return LOW if self._barge_frames else NONE
+            # 段已关闭但还在 hold 窗口内：本轮有过文本说明确实出过声。
+            # ⚠️ 用 `_spoke_this_segment` 而不是 `_barge_frames` —— 后者
+            #    已在 offline 时归零，用它会让 `说` 从 HIGH 直接跳到 NONE。
+            return LOW if self._spoke_this_segment else NONE
         return NONE
 
     def _barge_in(self) -> str:

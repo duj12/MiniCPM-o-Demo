@@ -189,10 +189,30 @@ def main() -> int:
     check(tr.update(online("吃饭")).barge_in_confidence == "MEDIUM", "第 2 帧 -> MEDIUM")
     check(tr.update(online("了吗")).barge_in_confidence == "HIGH", "第 3 帧 -> HIGH")
     check(tr.update(online("啊")).barge_in_confidence == "HIGH", "之后保持 HIGH")
-    check(tr.update(offline("今天吃饭了吗？", conf=0.96)).barge_in_confidence == "HIGH",
-          "offline 不计数、也不改变档位")
-    check(tr.update(online("下一段")).barge_in_confidence == "HIGH",
-          "VAD 切段不重置（按整轮累计）")
+
+    # ⚠️ **offline 必须归零**（实测踩过的 bug）
+    #    早先 `_barge_frames` 只在 `_clear_all()` 里重置，而那是**懒触发**的
+    #    （只在读 state 且 hold 过期时跑），静音期间根本不执行 —— 于是计数
+    #    **跨句累积**：句1 加 1、句2 加 1、句3 就到 HIGH。表现是
+    #    「每句话刚开始临时结果就已经是 HIGH」（真机复现）。
+    check(tr.update(offline("今天吃饭了吗？", conf=0.96)).barge_in_confidence == "NONE",
+          "offline 之后 barge 归零（下一句从 LOW 重新爬）")
+
+    # 三句连续 —— 每句都要从 LOW 起，不能累积
+    tr = AsrStateTracker()
+    firsts = []
+    for i in (1, 2, 3):
+        firsts.append(tr.update(online(f"句{i}")).barge_in_confidence)
+        tr.update(offline(f"句{i}内容", conf=0.95))
+    check(firsts == ["LOW", "LOW", "LOW"],
+          f"连续三句各自从 LOW 起（实际 {firsts}）—— 不跨句累积")
+
+    # 单句内仍能爬到 HIGH
+    tr = AsrStateTracker()
+    for _ in range(3):
+        tr.update(online("字"))
+    check(tr.state.barge_in_confidence == "HIGH", "单句内三帧仍爬到 HIGH")
+
     tr.reset_turn()
     check(tr.state.barge_in_confidence == "NONE", "reset_turn 后归零")
 
@@ -301,12 +321,58 @@ def main() -> int:
           "新段起来后 user_speaking 回到 HIGH（不是卡在 LOW）")
     check(seen[-1].transcript == "今天的说出去看的风景",
           "第二轮转写正确覆盖")
-    # 第 3 个「带文本的流式帧」是 seen[4]（第二轮的第一帧）——
-    # 计数不因 VAD 切分重置，所以此后一直 HIGH
-    check([s.barge_in_confidence for s in seen[:4]] == ["LOW", "MEDIUM", "MEDIUM", "MEDIUM"],
-          "前 3 条（2 流式 + turnsense + offline）barge 爬到 MEDIUM 为止")
-    check(all(s.barge_in_confidence == "HIGH" for s in seen[4:]),
-          "第 3 个带文本流式帧之后保持 HIGH")
+    # ⚠️ barge **每句 offline 后归零**（下一句从 LOW 重新爬）。
+    #    早先这里断言"跨句累计、不重置"—— 那正是"每句话刚开始就 HIGH"的 bug。
+    check([s.barge_in_confidence for s in seen[:4]] ==
+          ["LOW", "MEDIUM", "MEDIUM", "NONE"],
+          f"句1：两帧爬到 MEDIUM，offline 归零（实际 {[s.barge_in_confidence for s in seen[:4]]}）")
+    check([s.barge_in_confidence for s in seen[4:]] == ["LOW", "MEDIUM", "NONE"],
+          f"句2：又从 LOW 重新爬（实际 {[s.barge_in_confidence for s in seen[4:]]}）")
+
+    # ---------------- 一句结束后状态要清空 ----------------
+    # ⚠️ 这是实测踩过的 bug：状态机是**纯事件驱动**的，所有字段只在
+    #    "收到下一条消息"时被覆盖。可一句话说完就**不再有消息**了 ——
+    #    于是 `抢`/`信`/`完` 会**永远挂着旧值**（只有 `说` 会掉 NONE），
+    #    表现是"早就不说话了，状态栏还写着置信度 HIGH"。
+    print("\n[句末清空] 静音后四个状态量都要归 NONE（不能粘住）")
+    tr = AsrStateTracker()
+    tr.update(online("今天", conf=0.9))
+    tr.update(offline("今天天气", conf=0.95))
+    s = tr.state
+    # `抢` 在 offline 时**归零**（下一句重新爬），但 `信` 保留着本段的
+    # 最终置信度（那是有用的信息，不该跟着清）
+    check(s.barge_in_confidence == "NONE", "offline 后 抢 归零")
+    check(s.asr_confidence != "NONE", "offline 后 信 仍保留本段结果（可看）")
+    check(s.user_speaking_confidence == "LOW",
+          "offline 后在 hold 窗口内 说=LOW（不是 NONE）")
+
+    # 模拟 hold 窗口过期（不去真等 1.2s，直接压时间戳）
+    tr._hold_until_ms = 0
+    s = tr.state
+    check(s.user_speaking_confidence == "NONE", "过期后 说 -> NONE")
+    check(s.barge_in_confidence == "NONE", "过期后 抢 -> NONE（早先会粘住）")
+    check(s.asr_confidence == "NONE", "过期后 信 -> NONE（早先会粘住）")
+    check(s.turn_complete_confidence == "NONE", "过期后 完 -> NONE（早先会粘住）")
+    check(s.transcript == "", "过期后 transcript 也清空")
+
+    # ⚠️ 反向：**说话中不能被清**（段开着说明新一句已经开始）
+    tr2 = AsrStateTracker()
+    tr2.update(online("今天", conf=0.9))
+    tr2._hold_until_ms = 0          # 即使 hold 已过期
+    s = tr2.state
+    check(s.user_speaking_confidence == "HIGH" and s.transcript == "今天",
+          "段开着时读快照**不会**被清（新一句不被清坏）")
+
+    # ⚠️ 反向：offline 后**立刻**来新一句，不能被清坏、也不该等 hold
+    tr3 = AsrStateTracker()
+    tr3.update(online("今天", conf=0.9))
+    tr3.update(offline("今天天气", conf=0.95))
+    tr3.update(online("明天", conf=0.9))
+    tr3.update(online("开会", conf=0.9))
+    s = tr3.state
+    check(s.transcript == "明天开会", "新一句的 transcript 正确（旧句已被覆盖）")
+    check(s.barge_in_confidence == "MEDIUM",
+          "抢 从新句重新算（句2 两帧 -> MEDIUM，不带上句的计数）")
 
     # ---------------- state 快照 ----------------
     print("\n[快照] to_dict 字段齐全")
