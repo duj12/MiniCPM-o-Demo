@@ -50,7 +50,10 @@ export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$CODE/orchdump/s}"
 
 # ---- 人脸模块 ----
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
-export ORCH_FACE_SO="${ORCH_FACE_SO:-$CODE/board-face-and-cloud-infer/G1/lib/libsdk_stream.so}"
+# ⚠️ 产物路径按**架构**分目录（G1 新约定）：`lib/x86_64/` 是开发机编的，
+#    `lib/aarch64/` 是板子上编的。早先统一放 `lib/` 根下，新版 `build.sh`
+#    会落到 `lib/x86_64/` —— 指向旧路径会**静默用上过期的那份**。
+export ORCH_FACE_SO="${ORCH_FACE_SO:-$CODE/board-face-and-cloud-infer/G1/lib/x86_64/libsdk_stream.so}"
 export ORCH_FACE_MODELS="${ORCH_FACE_MODELS:-$CODE/board-face-and-cloud-infer/G1/models}"
 export ORCH_FACE_DB="${ORCH_FACE_DB:-$CODE/faceidentification/data/face_db.npz}"
 # ⚠️ 必须为 0：否则 create 时就会写最多约 4GB 视频
