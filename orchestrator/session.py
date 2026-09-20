@@ -1045,7 +1045,13 @@ class OrchestratorSession:
                     "speaking": bool(ev.speaking),
                     "lip": ev.lip_state,
                     "interacting": bool(ev.interacting),
+                    # ⚠️ person_id 只是**参考值** —— 上游从名字正则解析
+                    #    `person_N`，而线上人脸库存的是真名，解析全失败 →
+                    #    所有人都是同一个兜底值。**认人请用 uid**。
                     "person_id": int(ev.person_id),
+                    "uid": (ev.state or {}).get("identity_id"),
+                    "identity_state": ev.identity_state,
+                    "track_id": ev.track_id,
                     "src_w": fs[0] if fs else None,
                     "src_h": fs[1] if fs else None,
                 }
@@ -1053,16 +1059,18 @@ class OrchestratorSession:
                 # 一起发 —— 前端不必为它单开一条通道。
                 if ev.state is not None:
                     self._last_face_state = ev.state
-                    # 只在**刷新时**投给下游（按 state_seq 去重）—— 否则
-                    # 25Hz 的观测会把下游淹了。InteractionCore 需要这些档位
+                    # provider 只在刷新帧给 `state`，所以「有就给」即是去重，
+                    # 25Hz 的观测不会把下游淹掉。InteractionCore 需要这些档位
                     # 来判 SOP（face_present / bbox / track / dwell / identity）。
+                    #
+                    # ⚠️ **不要按 `state_seq` 去重**：身份结果回来时 seq 可能
+                    #    不 +1，按 seq 比会丢掉带身份的那一帧。
                     seq = int(ev.state_seq)
-                    if seq != self._last_face_state_seq:
-                        self._last_face_state_seq = seq
-                        self.post_downstream(FaceState(
-                            t=self.clock.now(), state=dict(ev.state),
-                            state_seq=seq,
-                        ))
+                    self._last_face_state_seq = seq
+                    self.post_downstream(FaceState(
+                        t=self.clock.now(), state=dict(ev.state),
+                        state_seq=seq,
+                    ))
                 self._push_face_display()
             elif kind == "wake":
                 self.post_downstream(FaceWake(
@@ -1093,6 +1101,7 @@ class OrchestratorSession:
                     "name": ev.name, "uid": ev.uid, "person_id": ev.person_id,
                     "similarity": round(ev.similarity, 3),
                     "enrolled": bool(ev.is_enrolled),
+                    "identity_state": ev.identity_state,
                 }
                 self._push_face_display()
 

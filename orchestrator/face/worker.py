@@ -38,7 +38,8 @@ class FaceWorker:
     """在专用线程里跑 G1 人脸库。
 
     ``provider`` 需实现 ``process(jpeg, t) -> FaceObservation`` 与可选
-    ``identify(frames) -> IdentityEvent``。见 ``LocalFaceProvider``。
+    ``poll_identity(t) -> IdentityEvent``、``close()``。
+    见 ``G1FaceProvider``（``g1face_provider.py``，官方 g1face 包的适配层）。
     """
 
     def __init__(self, provider, on_wake: Callable[[WakeEvent], None],
@@ -155,14 +156,18 @@ class FaceWorker:
             self._safe(self.on_obs, obs)
 
         # ---- 每帧 state（**只在刷新时发**）----
-        # G1 的 state 心跳绑在 landmark 上（≈208ms），其余帧沿用上次快照、
-        # `state_seq` 不变。用 seq 去重，避免把同一份 state 重复推 5 次。
-        if (self.on_state is not None and obs.state is not None
-                and obs.state_seq != self._last_state_seq):
-            self._last_state_seq = obs.state_seq
+        # provider 只在 state 刷新帧给 `state`（landmark 心跳 ≈5Hz，外加离散
+        # 状态变化与身份落地），其余帧是 None —— 所以「有就给」就足够去重。
+        #
+        # ⚠️ **不要按 `state_seq` 去重**：官方明确身份结果回来时 seq 可能不 +1
+        #    （g1face/state.py 的 docstring），按 seq 比会**恰好丢掉带身份的那一帧**
+        #    —— 现象是前端一直看不到名字。
+        if self.on_state is not None and obs.state is not None:
+            self._last_state_seq = obs.state_seq      # 只留作诊断
             self._safe(self.on_state, obs.state)
 
         # ---- 唤醒 ----
+        # 判据在 provider 里（`dwell_ms >= 阈值`），这里只做「边沿 → begin/end」的状态机。
         if obs.interacting and not self._was_interacting:
             self._was_interacting = True
             self._wake_started_at = time.monotonic()
@@ -170,8 +175,13 @@ class FaceWorker:
             self._conf_sum = obs.score
             self._conf_n = 1
             self.stats.wakes += 1
+            # 注意 ``begin`` 与 ``end`` 的 dwell_ms **含义不同**：
+            #   begin —— 唤醒那一刻 track 的**真实在场时长**（= 唤醒阈值附近），
+            #            用来核对「确实是熬够了 dwell 才唤醒的」。
+            #   end   —— 本次交互**持续了多久**（墙钟累计），与在场时长无关。
             self._safe(self.on_wake, WakeEvent(
-                t=obs.t, phase="begin", dwell_ms=0,
+                t=obs.t, phase="begin",
+                dwell_ms=int((obs.state or {}).get("dwell_ms") or 0),
                 mean_confidence=obs.score, peak_confidence=obs.score,
                 box=obs.box,
             ))

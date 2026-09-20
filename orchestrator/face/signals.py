@@ -25,11 +25,13 @@ except ImportError:  # Python < 3.8（本地开发机 3.7）
 
 @dataclass
 class FaceObservation:
-    """单帧的人脸观测（由 G1 库每帧同步返回）。
+    """单帧的人脸观测（由 provider 每帧同步返回）。
 
-    ⚠️ ``state`` / ``state_seq`` 不是每帧都变：G1 的 state 心跳绑在 landmark 上
-    （``lip_detect_every=5``，≈208ms），离散状态变化时才提前刷新。判断「本次是否
-    新 state」要用 ``state_seq`` 有没有变，而不是帧号。
+    ⚠️ ``state`` **不是每帧都有**：G1 的 state 心跳绑在 landmark 上
+    （墙钟 ≈5Hz / 208ms），离散状态变化（track 变、把握档变）和**身份结果
+    落地**时才提前刷新。所以判据是 ``state is not None``，**不要用
+    ``state_seq`` 去重** —— 官方明确身份结果回来时 seq 可能不 +1，
+    按 seq 去重会恰好丢掉带身份的那一帧（见 ``face/g1face_provider.py``）。
     """
 
     t: int                                  # 会话采样轴时刻
@@ -38,15 +40,25 @@ class FaceObservation:
     score: float = 0.0
     speaking: bool = False
     lip_state: str = "SILENT"               # SILENT | SPEAKING | GAP
-    interacting: bool = False               # 唤醒达标
-    person_id: int = -1                     # 未识别为 -1
+    #: 唤醒达标。判据是 ``state["dwell_ms"] >= 阈值``（不是库的 interacting ——
+    #: 上游已把那个字段标注为「保留但不对外」）。
+    interacting: bool = False
+    #: ⚠️ **只作参考值**：g1face 从名字正则解析 ``person_N``，而线上人脸库里
+    #: 存的是真名 → 解析全失败 → 所有人都落到同一个兜底值。UI 认人请用 uid。
+    person_id: int = -1
+    #: 视觉跟踪 id（g1face 里是字符串，如 ``"1000003"``）；无人为 None。
+    track_id: Optional[str] = None
+    #: 身份状态机名：recognized / enrolled / unknown / register_failed /
+    #: identify_error；None = 还没有识别结果。用来区分「低置信（unknown）」
+    #: 与「压根没算出来（register_failed / identify_error）」。
+    identity_state: Optional[str] = None
     is_repeat: bool = False                 # 库为凑 24fps 补槽
-    # G1 每帧 state 快照（见 g1.py 的 to_observation）。字段：
+    # G1 每帧 state 快照（g1face 的 FrameStateBuilder 产物）。字段：
     # face_present_confidence / lip_speaking_confidence / track_id / dwell_ms /
     # bbox_area_ratio / identity_id / identity_confidence / display_name /
-    # slot / state_seq / frame_index
+    # identity_state / slot / state_seq / frame_index
     state: Optional[dict] = None
-    #: 刷新计数。**变了才是新 state**（只在刷新时 +1，跨 reset 保持单调）。
+    #: 刷新计数（**仅诊断**：身份结果回来时可能不 +1，别拿它判有无新信息）。
     state_seq: int = -1
 
 
@@ -74,6 +86,10 @@ class IdentityEvent:
     name: Optional[str] = None
     similarity: float = 0.0
     is_enrolled: bool = False
+    #: 状态机名（recognized/enrolled/unknown/register_failed/identify_error）。
+    #: ``is_enrolled`` 只区分「在不在库」，这个字段区分**为什么没认出来** ——
+    #: 低置信（unknown，有候选但没确认）与算不出来（register_failed）要分开处理。
+    identity_state: Optional[str] = None
 
 
 @dataclass
@@ -117,8 +133,14 @@ def aggregate_lip(observations: List[FaceObservation], t0: int, t1: int
         states[o.lip_state] = states.get(o.lip_state, 0) + 1
     lip_state = max(states.items(), key=lambda kv: kv[1])[0] if states else "SILENT"
     conf = sum(o.score for o in observations) / len(observations)
+    # ⚠️ 这里早先写的是 ``observations[-1].person_id`` —— 把身份当成了跟踪 id
+    #    （复制粘贴错误）。IC 不读这个字段，所以一直没暴露出来。
+    last_tid = observations[-1].track_id
+    try:
+        tid = int(last_tid) if last_tid is not None else 0
+    except (TypeError, ValueError):
+        tid = 0
     return LipEvent(
-        t0=t0, t1=t1,
-        track_id=observations[-1].person_id if observations[-1].person_id >= 0 else 0,
+        t0=t0, t1=t1, track_id=tid,
         speaking=speaking, lip_state=lip_state, confidence=conf,
     )

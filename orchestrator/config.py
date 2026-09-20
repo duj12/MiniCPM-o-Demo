@@ -157,13 +157,34 @@ class Settings:
     omni_turn_trigger: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_TRIGGER", "asr"))
 
-    # 人脸（阶段 4）
+    # 人脸（阶段 4）—— 实现走 board-face-and-cloud-infer/G1 的官方 g1face 包
+    #
+    # ⚠️ `face_g1_root` 与 `face_model_dir` 是**两个不同的根**，不能合并：
+    #    检测模型（blazeface 等）由 C 侧按 `g1_face_create(model_dir)` 的入参解析，
+    #    而身份模型 `models/buffalo_l/` 由 G1IdentifyRuntime 按 g1_root 解析。
+    #    不设 g1_root 时自动探测「与本仓库同级的 board-face-and-cloud-infer/G1」。
+    face_g1_root: Optional[str] = field(default_factory=lambda: os.environ.get(
+        "ORCH_G1_ROOT"))
     face_lib_path: Optional[str] = field(default_factory=lambda: os.environ.get(
         "ORCH_FACE_SO"))
     face_model_dir: Optional[str] = field(default_factory=lambda: os.environ.get(
         "ORCH_FACE_MODELS"))
     face_db_path: Optional[str] = field(default_factory=lambda: os.environ.get(
         "ORCH_FACE_DB"))
+    #: 唤醒判据：track 连续在场多少毫秒算唤醒。2000 = C 侧 `wake_ms_high`，
+    #: 也 = IC 的 passerby 阈值（低于它 IC 判 passerby、永不 GREET），两边必须同值。
+    face_wake_dwell_ms: int = field(default_factory=lambda: int(os.environ.get(
+        "ORCH_FACE_WAKE_DWELL_MS", "2000")))
+    #: 身份识别总开关。关掉只做检测/唇动/唤醒。
+    face_identify: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_IDENTIFY", "1") not in ("0", "false", "False", ""))
+    #: 在线注册：**默认关**。上游默认把不在库的人注册进内存库，
+    #: 在编排场景会把每个路人都写成"熟人"。我们另外也永不落盘。
+    face_no_enroll: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_NO_ENROLL", "1") not in ("0", "false", "False", ""))
+    #: 识别阈值（LOW/MEDIUM 分界）。0.36 来自上游 100 轮交叉验证。
+    face_threshold: float = field(default_factory=lambda: float(os.environ.get(
+        "ORCH_FACE_THRESHOLD", "0.36")))
 
     # 调参
     tick_interval_s: float = 0.05

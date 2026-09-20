@@ -303,24 +303,50 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
 
 
 def preflight_face(cfg: Settings) -> bool:
-    """启动期人脸预检：只验证资产存在，**不加载模型**（避免空跑占 GPU）。
+    """启动期人脸预检：只验证资产存在，**不加载模型/不 CDLL**（避免空跑占 GPU）。
 
     为什么需要：人脸是会话建立时才懒加载的，如果路径配错，服务能正常
     起来、直到第一个用户连进来才失败 —— 那是很差的失败模式。这里在
     启动时就把问题暴露出来。
     """
     import os
+    from orchestrator.face.g1face_provider import arch_name, resolve_g1_root
+
+    g1_root, how = resolve_g1_root(cfg)
+    model_dir = cfg.face_model_dir or str(g1_root / "models")
     problems = []
-    if not cfg.face_lib_path or not os.path.isfile(cfg.face_lib_path):
-        problems.append(f"G1 库不存在: {cfg.face_lib_path}")
-    if not cfg.face_model_dir or not os.path.isdir(cfg.face_model_dir):
-        problems.append(f"模型目录不存在: {cfg.face_model_dir}")
+
+    # ⚠️ 新增强制项：g1face 包本身。它缺失时是「import 就炸」，
+    #    必须发生在启动期，而不是第一个用户连进来时。
+    if not (g1_root / "g1face" / "__init__.py").is_file():
+        problems.append(
+            f"g1face 包不存在: {g1_root / 'g1face'}（来自 {how}）—— "
+            f"同步 board-face-and-cloud-infer 仓库，或设 ORCH_G1_ROOT")
+    # .so 按架构分目录（G1 新约定 lib/<arch>/）
+    lib = cfg.face_lib_path or str(g1_root / "lib" / arch_name() / "libsdk_stream.so")
+    if not os.path.isfile(lib):
+        problems.append(f"G1 库不存在: {lib}（架构 {arch_name()}）"
+                        f"—— 在目标机器上 cd G1 && bash build.sh 重编")
+
+    if not os.path.isdir(model_dir):
+        problems.append(f"模型目录不存在: {model_dir}")
     else:
+        # 检测/唇动三件套缺失 = 阻断；身份两件套缺失只降级（见下）
         need = ["blazeface.onnx", "face_landmarks_op12.onnx", "anchors_192_v5.bin"]
-        miss = [n for n in need
-                if not os.path.isfile(os.path.join(cfg.face_model_dir, n))]
+        miss = [n for n in need if not os.path.isfile(os.path.join(model_dir, n))]
         if miss:
             problems.append(f"缺模型文件: {miss}")
+
+    # ---- 以下都只降级，不阻断 ----
+    id_miss = []
+    if cfg.face_identify:
+        id_miss = [n for n in ("buffalo_l/w600k_r50.onnx", "buffalo_l/2d106det.onnx")
+                   if not os.path.isfile(os.path.join(model_dir, n))]
+        if id_miss:
+            logger.warning("人脸：身份识别不可用（缺 %s）—— 只做检测/唇动/唤醒",
+                           id_miss)
+    else:
+        logger.info("人脸：身份识别已关闭（ORCH_FACE_IDENTIFY=0）")
     db_ok = bool(cfg.face_db_path) and os.path.isfile(cfg.face_db_path)
     if not db_ok:
         # 不阻断：没有离线库仍可做检测/唇动/唤醒，只是不做身份识别
@@ -333,38 +359,40 @@ def preflight_face(cfg: Settings) -> bool:
         logger.error("人脸已开启但预检不通过 —— **会话将降级为无人脸**")
         return False
     logger.info(
-        "人脸预检通过: lib=%s  models=%s  db=%s",
-        os.path.basename(cfg.face_lib_path), cfg.face_model_dir,
-        "可用" if db_ok else "不可用",
+        "人脸预检通过: g1_root=%s（%s）  lib=%s  models=%s  db=%s  唤醒阈值=%dms",
+        g1_root, how, os.path.basename(lib), model_dir,
+        "可用" if db_ok else "不可用", cfg.face_wake_dwell_ms,
     )
     return True
 
 
 def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
-    """装配人脸模块。任一前置缺失时**降级而非整体失败**。"""
-    lib_path = cfg.face_lib_path
-    model_dir = cfg.face_model_dir
-    if not lib_path or not model_dir:
-        logger.warning("人脸已开启但缺 face_lib_path/face_model_dir，跳过")
-        return
+    """装配人脸模块。任一前置缺失时**降级而非整体失败**。
 
-    from orchestrator.face.local_provider import (
-        LocalFaceProvider, PersonIdMap, load_face_service,
-    )
+    实现全部沿用 G1 仓库的官方 ``g1face`` 包（见 ``face/g1face_provider.py``）。
+    """
+    from orchestrator.face.g1face_provider import G1FaceProvider, resolve_g1_root
     from orchestrator.face.worker import FaceWorker
 
-    svc, err = (None, "未配置 face_db_path")
-    if cfg.face_db_path:
-        svc, err = load_face_service(model_dir, cfg.face_db_path)
-    if svc is None:
-        logger.warning("身份识别不可用（%s）—— 降级为仅检测/唇动", err)
+    g1_root, how = resolve_g1_root(cfg)
+    try:
+        provider = G1FaceProvider(
+            str(g1_root),
+            model_dir=cfg.face_model_dir,
+            lib_path=cfg.face_lib_path,
+            db_path=cfg.face_db_path,
+            identify=cfg.face_identify,
+            no_enroll=cfg.face_no_enroll,
+            threshold=cfg.face_threshold,
+            wake_dwell_ms=cfg.face_wake_dwell_ms,
+            debug=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 降级而非整体失败 —— 会话照跑，只是没有人脸信号
+        logger.error("人脸模块装配失败（%s: %s）—— 本会话降级为无人脸",
+                     type(exc).__name__, exc)
+        return
 
-    provider = LocalFaceProvider(
-        lib_path, model_dir, face_service=svc,
-        id_map=PersonIdMap(str(Path(cfg.face_db_path).with_suffix(".idmap.json"))
-                           if cfg.face_db_path else None),
-        identify_enabled=svc is not None,
-    )
     sess.face_worker = FaceWorker(
         provider,
         on_wake=sess._face_cb("wake"),
@@ -372,7 +400,8 @@ def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
         on_identity=sess._face_cb("identity"),
         on_obs=sess._face_cb("obs"),      # 每帧观测，供 UI 叠加
     )
-    logger.info("人脸模块已装配（身份识别=%s）", svc is not None)
+    logger.info("人脸模块已装配（g1_root=%s 来源=%s 身份识别=%s 唤醒阈值=%dms）",
+                g1_root, how, provider.available, provider.wake_dwell_ms)
 
 
 # ====================================================================== #

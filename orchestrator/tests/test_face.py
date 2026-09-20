@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """阶段 4 验证：G1 人脸模块（唤醒 / 唇动 / 身份识别）。
 
-用 G1 自带的样例录像回放（含唤醒），验证三个输出。
+用 G1 自带的样例录像回放（含唤醒），验证三个输出。跑的是**线上那条路径**
+（``G1FaceProvider`` → ``FaceWorker``），所以断言通过就等于线上链路没退化。
 
-    # 在 106 上
-    export G1_FACE_DEBUG=0
+    # 在 106 上（g1_root 会自动探测到与本仓库同级的 board-face-and-cloud-infer/G1）
     python -m orchestrator.tests.test_face \
-        --so  board-face-and-cloud-infer/G1/lib/libsdk_stream.so \
-        --models board-face-and-cloud-infer/G1/models \
         --mjpeg board-face-and-cloud-infer/G1/sample/camera_original.mjpeg \
         --tsv   board-face-and-cloud-infer/G1/sample/camera_capture_timestamps.tsv
 
-    # 加上身份识别（需 buffalo_l + face_db.npz）
+    # 加上身份识别（--db 省略时默认用 <g1_root>/models/face_db.npz）
     ... --db /data/megastore/Projects/DuJing/models/face/face_db.npz
+
+⚠️ 别再用全速灌帧（``--fast``）看结果 —— 队列 maxsize=3 会丢掉绝大部分，
+那是**测量方法**的问题，不是产品缺陷（真实浏览器就是 25fps 一条一条来的）。
 """
 from __future__ import annotations
 
@@ -97,43 +98,70 @@ def read_tsv(path: str):
 
 def main() -> None:
     p = argparse.ArgumentParser(description="G1 人脸模块验证")
-    p.add_argument("--so", required=True, help="libsdk_stream.so 路径")
-    p.add_argument("--models", required=True, help="模型目录（blazeface.onnx 等）")
+    p.add_argument("--g1-root", default=None,
+                   help="G1 仓库根（含 g1face/ 与 models/）；不设则自动探测")
+    p.add_argument("--models", default=None,
+                   help="模型目录（blazeface.onnx 等）；默认 <g1-root>/models")
+    p.add_argument("--so", default=None, help="libsdk_stream.so 路径（默认按架构找）")
     p.add_argument("--mjpeg", required=True)
     p.add_argument("--tsv", default=None)
-    p.add_argument("--db", default=None, help="face_db.npz（给了才测身份识别）")
+    p.add_argument("--db", default="__default__",
+                   help="face_db.npz；默认 <g1-root>/models/face_db.npz，"
+                        "传 none 用空库（不测身份）")
+    p.add_argument("--wake-dwell", type=int, default=2000,
+                   help="唤醒阈值 ms（默认 2000，与 C 侧 wake_ms_high / IC 同值）")
     p.add_argument("--fast", action="store_true",
                    help="全速回放（**会大量丢帧**，仅用于调试，不用于验证）")
     p.add_argument("--max-frames", type=int, default=0)
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
-    from orchestrator.face.signals import FaceObservation, IdentityEvent, LipEvent, WakeEvent
+    from collections import Counter
+
+    from orchestrator.config import Settings
+    from orchestrator.face.g1face_provider import G1FaceProvider, resolve_g1_root
     from orchestrator.face.worker import FaceWorker
-    from orchestrator.face.local_provider import LocalFaceProvider, PersonIdMap
 
-    print(f"加载模型: {args.models}")
-    svc = None
-    if args.db:
-        from orchestrator.face.local_provider import load_face_service
-        svc, err = load_face_service(args.models, args.db)
-        if svc is None:
-            print(f"  [!] FaceService 不可用（{err}）—— 跳过身份识别")
-        else:
-            print("  身份识别已启用")
+    # 复用线上同一套路径解析（不自己拼 parents[3]）
+    cfg = Settings()
+    cfg.face_g1_root = args.g1_root or cfg.face_g1_root
+    cfg.face_model_dir = args.models or cfg.face_model_dir
+    cfg.face_lib_path = args.so or cfg.face_lib_path
+    g1_root, how = resolve_g1_root(cfg)
 
-    provider = LocalFaceProvider(
-        args.so, args.models, face_service=svc,
-        id_map=PersonIdMap(None), identify_enabled=svc is not None,
-        identify_cooldown_s=2.0, debug=args.debug,
+    db = args.db
+    if db == "__default__":
+        cand = g1_root / "models" / "face_db.npz"
+        db = str(cand) if cand.is_file() else None
+    elif db in ("none", ""):
+        db = None
+    want_identify = db is not None
+    print(f"G1 根: {g1_root}（{how}）")
+    print(f"模型目录: {cfg.face_model_dir or g1_root / 'models'}")
+    print(f"人脸库: {db or '（无，跳过身份识别）'}")
+
+    provider = G1FaceProvider(
+        str(g1_root),
+        model_dir=cfg.face_model_dir,
+        lib_path=cfg.face_lib_path,
+        db_path=db,
+        identify=want_identify,
+        no_enroll=True,            # ⚠️ 测试绝不写库
+        wake_dwell_ms=args.wake_dwell,
+        debug=args.debug,
     )
+    print(f"身份识别: {'可用' if provider.available else '不可用（降级）'}")
 
     events = {"wake": [], "lip": [], "identity": []}
+    # 每帧观测也收 —— 用来断言 state 刷新帧真的下发了（旧用例只看事件，
+    # 漏掉了「state 一直没出」这种静默退化）
+    obs_list: list = []
     worker = FaceWorker(
         provider,
         on_wake=lambda e: events["wake"].append(e),
         on_lip=lambda e: events["lip"].append(e),
         on_identity=lambda e: events["identity"].append(e),
+        on_obs=obs_list.append,
     )
 
     frames = read_mjpeg_stream(args.mjpeg)
@@ -187,7 +215,7 @@ def main() -> None:
     ends = [w for w in wakes if w.phase == "end"]
     print(f"  唤醒事件: begin={len(begins)} end={len(ends)}")
     for w in begins[:3]:
-        print(f"    begin: conf={w.mean_confidence:.3f} box={w.box}")
+        print(f"    begin: dwell={w.dwell_ms}ms conf={w.mean_confidence:.3f} box={w.box}")
     for w in ends[:3]:
         print(f"    end:   dwell={w.dwell_ms}ms")
 
@@ -202,18 +230,37 @@ def main() -> None:
     idents = events["identity"]
     print(f"  身份事件: {len(idents)}")
     for e in idents[:3]:
-        print(f"    person_id={e.person_id} name={e.name} sim={e.similarity:.3f}")
+        print(f"    uid={e.uid} name={e.name} sim={e.similarity:.3f} "
+              f"state={e.identity_state} enrolled={e.is_enrolled} pid={e.person_id}")
+    if idents:
+        print(f"    identity_state 分布: "
+              f"{dict(Counter(e.identity_state for e in idents))}")
 
+    print(f"  输入帧尺寸: {provider._frame_size}")
     print("-" * 62)
     check(s.frames_processed > 0, "有帧被处理")
     check(s.frames_dropped == 0, f"无丢帧（dropped={s.frames_dropped}）")
     check(len(begins) >= 1, f"至少一次唤醒（{len(begins)} 次）")
     check(len(begins) <= 3, f"唤醒不抖动（{len(begins)} 次 ≤ 3）")
     check(len(lips) > 0, f"有唇动事件（{len(lips)} 条）")
-    if args.db and svc is not None:
+    # ---- 本次改造新增的断言（这才是验收标准）----
+    # 尺寸是 UI 叠加人脸框的依据，拿不到就会框错位（旧实现用 cv2 且失败静默）
+    fs = provider._frame_size
+    check(fs is not None and fs[0] > 0 and fs[1] > 0,
+          f"拿到输入帧尺寸（{fs}）—— UI 框映射依赖它")
+    # state 刷新帧要真的下发（唤醒判据、IC 的 SOP 都靠它）
+    n_state = sum(1 for o in obs_list if o.state is not None)
+    check(n_state > 0, f"有 state 刷新帧下发（{n_state} 帧）")
+    # 唤醒必须真的是「熬够了 dwell」才触发 —— 这是改用 dwell 判据的核心
+    bad = [w for w in begins if w.dwell_ms < args.wake_dwell]
+    check(not bad,
+          f"begin 的 dwell 均 ≥ 阈值 {args.wake_dwell}ms"
+          + (f"（有 {len(bad)} 条不满足）" if bad else ""))
+    # 身份结果必须带 uid（person_id 在线上是同一个兜底值，认人只能靠 uid）
+    if want_identify and provider.available:
         check(len(idents) >= 1, f"有身份识别事件（{len(idents)} 条）")
-        enrolled = [e for e in idents if e.is_enrolled]
-        print(f"    （在库 {len(enrolled)} 条）")
+        check(any(e.uid for e in idents),
+              "至少一条身份带 uid（UI 认人靠它，不是 person_id）")
     print("=" * 62)
 
     if _failures:
