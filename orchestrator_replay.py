@@ -1210,7 +1210,9 @@ class OrchestratorReplayClient:
                  speaker: Optional[Speaker] = None,
                  face_log_every: int = 5,
                  asr_params: Optional[dict] = None,
-                 system_prompt: str = "") -> None:
+                 system_prompt: str = "",
+                 ic_grpc: str = "", ic_agent_url: str = "",
+                 ic_enabled: Optional[bool] = None) -> None:
         self.url = url
         self.clock = clock
         self.aec_mode = aec_mode
@@ -1222,6 +1224,13 @@ class OrchestratorReplayClient:
         #   asr_params    —— ASR 调参，受服务端白名单限制
         #   system_prompt —— OmniLLM 系统提示词，覆盖服务端默认
         self.asr_params: dict = dict(asr_params or {})
+        # InteractionCore：**连接由服务端建**，这里只是把地址传过去
+        self.ic_grpc = ic_grpc
+        self.ic_agent_url = ic_agent_url
+        self.ic_enabled = ic_enabled
+        #: IC 的 Action 流（收到就记；可选落 JSONL 供 viz 工具用）
+        self.ic_actions: List[dict] = []
+        self._ic_fh = None
         self.system_prompt = system_prompt
 
         self.ws = None
@@ -1289,6 +1298,15 @@ class OrchestratorReplayClient:
             payload["asr"] = dict(self.asr_params)
         if self.system_prompt:
             payload["system_prompt"] = self.system_prompt
+        # InteractionCore：地址由客户端指定，但**连接建在服务端**
+        # （这样 web 客户端也自动具备，不用各写一份）。
+        if self.ic_grpc:
+            payload["ic"] = {"grpc": self.ic_grpc}
+            if self.ic_agent_url:
+                payload["ic"]["agent_url"] = self.ic_agent_url
+        elif self.ic_enabled is False:
+            # 显式关掉（覆盖服务端默认开的设置）—— 用于回归/对照实验
+            payload["ic"] = {"enabled": False}
         await self.ws.send(json.dumps(payload, ensure_ascii=False))
         # 等 session.ready
         while True:
@@ -1495,6 +1513,23 @@ class OrchestratorReplayClient:
                 if self.status is not None:
                     self.status.set_asr(txt, False, state)
                 print(f"\n  [{tms}ms ASR final] {txt} {tag}")
+
+        elif t == "ic":
+            # InteractionCore 的 Action 流（服务端决策 → 也推给 UI）。
+            # 只在 **非 HOLD/LISTEN/WAIT** 时打印 —— 那三个是常见态，
+            # IC 每 tick 都可能返回，打出来会刷屏。
+            self.ic_actions.append(m)
+            atype = str(m.get("action") or "")
+            if self._ic_fh is not None:
+                try:
+                    self._ic_fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+                    self._ic_fh.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            if atype not in ("HOLD", "LISTEN", "WAIT", ""):
+                print(f"\n  [IC] {atype}"
+                      + (f"（sop={m.get('sop')}）" if m.get("sop") else "")
+                      + (f" {m.get('text')}" if m.get("text") else ""), flush=True)
 
         elif t == "session.stats":
             self._last_stats = m
@@ -2121,11 +2156,24 @@ async def main_async(args) -> int:
         url, clock, aec_mode=args.aec_mode,
         save_tts_dir=args.save_tts, verbose=args.verbose,
         speaker=speaker, face_log_every=args.face_log_every,
-        asr_params=asr_params, system_prompt=args.system_prompt)
+        asr_params=asr_params, system_prompt=args.system_prompt,
+        ic_grpc=args.ic_grpc, ic_agent_url=args.ic_agent_url,
+        ic_enabled=(False if args.no_ic else None))
     if asr_params:
         print(f"  ASR 参数覆盖：{asr_params}")
     if args.system_prompt:
         print(f"  系统提示词覆盖（{len(args.system_prompt)} 字）")
+    if args.ic_grpc and not args.no_ic:
+        print(f"  InteractionCore：{args.ic_grpc}"
+              f"（回复由 IC+Agent 负责，服务端建连接）")
+    elif args.no_ic:
+        print("  InteractionCore：显式关闭（回复走 OmniLLM）")
+    if args.ic_events_out:
+        try:
+            client._ic_fh = open(args.ic_events_out, "w", encoding="utf-8")
+            print(f"  IC 事件 → {args.ic_events_out}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 无法写 IC 事件文件（{exc}）")
 
     window: Optional[FaceWindow] = None
     # ⚠️ `--show` 现在默认开，所以**必须**先确认有显示器：cv2 在无头机上
@@ -2225,6 +2273,17 @@ def main() -> None:
                    help="ASR: 离线（最终）置信度阈值。调低更容易触发回复")
     p.add_argument("--system-prompt", default="",
                    help="OmniLLM 系统提示词，覆盖服务端默认（空=用服务端默认）")
+    # ---- InteractionCore（地址传给服务端，连接由服务端建）----
+    p.add_argument("--ic-grpc", default="",
+                   help="InteractionCore 的 gRPC 地址（如 localhost:50051）。"
+                        "给了就打开 IC 决策链路 —— 回复由 IC+Agent 负责，"
+                        "不再是 OmniLLM。**连接由编排服务建**，这里只是传地址。")
+    p.add_argument("--ic-agent-url", default="",
+                   help="Agent Platform 地址（默认用服务端配置）")
+    p.add_argument("--no-ic", action="store_true",
+                   help="显式关掉 IC（覆盖服务端默认开）—— 回归/对照实验用")
+    p.add_argument("--ic-events-out", default="",
+                   help="把 IC 的 Action 流落成 JSONL（供 viz 工具画时间轴）")
     p.add_argument("--aec-mode", default="browser",
                    choices=["service", "browser", "off"],
                    help="回声消除模式（默认 browser=浏览器原生 AEC）。"

@@ -168,6 +168,88 @@ export ORCH_DUMP_AUDIO="$CODE/orchdump/s"
 
 ---
 
+## 决策链路：InteractionCore + Agent（默认开）
+
+回复**不是** OmniLLM 生成的。OmniLLM 只产出音视频描述，**谁来开口、说什么**
+由这两者决定：
+
+```
+感知（ASR state / 人脸 state / TTS 播放态）
+        │  gRPC apply_*          10Hz~25Hz 写状态
+        ▼
+  InteractionCore（gRPC，默认 localhost:50051）
+        │  Tick() → Action       我们每 50ms 问一次
+        ▼
+  ANSWER/INSERT/YIELD/END  →  Agent Platform（HTTP）
+  GREET/UTTER              →  本地模板文案，直接播
+        │
+        ▼
+  Agent 生成回复文本 → POST /v1/speak → TTS → 扬声器
+```
+
+**职责边界**（PRD §3.2 的「谁写」）：
+
+| 谁 | 写什么 |
+|---|---|
+| orchestrator | `apply_face/track/lip/identity`（人脸 state）、`apply_vad/asr`（ASR state）、**`apply_playback_active`**（表达层事实） |
+| Agent | `apply_agent(status, session_end_pending)` —— 它自己的投影，我们不写 |
+
+**为什么回复要绕回 orchestrator 播**：浏览器播放必须和 AEC 参考轨、播放回执
+严格对齐（回声消除靠它）。Agent 直接调 TTS 会绕过这些，回声消不掉。
+
+### 配置
+
+```bash
+export ORCH_INTERACTION=1                    # 默认就是 1；=0 关掉
+export ORCH_IC_GRPC="localhost:50051"        # InteractionCore 地址
+export ORCH_AGENT_URL="http://192.168.89.102:8081"
+```
+
+⚠️ **IC 由谁启动**：本服务**不启动也不管理 IC 进程**，只要求一个可达的地址。
+离线套件 `interactioncore/scripts/run_offline_sop_suite.py` 会自己起 IC；
+真实联调时由部署方起：
+
+```bash
+cd interactioncore && python -m interaction.grpc_server --port 50051
+```
+
+### ⚠️ IC 连不上 → 降级为 OmniLLM 回复
+
+IC 是默认的**唯一回复来源**，连不上会变成「能识别、但永远不回复」——
+与我们修过的 OmniLLM 断线 bug 同一病理，**极难排查**。所以有显式降级：
+
+```
+建会话时试连 IC
+  ├─ 成功 → InteractionDownstream（IC 决策 + Agent 回复）
+  └─ 失败 → ⚠️ 告警 + 回退 PassthroughDownstream（OmniLLM 回复）
+```
+
+日志里会明确打：
+
+```
+[sid] InteractionCore 不可用（localhost:50051：...）—— 降级为 OmniLLM 回复
+```
+
+**降级只有一层**，已经是 OmniLLM 就不再降。想主动关掉 IC 用
+`ORCH_INTERACTION=0`，或客户端在 `session.start` 里传 `{"ic":{"enabled":false}}`。
+
+### 环境依赖
+
+`interactioncore` 要求 `grpcio>=1.84.0` / `protobuf>=7.35.1`（比 TTS 的
+gencode 新）。实测**旧 gencode + 新 runtime 兼容**，升级不影响 TTS 客户端。
+
+```bash
+cd interactioncore && pip install -e .
+```
+
+### Agent 侧要做什么
+
+**Agent 需要调我们的 `POST /v1/speak` 把回复文本送进来** ——
+完整接口说明 + curl / Python 示例见
+[`docs/agent-integration.md`](docs/agent-integration.md)。
+
+---
+
 ## HTTP 接口
 
 | 路径 | 用途 |
@@ -176,6 +258,8 @@ export ORCH_DUMP_AUDIO="$CODE/orchdump/s"
 | `GET /healthz` | 健康检查 + 活跃会话数 |
 | `GET /stats` | 各活跃会话的原始统计 |
 | `GET /metrics` | 全局指标 + 最近会话快照（可接 Prometheus） |
+| `POST /v1/speak` | **Agent 回调**：整段播报（见下节） |
+| `POST /v1/speak/stream` | **Agent 回调**：流式播报 |
 | `WS /v1/orchestrator` | 会话主通道 |
 
 ---
@@ -238,6 +322,10 @@ python orchestrator_replay.py assets/video/turnbased/121.mp4 --host 192.168.89.1
 | 模拟插话 | `--bargein-at 5,12`（在第 5、12 秒打断） |
 | 换个播放设备 | `--audio-device <名字或编号>` |
 | 安静输出 | `--no-verbose` |
+| **接 InteractionCore** | `--ic-grpc localhost:50051` |
+| 指定 Agent 地址 | `--ic-agent-url http://…` |
+| 关掉 IC（走 OmniLLM） | `--no-ic` |
+| IC 事件落 JSONL | `--ic-events-out events.jsonl` |
 
 ⚠️ **`--replay-speed` 不要乱调**：服务端按实时流设计，加速会让 AEC/ASR
 表现失真。默认 1.0 是**慢放**（音频按 100ms/块真实节奏发）。

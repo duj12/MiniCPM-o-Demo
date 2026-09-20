@@ -227,6 +227,20 @@ class AsrDisplay:
 
 
 @dataclass
+class IcDisplay:
+    """InteractionCore 的 Action（仅 UI/日志显示）。
+
+    IC 每个 tick 都会出一个 Action，绝大多数是 ``HOLD``/``LISTEN``/``WAIT``
+    （常见态）。**服务端只在非常见态时下发** —— 否则每 50ms 一条会刷屏。
+    """
+    action: str                                    # ANSWER / INSERT / YIELD / END / GREET / UTTER
+    sop: Optional[str] = None                      # SOP 编号（"07"/"15"…）
+    text: Optional[str] = None                     # GREET/UTTER 的模板文案
+    t_ms: int = 0
+    type: Literal["ic"] = "ic"
+
+
+@dataclass
 class FaceDisplay:
     """人脸状态（仅 UI 显示，不参与控制流）。
 

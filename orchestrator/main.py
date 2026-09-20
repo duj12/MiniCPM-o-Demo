@@ -26,7 +26,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import WebSocket  # noqa: E402
+from fastapi import Request, WebSocket  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+
+from orchestrator.downstream.interface import Cancel  # noqa: E402
 # ⚠️ 必须模块级导入：本文件有 ``from __future__ import annotations``，
 # 所有注解都延迟成字符串，FastAPI 在**模块全局命名空间**里解析它们。
 # 放在函数内 import 会导致 ``NameError: name 'WebSocket' is not defined``。
@@ -227,19 +230,66 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
     from orchestrator.audio.ref_track import RefTrack
     sess.ref_track = RefTrack()
 
-    # ---- downstream（本阶段用桩）----
+    # ---- downstream ----
+    # 三种形态，优先级从高到低：
+    #   ① InteractionCore + Agent（决策权在 IC）
+    #   ② PassthroughDownstream（OmniLLM 回复 / ASR 直通；也是 ① 的降级目标）
+    #   ③ None（mode=none，什么都不做）
     from orchestrator.downstream.passthrough import PassthroughDownstream
     mode = cfg.downstream_mode
-    if mode == "none":
-        sess.downstream = None
-    else:
+    sess.downstream = None
+    if mode != "none":
         # 流式合成只在 omni 模式 + TTS 客户端支持时生效（见 PassthroughDownstream）
         streaming = bool(getattr(cfg, "tts_streaming", False)) and \
             mode == "omni" and \
             bool(getattr(sess.tts, "supports_streaming", False))
-        sess.downstream = PassthroughDownstream(mode=mode, streaming=streaming)
-        if streaming:
-            logger.info("TTS 流式合成已启用（LLM 文本 delta 边出边合成）")
+
+        # IC 的地址：客户端可在 session.start 里覆盖（离线套件传 --ic-grpc）
+        ic_cfg = (hello or {}).get("ic") or {}
+        ic_target = str(ic_cfg.get("grpc") or cfg.ic_grpc)
+        agent_target = str(ic_cfg.get("agent_url") or cfg.agent_url)
+        # ⚠️ `echo` 模式保持纯桩 —— test_duplex_sim 靠它起一个"永不 Speak"
+        #    的服务再自己替换 downstream，不能被 IC 抢走。
+        # 客户端可显式覆盖（`ic.enabled`）—— replay 的 --no-ic 走这条。
+        ic_on = ic_cfg.get("enabled")
+        ic_on = bool(cfg.interaction_enabled) if ic_on is None else bool(ic_on)
+        want_ic = ic_on and mode != "echo"
+
+        if want_ic:
+            from orchestrator.interaction import InteractionDownstream
+            from orchestrator.protocol import IcDisplay
+
+            def _on_ic_action(atype: str, sop, text) -> None:
+                """IC 的决策 → UI（**只在非常见态回调**，不会刷屏）。"""
+                sess._send_display(IcDisplay(
+                    action=atype, sop=sop, text=text,
+                    t_ms=int(sess.clock.seconds() * 1000),
+                ))
+
+            ic_ds = InteractionDownstream(
+                ic_target, agent_target, session_id=sid,
+                on_action=_on_ic_action)
+            # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
+            #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
+            if ic_ds.ic.connect():
+                ic_ds.agent.start()
+                sess.downstream = ic_ds
+                sess.interaction = ic_ds
+                logger.info("[%s] InteractionCore + Agent 已接管"
+                            "（ic=%s agent=%s）", sid, ic_target, agent_target)
+            else:
+                # 降级：IC 不可用就回退 OmniLLM 回复。
+                # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
+                #    与之前 OmniLLM 断线那个 bug 同一病理，极难排查。
+                logger.warning(
+                    "[%s] InteractionCore 不可用（%s：%s）"
+                    "—— 降级为 OmniLLM 回复", sid, ic_target, ic_ds.ic.error)
+
+        if sess.downstream is None:
+            sess.downstream = PassthroughDownstream(
+                mode=mode, streaming=streaming)
+            if streaming:
+                logger.info("TTS 流式合成已启用（LLM 文本 delta 边出边合成）")
 
     # ---- action 执行器 ----
     from orchestrator.actions.executor import ActionExecutor
@@ -570,6 +620,115 @@ def create_app(cfg: Settings):
                 return FileResponse(str(page))
             return {"service": "orchestrator",
                     "hint": "static/orchestrator-test.html 不存在"}
+
+    # ------------------------------------------------------------------ #
+    #  Agent 回调：TTS 播报（InteractionCore + Agent 链路的**回程**）
+    # ------------------------------------------------------------------ #
+    #
+    # PRD §2.8：TTS 是唯一开口通道，Agent 生成回复后直接把文本送进来。
+    # 这两个接口**不产生任何新逻辑** —— 只是把文本转成既有的 `Speak`
+    # action 投进下游队列，后面的 TTS / 参考轨 / 播放回执全部复用。
+    #
+    # ⚠️ **会话级接口**：必须指明是哪一路会话（`X-Session-Id` 头或
+    #    `?session_id=`）。找不到就 404 —— 不能静默丢弃（Agent 会以为播了）。
+
+    def _find_session(req) -> Optional[OrchestratorSession]:
+        sid = (req.headers.get("x-session-id")
+               or req.query_params.get("session_id") or "")
+        if sid and sid in REGISTRY.sessions:
+            return REGISTRY.sessions[sid]
+        # 没指定就取唯一活跃会话（单会话部署的便利路径）
+        if not sid and len(REGISTRY.sessions) == 1:
+            return next(iter(REGISTRY.sessions.values()))
+        return None
+
+    def _queue_speak(sess: OrchestratorSession, act) -> None:
+        """把 action 交给执行器。
+
+        ⚠️ **不能投 ``sess._down_q``** —— 那个队列装的是"发给 downstream 的
+        **事件**"，由 ``run_downstream`` 消费后调 ``downstream.on_event``。
+        把 ``Speak``（一个 **action**）投进去，会被当成事件解析然后忽略，
+        现象是接口返回 ``ok:true`` 但**永远不出声**（实测踩过）。
+
+        正确路径是 ``execute_action`` —— 但它会 ``await``（走 TTS），
+        所以**不能在这里直接 await**（会阻塞 HTTP 响应，且我们可能不在
+        session 的 event loop 上下文里）。用 ``create_task`` 异步执行。
+        """
+        async def _do():
+            try:
+                await sess.execute_action(act)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Agent 播报执行失败: %s", sess.session_id, exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("[%s] 无运行中的 event loop，播报被丢弃", sess.session_id)
+            return
+        sess.stats["agent_speaks"] = sess.stats.get("agent_speaks", 0) + 1
+        loop.create_task(_do())
+
+    @app.post("/v1/speak")
+    async def speak(request: Request):
+        """整段播报：Agent 把一条完整回复文本送进来。
+
+        Agent 侧调用示例见 ``orchestrator/README.md`` 的「Agent 接入」一节。
+        """
+        body = await request.json()
+        text = str(body.get("text") or "").strip()
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        if not text:
+            return {"ok": False, "error": "text 为空，未播报"}
+        # interrupt：先掐掉当前这句，再播新的
+        if body.get("interrupt"):
+            _queue_speak(sess, Cancel(reason="agent_speak"))
+        from orchestrator.downstream.interface import Speak as SpeakAction
+        _queue_speak(sess, SpeakAction(
+            text=text,
+            tts_type=str(body.get("tts_type") or "mltts"),
+            speaker_id=body.get("speaker_id"),
+        ))
+        logger.info("[%s] Agent 播报（%d 字，interrupt=%s）: %s",
+                    sess.session_id, len(text), bool(body.get("interrupt")),
+                    text[:40])
+        return {"ok": True, "session_id": sess.session_id}
+
+    @app.post("/v1/speak/stream")
+    async def speak_stream(request: Request):
+        """流式播报：Agent 边生成边推片段（首声更早）。
+
+        ⚠️ 同一轮的 ``stream_id`` 必须**唯一且稳定** —— 变了会被当成新的一轮
+        （常量 stream_id 会导致第二轮被吞进上一轮的流，踩过这个坑）。
+        最后一片传 ``is_final: true`` 收尾。
+        """
+        body = await request.json()
+        sid = str(body.get("stream_id") or "").strip()
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        if not sid:
+            return {"ok": False, "error": "stream_id 必填（同一轮内保持不变）"}
+        from orchestrator.downstream.interface import Speak as SpeakAction
+        text = str(body.get("text") or "")
+        is_final = bool(body.get("is_final"))
+        if text or is_final:
+            _queue_speak(sess, SpeakAction(
+                text=text, stream_id=sid, is_final=is_final,
+                tts_type=str(body.get("tts_type") or "mltts"),
+                speaker_id=body.get("speaker_id"),
+            ))
+        if is_final:
+            logger.info("[%s] Agent 流式播报收尾 stream_id=%s",
+                        sess.session_id, sid)
+        return {"ok": True, "session_id": sess.session_id}
 
     @app.get("/healthz")
     async def healthz():

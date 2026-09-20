@@ -695,6 +695,8 @@ class OrchestratorSession:
             # 浏览器**承诺**的起播时刻 —— 执行器正等着它去 place() 参考轨。
             self._note_armed(response_id, start_ctx, epoch)
             self._post_downstream_playback(response_id, phase, ctx_time, seq)
+            # InteractionCore：开始出声（SOP 07/23/39 的判据）
+            self._notify_playback_active(True)
             return
 
         if (phase == "started" and start_ctx > 0.0
@@ -764,6 +766,11 @@ class OrchestratorSession:
                         response_id, keep / SR, n, n / SR,
                     )
         self._post_downstream_playback(response_id, phase, ctx_time, seq)
+        # 停下/播完 —— InteractionCore 据此判 SOP 07/23/39。
+        # ⚠️ `ended` 只是"音频送完了"，严格说浏览器可能还在播尾巴；
+        #    但对 IC 来说"不再有新的开口"就够用（它要判断的是能不能切话轮）。
+        if phase in ("ended", "cancelled"):
+            self._notify_playback_active(False)
 
     # ------------------------------------------------------------------ #
     #  播放锚点（armed 承诺）
@@ -1010,8 +1017,10 @@ class OrchestratorSession:
         """
         if self.face_worker is None:
             return
+        # 上次投给下游的 face state_seq（去重用，见下面的 obs 分支）
+        self._last_face_state_seq = -1
         from .downstream.interface import (
-            FaceIdentity, FaceLipState, FaceWake,
+            FaceIdentity, FaceLipState, FaceState, FaceWake,
         )
         from .protocol import FaceDisplay
 
@@ -1044,6 +1053,16 @@ class OrchestratorSession:
                 # 一起发 —— 前端不必为它单开一条通道。
                 if ev.state is not None:
                     self._last_face_state = ev.state
+                    # 只在**刷新时**投给下游（按 state_seq 去重）—— 否则
+                    # 25Hz 的观测会把下游淹了。InteractionCore 需要这些档位
+                    # 来判 SOP（face_present / bbox / track / dwell / identity）。
+                    seq = int(ev.state_seq)
+                    if seq != self._last_face_state_seq:
+                        self._last_face_state_seq = seq
+                        self.post_downstream(FaceState(
+                            t=self.clock.now(), state=dict(ev.state),
+                            state_seq=seq,
+                        ))
                 self._push_face_display()
             elif kind == "wake":
                 self.post_downstream(FaceWake(
@@ -1076,6 +1095,21 @@ class OrchestratorSession:
                     "enrolled": bool(ev.is_enrolled),
                 }
                 self._push_face_display()
+
+    def _notify_playback_active(self, active: bool) -> None:
+        """告诉 InteractionCore「TTS 在不在出声」。
+
+        ⚠️ PRD §3.2 明确：表达层事实（播完 / 已开口 / 是否在播）**由表达层写**
+        —— 我们就是表达层，且只有我们知道真实播放状态。IC 的 SOP 07（抢话
+        停播）/ 23 / 39 全靠它。
+        """
+        ic = getattr(self, "interaction", None)
+        if ic is None:
+            return
+        try:
+            ic.ic.apply("apply_playback_active", playback_active=bool(active))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("回写 playback_active 失败: %s", exc)
 
     def _push_face_display(self) -> None:
         """把最新的观测/唤醒/身份合成一条 face.state 发给 UI。

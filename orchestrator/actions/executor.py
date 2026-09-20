@@ -556,6 +556,12 @@ class ActionExecutor:
         self._current_response_id = None
         self._current_play_until = 0
         self.cancels_done += 1
+        # 打断 = 立刻不再出声，**不等浏览器回执**（那要绕一圈才回来）。
+        # IC 的 SOP 07 靠这个判"用户抢话后已经停播"。
+        try:
+            session._notify_playback_active(False)
+        except Exception:  # noqa: BLE001
+            pass
         return rid
 
     async def _cancel(self, act: Cancel, session: "OrchestratorSession") -> None:

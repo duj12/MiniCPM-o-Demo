@@ -127,6 +127,26 @@ class FaceIdentity:
 
 
 @dataclass(frozen=True)
+class FaceState:
+    """G1 的每帧状态快照（离散档位 + 跟踪 + 身份）。
+
+    ⚠️ 不是每帧都发：G1 的 state 心跳绑在 landmark 上（≈208ms）。
+    这里只在 ``state_seq`` 变化时投递（``session.run_face_signals`` 做的去重），
+    所以下游拿到的每条都是**新的**。
+
+    给 InteractionCore 用 —— 它的 ``apply_face`` / ``apply_track`` /
+    ``apply_lip`` / ``apply_identity`` 需要的字段正是这里的
+    ``face_present_confidence`` / ``bbox_area_ratio`` / ``track_id`` /
+    ``dwell_ms`` / ``lip_speaking_confidence`` / ``identity_id`` 等。
+    """
+    t: int
+    state: Dict[str, Any] = field(default_factory=dict)
+    #: 刷新计数（变了才是新 state）
+    state_seq: int = -1
+    kind: Literal["face.state"] = "face.state"
+
+
+@dataclass(frozen=True)
 class FaceLipState:
     """唇动状态。以 **10Hz** 发出（每个 100ms 音频窗一条）。
 
@@ -163,7 +183,7 @@ class Tick:
 DownstreamEvent = Union[
     AsrPartial, AsrFinal, AsrTurnSense,
     OmniTurnSense, OmniDelta, OmniResponseDone,
-    FaceWake, FaceIdentity, FaceLipState,
+    FaceWake, FaceIdentity, FaceLipState, FaceState,
     PlaybackReceipt, Tick,
 ]
 

@@ -96,6 +96,25 @@ class Settings:
     # downstream 桩模式：asr | omni | echo | none
     downstream_mode: str = "omni"
 
+    # ---- InteractionCore + Agent 决策链路 ----
+    # 打开后**回复不再由 OmniLLM 生成**：IC 做 SOP 决策 → Agent 生成 →
+    # Agent 回调 orchestrator 的 /v1/speak 播报。OmniLLM 只产出音视频描述。
+    #
+    # ⚠️ **默认开**。两个例外：
+    #   · `downstream_mode == "echo"` 时保持纯桩（测试用它起"永不 Speak"的服务）
+    #   · IC 连不上 → 明确告警并**降级回 OmniLLM 回复**
+    #     （否则会变成"能识别、永远不回复"，与之前 OmniLLM 断线那个 bug
+    #      同一病理，极难排查）
+    interaction_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_INTERACTION", "1") not in ("0", "false", "False", ""))
+    #: InteractionCore 的 gRPC 地址。**由编排服务去连**（不是客户端连）——
+    #: 这样 web 和 python 客户端自动都具备。
+    ic_grpc: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_GRPC", "localhost:50051"))
+    #: Agent Platform 地址（IC 的四类 Action 派给它）
+    agent_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_AGENT_URL", "http://192.168.89.102:8081"))
+
     # TTS 参数
     tts_type: str = "mltts"
     tts_speaker_id: str = "17"
