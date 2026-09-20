@@ -192,9 +192,16 @@ class InteractionDownstream:
                 face_present_confidence=_conf(st.get("face_present_confidence")),
                 bbox_area_ratio=float(st.get("bbox_area_ratio") or 0.0),
             )
+            # ⚠️ `track_id` 必须转成**字符串**：G1 的 track_id 是 int64，
+            #    而 IC 的 proto 里是 ``optional string``。传 int 会让 gRPC
+            #    序列化抛错 —— 而写队列**把异常吞成 debug 日志**，表现为
+            #    IC 侧 track_id 恒为 None、dwell_ms 恒为 0，于是 policy 永远
+            #    判 `passerby`（dwell < 2000ms）→ 永远 HOLD 21 → 永不 GREET
+            #    → 永进不了 LISTENING → **ANSWER 永不触发**（实测踩过）。
+            _tid = st.get("track_id")
             self.ic.apply(
                 "apply_track",
-                track_id=st.get("track_id"),      # None 是合法的（清空）
+                track_id=(str(_tid) if _tid is not None else None),  # None=清空
                 dwell_ms=int(st.get("dwell_ms") or 0),
             )
             self.ic.apply(

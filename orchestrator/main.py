@@ -666,7 +666,15 @@ def create_app(cfg: Settings):
             logger.warning("[%s] 无运行中的 event loop，播报被丢弃", sess.session_id)
             return
         sess.stats["agent_speaks"] = sess.stats.get("agent_speaks", 0) + 1
-        loop.create_task(_do())
+        t = loop.create_task(_do())
+        # ⚠️ 记下 task 并挂回调 —— `create_task` 的异常**不会**自动冒出来
+        #    （除非被 await）。早先没挂，`_do` 里若抛在 logger 之前/之外
+        #    就完全静默，表现为"日志说接收了、但 TTS 一次没调"。
+        t.add_done_callback(lambda fut: (
+            logger.warning("[%s] 播报任务异常: %s", sess.session_id, fut.exception())
+            if fut.exception() else None))
+        logger.info("[%s] 播报任务已排入 event loop（loop=%s）",
+                    sess.session_id, id(loop))
 
     @app.post("/v1/speak")
     async def speak(request: Request):

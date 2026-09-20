@@ -50,6 +50,10 @@ class InteractionClient:
         self.available = False         # 连上了才 True
         self.error: Optional[str] = None
         self.dropped = 0               # 队列满丢掉的写次数
+        #: 各方法写失败计数（按方法名）—— 持续失败必须看得见，
+        #: 否则 IC 状态静静停在默认值、决策永远不变（踩过）
+        self.failures: dict = {}
+        self._fail_streak = 0
 
     # ------------------------------------------------------------------ #
 
@@ -125,9 +129,23 @@ class InteractionClient:
                 continue
             try:
                 fn(**kwargs)
+                self._fail_streak = 0
             except Exception as exc:  # noqa: BLE001
-                # 写失败只告警（含通道断开）—— 不抛、不退出线程
-                logger.debug("InteractionCore %s 失败: %s", method, exc)
+                # 写失败不抛、不退出线程（IC 挂了不该拖垮会话），但要**可见**。
+                # ⚠️ 早先这里打的是 debug —— 于是"参数类型不对"这种持续失败
+                #    完全看不见，表现为 IC 侧字段恒为默认值、决策永远不变，
+                #    排查了很久（实测：track_id 传 int 而 proto 要 string）。
+                #    改成：按方法名计数，**首次必 log.warning**，之后每 100 次
+                #    提醒一次（避免每 tick 刷屏）。
+                self._fail_streak += 1
+                self.failures[method] = self.failures.get(method, 0) + 1
+                n = self.failures[method]
+                if n == 1 or n % 100 == 0:
+                    logger.warning(
+                        "InteractionCore %s 失败（第 %d 次）: %s: %s"
+                        "  ← 持续失败会让 IC 状态停在默认值、决策永远不变，"
+                        "请检查参数类型/取值", method, n,
+                        type(exc).__name__, exc)
 
     # ------------------------------------------------------------------ #
     #  读：tick 取决策
