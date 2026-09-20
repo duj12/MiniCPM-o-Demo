@@ -8,7 +8,7 @@
 |---|---|---|
 | `probe_aec.py` | AEC 服务（`/ws/asr_frontend`）长时流、窗口节奏、样本守恒 | 本机或 106（需 `speech_frontend` 同层） |
 | `probe_asr.py` | ASR 服务连通性、部分结果延迟、字段契约、turnsense 形状 | 本机或 106 |
-| `probe_tts.py` | TTS gRPC 合成、首帧延迟、RTF、CHAR_TIME_MAP | **必须在 106**（需 grpc + `TTS/protos`） |
+| `probe_tts.py` | TTS gRPC 合成、首帧延迟、RTF、CHAR_TIME_MAP | **必须在 106**（需 grpc；proto 在仓库内 `protos/`） |
 
 ## 实测结果汇总
 
@@ -193,7 +193,7 @@ python -m orchestrator.tests.probe_aec --duration 30 --farend-mode omit   # 直�
 # ASR（用真实语音才有意义）
 python -m orchestrator.tests.probe_asr --wav assets/ref_audio/ref_minicpm_signature.wav --verbose
 
-# TTS（必须在 106 上，需 grpc + TTS/protos）
+# TTS（必须在 106 上，需 grpc；proto 在仓库内 protos/）
 ssh 192.168.89.106 'cd /data/megastore/Projects/DuJing/code && \
   /home/dujing/miniconda3/envs/py310/bin/python \
   MiniCPM-o-Demo/orchestrator/tests/probe_tts.py'

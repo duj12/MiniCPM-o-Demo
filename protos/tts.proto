@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package tts;
+
+
+service TTS {
+  rpc inference(Text) returns (stream InferenceResult) {};
+  rpc stream_inference(stream Text) returns (stream InferenceResult) {};
+  rpc stream_inference_fake(stream Text) returns (stream InferenceResult) {};
+  rpc duration_inference(Text) returns (stream DurationInferenceResult) {};
+  rpc check_input_text(Text) returns (CheckInputTextResult) {};
+  rpc extract_speaker_vector(SpeakerInfo) returns (SpeakerVector) {};
+  rpc get_version(GetVersionRequest) returns (Version) {};
+  rpc split_text(Text) returns (SplitTextResult) {};
+}
+
+
+message Text {
+   enum SECONDARY_STYLE_ID {
+      jiangpin = 0;
+      cudan = 1;
+   }
+   enum TTS_TYPE {
+      mltts = 0;
+      hntts = 1;
+      lvtts = 2;
+      entts = 3;
+      jimtts = 4;
+      lyhtts = 5;
+      cn_vc0 = 6;
+      en_vc0 = 7;
+      entts_vc = 8;
+      AZURE = 9;
+      volcano = 10;
+      eleven_labs = 11;
+   }
+  string text = 1;
+  string speaker_id = 2;
+  SECONDARY_STYLE_ID secondary_style_id = 3;
+  bool is_first = 4;
+  bool is_last = 5;
+  TTS_TYPE tts_type = 6;
+  bool return_sep = 7;      // 为 true 时，会在 split_text 分句之后，在返回的时间戳信息里，给两句之间加一个 '[SEP]'，duration_inference 时用到
+  bool no_padding = 8;
+  bytes speaker_vector = 9;
+  bool line_break = 10;     // 是否按换行符分句, 星云 大屏是大模型生成的 段落之间有\n
+  string tts_client_type = 11;  // 值: youyan, youguang, youling_lite, youling_pro
+  bool flush_buffer = 12; // 是否刷新分句缓冲区, 用于流式合成
+}
+
+
+message InferenceResult {
+  enum DataType
+  {
+    AUDIO = 0;
+    CHAR_TIME_MAP = 1;
+  }
+
+  DataType data_type = 1;
+  bytes data = 2;
+  float start_time = 3;
+  float end_time = 4;
+  int32 sentence_index = 5;
+  int32 char_index = 6;
+  bool inference_end = 7;
+  bool flush_buffer = 8; // 是否是刷新分句缓冲区的句子的结果
+}
+
+message DurationResult {
+  string data = 1;
+  float start_time = 2;
+  float end_time = 3;
+}
+
+message DurationInferenceResult {
+  repeated DurationResult results = 1;
+  string walk_data = 2;
+}
+
+message SpeakerInfo {
+  Text.TTS_TYPE tts_type = 1;
+  string speaker_path = 2;
+}
+
+message SpeakerVector {
+  bytes data = 1;
+  string version = 2;
+}
+
+message GetVersionRequest {
+  Text.TTS_TYPE tts_type = 1;
+}
+
+message Version {
+  string version = 1;
+}
+message SplitTextResult {
+  repeated string texts = 1;
+}
+
+
+message CheckInputTextResult {
+  bool result = 1;
+  string reason = 2;
+}
+

@@ -6,6 +6,9 @@
     stream-stream）。LLM 文本 delta 一到就喂，TTS 音频一出就下发，
     首声降到「首个 delta + TTS 首帧」。实测首帧 **381ms**。
 
+**proto 生成代码在本仓库内**（``<repo>/protos/``，自 TTS 仓库同步，
+见 ``protos/README.md``）—— 不再依赖同级的 ``TTS`` 仓库。
+
 **为什么两者都用同步 stub + 专用线程，不用 grpc.aio**：
 ``protos/tts_pb2_grpc.py`` 生成的是**同步 stub**（``channel.stream_stream``），
 配 aio channel 依赖生成代码恰好兼容，比较脆。整段合成阻塞几百毫秒本来就要
@@ -44,10 +47,36 @@ TTS_SR = 24000
 # 照抄示例：长文本会超默认接收上限
 GRPC_OPTIONS = [("grpc.max_receive_message_length", 4605632 * 2)]
 
-# TTS 仓库路径（proto 所在）
-_TTS_ROOT = Path(__file__).resolve().parents[3] / "TTS"
-if _TTS_ROOT.is_dir() and str(_TTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_TTS_ROOT))
+# proto 生成代码随本仓库分发（<repo>/protos/），不再从同级的 TTS 仓库取。
+# `python -m orchestrator.main` 在仓库根跑时 CWD 已在 sys.path 上，这里只是
+# 给 `python path/to/main.py` 那种启动方式兜底。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if ((_REPO_ROOT / "protos" / "tts_pb2.py").is_file()
+        and str(_REPO_ROOT) not in sys.path):
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _proto_modules():
+    """懒取 proto 模块，返回 ``(tts_pb2, tts_pb2_grpc)``。
+
+    ⚠️ **不要提到模块顶层** —— ``import orchestrator.tts.client`` 必须在不装
+    grpc/protobuf 的环境里也能成功（MockTtsClient 那条路要用它跑单测）。
+    """
+    try:
+        from protos import tts_pb2, tts_pb2_grpc  # type: ignore
+    except ImportError as exc:
+        # 两类失败要分开报 —— 修法完全不同（一个装包、一个同步代码）
+        root = (getattr(exc, "name", "") or "").split(".")[0]
+        if root in ("grpc", "google"):
+            raise ImportError(
+                f"TTS 客户端需要 grpc/protobuf（原始错误: {exc}）。"
+                " 请 pip install grpcio protobuf。") from exc
+        raise ImportError(
+            f"找不到 TTS proto 模块：期望 {_REPO_ROOT / 'protos' / 'tts_pb2.py'}。"
+            " proto 生成代码已随本仓库分发（protos/），不再从 TTS 仓库取；"
+            " 若该目录缺失，按 protos/README.md 同步。"
+            f" 原始错误: {exc}") from exc
+    return tts_pb2, tts_pb2_grpc
 
 
 @dataclass
@@ -178,7 +207,7 @@ class TtsStream:
     # ------------------------------------------------------------------ #
 
     def _build_request(self, text: str, is_last: bool):
-        from protos import tts_pb2  # type: ignore
+        tts_pb2, _ = _proto_modules()
 
         is_first = not self._sent_first
         self._sent_first = True
@@ -309,7 +338,7 @@ class TtsClient:
         if self._stub is not None:
             return self._stub
         import grpc
-        from protos import tts_pb2_grpc  # type: ignore
+        _, tts_pb2_grpc = _proto_modules()
         self._channel = grpc.insecure_channel(
             f"{self.host}:{self.port}", options=GRPC_OPTIONS
         )
@@ -324,7 +353,7 @@ class TtsClient:
                         speaker_vector_b64: Optional[str]) -> TtsResult:
         """阻塞式合成（在线程池里跑）。"""
         import time
-        from protos import tts_pb2  # type: ignore
+        tts_pb2, _ = _proto_modules()
 
         stub = self._ensure_stub()
         t0 = time.perf_counter()

@@ -7,7 +7,7 @@
   3. CHAR_TIME_MAP 的字级时间戳形状（字幕对齐要用）
   4. `check_input_text` / `get_version` 的可用性（上线前的输入校验）
 
-用法（在 106 上跑，因为需要 grpc + TTS/protos）::
+用法（在 106 上跑，因为需要 grpc；proto 代码已随本仓库分发）::
 
     cd /data/megastore/Projects/DuJing/code
     /home/dujing/miniconda3/envs/py310/bin/python -m MiniCPM-o-Demo.orchestrator.tests.probe_tts
@@ -31,10 +31,11 @@ from typing import List, Optional
 
 import numpy as np
 
-# TTS 仓库路径（在 106 上位于 code/TTS）
-TTS_ROOT = Path(__file__).resolve().parents[3] / "TTS"
-if str(TTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(TTS_ROOT))
+# proto 生成代码随本仓库分发（<repo>/protos/）—— 从仓库根跑 `-m` 时不需要
+# 这一步，直接 `python path/to/probe_tts.py` 才需要。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 DEFAULT_HOST = "192.168.88.253"
 DEFAULT_PORT = 31058
@@ -102,7 +103,9 @@ class ProbeResult:
 def run_probe(host: str, port: int, text: str, tts_type: str, speaker_id: str,
               out_wav: Optional[str], timeout: float) -> ProbeResult:
     import grpc
-    from protos import tts_pb2, tts_pb2_grpc  # type: ignore
+    # 复用客户端里的那一份取法 —— 报错信息、路径兜底只维护一处
+    from orchestrator.tts.client import _proto_modules
+    tts_pb2, tts_pb2_grpc = _proto_modules()
 
     res = ProbeResult(host=host, port=port, text=text, tts_type=tts_type,
                       speaker_id=speaker_id)
@@ -187,7 +190,7 @@ def main() -> None:
                         args.speaker_id, args.out_wav, args.timeout)
     except ImportError as exc:
         print(f"[FATAL] 缺少依赖: {exc}")
-        print("        需要 grpc（106 的 py310 有）与 TTS/protos 可 import。")
+        print("        需要 grpc（106 的 py310 有）；proto 在本仓库 protos/ 内。")
         raise SystemExit(2)
     except Exception as exc:  # noqa: BLE001
         print(f"[FATAL] {type(exc).__name__}: {exc}")

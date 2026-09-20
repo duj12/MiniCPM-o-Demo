@@ -31,20 +31,23 @@ from typing import List, Optional
 
 import numpy as np
 
-# 复用 speech_frontend 的帧编解码（协议唯一权威实现，不要自己写）
-_SPEECH_FRONTEND = Path(__file__).resolve().parents[3] / "speech_frontend"
-if _SPEECH_FRONTEND.is_dir():
-    sys.path.insert(0, str(_SPEECH_FRONTEND))
+# 帧编解码走线上同一份实现（默认本仓库内联的 _protocol.py；可用
+# ORCH_AEC_PROTOCOL=upstream 切回 speech_frontend 的权威实现）。
+# **不要在这里另写一份** —— 测出来的东西必须和线上一致。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 try:
-    from webserver.protocol import (  # type: ignore
+    from orchestrator.aec.client import (  # type: ignore
         ProtocolError,
         encode_frame,
         pack_arrays,
         parse_result_frame,
     )
 except ImportError as exc:  # pragma: no cover
-    print(f"[FATAL] 无法从 {_SPEECH_FRONTEND} 导入 webserver.protocol: {exc}")
-    print("        需要 speech_frontend 仓库在同一层的 code/ 目录下。")
+    print(f"[FATAL] 无法导入 AEC 帧协议: {exc}")
+    print("        协议随本仓库分发（orchestrator/aec/_protocol.py）；")
+    print("        若内联副本自检失败，可设 ORCH_AEC_PROTOCOL=upstream 兜底。")
     raise SystemExit(2)
 
 import websockets  # noqa: E402

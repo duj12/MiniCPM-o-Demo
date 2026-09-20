@@ -42,7 +42,7 @@ AEC 只调一次，扇出在其后 —— 绝不两路各自调 AEC（它是有�
 ```bash
 # 运行环境：Python 3.10（106 上为 py310）
 pip install websockets fastapi uvicorn numpy
-# TTS 需要 grpc + TTS 仓库的 protos
+# TTS 需要 grpc（proto 生成代码已随本仓库分发在 protos/，不再依赖 TTS 仓库）
 pip install grpcio protobuf
 ```
 
@@ -133,13 +133,39 @@ export ORCH_DOWNSTREAM_MODE="omni"
 
 ### 人脸（默认关，需显式开启）
 
+实现**全部沿用** G1 仓库的官方 Python 包 `board-face-and-cloud-infer/G1/g1face`
+（ctypes 绑定、每帧 state 组装、身份识别都在那边）。我们只做一层翻译
+（[`face/g1face_provider.py`](face/g1face_provider.py)），**不自己绑 ctypes、
+不自己写识别封装** —— 早先抄的那份已经落后上游了。
+
 ```bash
 export ORCH_ENABLE_FACE=1
-export ORCH_FACE_SO="$CODE/board-face-and-cloud-infer/G1/lib/libsdk_stream.so"
-export ORCH_FACE_MODELS="$CODE/board-face-and-cloud-infer/G1/models"
-export ORCH_FACE_DB="$CODE/faceidentification/data/face_db.npz"
-export G1_FACE_DEBUG=0     # ⚠️ 必须！否则 create 就写最多约 4GB 视频
+# 主旋钮：G1 仓库根。不设则自动探测「与本仓库同级的 board-face-and-cloud-infer/G1」
+export ORCH_G1_ROOT="$CODE/board-face-and-cloud-infer/G1"
+# 下面三个一般不用设（默认都从 ORCH_G1_ROOT 推导）
+export ORCH_FACE_SO="$ORCH_G1_ROOT/lib/x86_64/libsdk_stream.so"   # 按架构分目录
+export ORCH_FACE_MODELS="$ORCH_G1_ROOT/models"
+export ORCH_FACE_DB="$ORCH_G1_ROOT/models/face_db.npz"
+
+# 唤醒判据：track 连续在场多少毫秒算唤醒（默认 2000）
+# ⚠️ 必须与 IC 的 passerby 阈值同值，否则「我们唤醒、IC 判路人」错位
+export ORCH_FACE_WAKE_DWELL_MS=2000
+export ORCH_FACE_IDENTIFY=1        # =0 只做检测/唇动/唤醒
+export ORCH_FACE_NO_ENROLL=1       # 默认关在线注册；开 = 陌生人写进内存库
+export G1_FACE_DEBUG=0             # 代码已兜底，显式设置仍生效
 ```
+
+⚠️ **`ORCH_G1_ROOT` 与 `ORCH_FACE_MODELS` 是两个不同的根，不能合并**：
+检测模型（blazeface 等）由 C 侧按 `g1_face_create(model_dir)` 的入参解析，
+而身份模型 `models/buffalo_l/` 按 `g1_root` 解析。
+
+⚠️ **`person_id` 只能当参考值**：g1face 从名字正则解析 `person_N`，而线上人脸库
+存的是真名 → 解析全失败 → 所有人都落到同一个兜底值。**UI 认人请用 `uid`**。
+
+⚠️ 换机器/换架构要**在目标机器上重编** `.so`（`cd G1 && bash build.sh`）：
+开发机编的只能给开发机用，架构不对加载时会直接抛（读 ELF 头判断）。
+libsdk_stream.so 的 ABI 版本与 g1face 不符时也会在加载时抛错，不会静默跑出
+「state 只出一次」这种怪现象。
 
 ### 音视频转储（排障必备）
 
@@ -688,9 +714,10 @@ python -m orchestrator.tests.test_concurrent --n 8 --wav assets/ref_audio/ref_mi
 # 拆除路径（资源泄漏）
 python -m orchestrator.tests.test_teardown --rounds 20 --wav assets/ref_audio/ref_minicpm_signature.wav
 
-# 人脸模块（需 G1 库 + 模型）
-python -m orchestrator.tests.test_face --so <libsdk_stream.so> --models <models> \
-  --mjpeg <camera_original.mjpeg> --tsv <camera_capture_timestamps.tsv>
+# 人脸模块（需 G1 仓库；g1_root 自动探测）
+python -m orchestrator.tests.test_face \
+  --mjpeg board-face-and-cloud-infer/G1/sample/camera_original.mjpeg \
+  --tsv   board-face-and-cloud-infer/G1/sample/camera_capture_timestamps.tsv
 
 # 单元测试（无外部依赖）
 python -m orchestrator.tests.test_clock         # 含 ctx↔会话采样 锚点映射
@@ -725,7 +752,7 @@ python -m orchestrator.tests.test_aec_live_fidelity \
 # 服务量测（阶段 0 工具）
 python -m orchestrator.tests.probe_aec --duration 60
 python -m orchestrator.tests.probe_asr --wav <16k.wav> --verbose
-python -m orchestrator.tests.probe_tts          # 需在 106（要 grpc + protos）
+python -m orchestrator.tests.probe_tts          # 需在 106（要 grpc；proto 在仓库内 protos/）
 ```
 
 见 `orchestrator/tests/README.md` 的实测结果记录。
@@ -753,10 +780,9 @@ orchestrator/
   omni/client.py       OmniLLM 客户端（复用 StreamingChatClient）
   tts/client.py        TTS 客户端（同步 stub + 线程池）+ MockTtsClient
   face/
-    g1.py              G1 库 ctypes 绑定
+    g1face_provider.py 适配 G1 仓库的官方 g1face 包（不自己绑 ctypes）
     worker.py          专用线程 + 有界队列
     signals.py         数据契约
-    local_provider.py  G1 + FaceService 组合
   downstream/          下游接口契约 + 确定性桩
   actions/executor.py  执行 action（TTS 合成、播放、取消、armed 承诺落位）
   tools/

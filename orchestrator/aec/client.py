@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,22 +36,62 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# 复用官方协议实现（唯一权威）
+# ---- 帧协议实现 ---------------------------------------------------------- #
+# 默认用本仓库内联的那份（``orchestrator/aec/_protocol.py``，自 speech_frontend
+# 原样拷贝），这样部署不必再同步那个仓库。它带一段 round-trip 自检。
+#
+# 上游是该协议的**唯一权威**，所以留一个开关：设 ORCH_AEC_PROTOCOL=upstream
+# 就切回直接 import speech_frontend 的 webserver.protocol（内联前的老行为）。
+# 内联自检失败时也会提示这个兜底。
+_PROTOCOL_SOURCE = (os.environ.get("ORCH_AEC_PROTOCOL") or "local").strip().lower()
+
 _SF_ROOT = Path(__file__).resolve().parents[3] / "speech_frontend"
-if _SF_ROOT.is_dir() and str(_SF_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SF_ROOT))
-try:
+
+
+def _load_protocol_upstream():
+    """从 speech_frontend 仓库取（老行为；需要该仓库在同级目录）。"""
+    if _SF_ROOT.is_dir() and str(_SF_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SF_ROOT))
     from webserver.protocol import (  # type: ignore
         ProtocolError,
         encode_frame,
         pack_arrays,
         parse_result_frame,
     )
-except ImportError:  # pragma: no cover
+    return ProtocolError, encode_frame, pack_arrays, parse_result_frame
+
+
+def _load_protocol_local():
+    """用本仓库内联的那份。"""
+    from . import _protocol
+    if not _protocol.roundtrip_ok:
+        # 自检失败 = 这份拷贝与「能被正确解析」的语义不符，宁可起不来
+        raise ImportError(
+            f"内联的 AEC 帧协议未通过 round-trip 自检"
+            f"（{_protocol.roundtrip_error}）。\n"
+            f"  这份拷贝在 {Path(__file__).with_name('_protocol.py')}，"
+            f"源自 speech_frontend 的 webserver/protocol.py。\n"
+            f"  若上游确实改了协议：按 _protocol.py 顶部的说明重新同步；\n"
+            f"  若想先用权威实现跑起来：设 ORCH_AEC_PROTOCOL=upstream"
+            f"（需要同级有 speech_frontend 仓库）。")
+    return (_protocol.ProtocolError, _protocol.encode_frame,
+            _protocol.pack_arrays, _protocol.parse_result_frame)
+
+
+try:
+    (_ProtocolError, _encode_frame, _pack_arrays,
+     _parse_result_frame) = (
+        _load_protocol_upstream() if _PROTOCOL_SOURCE == "upstream"
+        else _load_protocol_local())
+except ImportError as exc:
     raise ImportError(
-        f"需要 speech_frontend 的 webserver.protocol（在 {_SF_ROOT}）。"
-        " 若未同步该仓库，请在 106 上同步后再运行。"
-    )
+        f"加载 AEC 帧协议失败（ORCH_AEC_PROTOCOL={_PROTOCOL_SOURCE}）: {exc}") from exc
+
+# 对外保持与内联前一致的四个符号名
+ProtocolError = _ProtocolError
+encode_frame = _encode_frame
+pack_arrays = _pack_arrays
+parse_result_frame = _parse_result_frame
 
 import websockets  # noqa: E402
 
