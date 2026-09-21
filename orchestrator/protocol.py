@@ -230,12 +230,20 @@ class AsrDisplay:
 class IcDisplay:
     """InteractionCore 的 Action（仅 UI/日志显示）。
 
-    IC 每个 tick 都会出一个 Action，绝大多数是 ``HOLD``/``LISTEN``/``WAIT``
-    （常见态）。**服务端只在非常见态时下发** —— 否则每 50ms 一条会刷屏。
+    IC 每个 tick（50ms）都会出一个 Action。**全部下发** —— 包括
+    ``HOLD`` / ``LISTEN`` / ``WAIT`` 这三种常见态，否则 viz 的 IC 时间轴上
+    只剩 6 种非常见态，看不出「Policy 一直在等」这段过程。
+
+    常见态已由 ``InteractionDownstream`` 折叠：类型变化时立刻发，之后
+    每 ``QUIET_STREAK_REPORT`` 个 tick（≈1s）发一条心跳 —— 所以不会刷屏。
     """
-    action: str                                    # ANSWER / INSERT / YIELD / END / GREET / UTTER
+    action: str                                    # ANSWER / INSERT / YIELD / END / GREET /
+                                                   # UTTER / LISTEN / WAIT / HOLD
     sop: Optional[str] = None                      # SOP 编号（"07"/"15"…）
     text: Optional[str] = None                     # GREET/UTTER 的模板文案
+    #: 该常见态已连续多少个 tick 没变（非常见态恒为 1）。
+    #: viz 据此知道这条心跳代表「持续了 streak 个 tick」，而不是刚发生。
+    streak: int = 1
     t_ms: int = 0
     type: Literal["ic"] = "ic"
 

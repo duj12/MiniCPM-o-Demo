@@ -259,10 +259,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             from orchestrator.interaction import InteractionDownstream
             from orchestrator.protocol import IcDisplay
 
-            def _on_ic_action(atype: str, sop, text) -> None:
-                """IC 的决策 → UI（**只在非常见态回调**，不会刷屏）。"""
+            def _on_ic_action(atype: str, sop, text, streak: int = 1) -> None:
+                """IC 的决策 → UI / replay（**含常见态**）。
+
+                ⚠️ 早先注释写的是「只在非常见态回调」—— 那是**服务端提前
+                return 造成的假象**，不是有意设计。缺少 LISTEN/WAIT/HOLD
+                会让 viz 的 IC 时间轴断成一段一段，看不出 Policy 一直在等。
+                现在全量下发，常见态已由 InteractionDownstream 折成
+                ~1s 一条心跳（``QUIET_STREAK_REPORT``），不会刷屏。
+                """
                 sess._send_display(IcDisplay(
-                    action=atype, sop=sop, text=text,
+                    action=atype, sop=sop, text=text, streak=streak,
                     t_ms=int(sess.clock.seconds() * 1000),
                 ))
 
@@ -310,7 +317,7 @@ def preflight_face(cfg: Settings) -> bool:
     启动时就把问题暴露出来。
     """
     import os
-    from orchestrator.face.g1face_provider import arch_name, resolve_g1_root
+    from orchestrator.face.g1face_provider import resolve_g1_root
 
     g1_root, how = resolve_g1_root(cfg)
     model_dir = cfg.face_model_dir or str(g1_root / "models")
@@ -322,11 +329,17 @@ def preflight_face(cfg: Settings) -> bool:
         problems.append(
             f"g1face 包不存在: {g1_root / 'g1face'}（来自 {how}）—— "
             f"同步 board-face-and-cloud-infer 仓库，或设 ORCH_G1_ROOT")
-    # .so 按架构分目录（G1 新约定 lib/<arch>/）
-    lib = cfg.face_lib_path or str(g1_root / "lib" / arch_name() / "libsdk_stream.so")
-    if not os.path.isfile(lib):
-        problems.append(f"G1 库不存在: {lib}（架构 {arch_name()}）"
-                        f"—— 在目标机器上 cd G1 && bash build.sh 重编")
+    # ⚠️ 用**同一个挑选器**，不要自己拼 lib/<arch>/ 路径：G1 里有好几份
+    #    产物，按目录名挑会选到缺 opencv 或 ABI 太老的那份（已踩过）。
+    #    这里真的 CDLL 一次，所以「预检通过」≈「装配一定能成」。
+    from orchestrator.face.g1face_provider import pick_g1_lib
+    lib, why = pick_g1_lib(g1_root, cfg.face_lib_path)
+    if lib is None:
+        problems.append(
+            f"G1 库不可用（{why}）\n"
+            f"    候选：{g1_root}/lib/*/libsdk_stream.so 与 {g1_root}/src/\n"
+            f"    在**目标机器**上重编：cd G1 && bash build.sh"
+            f"（注意编译机的 opencv 版本）")
 
     if not os.path.isdir(model_dir):
         problems.append(f"模型目录不存在: {model_dir}")
