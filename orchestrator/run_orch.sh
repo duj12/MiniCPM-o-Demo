@@ -58,10 +58,22 @@ export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$CODE/orchdump/s}"
 
 # ---- 人脸模块 ----
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
-# ⚠️ 产物路径按**架构**分目录（G1 新约定）：`lib/x86_64/` 是开发机编的，
-#    `lib/aarch64/` 是板子上编的。早先统一放 `lib/` 根下，新版 `build.sh`
-#    会落到 `lib/x86_64/` —— 指向旧路径会**静默用上过期的那份**。
-export ORCH_FACE_SO="${ORCH_FACE_SO:-$CODE/board-face-and-cloud-infer/G1/lib/x86_64/libsdk_stream.so}"
+# ⚠️ **默认不指定 .so 路径 —— 让代码自己挑。**
+#
+# G1 仓库里同时躺着几份 x86_64 产物，**它们不通用**：`lib/<arch>/` 那份是
+# `build.sh` 的正规产物，但它链接的 opencv 取决于**编译那台机器**（在
+# opencv 4.10 上编的，拿到只有 4.5 的 106 上就是 `imgcodecs.so.410 not found`）；
+# `lib/` 根下那份是旧约定遗留，**ABI 太老**（没有 g1_face_abi_version）。
+#
+# 按目录名挑（"分架构 = 新的"）已经踩过一次：编排服务人脸模块整个装配失败，
+# 而 g1face 自己的 `_find_lib()` 也优先挑 `lib/<arch>/`，同样中招。
+#
+# 现在 provider 会**实测**每份候选（真的 CDLL 一次 + 验 ABI 版本），
+# 选中第一份能用的，并把它钉给 g1face（见 `face/g1face_provider.py` 的
+# `pick_g1_lib`）。所以在 106 上只要 G1 仓库在、模型在，就能直接跑。
+#
+# 想强制用某一份时才设它（同样会过校验，坏的不会被静默采纳）：
+# export ORCH_FACE_SO="/path/to/libsdk_stream.so"
 export ORCH_FACE_MODELS="${ORCH_FACE_MODELS:-$CODE/board-face-and-cloud-infer/G1/models}"
 export ORCH_FACE_DB="${ORCH_FACE_DB:-$CODE/faceidentification/data/face_db.npz}"
 # ⚠️ 必须为 0：否则 create 时就会写最多约 4GB 视频

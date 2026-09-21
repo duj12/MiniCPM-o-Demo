@@ -89,6 +89,107 @@ def resolve_g1_root(cfg=None) -> Tuple[Path, str]:
     return _DEFAULT_G1_ROOT, "默认路径（未探测到，多半需要设 ORCH_G1_ROOT）"
 
 
+#: G1 仓库里可能同时躺着多份 x86_64 产物，**它们不通用**（实测）：
+#:
+#:   lib/<arch>/libsdk_stream.so  `build.sh` 的正规产物，ABI 3；
+#:                                但它链接的 opencv 版本取决于**编译那台机器**——
+#:                                在 opencv 4.10 的机器上编的，拿到只有 4.5 的
+#:                                106 上会 `libopencv_imgcodecs.so.410 not found`
+#:   src/libsdk_stream.so         编译中间产物，ABI 3、**不链 opencv**，
+#:                                只差一个 libonnxruntime（旁边 lib/<arch>/ 就有）
+#:   lib/libsdk_stream.so         旧约定路径的遗留，**没有 g1_face_abi_version**，
+#:                                是 ABI 3 之前的构建 —— 能加载但 state 只出一次
+#:
+#: 所以**不能按目录名挑**（"按架构分目录 = 新的"这个直觉是错的），
+#: 必须实测 + 验 ABI。下面的顺序是「先正规产物，再中间产物，最后遗留」。
+_LIB_CANDIDATES = (
+    "lib/{arch}/libsdk_stream.so",   # build.sh 正规产物
+    "src/libsdk_stream.so",          # 编译中间产物（不链 opencv，最稳）
+    "lib/libsdk_stream.so",          # 旧约定遗留（多半 ABI 太老）
+)
+
+#: 与 g1face 的 `ABI_VERSION` 对齐；`g1_face_abi_version()` 早于此就是旧构建。
+_MIN_ABI = 3
+
+
+def pick_g1_lib(g1_root: Path, explicit: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """挑一份**本机能真正加载、且 ABI 够新**的 ``libsdk_stream.so``。
+
+    返回 ``(路径 | None, 说明)``。``explicit``（``ORCH_FACE_SO``）优先 ——
+    但同样要过下面的校验，坏路径不会静默放行。
+
+    ⚠️ **只看文件存不存在是不够的**：`lib/<arch>/` 和 `lib/` 两个目录下都
+    可能有文件，一个缺 opencv、一个 ABI 太老。所以这里真的去
+    ``ctypes.CDLL`` 一次并调 ``g1_face_abi_version()`` —— 多花几十毫秒，
+    换掉一整类"服务起来了、人脸却是坏的"故障。
+    """
+    import ctypes
+
+    tried = []
+    if explicit:
+        cands = [Path(explicit)]
+    else:
+        cands = [g1_root / t.format(arch=arch_name()) for t in _LIB_CANDIDATES]
+
+    for path in cands:
+        if not path.is_file():
+            tried.append(f"{path.name}(不存在)")
+            continue
+        # 预载 onnxruntime（RTLD_GLOBAL）—— 让 soname 能解析到，
+        # 这样**不需要**调用方设 LD_LIBRARY_PATH（部署"拉下来就能用"）。
+        _preload_ort_for(path)
+        try:
+            lib = ctypes.CDLL(str(path))
+        except OSError as exc:
+            tried.append(f"{path}({str(exc)[:60]})")
+            continue
+        fn = getattr(lib, "g1_face_abi_version", None)
+        if fn is None:
+            # 能加载但太旧：用它跑不会报错，只会让 state 一辈子只出一次
+            tried.append(f"{path}(没有 g1_face_abi_version，是旧构建)")
+            continue
+        fn.restype = ctypes.c_int
+        fn.argtypes = []
+        ver = int(fn())
+        if ver < _MIN_ABI:
+            tried.append(f"{path}(ABI={ver} < {_MIN_ABI})")
+            continue
+        return str(path), f"ABI={ver}"
+    return None, "；".join(tried) or "没有候选文件"
+
+
+def _preload_ort_for(lib_path: Path) -> None:
+    """把 libonnxruntime 以 ``RTLD_GLOBAL`` 预载，供 ``lib_path`` 解析 soname。
+
+    ``src/libsdk_stream.so`` 的 RUNPATH 是 ``$ORIGIN/../../src/.ort_sdk/...``，
+    而 ORT 实际在 ``G1/lib/<arch>/`` 下 —— 解析不到，于是
+    ``libonnxruntime.so.1.16.3: cannot open shared object file``。
+    普通 ``CDLL``（RTLD_LOCAL）**不够**，soname 解析要求全局符号可见。
+
+    g1face 的 ``_preload_onnxruntime()`` 也会找这些目录，但它用的是
+    RTLD_LOCAL、且**先命中哪个目录取决于顺序** —— 所以这里自己来一遍。
+    """
+    import ctypes
+
+    roots = [lib_path.parent,                       # 与 .so 同目录
+             lib_path.parent.parent / "x86_64",     # lib/<arch>/
+             lib_path.parent.parent.parent / "lib" / arch_name(),
+             lib_path.parent.parent / "lib" / arch_name(),
+             lib_path.parent.parent / "src" / ".ort_sdk"]
+    for d in roots:
+        if not d.is_dir():
+            continue
+        cands = [d / "libonnxruntime.so.1.16.3", d / "libonnxruntime.so"]
+        cands += sorted(d.glob("libonnxruntime.so.*"))
+        for c in cands:
+            if c.is_file():
+                try:
+                    ctypes.CDLL(str(c), mode=ctypes.RTLD_GLOBAL)
+                    return
+                except OSError:
+                    continue
+
+
 def _ensure_g1face(g1_root: Path):
     """把 ``g1_root`` 塞进 ``sys.path`` 并 import ``g1face``。返回 ``(模块, 错误)``。
 
@@ -190,9 +291,25 @@ class G1FaceProvider:
         # ⚠️ 必须早于 create：G1 库**默认开 debug**，会往 CWD 写 ./debug/sess_*
         #    （视频最多约 4GB）。旧实现（face/g1.py）有同样的兜底，别丢。
         os.environ.setdefault("G1_FACE_DEBUG", "1" if self.debug else "0")
-        # 让 g1face 的 _find_lib() 与 ORCH_FACE_SO 指向同一份 .so
-        if self.lib_path:
-            os.environ.setdefault("G1_LIB", self.lib_path)
+
+        # ⚠️ 这里**必须**把挑好（且已实测能加载）的那份写进 G1_LIB，而不是
+        #    「设了就完事」：g1face 的 `_find_lib()` 是**先看 G1_LIB、再看
+        #    lib/<arch>/**，而 `lib/<arch>/` 那份可能缺 opencv（见
+        #    `_LIB_CANDIDATES` 的说明）。只把 ORCH_FACE_SO setdefault 进去、
+        #    它指向别的文件时，g1face 仍会去挑 lib/<arch>/ 那份坏的。
+        #    所以：**先选出可用的，再钉死给 g1face**。
+        os.environ.pop("G1_LIB", None)
+        picked, why = pick_g1_lib(self.g1_root, self.lib_path)
+        if picked is None:
+            raise RuntimeError(
+                f"找不到可用的 libsdk_stream.so（{why}）。\n"
+                f"  候选目录：{self.g1_root}/lib/<arch>/ 与 {self.g1_root}/src/。\n"
+                f"  在**目标机器**上重编：cd G1 && bash build.sh（注意编译机的 "
+                f"opencv 版本 —— 链接了 opencv 的那份拿到 opencv 更旧的机器上"
+                f"会 not found）。")
+        self.lib_path = picked
+        os.environ["G1_LIB"] = picked
+        logger.info("G1 库选定: %s（%s）", picked, why)
 
         mod, err = _ensure_g1face(self.g1_root)
         if mod is None:
