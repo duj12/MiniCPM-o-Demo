@@ -782,6 +782,41 @@ def create_app(cfg: Settings):
                         sess.session_id, sid)
         return {"ok": True, "session_id": sess.session_id}
 
+    @app.post("/v1/stop")
+    async def stop(request: Request):
+        """**立刻停掉当前播报** —— 不管这条播报是谁排的。
+
+        InteractionCore 的 ``ExpressionSink.stop()`` 调这里（Policy 判
+        ``YIELD`` 抢话 / ``END`` 收尾时）。
+
+        ⚠️ 与 ``/v1/speak`` 的 ``interrupt:true`` **不是一回事**：
+        那个是"我要播新的了，先把旧的掐掉"，**只有发起方自己会用**；
+        这个是"谁在播都给我停" —— 因为 IC 判的是**表达层事实**（用户
+        抢话了 / 会话该收尾了），它不关心、也无从知道当前这句文本来自
+        IC 模板还是 Agent 的回复。
+
+        执行的是既有的 ``Cancel`` 链路（原子做三件事）：掐断浏览器播放 →
+        按实际播出点截断参考轨 → 停 TTS 流。同时报 ``playback_active=False``
+        （打断是**动作**不是观察，不必等浏览器回执）。
+        """
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            pass          # body 可选：不带也照样停
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        reason = str(body.get("reason") or "ic_stop")
+        _queue_speak(sess, Cancel(reason=reason))
+        logger.info("[%s] 外部请求停止播报（reason=%s）—— 掐断当前播报"
+                    "（来源不问：IC 模板与 Agent 回复一视同仁）",
+                    sess.session_id, reason)
+        return {"ok": True, "session_id": sess.session_id, "reason": reason}
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok", "active_sessions": len(REGISTRY.sessions)}
