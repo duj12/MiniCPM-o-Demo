@@ -259,17 +259,16 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             from orchestrator.interaction import InteractionDownstream
             from orchestrator.protocol import IcDisplay
 
-            def _on_ic_action(atype: str, sop, text, streak: int = 1) -> None:
-                """IC 的决策 → UI / replay（**含常见态**）。
+            def _on_ic_action(atype: str, sop, text) -> None:
+                """IC 的决策 → UI / replay。**每个 tick 都调，含常见态。**
 
                 ⚠️ 早先注释写的是「只在非常见态回调」—— 那是**服务端提前
                 return 造成的假象**，不是有意设计。缺少 LISTEN/WAIT/HOLD
                 会让 viz 的 IC 时间轴断成一段一段，看不出 Policy 一直在等。
-                现在全量下发，常见态已由 InteractionDownstream 折成
-                ~1s 一条心跳（``QUIET_STREAK_REPORT``），不会刷屏。
+                现在全量下发（不去重、不节流），客户端拿到完整决策流。
                 """
                 sess._send_display(IcDisplay(
-                    action=atype, sop=sop, text=text, streak=streak,
+                    action=atype, sop=sop, text=text,
                     t_ms=int(sess.clock.seconds() * 1000),
                 ))
 

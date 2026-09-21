@@ -63,10 +63,9 @@ def _conf(v: Any, default: str = NONE) -> str:
 class InteractionDownstream:
     """把事件接到 InteractionCore，把其 Action 派给 Agent / 模板播报。"""
 
-    #: 常见态：IC 每个 tick 都可能返回，不推会刷屏、也不该触发任何动作。
-    #: 但它们**必须照样经由 ``on_action`` 下发** —— 否则 viz 的 IC 时间轴上
-    #: 只剩下 6 种非常见态，Policy「一直在 HOLD/LISTEN/WAIT」这段过程完全
-    #: 看不出来。刷屏交给下游节流（见 ``main._on_ic_action``）。
+    #: 常见态：IC 每个 tick 都可能返回，**永不产生动作**（只做状态上报）。
+    #: ⚠️ 它们照样要经由 ``on_action`` 下发 —— 否则 viz 的 IC 时间轴上
+    #: 只剩下 6 种非常见态，Policy「一直在 HOLD/LISTEN/WAIT」看不出来。
     QUIET_TYPES = ("LISTEN", "WAIT", "HOLD")
 
     def __init__(self, ic_target: str, agent_url: str,
@@ -85,9 +84,6 @@ class InteractionDownstream:
         self._last_tick: Optional[float] = None
         #: 最近一次 Action（去重，避免同一个 ANSWER 重复派发）
         self._last_action_key: Optional[tuple] = None
-        #: 最近一次**已下发**的常见态（用来判「连续多少个 tick 都是它」）
-        self._quiet_streak: int = 0
-        self._quiet_last: Optional[str] = None
         #: 给 UI/日志看的 Action 流
         self.actions: List[Dict[str, Any]] = []
         self.counts: Dict[str, int] = {}
@@ -281,39 +277,28 @@ class InteractionDownstream:
         key = (atype, sop, getattr(action, "transcript", None))
         fresh = key != self._last_action_key
 
-        # ---- 常见态（LISTEN / WAIT / HOLD）----
-        # ⚠️ 早先这里**直接 `return []`**，于是 `on_action` 根本收不到它们 ——
-        #    viz 的 IC 时间轴上只剩下 6 种非常见态，Policy「一直在 HOLD」
-        #    这段过程完全看不出来。**状态类信息必须下发**。
+        # ---- 全量下发：**每个 tick 的决策都推给客户端** ----
         #
-        # 只在**类型变化**时发（HOLD→WAIT 发一条；连续 HOLD 不重复发）：
-        #   · 每条记录都代表一次真实的决策变化，时间轴上没有冗余
-        #   · 不是心跳 —— 「一直保持同一状态」在时间轴上表现为一段连续区间，
-        #     由 viz 按下一条的时间戳来画，不需要靠重复记录撑长度
-        if atype in self.QUIET_TYPES:
-            if atype == self._quiet_last:
-                self._quiet_streak += 1
-                return []          # 同类型连续出现，不重复下发
-            self._quiet_last = atype
-            self._quiet_streak = 1
-            if self._on_action is not None:
-                try:
-                    self._on_action(atype, sop, getattr(action, "text", None), 1)
-                except Exception:  # noqa: BLE001
-                    pass
-            return []              # 常见态**永不产生动作**，只做上报
-
-        # 从常见态切到非常见态：清掉心跳计数，下次再进常见态从 1 数起
-        self._quiet_streak = 0
-        self._quiet_last = None
-        self._last_action_key = key
-
-        # 推给 UI（非常见态每次变化都推）
+        # ⚠️ 早先这里对常见态**直接 `return []`**（且在所有分支之前），于是
+        #    `on_action` 根本收不到 LISTEN/WAIT/HOLD —— viz 的 IC 时间轴上
+        #    只剩 6 种非常见态，Policy「一直在 HOLD」这段过程完全看不出来。
+        #
+        # 现在**不去重、不节流**：IC 每 50ms 返回什么就推什么，客户端拿到的是
+        # 完整的决策流（viz 时间轴没有缺口，能直接看 Policy 是否在推进）。
+        # 代价是量大（一场 6 分钟会话约 7000 条），所以：
+        #   · 落盘由客户端决定（replay 的 --ic-events-out）
+        #   · **不进 downstream 事件队列**（那是控制流，会拖慢 tick）
         if self._on_action is not None:
             try:
-                self._on_action(atype, sop, getattr(action, "text", None), 1)
+                self._on_action(atype, sop, getattr(action, "text", None))
             except Exception:  # noqa: BLE001
                 pass
+
+        # 下面只处理「要不要产生动作」—— 与上报无关
+        if atype in self.QUIET_TYPES:
+            return []              # 常见态**永不产生动作**，只做上报
+
+        self._last_action_key = key
 
         if atype == "ANSWER":
             if not fresh:
