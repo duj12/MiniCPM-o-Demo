@@ -32,9 +32,9 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..downstream.interface import (
-    AsrFinal, AsrPartial, Cancel, DownstreamAction, DownstreamEvent,
-    FaceIdentity, FaceLipState, FaceState, FaceWake, PlaybackReceipt, Speak,
-    Tick,
+    AsrFinal, AsrPartial, AsrStateUpdate, Cancel, DownstreamAction,
+    DownstreamEvent, FaceIdentity, FaceLipState, FaceState, FaceWake,
+    PlaybackReceipt, Speak, Tick,
 )
 from .agent import AgentClient
 from .client import InteractionClient
@@ -180,7 +180,27 @@ class InteractionDownstream:
         if not self.ic.available:
             return
 
-        if isinstance(ev, AsrPartial):
+        if isinstance(ev, AsrStateUpdate):
+            # tick 驱动的**周期性快照** —— 与内部状态**完全一致**（含归零）。
+            # ⚠️ 这是 IC 唯一能得知"状态已经清了"的途径：`AsrPartial`/`AsrFinal`
+            #    只在用户说话时才来，静音后没有任何消息，IC 会一直停在最后
+            #    一条快照上（实测：一轮结束后 `说`/`抢` 仍显示 HIGH）。
+            #
+            # 转写**忠实透传**（归零后就是空串）—— 与 IC 的 `apply_asr` 口径一致。
+            st = ev.state or {}
+            self.ic.apply(
+                "apply_vad",
+                user_speaking_confidence=_conf(st.get("user_speaking_confidence")),
+                barge_in_confidence=_conf(st.get("barge_in_confidence")),
+            )
+            self.ic.apply(
+                "apply_asr",
+                transcript=str(st.get("transcript") or ""),
+                asr_confidence=_conf(st.get("asr_confidence")),
+                turn_complete_confidence=_conf(st.get("turn_complete_confidence")),
+            )
+
+        elif isinstance(ev, AsrPartial):
             # 流式帧只更新"用户在说话"的证据；转写等 final 更准
             st = ev.state or {}
             self.ic.apply(

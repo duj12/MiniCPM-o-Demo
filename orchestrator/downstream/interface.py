@@ -54,6 +54,23 @@ class AsrFinal:
 
 
 @dataclass(frozen=True)
+class AsrStateUpdate:
+    """ASR 状态量的**周期性快照**（由 tick 驱动，不是收到 ASR 消息时发）。
+
+    ⚠️ 为什么需要单独一条事件：``AsrPartial`` / ``AsrFinal`` 只在**用户说话时**
+    才来。而「说完一句就静音」时状态会被超时清成 ``NONE`` —— 若只靠那两条
+    事件驱动，下游永远收不到"已经清了"，会一直停在第最后一条消息的快照上
+    （实测：一轮结束后 IC 侧 `说`/`抢` 仍是 HIGH，SOP 06 判定跟着错）。
+
+    ``state`` 与 ``AsrStateTracker.state`` **完全一致**（含归零后的空
+    ``transcript``）—— 下游拿到的就是当前真相，不需要自己推断。
+    """
+    t: int
+    state: Dict[str, str] = field(default_factory=dict)
+    kind: Literal["asr.state"] = "asr.state"
+
+
+@dataclass(frozen=True)
 class AsrTurnSense:
     """ASR 的语义完整性判决。
 
@@ -197,7 +214,7 @@ class Tick:
 
 
 DownstreamEvent = Union[
-    AsrPartial, AsrFinal, AsrTurnSense,
+    AsrPartial, AsrFinal, AsrTurnSense, AsrStateUpdate,
     OmniTurnSense, OmniDelta, OmniResponseDone,
     FaceWake, FaceIdentity, FaceLipState, FaceState,
     PlaybackReceipt, Tick,

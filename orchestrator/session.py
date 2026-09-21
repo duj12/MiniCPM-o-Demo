@@ -144,6 +144,14 @@ class OrchestratorSession:
         # 2pass-online 给的是**增量片段**（"今天"/"吃饭"/"了吗"），必须自己
         # 拼接；2pass-offline 到达时用它覆盖并清空。
         self._asr_online_text = ""
+        #: 上次**推给 IC** 的 ASR 状态快照 —— 「变化才推」的去重键。
+        #: ⚠️ 没有它，归零那一刻就没人通知 IC：ASR 消息只在说话时才有，
+        #:    静音时状态被 tick 清了，却没有任何推送 → IC 的 `说`/`抢`
+        #:    永远停在最后一帧（比如 HIGH），SOP 06 判定跟着错。
+        self._last_asr_pushed: Optional[dict] = None
+        #: 上次**推给 UI** 的 ASR 文字。UI 要保留最后一句字幕（不随内部
+        #: `transcript` 归零而消失），直到下一句开始才被替换。
+        self._last_asr_text = ""
 
         # ---- 实时 ERLE：**按每次播报独立统计** ----
         # ⚠️ 早先的实现有 bug：mic 能量只在播放窗口累加，而 AEC 输出能量
@@ -1315,7 +1323,44 @@ class OrchestratorSession:
             #    `_periodic_diag`（由 on_audio 调用，收不到音频时自己就不跑）。
             if self.asr is not None:
                 self.asr.expire_if_idle()
+                self._push_asr_state_if_changed()
             self.post_downstream(Tick(t=self.clock.now()))
+
+    def _push_asr_state_if_changed(self) -> None:
+        """ASR 状态**变了就推**（IC 忠实内部；UI 文字单独保留）。
+
+        ⚠️ **为什么必须在 tick 里推**：`AsrDisplay` / `apply_vad` 原先只在
+        `on_message`（收到 ASR 消息）里发。而「说完一句就静音」时**没有新
+        消息** —— 状态被 tick 清成 NONE 了，却没人告诉 IC / UI，它们永远
+        停在最后一条消息的快照上（实测现象：一轮结束后页面 `说`/`抢` 仍是
+        HIGH、`完`/`信` 也一直是 HIGH）。
+        这与「清空逻辑绑在读快照上」是同一类毛病，只是发生在**推送**环节。
+
+        去重比对整份快照（5 个字段），变了才推 —— 静音时只在归零那一刻推
+        一次，之后每拍比对的成本可忽略。
+        """
+        if self.asr is None:
+            return
+        cur = self.asr.state.to_dict()
+        if cur == self._last_asr_pushed:
+            return
+        self._last_asr_pushed = cur
+
+        from .downstream.interface import AsrStateUpdate
+        from .protocol import AsrDisplay
+
+        # ---- ① IC：**与内部状态完全一致**（transcript 归零后就是空串）----
+        self.post_downstream(AsrStateUpdate(t=self.clock.now(), state=cur))
+
+        # ---- ② UI：state 用当前的（已归零），text 保留最后一句 ----
+        # 文字不随内部 `transcript` 归零而消失 —— 用户要一直看得到刚才说了
+        # 什么，直到下一句开始才被替换（那时 `text` 又非空，自然覆盖）。
+        if cur.get("transcript"):
+            self._last_asr_text = cur["transcript"]
+        self._send_display(AsrDisplay(
+            phase="partial", text=self._last_asr_text,
+            t_ms=int(self.clock.seconds() * 1000), state=cur,
+        ))
 
     async def _loop_lag_probe(self) -> None:
         """事件循环卡顿看门狗：每 0.5s 唤醒一次，测**实际**被推迟了多久。
