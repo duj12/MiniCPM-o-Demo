@@ -235,6 +235,16 @@ function diagUpdate() {
   } else {
     tts = `TTS <b>空闲</b>`;
   }
+  // ---- 把「实际在出声」上报给服务端（IC 的 playback_active）----
+  // ⚠️ 判据与上面显示完全同一个：`remaining() > 0`。它与 tts.start/tts.end
+  //    **无关** —— 那两条只表示文本和音频的**送达**，而流式下服务端一次把
+  //    几十秒推完，送到时往往才刚起播。早先服务端拿 `armed`（承诺起播，
+  //    还带 200ms 提前量）当"开始出声"、拿 `ended`（音频送完）当"停止"，
+  //    两头都不准：开头早报约 200ms+，结尾早报几百 ms（尾巴还在响）。
+  //
+  //    多句连播时 remaining() 一直是正的（后一句紧接着排上），所以**不会**
+  //    中途报 false —— 这正是"前一句播完立即播下一句"该有的表现。
+  reportPlaybackState(rem > 0.05);
   el.innerHTML =
     `AudioContext: <b>${diag.ctxState}</b> @${diag.ctxRate}Hz${lat}　` +
     `TTS 帧 <b>${diag.frames}</b> / ${(diag.bytes/2/24000).toFixed(2)}s　` +
@@ -246,6 +256,44 @@ function diagUpdate() {
 /** 设备报告的延迟格式化（n/a 表示浏览器没提供）。 */
 function fmtLat(v) {
   return (v == null || !isFinite(v)) ? 'n/a' : (v * 1000).toFixed(1) + 'ms';
+}
+
+/** 把 diagUpdate 排到下一个微任务。
+ *
+ * 为什么需要：`diagUpdate` 是**事件驱动**的（收到 tts.audio / tts.end 才调），
+ * 而「最后一块播完」这个时刻**没有任何服务端消息**会触发它 —— 状态会卡在
+ * 「在播」。所以由播放器的 `onended`（音频线程触发，最准）来补这一环。
+ *
+ * 用微任务而不是直接调：`onended` 在音频线程回调里，不该在里面跑
+ * 一堆 DOM 更新；也让同一帧内的多个 onended 合并成一次。 */
+let _diagPending = false;
+function scheduleDiagUpdate() {
+  if (_diagPending) return;
+  _diagPending = true;
+  Promise.resolve().then(() => { _diagPending = false; diagUpdate(); });
+}
+
+/* ---------- 实际播放状态上报（IC 的 playback_active）----------
+ * 只有浏览器知道**真实**的出声情况：`player.remaining()` 按已排程的源算
+ * 「还有多少秒没播完」，读的是 AudioContext 音频时钟。
+ *
+ * ⚠️ 与 tts.start / tts.end **无关**（那是"送没送到"）：
+ *    · tts.start 在 TTS 合成**之前**发，此刻还没音频
+ *    · tts.end 只表示音频**送**完了；流式下服务端一次推完几十秒，
+ *      送到时往往才刚起播 —— 拿它当"停止"会在开播两秒后就报停止
+ *
+ * **边沿触发**：只在状态真的翻转时发一条，不是每次 diagUpdate（10Hz）都发。
+ * 判据与页面显示完全同源（同一个 `remaining()`），两处不会打架。 */
+let _lastPlaybackActive = null;      // null=还没报过（首次必发）
+function reportPlaybackState(active) {
+  if (active === _lastPlaybackActive) return;
+  _lastPlaybackActive = active;
+  try {
+    if (session && session.send) {
+      session.send({ type: 'playback', phase: active ? 'playing' : 'stopped' });
+    }
+  } catch (e) { /* ignore */ }
+  log('v', `播放状态 → ${active ? '在播' : '停止'}（上报 IC）`);
 }
 /** 音频会话事件记录 —— 排查"D 为什么中途变了"用。
  *  D 跳变时，outputLatency / ctx 状态 / devicechange 里必有一个同步变化。 */
@@ -268,6 +316,7 @@ class PcmPlayer {
     this.responseId = null;
     this.srcRate = 24000;       // 服务端 TTS 输出采样率
     this._sources = [];         // 已排程的源，stop() 要逐个掐断
+    this._startedTimer = null;  // 精确定时到"真正出声"那一刻再报状态
     this._cancelled = false;    // 上一句是否被 cancel（决定下一句是否重排）
     this._armed = 0;            // 本句**承诺**的起播时刻（ctx 秒）
     this._firstAt = 0;          // 本句**实际**首播时刻（ctx 秒）
@@ -451,12 +500,28 @@ class PcmPlayer {
       node._playedFull = true;          // 自然播完 → 整块都算播过
       const i = this._sources.indexOf(node);
       if (i >= 0) this._sources.splice(i, 1);
+      // 队列空了 = **真的播完了**。这是"停止出声"最准的时刻 ——
+      // 比任何轮询都准，`onended` 由音频线程在块播完时触发。
+      //
+      // ⚠️ 多句连播时后一句已经排上（`_sources` 非空），这里不会误报停止 ——
+      //    正是"前一句播完立即播下一句"该有的表现。
+      if (this._sources.length === 0) scheduleDiagUpdate();
     };
     this.nextAt = at + buf.duration;
     this.lastStartAt = at;      // 最近一块的起播时刻（ctx 秒）
     diag.scheduled += 1;
     if (diag.startedAt === '-') {
       diag.startedAt = `+${(at - this.ctx.currentTime).toFixed(2)}s`;
+    }
+    // 排程 ≠ 出声：`at` 带着提前量（默认 200ms）在未来。只有等到那一刻，
+    // 「实际在播」才成立 —— 所以**精确定时**到 `at` 再报一次。
+    // 用 ctx 时钟换算成墙上毫秒，比固定轮询准得多（误差只剩定时器抖动）。
+    if (!this._startedTimer) {
+      const waitMs = Math.max(0, (at - this.ctx.currentTime) * 1000);
+      this._startedTimer = setTimeout(() => {
+        this._startedTimer = null;
+        diagUpdate();
+      }, waitMs);
     }
     diagUpdate();
     return at;
@@ -479,6 +544,8 @@ class PcmPlayer {
     // 掐断之前先记下"播了多少" —— 回执要用它告诉服务端参考轨该保留多长
     // （见 session.on_playback_receipt / playedSamples）。
     this._playedOnStop = this.playedSamples();
+    // 取消掉"等真正出声"那个定时器：都被打断了，不该再报「开始播」
+    if (this._startedTimer) { clearTimeout(this._startedTimer); this._startedTimer = null; }
     for (const n of (this._sources || [])) {
       try { n.stop(0); } catch (e) { /* 已播完的源 stop 会抛，忽略 */ }
       try { n.disconnect(); } catch (e) { /* ignore */ }

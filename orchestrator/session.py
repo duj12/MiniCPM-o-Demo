@@ -700,12 +700,28 @@ class OrchestratorSession:
         if self.closed or self.ref_track is None:
             return
 
+        # ---- 实际出声边沿（playing / stopped）----
+        # ⚠️ **只有这两个 phase 能定义 playback_active**。它们由浏览器按
+        #    `player.remaining()`（读 AudioContext 音频时钟）算出、边沿触发，
+        #    和 tts.start/tts.end 无关。
+        #
+        #    早先用 `armed`（承诺起播，还带 200ms 提前量）当"开始出声"、
+        #    用 `ended`（音频送完）当"停止"，两头都不准：开头早报 200ms+，
+        #    结尾早报几百 ms（耳朵里尾巴还在响）。PRD 要的是表达层事实，
+        #    那就只能由表达层按真实播放进度写。
+        #
+        #    多句连播时浏览器一路报 playing（后一句紧接着排上），中间不会
+        #    掉到 stopped —— 正是"前一句播完立即播下一句"该有的表现。
+        if phase in ("playing", "stopped"):
+            self._notify_playback_active(phase == "playing")
+            return
+
         if phase == "armed":
             # 浏览器**承诺**的起播时刻 —— 执行器正等着它去 place() 参考轨。
+            # ⚠️ 这里**不再**置 playback_active（它只表示"排程好了"，不是
+            #    "在出声"，见上）。
             self._note_armed(response_id, start_ctx, epoch)
             self._post_downstream_playback(response_id, phase, ctx_time, seq)
-            # InteractionCore：开始出声（SOP 07/23/39 的判据）
-            self._notify_playback_active(True)
             return
 
         if (phase == "started" and start_ctx > 0.0
@@ -775,11 +791,15 @@ class OrchestratorSession:
                         response_id, keep / SR, n, n / SR,
                     )
         self._post_downstream_playback(response_id, phase, ctx_time, seq)
-        # 停下/播完 —— InteractionCore 据此判 SOP 07/23/39。
-        # ⚠️ `ended` 只是"音频送完了"，严格说浏览器可能还在播尾巴；
-        #    但对 IC 来说"不再有新的开口"就够用（它要判断的是能不能切话轮）。
-        if phase in ("ended", "cancelled"):
-            self._notify_playback_active(False)
+        # ⚠️ 这里**不再**置 playback_active：
+        #    `ended`   = 音频**送**完了（流式下一次推完几十秒，送到时往往才刚
+        #                起播）—— 拿它当"停止"会在开播两秒后就报停，而耳朵里
+        #                还在响。
+        #    `cancelled` = 被打断，但浏览器随后会按真实进度报 `stopped`。
+        #    两种情况都由浏览器的 playing/stopped 收口（见本函数开头）。
+        #
+        #    `ended`/`cancelled` 本身**不能删** —— 参考轨的截断与
+        #    `sample_offset` 校正还靠它们。
 
     # ------------------------------------------------------------------ #
     #  播放锚点（armed 承诺）

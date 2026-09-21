@@ -558,6 +558,11 @@ class ActionExecutor:
         self.cancels_done += 1
         # 打断 = 立刻不再出声，**不等浏览器回执**（那要绕一圈才回来）。
         # IC 的 SOP 07 靠这个判"用户抢话后已经停播"。
+        #
+        # ⚠️ 这是 `playback_active` 的**唯一例外**：常规路径由浏览器按真实
+        #    播放进度报 playing/stopped（见 session.on_playback_receipt），
+        #    但打断是**动作**而不是观察 —— 我们主动把源掐了，不必等回执。
+        #    浏览器随后也会报一次 stopped，IC 那边是幂等覆盖，无害。
         try:
             session._notify_playback_active(False)
         except Exception:  # noqa: BLE001

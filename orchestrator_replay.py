@@ -1244,6 +1244,10 @@ class OrchestratorReplayClient:
 
         self.player = VirtualPlayer(clock)
         self.epoch = int(clock.now() * 1000) % 2147483647 or 1
+        #: 上次上报给服务端的「实际是否在出声」（None = 还没报过）。
+        #: 与浏览器的 `_lastPlaybackActive` 同义，用于边沿触发 ——
+        #: 只有状态翻转才发消息，不是每块都发。见主循环里的上报点。
+        self._last_playback_active: Optional[bool] = None
 
         # 统计
         self.asr_partials = 0
@@ -1873,6 +1877,19 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             tts_left = client.player.remaining_s()
             if window is not None and window.status is not None:
                 window.status.tts_remaining_s = tts_left
+            # ── 实际播放状态上报（IC 的 playback_active）──
+            # 判据与上面状态栏**完全同源**（同一个 remaining_s），边沿触发。
+            # ⚠️ 这是浏览器侧那条 `reportPlaybackState` 的等价物：replay 扮演
+            #    浏览器，不发这个，服务端就永远拿不到"真的在出声"的信号
+            #    （IC 的 SOP 07/23/39 会一直停在默认值）。
+            #    多句连播时 remaining_s 一路为正，中间不会掉到 stopped。
+            _pb = tts_left > 0.05
+            if _pb != client._last_playback_active:
+                client._last_playback_active = _pb
+                await client.send_playback("", "playing" if _pb else "stopped")
+                if client.verbose:
+                    print(f"\n  [播放状态] → {'在播' if _pb else '停止'}"
+                          f"（剩余 {tts_left:.2f}s）")
 
             # ── 输入音频：TTS 在播时让路（**串行不重叠**）──
             # 两个 Speaker 同时开会抢输出设备（实测互相打架、谁都出不来声）。

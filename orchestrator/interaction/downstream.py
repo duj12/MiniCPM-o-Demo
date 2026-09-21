@@ -238,9 +238,17 @@ class InteractionDownstream:
                               identity_confidence=NONE, display_name=None)
 
         elif isinstance(ev, PlaybackReceipt):
-            # ⚠️ 只有 cancelled/ended 才是"停了"；started 之后还在播
-            if ev.phase in ("ended", "cancelled"):
-                self.ic.apply("apply_playback_active", playback_active=False)
+            # ⚠️ **这里不再写 playback_active**。
+            #
+            # `PlaybackReceipt` 整条流都流经 ``session.on_playback_receipt``，
+            # 由那边**唯一一处**按 phase 决定是否写 IC（只有 playing/stopped
+            # 写）。早先这里又按 ended/cancelled 写了一次 False，于是同一句
+            # 播完 IC 会收到 2 次 False（session 一次 + 这里一次），打断时
+            # 叠加 executor 那次最多 3 次。IC 是幂等覆盖所以没出故障，但纯属
+            # 浪费 gRPC 往返，而且两条写入路径的语义会各自漂移。
+            #
+            # 表达层事实**只有一个权威写入点**（见 ``_notify_playback_active``）。
+            pass
 
     # ------------------------------------------------------------------ #
     #  Tick → 要决策

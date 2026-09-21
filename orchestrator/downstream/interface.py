@@ -164,10 +164,26 @@ class FaceLipState:
 
 @dataclass(frozen=True)
 class PlaybackReceipt:
-    """浏览器播放回执。驱动 AEC 参考轨的时钟。"""
+    """浏览器播放回执。驱动 AEC 参考轨的时钟。
+
+    ``phase`` 有两类，**语义完全不同，别混用**：
+
+      · ``armed`` / ``started`` / ``ended`` / ``cancelled``
+        —— **调度**事件：承诺起播、实际排程、音频送完、被打断。
+        驱动参考轨落位与截断（``sample_offset`` 校正）。
+        ⚠️ 它们**不能**用来判断"是否正在出声"：``armed`` 带提前量、
+        ``ended`` 只表示送完（流式下服务端一次推完几十秒，送到时往往
+        才刚起播）。
+
+      · ``playing`` / ``stopped``
+        —— **实际出声**边沿：由浏览器按 ``player.remaining()``（读
+        AudioContext 音频时钟）算出来，边沿触发。**只有它能定义
+        IC 的 playback_active。**
+    """
     t: int
-    response_id: str
-    phase: Literal["started", "ended", "cancelled"]
+    response_id: str = ""
+    phase: Literal["armed", "started", "ended", "cancelled",
+                   "playing", "stopped"] = "started"
     ctx_time: float = 0.0
     seq: int = 0
     kind: Literal["playback"] = "playback"
