@@ -42,6 +42,14 @@ fi
 # 「算法服务 AEC」时才用到这个值。
 export ORCH_AEC_DEFAULT_DELAY_MS="${ORCH_AEC_DEFAULT_DELAY_MS:-250}"
 
+# ---- 日志级别（排障用）----
+# debug 会逐条打出服务端回来的**每一条** ASR 原始消息（mode / text / is_final /
+# confidence / turnsense 判决）。「UI 上没有 ASR 文字」有两种完全不同的原因
+# —— 服务端没收到结果 vs 收到了但没下发 UI —— 这条日志把两者分开。
+# ⚠️ 必须在这里透传：orchestrator.main 的 --log-level 默认是 info，
+#    只设 ORCH_LOG_LEVEL 环境变量**不会**生效。
+export ORCH_LOG_LEVEL="${ORCH_LOG_LEVEL:-info}"
+
 # ---- 音视频转储（排障用；不设则关闭，零开销）----
 # 会话结束时落盘：mic/ref/raw/aec 四路 wav + face/omni 的 mjpeg+tsv。
 # 文件名里的 <sid> 就是网页状态栏显示的那个会话 id。
@@ -79,4 +87,5 @@ fi
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "${ORCH_PORT:-8100}" \
   --downstream-mode "${ORCH_DOWNSTREAM_MODE:-omni}" \
+  --log-level "${ORCH_LOG_LEVEL:-info}" \
   "${SSL_ARGS[@]}"

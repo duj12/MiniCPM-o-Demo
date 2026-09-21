@@ -30,6 +30,12 @@ from .protocol import MIC_CHUNK
 
 logger = logging.getLogger(__name__)
 
+#: 事件循环看门狗：探测间隔（秒）与告警阈值（秒）。
+#: 阈值取 0.5s —— 正常抖动在几十 ms 量级，真卡一下就远超这个数；
+#: 定太高会漏掉「卡 1~2s 又恢复」这种（它已经足以让 ASR 丢字、Omni 断连）。
+_LOOP_LAG_INTERVAL = 0.5
+_LOOP_LAG_WARN = 0.5
+
 
 class OrchestratorSession:
     """一路会话的编排器。
@@ -92,6 +98,9 @@ class OrchestratorSession:
         from .metrics import SessionMetrics
         self.metrics = SessionMetrics(session_id)
         self._mark_audio_t0: Optional[float] = None
+        #: 诊断用：会话建立时刻。用来在「一直没收到音频块」时给出等待时长
+        #: （见 ``_periodic_diag``）—— 那是「web 端没有 ASR 结果」的头号根因。
+        self._t_audio_wait_start = time.monotonic()
 
         # 音频转储（仅在 ORCH_DUMP_AUDIO 设置时开启；默认零开销）
         import os as _os
@@ -901,6 +910,17 @@ class OrchestratorSession:
             mode = str(msg.get("mode") or "")
             # state 由 AsrClient.recv_loop 在本回调之前归纳好，这里直接取。
             st = self.asr.state.to_dict() if self.asr else None
+            # ⚠️ 「UI 上没有 ASR 文字」有两种完全不同的原因：服务端**没收到**
+            #    结果，和收到了但**没下发 UI**。这条日志把两者分开 —— 它记录
+            #    服务端回来的每一条原始消息的关键字段（默认关闭，零开销；
+            #    开 ORCH_LOG_LEVEL=DEBUG 即可）。
+            #    ⚠️ 往这里加日志必须放在**各 return 之前**，否则会漏掉其中
+            #    一类（turnsense 那条就走 early return）。
+            logger.debug("[%s] ASR<- mode=%r text=%r is_final=%s conf=%s ts=%s",
+                         self.session_id, mode, (msg.get("text") or "")[:60],
+                         msg.get("is_final"), msg.get("confidence"),
+                         (msg.get("turnsense") or {}).get("label")
+                         if isinstance(msg.get("turnsense"), dict) else None)
 
             if mode == "turnsense":
                 ts = extract_turnsense(msg)
@@ -1251,7 +1271,71 @@ class OrchestratorSession:
         while not self.closed:
             await asyncio.sleep(interval)
             self.stats["ticks"] += 1
+            self._check_audio_watchdog()
             self.post_downstream(Tick(t=self.clock.now()))
+
+    async def _loop_lag_probe(self) -> None:
+        """事件循环卡顿看门狗：每 0.5s 唤醒一次，测**实际**被推迟了多久。
+
+        为什么需要：本服务所有活儿都在**同一个事件循环**里 —— mic 收流、
+        扇出给 ASR/Omni（都是 await 网络发送）、TTS、UI 推送、人脸信号转投。
+        任何一处跑了个**同步阻塞**调用（GIL 下的重活、第三方库的阻塞 IO、
+        大数组在 C 里跑很久），整个循环就会停摆：
+        ASR 不再收音频、人脸不再出框、ping 不再回应（→ gateway 20s 后
+        以 `1011 keepalive ping timeout` 断开 Omni）—— 现象就是
+        「几十秒后整个卡住，ASR 和视频都没反应」，而**日志里什么都看不到**
+        （因为打日志本身也要靠循环）。真机踩过。
+
+        光看"最后一次心跳在什么时候"分不出「循环卡住」和「没有事件」，
+        所以这里测的是 ``sleep`` 的**实际延迟**：它是循环健康度的直接测量，
+        与有没有业务事件无关。超阈值时顺带把最可能阻塞的那几项计数打出来。
+        """
+        while not self.closed:
+            t0 = time.monotonic()
+            await asyncio.sleep(_LOOP_LAG_INTERVAL)
+            lag = time.monotonic() - t0 - _LOOP_LAG_INTERVAL
+            if lag < _LOOP_LAG_WARN:
+                self._loop_lag_max = max(getattr(self, "_loop_lag_max", 0.0), lag)
+                continue
+            self._loop_lag_max = max(getattr(self, "_loop_lag_max", 0.0), lag)
+            logger.warning(
+                "[%s] ⚠️ 事件循环卡顿 %.0fms（阈值 %.0fms，本会话最大 %.0fms）"
+                "—— ASR/人脸/Omni 都会同时停摆。当时计数：音频块=%d 下游积压=%d"
+                " 人脸帧=%d 人脸丢帧=%d ASR发=%s",
+                self.session_id, lag * 1000, _LOOP_LAG_WARN * 1000,
+                self._loop_lag_max * 1000,
+                self.stats.get("audio_chunks_in", 0),
+                self._down_q.qsize() if getattr(self, "_down_q", None) else -1,
+                self.stats.get("video_face_frames", 0),
+                self.stats.get("face_dropped", 0),
+                getattr(getattr(self, "asr", None), "chunks_sent", "?"))
+
+    def _check_audio_watchdog(self) -> None:
+        """会话建立后一直没收到音频 → 告警（每 10s 一次，不刷屏）。
+
+        ⚠️ **必须挂在 tick 上，不能挂在 ``_periodic_diag`` 里** —— 后者由
+        ``on_audio`` 调用，收不到音频时它自己就不会跑，这个告警永远不会触发
+        （正是它要报的那个场景）。踩过。
+
+        首块音频是整条链路的**起点**：它没来，服务端一切正常、日志干净，
+        而页面上既没有 ASR、也没有任何报错。「web 端没有 ASR 结果」绝大多数
+        就是这一种 —— 采集没起来 / AudioContext 停在 suspended / worklet
+        没启动。这条日志把「没收到音频」与「收到了但没识别」一刀切开。
+        """
+        if self.stats.get("audio_chunks_in", 0) > 0:
+            return
+        waited = time.monotonic() - self._t_audio_wait_start
+        if waited < 10.0:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_audio_warn_at", 0.0) < 10.0:
+            return
+        self._last_audio_warn_at = now
+        logger.warning(
+            "[%s] 已过 %.0fs 仍未收到**任何音频块** —— 浏览器没在发音频。"
+            "查页面「诊断」面板的 AudioContext 状态（suspended 则点一下页面）"
+            "与「音频块」计数；Python 客户端正常而只有 web 端如此，问题在浏览器侧。",
+            self.session_id, waited)
 
     # ------------------------------------------------------------------ #
     #  生命周期

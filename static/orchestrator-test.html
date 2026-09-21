@@ -876,8 +876,32 @@ async function startCapture() {
     return cv.toDataURL('image/jpeg', q).split(',')[1] || null;
   }
 
+  // 采集自检：worklet 装好、`{command:'start'}` 已发出之后，**第一个 chunk
+  // 必须在这里被看到**。若 3 秒还没有，说明链路卡在
+  // 「AudioContext 没跑 → worklet 不渲染 → 没有音频也没有视频」
+  // —— 这是「web 端音视频全无反馈」最可能的形态，而它在服务端看起来
+  // 完全正常（收不到任何东西，日志干净）。
+  let _chunkSeen = false;
+  const _capTimer = setTimeout(() => {
+    if (!_chunkSeen && running) {
+      log('e', `采集自检失败：3s 内没有收到任何音频块 —— `
+             + `AudioContext=${audioCtx ? audioCtx.state : 'null'}`
+             + ` 采样率=${audioCtx ? audioCtx.sampleRate : '?'}`
+             + `。若为 suspended，点一下页面任意处恢复。`);
+      diag.lastErr = '采集未产出音频块（AudioContext=' +
+                     (audioCtx ? audioCtx.state : 'null') + '）';
+      diagUpdate();
+    }
+  }, 3000);
+
   workletNode.port.onmessage = (ev) => {
     if (!running || ev.data.type !== 'chunk') return;
+    if (!_chunkSeen) {
+      _chunkSeen = true;
+      clearTimeout(_capTimer);
+      log('k', `采集自检通过：收到首个音频块`
+             + `（${ev.data.audio.length} 采样，AudioContext=${audioCtx.state}）`);
+    }
     frameCounter = (frameCounter + 1) % 10;   // 10 块 = 1s
     // ⚠️ **必须重采样到 16kHz 再回传**。设备不认 16kHz 的 AudioContext 时会
     //    退到 44.1k/48k，此时每块是 4410/4800 个采样，而服务端

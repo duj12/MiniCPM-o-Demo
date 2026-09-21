@@ -516,6 +516,9 @@ async def handle_client(ws, cfg: Settings) -> None:
         tasks.append(asyncio.create_task(sess.run_downstream()))
         tasks.append(asyncio.create_task(sess.run_display()))
         tasks.append(asyncio.create_task(sess.run_tick(cfg.tick_interval_s)))
+        # 事件循环健康度探针：卡顿会让 ASR/人脸/Omni **同时**停摆，
+        # 而那种情况下日志里什么都不会出现（打日志本身也要靠循环）。
+        tasks.append(asyncio.create_task(sess._loop_lag_probe()))
         if sess.face_worker is not None:
             tasks.append(asyncio.create_task(sess.run_face_signals()))
 
