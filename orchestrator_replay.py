@@ -94,6 +94,14 @@ TTS_SR = 24000          # 服务端 TTS 输出采样率
 DEFAULT_FACE_FPS = 24.0
 DEFAULT_OMNI_FPS = 1.0
 FACE_MAX_W, FACE_MAX_H, FACE_Q = 320, 240, 0.5
+#: 人脸抽帧尺寸可被 ``--face-size`` 覆盖（形如 ``640x480``）。
+#: ⚠️ 为什么需要这个旋钮：G1 的人脸检测分**随人脸像素尺寸下降** —— 源片
+#:    1440×1080 缩到 320 宽后，中等距离的人脸只有 ~50px，检测分落在
+#:    0.7x（= MEDIUM）。而 IC 的迎宾门禁要求 ``face_present_confidence
+#:    == HIGH``（score ≥ 0.8），于是**IC 一直 HOLD、不出 GREET、没有任何
+#:    播报**，而 ASR/人脸本身都是正常的（实测踩过）。调大抽帧尺寸就能
+#:    把检测分抬上去。浏览器端发的也是缩放图，所以这只是在改"模拟哪种
+#:    摄像头画面"，不是绕过产品逻辑。
 OMNI_MAX_W, OMNI_MAX_H, OMNI_Q = 1280, 720, 0.7
 TICK_S = 0.004          # 主循环粒度（4ms）—— 足够区分 24fps 的帧间隔
 
@@ -1944,7 +1952,16 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     #    只看剩余会在**第一段 TTS 到达之前**就退出（实测 TTS 0 段）。
     #    另外还要留一个"一直没有 TTS"的兜底（比如这轮模型没回复）。
     got_any = False
-    quiet_since = time.monotonic()
+    # ⚠️ 「等不到 TTS」的计时**必须从 ASR final 之后才开始**。
+    #    原因：`request_stop()` 只是叫服务端收尾，ASR 的**最终结果**此刻
+    #    往往还没出来（服务端要 drain ASR 才拿得到）。而整条回复链是
+    #        ASR final → 送进 IC → 下一 tick 出 ANSWER → Agent 生成
+    #        → Agent 调 /v1/speak → TTS 合成 → tts.audio
+    #    —— Agent 是**外部服务**（HTTP + 生成耗时），几秒很正常。
+    #    早先从 request_stop 就开始计时、窗口又只有 8s，于是 ASR 明明识别到了、
+    #    IC 也出了 ANSWER、Agent 也在播，replay 却已经断开 —— 现象是
+    #    "什么都不播"，极易误判成服务端没播报（实测踩过）。
+    quiet_since = None          # None = 还没等到 ASR final，暂不计时
     # ⚠️ **不能是固定的墙钟上限**。早先写成 `while now - t_stop < drain_s`，
     #    60s 的长回复会在第 30s 被硬切 —— 与刚修好的"没播完就关"是同一类
     #    问题，只是触发条件是"回复比 drain_s 长"。
@@ -1998,9 +2015,13 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             print(f"    （{args.drain_s:.0f}s 无进展 —— 收工；"
                   f"收到 {n_resp} 段，剩余 {remain:.1f}s）")
             break
-        if not got_any and now - quiet_since > 8.0:
-            # 8s 内一段 TTS 都没来 —— 这轮大概没有回复，不必再等
-            print("    （8s 内没有 TTS 到达 —— 本轮可能无回复，收工）")
+        # ASR final 到达 = 回复链真正开始跑，从现在起才计「等不到 TTS」的钟
+        if quiet_since is None and client.asr_finals:
+            quiet_since = now
+        if (not got_any and quiet_since is not None
+                and now - quiet_since > args.wait_reply_s):
+            print(f"    （ASR final 后 {args.wait_reply_s:.0f}s 内没有 TTS 到达 "
+                  f"—— 本轮无回复，收工。若预期应有回复，把 --wait-reply-s 调大）")
             break
         if now - t_stop > hard_limit:
             print(f"  ⚠️ 收尾总时长超过 {hard_limit:.0f}s，强制退出")
@@ -2019,6 +2040,14 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         if window is not None and (window.show or window.out_path):
             # 本循环 20Hz（sleep 0.05），每轮投一帧即 ~20fps —— 与主循环的
             # 24fps 同量级，够用；再高只会把只有 8 格的渲染队列塞满、白丢帧。
+            #
+            # ⚠️ 已知局限（用 replay 验证 IC 时必看）：这里**一直投素材的
+            #    最后一帧**，而素材里人常说个不停 → `lip=HIGH` 冻在 IC 里，
+            #    IC 按 PRD §C 判「嘴还在动，不算说完」→ 一直出 `WAIT sop=06`，
+            #    **不出 ANSWER、也就没有播报**。真实场景里用户说完会闭嘴，
+            #    所以这是 replay 的模拟局限，不是产品缺陷。
+            #    → 验证「IC 决策 → Agent 播报」这条链请用**浏览器**（真麦克风），
+            #      或用说完就静音的素材。
             window.push(client.latest_face(
                 args.face_hold_ms / 1000.0, speed), client.face_src_wh)
         # ⚠️ 收尾期间也要驱动窗口 —— 否则等待的这几秒里窗口**无响应**
@@ -2125,8 +2154,13 @@ async def main_async(args) -> int:
     face_frames: List[bytes] = []
     omni_frames: List[bytes] = []
     if args.video:
-        print("  抽帧中（ffmpeg）...", flush=True)
-        face_frames = extract_frames(args.video, args.face_fps, FACE_MAX_W, FACE_MAX_H, 5)
+        try:
+            fw, fh = (int(x) for x in args.face_size.lower().split("x"))
+        except Exception:  # noqa: BLE001
+            raise SystemExit(f"--face-size 格式应为 WxH（如 640x480），"
+                             f"得到 {args.face_size!r}")
+        print(f"  抽帧中（ffmpeg，人脸 {fw}×{fh}）...", flush=True)
+        face_frames = extract_frames(args.video, args.face_fps, fw, fh, 5)
         omni_frames = extract_frames(args.video, args.omni_fps, OMNI_MAX_W, OMNI_MAX_H, 5)
 
     # 默认 wss（服务端现在跑 HTTPS）。要连老式明文服务用 --ws。
@@ -2319,10 +2353,26 @@ def main() -> None:
                    help="收尾时「多久没有进展」才放弃（秒，默认 300）。"
                         "⚠️ 它**不是总时长上限** —— 只要 TTS 还在播就继续等，"
                         "所以长回复不会被掐断（另有 drain_s×6 的硬上限兜底）")
+    p.add_argument("--wait-reply-s", type=float, default=30.0,
+                   help=(
+                       "**从 ASR final 起算**，多久等不到 TTS 就认为本轮无回复"
+                       "（秒，默认 30）。整条链是「ASR final → IC → ANSWER → "
+                       "Agent 生成 → /v1/speak → TTS」，Agent 是外部服务、"
+                       "几秒很正常，所以窗口要够宽。调小会误判成「没播报」。"
+                   ))
     p.add_argument("--bargein-at", default="",
                    help="在这些秒数模拟插话（逗号分隔），如 5,12")
     p.add_argument("--face-fps", type=float, default=DEFAULT_FACE_FPS,
                    help=f"人脸帧抽帧率（默认 {DEFAULT_FACE_FPS:.0f}）")
+    p.add_argument("--face-size", default=f"{FACE_MAX_W}x{FACE_MAX_H}",
+                   help=(
+                       f"人脸帧抽帧尺寸 WxH（默认 {FACE_MAX_W}x{FACE_MAX_H}，"
+                       "与浏览器发的 320×240 一致）。"
+                       "**人脸检测分随像素尺寸下降** —— 源片较大/人脸较远时，"
+                       "320 宽下 score 会落到 0.7x（= MEDIUM），而 IC 的迎宾"
+                       "门禁要求 HIGH（≥0.8）→ IC 一直 HOLD、不出 GREET、"
+                       "**没有任何播报**。此时调大它（如 640x480）即可。"
+                   ))
     p.add_argument("--omni-fps", type=float, default=DEFAULT_OMNI_FPS,
                    help=f"Omni 帧抽帧率（默认 {DEFAULT_OMNI_FPS:.0f}）")
     p.add_argument("--save-tts", default="", help="把服务端回来的 TTS 存成 wav 的目录")

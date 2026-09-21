@@ -177,12 +177,40 @@ class InteractionDownstream:
 
         elif isinstance(ev, AsrFinal):
             st = ev.state or {}
-            self.ic.apply(
-                "apply_asr",
-                transcript=ev.text or "",
-                asr_confidence=_conf(st.get("asr_confidence")),
-                turn_complete_confidence=_conf(st.get("turn_complete_confidence")),
-            )
+            text = (ev.text or "").strip()
+            # ⚠️⚠️ **空文本的 final 绝不能覆盖已有转写。**
+            #
+            # ASR 在一段话结束后会再补一条**收尾帧**（`2pass-offline`、
+            # `is_final=true`、**text 为空**）。早先这里无条件写
+            # `transcript=ev.text or ""`，于是那条空帧把刚拿到的转写**擦成了
+            # 空串**。后果很隐蔽：
+            #   · IC 侧 transcript='' 而 turn_complete=HIGH
+            #   · Policy 用 ('', conf) 当轮次键 → 判出一个**转写为空**的 ANSWER
+            #   · Agent 拿到空转写、生成不出内容 → **没有任何播报**
+            # 现象是「ASR 明明识别到了，却什么都不播」，而服务端日志里
+            # `apply_asr` 的文本是对的 —— 只看服务端永远查不出来（实测踩过）。
+            #
+            # 所以空文本时**只更新档位，不动 transcript**。
+            logger.debug("[%s] → IC: apply_asr text=%r asr=%s turn=%s%s",
+                         self.session_id, text[:30],
+                         _conf(st.get("asr_confidence")),
+                         _conf(st.get("turn_complete_confidence")),
+                         "" if text else "（空文本，保留上次转写）")
+            kwargs: Dict[str, Any] = {}
+            if text:
+                # 有文本 = 真正的识别结果：转写与档位一起写
+                kwargs["transcript"] = text
+                kwargs["asr_confidence"] = _conf(st.get("asr_confidence"))
+            else:
+                # 空文本 = 收尾帧：**整条都不写**，让 IC 保留上一次的结果。
+                # 连档位也不能写 —— 空帧的 asr_confidence 是 NONE，写进去会把
+                # 刚拿到的 HIGH 降级，Policy 判 `asr_confidence == LOW` 时会
+                # 误走「没听清，请您再说一遍」(SOP 01) 分支。
+                # ⚠️ 例外：`turn_complete` 要写 —— 收尾帧正是「这轮说完了」
+                #    的信号，IC 靠它推进话轮（fresh_turn → ANSWER）。
+                kwargs["turn_complete_confidence"] = _conf(
+                    st.get("turn_complete_confidence"))
+            self.ic.apply("apply_asr", **kwargs)
             self.ic.apply(
                 "apply_vad",
                 user_speaking_confidence=_conf(st.get("user_speaking_confidence")),
