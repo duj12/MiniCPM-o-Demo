@@ -936,9 +936,20 @@ class OrchestratorSession:
             #    开 ORCH_LOG_LEVEL=DEBUG 即可）。
             #    ⚠️ 往这里加日志必须放在**各 return 之前**，否则会漏掉其中
             #    一类（turnsense 那条就走 early return）。
-            logger.debug("[%s] ASR<- mode=%r text=%r is_final=%s conf=%s ts=%s",
+            # ⚠️ 拉置信度必须走 `parse_online_confidence`（先标量、后对象），
+            #    **不能只看 `msg["confidence"]`** —— 两个服务端字段形态不同：
+            #    asr-2pass(C++) 流式走标量 `online_confidence`，
+            #    Fun-ASR(Python) 走 `confidence` 对象。
+            #    早先这里只打对象，于是 C++ 的帧在日志里全显示 conf=None，
+            #    看起来像"这批帧没带置信度"，实际有值 —— 把人带偏过。
+            from .asr.client import parse_online_confidence as _poc
+            logger.debug("[%s] ASR<- mode=%r text=%r is_final=%s "
+                         "conf=%s（原始 online_conf=%s obj=%s）ts=%s",
                          self.session_id, mode, (msg.get("text") or "")[:60],
-                         msg.get("is_final"), msg.get("confidence"),
+                         msg.get("is_final"), _poc(msg),
+                         msg.get("online_confidence"),
+                         (msg.get("confidence") or {}).get("avg")
+                         if isinstance(msg.get("confidence"), dict) else None,
                          (msg.get("turnsense") or {}).get("label")
                          if isinstance(msg.get("turnsense"), dict) else None)
 

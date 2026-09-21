@@ -176,10 +176,42 @@ def main() -> int:
     # 流式文本被服务端过滤（返回了结果但文本空）→ LOW，不是 NONE
     tr = AsrStateTracker()
     s = tr.update(online("", conf=0.4))
-    check(s.asr_confidence == "LOW", "流式文本被过滤 -> LOW（有信号，只是被丢）")
+    check(s.asr_confidence == "LOW", "空帧带低分 -> LOW（有信号，只是被丢）")
 
     tr2 = AsrStateTracker()
     check(tr2.state.asr_confidence == "NONE", "没有任何信号 -> NONE")
+
+    # ⚠️ **空帧不带分数时，保留上一次的值**（实测 31366/C++：有文本的帧
+    #    一定带 online_confidence、空帧一定不带）。早先"拿不到分就置 NONE"，
+    #    于是每个空帧都擦掉上一帧刚给的分 → 信 在 HIGH/NONE 之间逐帧抖动。
+    tr = AsrStateTracker()
+    check(tr.update(online("好了现在", conf=0.854)).asr_confidence == "HIGH",
+          "有文本 0.854 -> HIGH")
+    check(tr.update(online("", conf=None)).asr_confidence == "HIGH",
+          "空帧**无分** -> 保持 HIGH（不擦掉上一帧的分数）")
+    check(tr.update(online("呃我今", conf=0.795)).asr_confidence == "MEDIUM",
+          "下一帧有文本 0.795 -> MEDIUM（正常更新）")
+
+    # 空帧**带高分**：文本因其它原因被丢，按分数正常分档、不凭空降级
+    tr = AsrStateTracker()
+    check(tr.update(online("", conf=0.85)).asr_confidence == "HIGH",
+          "空帧带 0.85 -> HIGH（按分数分档，不因文本空而降级）")
+
+    # ⚠️ **离线收尾帧同样**：空文本 + 不带分 → 保留上次（不擦成 NONE）。
+    #    与流式空帧同一口径。收尾帧（is_final=true / text 空）只表示
+    #    "这段结束了"，不代表这一轮没置信度。
+    tr = AsrStateTracker()
+    tr.update(online("今天", conf=0.9))
+    check(tr.update(offline("", conf=None)).asr_confidence == "HIGH",
+          "空文本 offline（无分）-> 保留上次 HIGH（收尾帧不擦分数）")
+    tr = AsrStateTracker()
+    tr.update(online("今天", conf=0.9))
+    check(tr.update(offline("", conf=0.85)).asr_confidence == "HIGH",
+          "空文本 offline（带 0.85）-> 按分数分档 HIGH")
+    tr = AsrStateTracker()
+    tr.update(online("今天", conf=0.9))
+    check(tr.update(offline("今天天气", conf=0.5)).asr_confidence == "LOW",
+          "有文本 offline（0.5）-> 正常更新 LOW")
 
     # ---------------- barge_in ----------------
     print("\n[barge_in_confidence] 按带文本的流式帧爬档")
@@ -195,7 +227,8 @@ def main() -> int:
     #    offline 同时是「本轮结束」，若直接关段这个 HIGH 就永远观测不到。
     check(tr.update(offline("今天吃饭了吗？", conf=0.96)).barge_in_confidence == "HIGH",
           "offline（拿到带转写的最终结果）-> 抢 HIGH")
-    # 下一拍（IC 已经收到过 HIGH 了）→ 立即 NONE
+    # 下一拍（tick 消费缓冲；IC 已收到过 HIGH）→ 立即 NONE
+    tr.expire_if_idle()
     check(tr.state.barge_in_confidence == "NONE",
           "下一拍 抢 -> NONE（本轮内量，轮结束即清）")
     # ⚠️ 跨句**不能累积**：这是实测踩过的 bug（早先只在 `_clear_all` 里重置，
@@ -240,6 +273,7 @@ def main() -> int:
     #    那个语义已废弃（一轮结束了还在报 LOW 是错的）。
     check(tr.update(offline("今天", conf=0.96)).user_speaking_confidence == "HIGH",
           "offline 那一拍 -> 说 仍 HIGH（缓冲，保证 IC 收到）")
+    tr.expire_if_idle()          # 下一拍（tick 消费缓冲）
     check(tr.state.user_speaking_confidence == "NONE",
           "下一拍 -> 说 NONE（本轮内量，轮结束即清）")
     # 低置信度被过滤 -> LOW
@@ -356,8 +390,9 @@ def main() -> int:
     tr = AsrStateTracker()
     tr.update(online("今天", conf=0.9))
     tr.update(offline("今天天气", conf=0.95))
+    tr.expire_if_idle()      # 下一拍：tick 消费掉"刚拍板"那一拍的缓冲
     s = tr.state
-    # 「本轮内」的量（`说`/`抢`）：一轮结束**立即** NONE。
+    # 「本轮内」的量（`说`/`抢`）：一轮结束（+一拍缓冲被消费后）**立即** NONE。
     # 「本轮结论」（`信`/`完`/`transcript`）：**保留**一段时间供 UI 读。
     check(s.barge_in_confidence == "NONE", "offline 后 抢 立即 NONE（本轮内）")
     check(s.user_speaking_confidence == "NONE",
@@ -404,13 +439,22 @@ def main() -> int:
     print("\n[两类语义] 本轮内（说/抢）立即清，本轮结论（完/信/text）保留")
 
     # ① 一拍缓冲：offline 那一拍说/抢仍 HIGH（保证 IC 一定收到）
+    #
+    # ⚠️ **必须模拟 recv_loop 的双读**：它对每条消息读两次快照 ——
+    #    `self._tracker.update(msg)`（内部 `return self.state`）一次，
+    #    紧接的 `on_message(msg)` 里再读一次，**后者才是发给 IC/UI 的**。
+    #    早先只在 `update()` 的返回值上断言，恰好也是 HIGH，把这个 bug
+    #    掩盖了（清空逻辑一度放在读快照路径里 → 第一次读就消耗掉缓冲，
+    #    发给 IC 的已是 NONE）。用户一眼看出来的就是这个。
     tr = AsrStateTracker()
     tr.update(online("今天"))
-    s = tr.update(offline("今天天气", conf=0.95))
+    tr.update(offline("今天天气", conf=0.95))   # 内部那次读（被丢弃）
+    s = tr.state                                # ← on_message 里给 IC 的那次
     check(s.user_speaking_confidence == "HIGH" and s.barge_in_confidence == "HIGH",
-          "offline 那一拍：说/抢 仍 HIGH（一拍缓冲，IC 必达）")
+          "offline 那一拍：说/抢 仍 HIGH（经 recv_loop 双读后仍成立，IC 必达）")
 
-    # ② 下一拍：说/抢 立即 NONE，但 完/信/text **仍在**
+    # ② 下一拍（tick）：说/抢 立即 NONE，但 完/信/text **仍在**
+    tr.expire_if_idle()
     s = tr.state
     check(s.user_speaking_confidence == "NONE" and s.barge_in_confidence == "NONE",
           "下一拍：说/抢 立即 NONE（本轮内量）")
@@ -428,18 +472,16 @@ def main() -> int:
     check(s.user_speaking_confidence == "NONE" and s.barge_in_confidence == "NONE",
           "说/抢 仍是 NONE（不因保留窗口而复活）")
 
-    # ④ tick 与读快照两条路径幂等
+    # ④ `expire_if_idle()` 重复调用不改变结果（tick 50ms 跑一次，会重复调）
     tr2 = AsrStateTracker()
     tr2.update(online("你好"))
     tr2.update(offline("你好世界", conf=0.95))
-    a = tr2.state
-    tr2.expire_if_idle()           # 显式再调一次（模拟 tick 与读快照都跑）
+    tr2.expire_if_idle()           # 第一次：消费缓冲
+    a = tr2.state.to_dict()
+    tr2.expire_if_idle()           # 第二次：无变化
     tr2.expire_if_idle()
-    b = tr2.state
-    check(a.to_dict() == b.to_dict() or
-          (b.user_speaking_confidence == "NONE"
-           and b.turn_complete_confidence == "HIGH"),
-          "tick 清空与读快照清空幂等（重复调用不改变结果）")
+    b = tr2.state.to_dict()
+    check(a == b, "expire_if_idle 重复调用幂等（tick 会反复调它）")
 
     # ⑤ 空文本的最终结果**不置** barge=HIGH（那只是 VAD 收尾帧）
     tr3 = AsrStateTracker()

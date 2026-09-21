@@ -368,7 +368,8 @@ class AsrState:
 
     ``transcript`` —— 本轮说了什么（online 增量拼接 / offline 覆盖）
     ``asr_confidence`` —— 本轮转写置信度
-        ``HIGH`` ≥0.8 · ``MEDIUM`` ≥0.6 · ``LOW`` <0.6 或文本被过滤 · ``NONE`` 无信号
+        ``HIGH`` ≥0.8 · ``MEDIUM`` ≥0.6 · ``LOW`` <0.6 · ``NONE`` 本轮还没有信号
+        ⚠️ 空文本帧若**不带**分数，**保持**上一次的值（不擦成 NONE）
     ``turn_complete_confidence`` —— 本轮说完的把握
         ``HIGH``   已拍板（offline 或 turnsense=complete）
         ``MEDIUM`` 发生过 VAD 切分但未拍板
@@ -428,13 +429,14 @@ class AsrStateTracker:
         #: 段一开始就复位；空文本的最终结果**不置位**（那只是 VAD 收尾帧，
         #: 不代表说出了内容 —— 与「空帧不擦转写」同一口径）。
         self._barge_final = False
-        #: **刚拍板、还没被读过的那一拍**（见 ``_turn_active``）。
-        #: ``_on_offline`` 置位 → 该拍的 ``说``/``抢`` 仍报 HIGH（IC 收到）
-        #: → 下一次 ``expire_if_idle()`` 清掉。保证「拿到最终结果 = 抢 HIGH」
-        #: 这个事实**至少被观测到一次**。
+        #: **刚拍板、等着被消费的那一拍**（见 ``_turn_active``）。
+        #: ``_on_offline`` 置位 → 该拍的 ``说``/``抢`` 仍报 HIGH
+        #: → 由 ``expire_if_idle()``（tick）或新消息到达时清掉。
+        #:
+        #: ⚠️ **读快照（``.state``）不会消费它** —— recv_loop 对每条消息读
+        #: 两次快照，只有后一次（``on_message`` 里那次）是发给 IC/UI 的；
+        #: 若读快照就消费，第一次读用掉缓冲、发给 IC 的已是 NONE。
         self._pending_close = False
-        #: 上面那个缓冲**是否已经被读过一次** —— 用于延后一拍再清。
-        self._pending_close_seen = False
         #: **本段**是否出过声（有过带文本的流式帧）。
         #: ⚠️ 早先它还兼管 `_user_speaking()` 在段关闭后 hold 窗口里的 LOW
         #:    判定；那个 hold 语义已废弃（一轮结束立即 NONE），现在它只剩
@@ -474,8 +476,17 @@ class AsrStateTracker:
         ⚠️ **不会影响"offline 后立刻来新一句"**：新消息一进来就自己在
         `_on_online` / `_on_offline` 里把该覆盖的覆盖掉（新 transcript、
         barge 重新计数），这条清理路径只在**没有新消息**时才起作用。
+
+        ⚠️⚠️ **这里只清「本轮结论」的超时，绝不消费 ``_pending_close``**。
+        原因：``recv_loop`` 对**每条消息读两次快照** ——
+        ``self._tracker.update(msg)``（内部 ``return self.state``）一次，
+        紧接的 ``on_message(msg)`` 里再读一次，而**后者的 ``st`` 才是发给
+        IC / UI 的那份**。若在这里消费缓冲，第一次读就把它用掉了，
+        真正的下发读到的已经是 ``NONE`` —— 「拿到最终结果 = 抢 HIGH」
+        永远到不了 IC（实测踩过，用户一眼看出来）。
+        ``_pending_close`` 只由 ``expire_if_idle()``（tick）或新消息到达消费。
         """
-        self.expire_if_idle()
+        self._expire_turn_results()
         return AsrState(
             user_speaking_confidence=self._user_speaking(),
             barge_in_confidence=self._barge_in(),
@@ -485,37 +496,27 @@ class AsrStateTracker:
         )
 
     def expire_if_idle(self) -> None:
-        """一轮结束（段关闭）后又过了 ``TURN_HOLD_MS`` ⇒ 清掉**本轮结论**。
+        """周期性推进：消费一拍缓冲 + 过期「本轮结论」。**由 tick 调用**。
 
-        ⚠️ **必须由外部周期性调用**（``session.run_tick`` 每 50ms 一次），
+        ⚠️ **必须由外部周期性调用**（``session.run_tick`` 每 50ms 一次）。
         不能只靠读快照时顺手清 —— 那条路只在**收到新 ASR 消息**时才发生，
-        而"说完一句就静音"的场景下恰恰没有新消息，于是
-        ``完``/``信``/``transcript`` 会**永远挂在那里**（实测：静音后
-        ``完`` 恒为 HIGH）。这正是本次修复的问题 A。
+        而「说完一句就静音」的场景下恰恰没有新消息（这正是问题 A）。
+        """
+        # 消费「刚拍板那一拍」的缓冲 —— 让 `说`/`抢` 从 HIGH 转 NONE。
+        # offline 那一拍已让 IC 收到过 HIGH，这里是"下一拍清"。
+        if self._pending_close and not self._seg_open:
+            self._pending_close = False
+        self._expire_turn_results()
+
+    def _expire_turn_results(self) -> None:
+        """过了 ``TURN_HOLD_MS`` ⇒ 清掉**本轮结论**（`完`/`信`/`transcript`）。
 
         条件收紧到「**不在说话**」：``_seg_open`` 为真说明新一轮已经开始了，
         此时绝不能清 —— 那会打断刚爬起来的本轮状态。
 
-        ⚠️ 只管「**本轮结论**」那三个字段（见 ``_clear_all``）。
-        ``说``/``抢`` 是「本轮内」的量，段一关就已返回 ``NONE``，
-        不依赖这个方法（也就不依赖它被按时调用）。
+        ⚠️ 只管「本轮结论」那三个字段。``说``/``抢`` 是「本轮内」的量，
+        段一关就已返回 ``NONE``，不依赖这个方法。
         """
-        # ① 消费「刚拍板那一拍」的缓冲 —— 让 `说`/`抢` 从 HIGH 转 NONE。
-        #
-        # ⚠️ **必须延后一拍**：`_pending_close` 由 `_on_offline` 置位，
-        #    而 `state` property 会先 `expire_if_idle()` 再构造快照 —— 若
-        #    这里当场清掉，offline 那一拍的快照就已经是 NONE 了，
-        #    「拿到最终结果 = 抢 HIGH」**永远观测不到**（实测踩过）。
-        #    所以置位后要**经过一次读取**才允许清：`_pending_close` 保持
-        #    True 让本拍快照报 HIGH，同时记下"已读过"，下一拍才真正清。
-        if self._pending_close and not self._seg_open:
-            if self._pending_close_seen:
-                self._pending_close = False
-                self._pending_close_seen = False
-            else:
-                self._pending_close_seen = True
-
-        # ② 「本轮结论」三个字段的过期（`完`/`信`/`transcript`）
         if self._seg_open:
             return
         if self._hold_until_ms is None:
@@ -538,7 +539,6 @@ class AsrStateTracker:
         self._barge_frames = 0
         self._barge_final = False
         self._pending_close = False
-        self._pending_close_seen = False
         self._spoke_this_segment = False
         self._segment_closed = False
         self._hold_until_ms = None
@@ -594,8 +594,8 @@ class AsrStateTracker:
             # 又不会因为 offline 不再归零而丢掉"本段已确认说出内容"。
             self._barge_frames = 0
             self._barge_final = False
-            self._pending_close = False    # 新段开始，上一轮的缓冲无意义了
-            self._pending_close_seen = False
+            # 新段开始：上一轮的"一拍缓冲"就此作废（它只在 offline 那一拍有效）
+            self._pending_close = False
             # 新的一段还没拍板。注意 `_vad_split_seen` **不清** —— 它按整轮
             # 累计，正是它把「切分之后的流式帧」标成 MEDIUM。
             self._segment_done = False
@@ -610,12 +610,22 @@ class AsrStateTracker:
             self._asr_conf = self._grade(parse_online_confidence(msg))
         else:
             # 空文本帧：要么是低置信度被服务端过滤掉，要么是纯噪声段。
-            # 有置信度且偏低 ⇒ LOW；否则没有出声证据 ⇒ NONE。
+            #
+            # ⚠️ **没有置信度时保留上一次的值，不回退 NONE。**
+            #    实测（31366 / C++）：**有文本的帧一定带 `online_confidence`，
+            #    空文本帧一定不带**。早先这里"拿不到分就置 NONE"，于是每个
+            #    空帧都把上一帧刚给的分擦掉 —— `信` 在 HIGH/NONE 之间逐帧
+            #    抖动（实测日志：0.854 → None → 0.795 → None …）。
+            #    空帧只是"这一帧没有新分数"，不代表这一轮没置信度。
             conf = parse_online_confidence(msg)
-            if conf is not None and conf < self.config.online_confidence_threshold:
-                self._asr_conf = LOW
+            if conf is None:
+                pass                      # 保留上一次的 `_asr_conf`
+            elif conf < self.config.online_confidence_threshold:
+                self._asr_conf = LOW      # 有分且偏低 ⇒ 确实没识别出来
             else:
-                self._asr_conf = NONE
+                # 有分但不低：文本却被过滤了 —— 说明服务端因其它原因丢弃
+                # （噪声段/无效段），按分数正常分档，不要凭空降级。
+                self._asr_conf = self._grade(conf)
 
     def _on_offline(self, msg: dict) -> None:
         text = (msg.get("text") or "").strip()
@@ -640,8 +650,16 @@ class AsrStateTracker:
         self._vad_split_seen = True
         self._mark_closed()
         # 离线也走同一套三档（用离线自带的 confidence.avg）—— 与流式口径
-        # 一致，用户不用记"流式看这个线、离线看那个线"
-        self._asr_conf = self._grade(parse_confidence(msg))
+        # 一致，用户不用记"流式看这个线、离线看那个线"。
+        #
+        # ⚠️ **没带分数时保留上一次的值，不擦成 NONE** —— 与流式空帧同一口径
+        #    （见 `_on_online` 里的长注释）。收尾帧（`is_final=true`、
+        #    `text` 为空）就是典型：它只是"这段结束了"，不代表这一轮没置信度。
+        #    早先无条件 `_grade(...)`，`_grade(None)` 返回 NONE，于是收尾帧
+        #    把刚拿到的分擦掉。
+        _off_conf = parse_confidence(msg)
+        if _off_conf is not None:
+            self._asr_conf = self._grade(_off_conf)
 
         # ---- 抢话：**有转写 = 确实说出了内容 → 置位（不再归零）** ----
         #
