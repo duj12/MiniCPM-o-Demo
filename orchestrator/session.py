@@ -1292,6 +1292,18 @@ class OrchestratorSession:
             await asyncio.sleep(interval)
             self.stats["ticks"] += 1
             self._check_audio_watchdog()
+            # ASR「本轮结论」的过期检查 —— **必须周期性地推**。
+            #
+            # ⚠️ 「说完一句就静音」时**没有任何新 ASR 消息**，而清空逻辑
+            #    （`expire_if_idle`）只在收到消息或读快照时才会被调用 ——
+            #    两者在静音下永不相遇，于是 `完`/`信`/`transcript` 会**永远
+            #    挂着**（实测：静音后 `完` 恒为 HIGH）。tick 是唯一与
+            #    ASR 消息无关的时钟，所以挂这里。
+            #
+            #    这与 `_check_audio_watchdog` 是**同一类坑**：那个也不能挂在
+            #    `_periodic_diag`（由 on_audio 调用，收不到音频时自己就不跑）。
+            if self.asr is not None:
+                self.asr.expire_if_idle()
             self.post_downstream(Tick(t=self.clock.now()))
 
     async def _loop_lag_probe(self) -> None:

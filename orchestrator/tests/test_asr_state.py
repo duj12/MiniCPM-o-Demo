@@ -190,13 +190,17 @@ def main() -> int:
     check(tr.update(online("了吗")).barge_in_confidence == "HIGH", "第 3 帧 -> HIGH")
     check(tr.update(online("啊")).barge_in_confidence == "HIGH", "之后保持 HIGH")
 
-    # ⚠️ **offline 必须归零**（实测踩过的 bug）
-    #    早先 `_barge_frames` 只在 `_clear_all()` 里重置，而那是**懒触发**的
-    #    （只在读 state 且 hold 过期时跑），静音期间根本不执行 —— 于是计数
-    #    **跨句累积**：句1 加 1、句2 加 1、句3 就到 HIGH。表现是
-    #    「每句话刚开始临时结果就已经是 HIGH」（真机复现）。
-    check(tr.update(offline("今天吃饭了吗？", conf=0.96)).barge_in_confidence == "NONE",
-          "offline 之后 barge 归零（下一句从 LOW 重新爬）")
+    # ⚠️ **offline 那一拍 = HIGH**（新语义：拿到带转写的最终结果 = 确实
+    #    说出了内容）。这是"至少让 IC 收到一次 HIGH"的一拍缓冲 ——
+    #    offline 同时是「本轮结束」，若直接关段这个 HIGH 就永远观测不到。
+    check(tr.update(offline("今天吃饭了吗？", conf=0.96)).barge_in_confidence == "HIGH",
+          "offline（拿到带转写的最终结果）-> 抢 HIGH")
+    # 下一拍（IC 已经收到过 HIGH 了）→ 立即 NONE
+    check(tr.state.barge_in_confidence == "NONE",
+          "下一拍 抢 -> NONE（本轮内量，轮结束即清）")
+    # ⚠️ 跨句**不能累积**：这是实测踩过的 bug（早先只在 `_clear_all` 里重置，
+    #    而那是懒触发的，静音期间不执行 → 句3 刚开始就 HIGH）。
+    #    现在帧数在**段开始时**重置（见 `_on_online`），所以不依赖 offline 归零。
 
     # 三句连续 —— 每句都要从 LOW 起，不能累积
     tr = AsrStateTracker()
@@ -230,9 +234,14 @@ def main() -> int:
           "空文本流式帧（盲窗）-> MEDIUM，不是 NONE")
     check(tr.update(online("今天")).user_speaking_confidence == "HIGH",
           "段内有文本 -> HIGH")
-    # 关键：offline 到达后用户可能还在说下半句，不能掉到 NONE
-    check(tr.update(offline("今天", conf=0.96)).user_speaking_confidence == "LOW",
-          "段关闭后仍在 hold 窗口 -> LOW（不闪烁到 NONE）")
+    # ⚠️ offline 那一拍 `说` 仍报 HIGH（一拍缓冲，让 IC 一定收到
+    #    "用户刚才在说话 + 确实说出了内容"这个组合）；下一拍才 NONE。
+    #    早先这里断言 LOW（"用户可能还在说下半句"的防闪烁保持窗口），
+    #    那个语义已废弃（一轮结束了还在报 LOW 是错的）。
+    check(tr.update(offline("今天", conf=0.96)).user_speaking_confidence == "HIGH",
+          "offline 那一拍 -> 说 仍 HIGH（缓冲，保证 IC 收到）")
+    check(tr.state.user_speaking_confidence == "NONE",
+          "下一拍 -> 说 NONE（本轮内量，轮结束即清）")
     # 低置信度被过滤 -> LOW
     tr2 = AsrStateTracker()
     tr2.update(online("今天", conf=0.9))
@@ -321,13 +330,22 @@ def main() -> int:
           "新段起来后 user_speaking 回到 HIGH（不是卡在 LOW）")
     check(seen[-1].transcript == "今天的说出去看的风景",
           "第二轮转写正确覆盖")
-    # ⚠️ barge **每句 offline 后归零**（下一句从 LOW 重新爬）。
-    #    早先这里断言"跨句累计、不重置"—— 那正是"每句话刚开始就 HIGH"的 bug。
+    # ⚠️ barge 的**新语义**（本次重构）：
+    #    · 段内按「带文本的流式帧」数爬档：1→LOW / 2→MEDIUM / 3+→HIGH
+    #    · offline **拿到带转写的最终结果** → 本段 HIGH（不再归零！）
+    #    · 段一关（本轮结束）→ **立即 NONE**
+    #    所以要分两个视角看：`update()` 的**返回值**是"该消息处理后"的快照，
+    #    而段关闭后 `说`/`抢` 已 NONE。
+    # seen[2] 是 REAL_TURNSENSE_CXX —— turnsense 消息**关段但不带转写**，
+    # 所以那一拍 `抢` 就是 NONE（段关了、且没有"说出内容"的证据）。
+    # 这正是「空文本不置 _barge_final」该有的表现。
     check([s.barge_in_confidence for s in seen[:4]] ==
-          ["LOW", "MEDIUM", "MEDIUM", "NONE"],
-          f"句1：两帧爬到 MEDIUM，offline 归零（实际 {[s.barge_in_confidence for s in seen[:4]]}）")
-    check([s.barge_in_confidence for s in seen[4:]] == ["LOW", "MEDIUM", "NONE"],
-          f"句2：又从 LOW 重新爬（实际 {[s.barge_in_confidence for s in seen[4:]]}）")
+          ["LOW", "MEDIUM", "NONE", "HIGH"],
+          f"句1：两帧爬到 MEDIUM；turnsense 关段 -> NONE；"
+          f"offline（有转写）-> HIGH（实际 {[s.barge_in_confidence for s in seen[:4]]}）")
+    check([s.barge_in_confidence for s in seen[4:]] == ["LOW", "MEDIUM", "HIGH"],
+          f"句2：从 LOW 重新爬（不跨句累积）；offline -> HIGH"
+          f"（实际 {[s.barge_in_confidence for s in seen[4:]]}）")
 
     # ---------------- 一句结束后状态要清空 ----------------
     # ⚠️ 这是实测踩过的 bug：状态机是**纯事件驱动**的，所有字段只在
@@ -339,12 +357,12 @@ def main() -> int:
     tr.update(online("今天", conf=0.9))
     tr.update(offline("今天天气", conf=0.95))
     s = tr.state
-    # `抢` 在 offline 时**归零**（下一句重新爬），但 `信` 保留着本段的
-    # 最终置信度（那是有用的信息，不该跟着清）
-    check(s.barge_in_confidence == "NONE", "offline 后 抢 归零")
-    check(s.asr_confidence != "NONE", "offline 后 信 仍保留本段结果（可看）")
-    check(s.user_speaking_confidence == "LOW",
-          "offline 后在 hold 窗口内 说=LOW（不是 NONE）")
+    # 「本轮内」的量（`说`/`抢`）：一轮结束**立即** NONE。
+    # 「本轮结论」（`信`/`完`/`transcript`）：**保留**一段时间供 UI 读。
+    check(s.barge_in_confidence == "NONE", "offline 后 抢 立即 NONE（本轮内）")
+    check(s.user_speaking_confidence == "NONE",
+          "offline 后 说 立即 NONE（本轮内）")
+    check(s.asr_confidence != "NONE", "offline 后 信 仍保留本段结果（本轮结论）")
 
     # 模拟 hold 窗口过期（不去真等 1.2s，直接压时间戳）
     tr._hold_until_ms = 0
@@ -380,6 +398,65 @@ def main() -> int:
     check(set(d) == {"user_speaking_confidence", "barge_in_confidence",
                      "transcript", "asr_confidence", "turn_complete_confidence"},
           "五个字段齐全")
+
+    # ---------------- 「本轮内」vs「本轮结论」两类语义 ----------------
+    # 这是本次重构的核心约定，单独一节锁住，防止以后被实现成一样的。
+    print("\n[两类语义] 本轮内（说/抢）立即清，本轮结论（完/信/text）保留")
+
+    # ① 一拍缓冲：offline 那一拍说/抢仍 HIGH（保证 IC 一定收到）
+    tr = AsrStateTracker()
+    tr.update(online("今天"))
+    s = tr.update(offline("今天天气", conf=0.95))
+    check(s.user_speaking_confidence == "HIGH" and s.barge_in_confidence == "HIGH",
+          "offline 那一拍：说/抢 仍 HIGH（一拍缓冲，IC 必达）")
+
+    # ② 下一拍：说/抢 立即 NONE，但 完/信/text **仍在**
+    s = tr.state
+    check(s.user_speaking_confidence == "NONE" and s.barge_in_confidence == "NONE",
+          "下一拍：说/抢 立即 NONE（本轮内量）")
+    check(s.turn_complete_confidence == "HIGH" and s.asr_confidence != "NONE"
+          and s.transcript == "今天天气",
+          "同一拍：完/信/text 仍在（本轮结论，保留供 UI 读）")
+
+    # ③ 超过 TURN_HOLD_MS 后，本轮结论才清
+    tr._hold_until_ms = 0          # 压时间戳，不等真时间
+    tr.expire_if_idle()
+    s = tr.state
+    check(s.turn_complete_confidence == "NONE" and s.asr_confidence == "NONE"
+          and s.transcript == "",
+          "超过保留窗口：完/信/text 一并清空")
+    check(s.user_speaking_confidence == "NONE" and s.barge_in_confidence == "NONE",
+          "说/抢 仍是 NONE（不因保留窗口而复活）")
+
+    # ④ tick 与读快照两条路径幂等
+    tr2 = AsrStateTracker()
+    tr2.update(online("你好"))
+    tr2.update(offline("你好世界", conf=0.95))
+    a = tr2.state
+    tr2.expire_if_idle()           # 显式再调一次（模拟 tick 与读快照都跑）
+    tr2.expire_if_idle()
+    b = tr2.state
+    check(a.to_dict() == b.to_dict() or
+          (b.user_speaking_confidence == "NONE"
+           and b.turn_complete_confidence == "HIGH"),
+          "tick 清空与读快照清空幂等（重复调用不改变结果）")
+
+    # ⑤ 空文本的最终结果**不置** barge=HIGH（那只是 VAD 收尾帧）
+    tr3 = AsrStateTracker()
+    tr3.update(online("喂"))
+    s = tr3.update(offline("", conf=None))
+    check(s.barge_in_confidence != "HIGH",
+          f"空文本 final 不置 抢=HIGH（实际 {s.barge_in_confidence}）")
+
+    # ⑥ TURN_HOLD_MS 可被环境变量覆盖
+    import importlib
+    import os as _os
+    _os.environ["ORCH_ASR_TURN_HOLD_MS"] = "2500"
+    import orchestrator.asr.client as _c
+    importlib.reload(_c)
+    check(_c.TURN_HOLD_MS == 2500, "ORCH_ASR_TURN_HOLD_MS 覆盖生效")
+    _os.environ.pop("ORCH_ASR_TURN_HOLD_MS", None)
+    importlib.reload(_c)
 
     print("=" * 68)
     if _failures:

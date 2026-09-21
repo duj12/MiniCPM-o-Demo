@@ -401,10 +401,21 @@ float32，只有 ASR 要 int16 —— 服务端转一次优于浏览器转了再
 {"type":"tts.audio","response_id":"r1","seq":0,"audio_base64":"..."}  // int16 PCM 24k
 {"type":"tts.end","response_id":"r1"}
 {"type":"tts.cancel","response_id":"r1","reason":"bargein"}
-{"type":"asr","phase":"partial|final","text":"...","t_ms":0}
+{"type":"asr","phase":"partial|final","text":"...","t_ms":0,"state":{...}}
 {"type":"face.state","tracks":[...],"identity":{...}}
 {"type":"error","code":"...","message":"..."}
 ```
+
+**`asr` 消息的 `state`** 是五个状态量的快照，分**两类**（清空时机不同）：
+
+| 类别 | 字段 | 一轮结束后 |
+|---|---|---|
+| **本轮内** | `说` `user_speaking_confidence`、`抢` `barge_in_confidence` | **立即** `NONE` |
+| **本轮结论** | `完` `turn_complete_confidence`、`信` `asr_confidence`、`text` `transcript` | **保留 1s** 供 UI 读 |
+
+取值域统一 `HIGH`/`MEDIUM`/`LOW`/`NONE`。
+⚠️ **完整取值表见 [`docs/asr-state.md`](docs/asr-state.md)**（权威）——
+这里不重复贴，避免两处漂移。
 
 ### ⚠️⚠️ 参考轨的播出时刻必须由浏览器**承诺**（本轮修复的核心）
 

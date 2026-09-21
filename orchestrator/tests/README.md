@@ -135,8 +135,24 @@ alpha predictor 里 k=10 帧 ≈ **100ms** 的学习式 lookback。
 - `segment_start`/`segment_end` 毫秒；`speech_duration` **秒**
 - ⚠️ **条件触发，不是每段都发**：合成信号触发 1 次，真实语音 **0 次** → 下游必须容忍缺失
 
-**部分结果延迟**：首个 `2pass-online` **950–1450ms** —— 高于 Policy 实时决策的理想值，
-**所以 barge-in 不能依赖 ASR**（走本地 VAD + 人脸唇动，见决策 3）。
+**部分结果延迟**：首个 `2pass-online` **950–1450ms** —— 高于 Policy 实时决策的理想值。
+
+**barge-in 的两个条件分工**（⚠️ 早先这里写的是「barge-in 不能依赖 ASR，走本地
+VAD + 人脸唇动」—— 那与实现不符，也已经不是当前口径）：
+
+| 谁 | 判什么 |
+|---|---|
+| **ASR**（本仓库归纳的 `抢`） | 用户**确实说出了内容**：带文本的流式帧数 / 拿到带转写的最终结果 |
+| **IC**（`barge_yield_signal`） | **视觉上在说**：`face HIGH ∧ lip≥MEDIUM` |
+
+两者是**与**关系，不是二选一 —— IC 的 SOP 07 判据就是
+`抢≥MEDIUM ∧ face HIGH ∧ lip≥MEDIUM`。ASR 侧的延迟由「段内爬档」补偿
+（1 帧即 `LOW`、2 帧 `MEDIUM`），不必等最终结果。
+
+⚠️ 那个「本地 VAD」信号（`session._raw_recent`）**目前是只写不读的死代码** ——
+它的注释写着「barge-in 检测用」，但实际没用上。当前设计不依赖它。
+
+**取值约定（权威）**：[`docs/asr-state.md`](../docs/asr-state.md)。
 
 ### TTS（`192.168.88.253:31058`，gRPC）
 
