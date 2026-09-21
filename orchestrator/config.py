@@ -114,6 +114,12 @@ class Settings:
     #: Agent Platform 地址（IC 的四类 Action 派给它）
     agent_url: str = field(default_factory=lambda: os.environ.get(
         "ORCH_AGENT_URL", "http://192.168.89.102:8081"))
+    #: IC 决策下发给客户端（UI / replay JSONL）的**稳态心跳间隔**（秒）。
+    #: 状态变化时**立即**下发，不受它影响 —— 这个值只管「状态没变时多久
+    #: 补一条」，用来证明决策还在跑、viz 时间轴不会看起来断掉。
+    #: 设 0 = 关掉心跳（只在变化时发）。
+    ic_report_interval_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_IC_REPORT_S", "10")))
 
     # TTS 参数
     tts_type: str = "mltts"

@@ -260,12 +260,16 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             from orchestrator.protocol import IcDisplay
 
             def _on_ic_action(atype: str, sop, text) -> None:
-                """IC 的决策 → UI / replay。**每个 tick 都调，含常见态。**
+                """IC 的决策 → UI / replay。**含 LISTEN/WAIT/HOLD 这些常见态。**
 
                 ⚠️ 早先注释写的是「只在非常见态回调」—— 那是**服务端提前
-                return 造成的假象**，不是有意设计。缺少 LISTEN/WAIT/HOLD
-                会让 viz 的 IC 时间轴断成一段一段，看不出 Policy 一直在等。
-                现在全量下发（不去重、不节流），客户端拿到完整决策流。
+                return 造成的假象**，不是有意设计。缺少常见态会让 viz 的
+                IC 时间轴断成一段一段，看不出 Policy 一直在等。
+
+                下发频率由 ``InteractionDownstream`` 控制：**状态变化立刻发，
+                不变则每 ``ORCH_IC_REPORT_S``（默认 10s）补一条心跳** ——
+                不是每 tick 都发（那是 50ms 一条，一场会话上万条且绝大多数
+                重复）。
                 """
                 sess._send_display(IcDisplay(
                     action=atype, sop=sop, text=text,
@@ -274,7 +278,8 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
 
             ic_ds = InteractionDownstream(
                 ic_target, agent_target, session_id=sid,
-                on_action=_on_ic_action)
+                on_action=_on_ic_action,
+                report_interval_s=cfg.ic_report_interval_s)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():

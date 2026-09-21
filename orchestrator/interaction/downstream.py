@@ -68,14 +68,23 @@ class InteractionDownstream:
     #: 只剩下 6 种非常见态，Policy「一直在 HOLD/LISTEN/WAIT」看不出来。
     QUIET_TYPES = ("LISTEN", "WAIT", "HOLD")
 
+    #: 状态**没变**时的定时上报间隔（秒）。
+    #: 变化时立刻发；不变时每这么久补一条心跳，证明「决策还在跑」。
+    #: 10s 是「既能看出还活着、又不制造噪声」的折中 —— 一场 6 分钟会话的
+    #: 稳态心跳约 36 条，而状态切换点仍是零延迟。
+    REPORT_INTERVAL_S = 10.0
+
     def __init__(self, ic_target: str, agent_url: str,
                  session_id: str = "",
-                 on_action: Optional[Any] = None) -> None:
+                 on_action: Optional[Any] = None,
+                 report_interval_s: Optional[float] = None) -> None:
         self.ic = InteractionClient(ic_target)
         self.agent = AgentClient(agent_url)
         self.session_id = session_id
         #: `(action_type, sop, text)` 回调 —— 给 UI/日志用（可选）
         self._on_action = on_action
+        if report_interval_s is not None:
+            self.REPORT_INTERVAL_S = float(report_interval_s)
         #: 最近一次 ASR 的 people 信息 —— ANSWER 时要带给 Agent
         self._transcript = ""
         self._identity_id: Optional[str] = None
@@ -84,6 +93,11 @@ class InteractionDownstream:
         self._last_tick: Optional[float] = None
         #: 最近一次 Action（去重，避免同一个 ANSWER 重复派发）
         self._last_action_key: Optional[tuple] = None
+        #: 上一次**下发**给客户端的 Action 键（(atype, sop)）。
+        #: 用来判「状态变没变」—— 变了立刻发，没变就等下一个心跳时刻。
+        self._last_reported_key: Optional[tuple] = None
+        #: 上一次下发的单调时刻（节流用）
+        self._last_report_at: float = 0.0
         #: 给 UI/日志看的 Action 流
         self.actions: List[Dict[str, Any]] = []
         self.counts: Dict[str, int] = {}
@@ -278,6 +292,32 @@ class InteractionDownstream:
             # 表达层事实**只有一个权威写入点**（见 ``_notify_playback_active``）。
             pass
 
+    def _should_report(self, atype: str, sop: Optional[str]) -> bool:
+        """这次决策要不要下发给客户端 —— **变化时立刻发，不变时定时刷**。
+
+          · `(atype, sop)` 与上次不同 → 立即发（状态真的切了）
+          · 相同 → 距上次下发超过 `REPORT_INTERVAL_S` 才补一条心跳
+
+        为什么比 `(atype, sop)` 而不是只比 `atype`：`WAIT` 带不同 `sop`
+        代表**不同的等待原因**（06=嘴还在动、21=路人/脸不够清），只比
+        atype 会把这种切换吞掉。
+
+        为什么不比 `transcript`：它在稳态下**每拍都在变**（流式累积），
+        拿它当判据等于没节流。但下发时会把当前内容带上（回调里取
+        `action.text`），所以信息不丢。
+        """
+        import time
+        now = time.monotonic()
+        key = (atype, sop)
+        if key != self._last_reported_key:
+            self._last_reported_key = key
+            self._last_report_at = now
+            return True
+        if now - self._last_report_at >= self.REPORT_INTERVAL_S:
+            self._last_report_at = now
+            return True
+        return False
+
     # ------------------------------------------------------------------ #
     #  Tick → 要决策
     # ------------------------------------------------------------------ #
@@ -313,18 +353,24 @@ class InteractionDownstream:
         key = (atype, sop, getattr(action, "transcript", None))
         fresh = key != self._last_action_key
 
-        # ---- 全量下发：**每个 tick 的决策都推给客户端** ----
+        # ---- 下发给客户端：**变化时立刻发，不变时定时刷** ----
         #
-        # ⚠️ 早先这里对常见态**直接 `return []`**（且在所有分支之前），于是
-        #    `on_action` 根本收不到 LISTEN/WAIT/HOLD —— viz 的 IC 时间轴上
-        #    只剩 6 种非常见态，Policy「一直在 HOLD」这段过程完全看不出来。
+        # ⚠️ 演进过程（两次都踩过，别再退回）：
+        #   ① 最早对常见态**直接 `return []`**（且在调 `_on_action` 之前），
+        #      于是客户端根本收不到 LISTEN/WAIT/HOLD —— viz 的 IC 时间轴上
+        #      只剩 6 种非常见态，Policy「一直在等待」这段过程完全看不出来。
+        #   ② 改成每 tick 全量发（50ms 一条）。时间轴没缺口了，但量大
+        #      （一场 6 分钟约 7000 条），而且**绝大多数是重复的**——
+        #      稳态下 IC 连着几百拍返回同一个 HOLD，逐条发没有信息量。
         #
-        # 现在**不去重、不节流**：IC 每 50ms 返回什么就推什么，客户端拿到的是
-        # 完整的决策流（viz 时间轴没有缺口，能直接看 Policy 是否在推进）。
-        # 代价是量大（一场 6 分钟会话约 7000 条），所以：
-        #   · 落盘由客户端决定（replay 的 --ic-events-out）
-        #   · **不进 downstream 事件队列**（那是控制流，会拖慢 tick）
-        if self._on_action is not None:
+        # 现在：**状态变了立刻发；没变则每 `REPORT_INTERVAL_S` 补一条心跳。**
+        #   · 变化 = (atype, sop) 不同 → 立即下发，零延迟（viz 看得到切换点）
+        #   · 不变 = 每 REPORT_INTERVAL_S 一条 → 证明「决策还在跑」，而非卡死
+        #   · transcript 变不算"变化"（它在稳态下每拍都在变），但**内容会带上**
+        #
+        # 心跳频率由 `REPORT_INTERVAL_S` 控制，会话建立时可用
+        # `report_interval_s` 覆盖（`InteractionDownstream` 的构造参数）。
+        if self._on_action is not None and self._should_report(atype, sop):
             try:
                 self._on_action(atype, sop, getattr(action, "text", None))
             except Exception:  # noqa: BLE001
