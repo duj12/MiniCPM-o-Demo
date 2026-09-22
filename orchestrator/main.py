@@ -259,22 +259,31 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             from orchestrator.interaction import InteractionDownstream
             from orchestrator.protocol import IcDisplay
 
-            def _on_ic_action(atype: str, sop, text) -> None:
+            def _on_ic_action(atype: str, sop, text) -> bool:
                 """IC 的决策 → UI / replay。**含 LISTEN/WAIT/HOLD 这些常见态。**
+
+                **返回是否真的投递成功** —— 调用方（``_should_report``）只有在
+                成功后才记「已上报」。否则这条动作就永远丢了（见下）。
 
                 ⚠️ 早先注释写的是「只在非常见态回调」—— 那是**服务端提前
                 return 造成的假象**，不是有意设计。缺少常见态会让 viz 的
                 IC 时间轴断成一段一段，看不出 Policy 一直在等。
 
                 下发频率由 ``InteractionDownstream`` 控制：**状态变化立刻发，
-                不变则每 ``ORCH_IC_REPORT_S``（默认 10s）补一条心跳** ——
-                不是每 tick 都发（那是 50ms 一条，一场会话上万条且绝大多数
-                重复）。
+                不变则每 ``ORCH_IC_REPORT_S``（默认 10s）补一条心跳**。
+
+                ⚠️⚠️ 用 ``critical=True`` 投递 —— **IC 动作不允许被丢**。
+                `GREET`/`ANSWER` 这类动作**一瞬就过去**（下一拍就变 HOLD），
+                丢了之后：
+                  · 离线判题（D16/D18）只看客户端收到的 `ic` 消息 → 记成失败
+                  · 而**播报其实正常发生了**（走 `_dispatch` → `Speak` → TTS
+                    的另一条路）→ 现象是「喇叭响了、dump 里却没有 GREET」，
+                    极难定位（实测踩过）。
                 """
-                sess._send_display(IcDisplay(
+                return sess._send_display(IcDisplay(
                     action=atype, sop=sop, text=text,
                     t_ms=int(sess.clock.seconds() * 1000),
-                ))
+                ), critical=True)
 
             ic_ds = InteractionDownstream(
                 ic_target, agent_target, session_id=sid,

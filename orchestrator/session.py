@@ -1057,16 +1057,74 @@ class OrchestratorSession:
 
         self._trigger_task = asyncio.create_task(_do())
 
-    def _send_display(self, msg) -> None:
-        """投递纯 UI 消息（不参与控制流）。
+    def _send_display(self, msg, *, critical: bool = False) -> bool:
+        """投递 UI 消息。返回**是否入队成功**。
 
         ASR 的回调是同步的，不能在里面 await；入队后由 ``run_display``
-        异步取出发送。队列满则丢弃 UI 消息（它不影响正确性）。
+        异步取出发送。
+
+        ``critical=True`` 的消息（**IC 动作**）**不允许丢** —— 队列满时
+        腾掉最旧的**可丢**消息给它让位。
+
+        ⚠️ 为什么 IC 动作必须特殊对待：离线判题（D16/D18）**只看客户端
+        收到的 `ic` 消息**。`GREET` 这类动作**一瞬就过去**（下一拍就变
+        `HOLD`），一旦这条显示消息被丢，判题侧永远看不到 —— 而播报其实
+        正常发生了（走的是另一条路：`_dispatch` 返回 `Speak`）。现象是
+        「喇叭响了、dump 里没有 GREET」，极难定位（实测踩过）。
+
+        早先所有消息同等对待、满了就丢、且**丢弃只记一个从没被暴露过的
+        计数器** —— 所以丢了也无人知晓。
         """
         try:
             self._display_q.put_nowait(msg)
+            return True
         except asyncio.QueueFull:
-            self.stats["display_dropped"] = self.stats.get("display_dropped", 0) + 1
+            if not critical:
+                self.stats["display_dropped"] = \
+                    self.stats.get("display_dropped", 0) + 1
+                return False
+            # 关键消息：腾掉最旧的一条**非关键**消息让位。
+            # 直接丢队首风险太大（可能又丢了一条关键消息），所以从队首
+            # 找到第一条非关键的丢掉。
+            return self._force_enqueue_critical(msg)
+
+    def _force_enqueue_critical(self, msg) -> bool:
+        """队列满时为关键消息腾位：丢掉最早的**非关键**消息。
+
+        关键消息带 ``_critical`` 标记；非关键的（人脸/ASR 字幕/SessionStats）
+        丢一条不影响正确性 —— 它们下一拍还会再来（或被下游容忍缺失）。
+        """
+        q = self._display_q
+        kept: list = []
+        dropped_one = False
+        while True:
+            try:
+                old = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not dropped_one and not getattr(old, "_critical", False):
+                dropped_one = True          # 丢掉它，给新消息腾位
+                self.stats["display_evicted"] = \
+                    self.stats.get("display_evicted", 0) + 1
+                continue
+            kept.append(old)
+        # 把保留的放回去，再放新的关键消息
+        for m in kept:
+            try:
+                q.put_nowait(m)
+            except asyncio.QueueFull:
+                break
+        try:
+            q.put_nowait(msg)
+            return True
+        except asyncio.QueueFull:
+            # 全队列都是关键消息 —— 这种情况不该发生（关键消息很少），
+            # 真发生了就记下来，别静默丢。
+            self.stats["display_dropped_critical"] = \
+                self.stats.get("display_dropped_critical", 0) + 1
+            logger.error("[%s] 显示队列全是关键消息，无法腾位 —— "
+                         "这条 IC 动作会丢（判题侧可能漏记）", self.session_id)
+            return False
 
     async def run_face_signals(self) -> None:
         """把人脸线程的回调转成 downstream 事件 + UI 消息。
@@ -1345,6 +1403,13 @@ class OrchestratorSession:
         if cur == self._last_asr_pushed:
             return
         self._last_asr_pushed = cur
+        # ⚠️ 排查用：这条日志能直接回答「静音后到底推没推」。
+        #    （默认 DEBUG；前面几次排查都因为看不到这一步而只能推断）
+        logger.debug("[%s] ASR 状态变化 → 推下游: 说=%s 抢=%s 信=%s 完=%s text=%r",
+                     self.session_id, cur.get("user_speaking_confidence"),
+                     cur.get("barge_in_confidence"), cur.get("asr_confidence"),
+                     cur.get("turn_complete_confidence"),
+                     (cur.get("transcript") or "")[:20])
 
         from .downstream.interface import AsrStateUpdate
         from .protocol import AsrDisplay

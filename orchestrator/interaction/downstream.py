@@ -96,6 +96,9 @@ class InteractionDownstream:
         #: 上一次**下发**给客户端的 Action 键（(atype, sop)）。
         #: 用来判「状态变没变」—— 变了立刻发，没变就等下一个心跳时刻。
         self._last_reported_key: Optional[tuple] = None
+        #: 「上一次该发的动作**没送出去**」—— 下一拍重试同一条。
+        #: 专门救 `GREET` 这类一瞬就过去的动作（只出现一两拍，丢了就没了）。
+        self._pending_report: bool = False
         #: 上一次下发的单调时刻（节流用）
         self._last_report_at: float = 0.0
         #: 给 UI/日志看的 Action 流
@@ -325,18 +328,34 @@ class InteractionDownstream:
         为什么不比 `transcript`：它在稳态下**每拍都在变**（流式累积），
         拿它当判据等于没节流。但下发时会把当前内容带上（回调里取
         `action.text`），所以信息不丢。
+
+        ⚠️ **这里只"判断该不该发"，不记账** —— 记账由调用方在**确认送出后**
+        执行（见 `_dispatch`）。早先在这里就更新 `_last_reported_key`，于是
+        送失败时标记已置位、下一拍不再重发 —— 恰好丢掉 `GREET` 这类
+        一瞬就过去的动作（D16/D18 判题失败的根因）。
         """
         import time
         now = time.monotonic()
         key = (atype, sop)
         if key != self._last_reported_key:
-            self._last_reported_key = key
-            self._last_report_at = now
             return True
-        if now - self._last_report_at >= self.REPORT_INTERVAL_S:
-            self._last_report_at = now
+        # ⚠️ key 相同，但**上一次没送出去**（`_pending_report`）→ 重试。
+        #    这条路径专门救 `GREET` 这类一瞬就过去的动作：它只出现一两拍，
+        #    那一两拍内送不出去就永远没了。
+        #
+        #    ⚠️ 重试**只针对"没送出去"**，不是"每次都发" —— 早先写成
+        #    「一瞬动作永不走心跳节流」，结果**送出成功后仍每拍重发**，
+        #    IC / replay 会收到重复的 GREET（实测发现）。
+        if self._pending_report:
             return True
-        return False
+        return now - self._last_report_at >= self.REPORT_INTERVAL_S
+
+    def _mark_reported(self, atype: str, sop: Optional[str]) -> None:
+        """确认送出后记账 —— 清掉"待重试"标记。"""
+        import time
+        self._last_reported_key = (atype, sop)
+        self._last_report_at = time.monotonic()
+        self._pending_report = False
 
     # ------------------------------------------------------------------ #
     #  Tick → 要决策
@@ -390,11 +409,31 @@ class InteractionDownstream:
         #
         # 心跳频率由 `REPORT_INTERVAL_S` 控制，会话建立时可用
         # `report_interval_s` 覆盖（`InteractionDownstream` 的构造参数）。
+        # ⚠️⚠️ **只有"真的送出去了"才记 `_last_reported_key`**。
+        #
+        # 早先这里先记 key、再调 `_on_action` —— 而 `_on_action` 底层是
+        # **可丢的显示队列**（满了就丢）。于是：
+        #   ① 队列满 → 这条被丢
+        #   ② 但 key 已经记成「已上报」
+        #   ③ 下一拍动作变成 `HOLD`，key 也变了 → **永远不会补发那条**
+        # 恰好丢掉的就是 `GREET` 这种**一瞬就过去**的动作，表现为
+        # 「喇叭响了、离线 dump 里却没有 GREET」（D16/D18 判题失败，实测踩过）。
+        #
+        # 现在：送失败就**不记 key**，下一拍会重试同一条，直到送达。
+        # （IC 动作队列已改为不丢，正常情况下一次就成；这是第二道保险。）
         if self._on_action is not None and self._should_report(atype, sop):
             try:
-                self._on_action(atype, sop, getattr(action, "text", None))
+                ok = self._on_action(atype, sop, getattr(action, "text", None))
             except Exception:  # noqa: BLE001
-                pass
+                ok = False
+            if ok is False:
+                # 没送出去 —— 置「待重试」，下一拍会重发**同一条**动作。
+                self._pending_report = True
+                logger.warning("[%s] IC 动作 %s（sop=%s）**下发失败**，"
+                               "下一拍重试 —— 该动作若丢失，判题侧会漏记",
+                               self.session_id, atype, sop)
+            else:
+                self._mark_reported(atype, sop)
 
         # 下面只处理「要不要产生动作」—— 与上报无关
         if atype in self.QUIET_TYPES:
