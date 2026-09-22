@@ -78,7 +78,9 @@ class InteractionDownstream:
                  session_id: str = "",
                  on_action: Optional[Any] = None,
                  report_interval_s: Optional[float] = None) -> None:
-        self.ic = InteractionClient(ic_target)
+        # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
+        # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
+        self.ic = InteractionClient(ic_target, owner_key=session_id)
         self.agent = AgentClient(agent_url)
         self.session_id = session_id
         #: `(action_type, sop, text)` 回调 —— 给 UI/日志用（可选）

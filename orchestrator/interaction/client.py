@@ -33,16 +33,37 @@ _QUEUE_MAX = 256
 _CALL_TIMEOUT = 2.0
 
 
+#: 当前**唯一**被允许驱动 IC 的客户端实例（模块级单例）。
+#:
+#: ⚠️ IC 的 ``InteractionState`` 是服务端**全局一份**，没有 session 概念 ——
+#: 所以「谁在驱动它」必须**全局唯一**。两个会话同时驱动同一个 IC 时：
+#:   · 两者的 ``tick()`` 一起推进同一个状态机 → ``dt`` 累加翻倍
+#:   · 各自的 ``apply_action`` 互相覆盖 ``mode`` / ``barge_hold_ms`` 等
+#:   · 一方写进去的 ``turn=HIGH``，可能被另一方的 ``apply_action`` 先冲掉
+#: 现象是「ASR 识别完美、也送进 IC 了，却没有任何回复」—— 而 IC 自己的
+#: 日志里**明明出过 ANSWER**（被另一路的 tick 领走了）。实测踩过。
+_OWNER: Optional["InteractionClient"] = None
+
+
 class InteractionClient:
     """一路会话对应一个实例（IC 的状态是**进程内单例**，非按会话隔离）。
 
     ⚠️ IC 的 ``InteractionState`` 是服务端**全局一份**，没有 session 概念。
-    多个并发会话会互相覆盖状态 —— 当前部署是单会话场景，先按此使用；
-    要多路并发需要 IC 侧支持多实例（不在本次范围）。
+    所以本类实现了「**单一驱动者**」约束：同一时刻只允许一个实例真正读写
+    IC，其余实例被**挂起**（``suspended``）。
+
+    为什么要挂起而不是直接不管：会话**收尾很慢**（等 ASR/Omni drain，实测
+    10~20 秒），而新会话立刻就起来了 —— 这段重叠**必然发生**。若不挂起旧
+    实例，两个会话会同时 tick 同一个 IC，互相踩状态（见 ``_OWNER`` 的注释）。
+
+    多路真并发需要 IC 侧支持多实例（不在本次范围）。
     """
 
-    def __init__(self, target: str = "localhost:50051") -> None:
+    def __init__(self, target: str = "localhost:50051",
+                 owner_key: str = "") -> None:
         self.target = target
+        #: 谁在用这个实例（会话 id）—— 只为日志可读
+        self.owner_key = owner_key or "?"
         self._client = None            # InteractionStateClient
         self._q: "queue.Queue" = queue.Queue(maxsize=_QUEUE_MAX)
         self._thread: Optional[threading.Thread] = None
@@ -50,10 +71,34 @@ class InteractionClient:
         self.available = False         # 连上了才 True
         self.error: Optional[str] = None
         self.dropped = 0               # 队列满丢掉的写次数
+        #: 被别的会话接管了 ⇒ 本实例**停止读写 IC**（见 ``activate``）。
+        self.suspended = False
+        #: 挂起后丢弃的 tick 次数（诊断用）
+        self.suspended_ticks = 0
         #: 各方法写失败计数（按方法名）—— 持续失败必须看得见，
         #: 否则 IC 状态静静停在默认值、决策永远不变（踩过）
         self.failures: dict = {}
         self._fail_streak = 0
+
+    def activate(self) -> None:
+        """声明本实例为 IC 的**唯一驱动者**，把上一个挂起。
+
+        在 ``connect()`` 成功后调用 —— 时机天然正确：新会话建立时接管，
+        旧会话（正在收尾）自动让位。
+
+        ⚠️ 「后来者接管」策略：真正多用户并发时，后开的会话会把先开的
+        **踢下线**（它的 IC 决策全停）。这是 IC 单例的固有限制，不是本闸门
+        引入的 —— 闸门只是让它**从静默出错变成显式接管**。
+        """
+        global _OWNER
+        prev, _OWNER = _OWNER, self
+        self.suspended = False
+        if prev is not None and prev is not self:
+            prev.suspended = True
+            logger.warning(
+                "IC 被会话 %s 接管 —— 会话 %s 暂停驱动 IC"
+                "（它若还在收尾，其 IC 决策将不再生效；这是单例 IC 的固有限制）",
+                self.owner_key, prev.owner_key)
 
     # ------------------------------------------------------------------ #
 
@@ -86,7 +131,10 @@ class InteractionClient:
         self._thread = threading.Thread(
             target=self._run, name="ic-apply", daemon=True)
         self._thread.start()
-        logger.info("InteractionCore 已连接: %s", self.target)
+        # 连上就声明接管 —— 把正在收尾的旧会话挂起，避免两个会话同时驱动 IC
+        self.activate()
+        logger.info("InteractionCore 已连接: %s（会话 %s）",
+                    self.target, self.owner_key)
         return True
 
     # ------------------------------------------------------------------ #
@@ -97,8 +145,11 @@ class InteractionClient:
         """把一次 ``apply_*`` 投进队列（**立即返回**）。
 
         ``method`` 是 IC 客户端的方法名（``apply_face`` / ``apply_asr`` …）。
+
+        ⚠️ **被别的会话接管后（``suspended``）直接丢弃** —— 否则本会话
+        （正在收尾）的状态会覆盖掉新会话写进去的，后者拿不到自己的转写。
         """
-        if not self.available:
+        if not self.available or self.suspended:
             return
         try:
             self._q.put_nowait((method, kwargs))
@@ -155,8 +206,17 @@ class InteractionClient:
         """调一次 ``Tick``，返回 ``Action``；失败返回 ``None``。
 
         用 ``to_thread`` 包 —— 这是**读**操作要拿返回值，不能走队列。
+
+        ⚠️⚠️ **``tick()`` 不是只读的**：IC 侧它会推进状态机
+        （``advance_*`` → ``decide()`` → ``apply_action()``，后者会改
+        ``mode`` / ``barge_hold_ms``）。所以**两个会话同时 tick 就是两个
+        驱动者在踩同一个状态机** —— 这正是「ASR 完美却无回复」的根因。
+        被接管后必须**直接返回 None**，一次都不能发（``_dispatch(None)``
+        已经是安全的空操作）。
         """
-        if not self.available or self._client is None:
+        if not self.available or self._client is None or self.suspended:
+            if self.suspended:
+                self.suspended_ticks += 1
             return None
         try:
             return await asyncio.to_thread(self._client.tick, dt_ms)
@@ -165,8 +225,12 @@ class InteractionClient:
             return None
 
     async def snapshot(self) -> Optional[dict]:
-        """读整份状态（调试/诊断用）。"""
-        if not self.available or self._client is None:
+        """读整份状态（调试/诊断用）。
+
+        被接管后返回 ``None`` —— 此时 IC 里装的是**别的会话**的状态，
+        读出来只会误导诊断。
+        """
+        if not self.available or self._client is None or self.suspended:
             return None
         try:
             return await asyncio.to_thread(self._client.get_snapshot)
@@ -185,6 +249,7 @@ class InteractionClient:
         logger.warning("InteractionCore 连接失效（%s）—— %s", self.target, why)
 
     def close(self) -> None:
+        global _OWNER
         self._stop.set()
         try:
             self._q.put_nowait(None)     # 唤醒阻塞的 get
@@ -200,4 +265,10 @@ class InteractionClient:
                 pass
             self._client = None
         self.available = False
-        logger.info("InteractionCore 已关闭（丢写 %d 次）", self.dropped)
+        # 释放所有权（若还是自己）—— 但**不自动移交给别人**：
+        # 谁是下一个驱动者由它的 connect() → activate() 决定，这里只清空。
+        if _OWNER is self:
+            _OWNER = None
+        logger.info("InteractionCore 已关闭（丢写 %d 次%s）", self.dropped,
+                    f"，被接管后丢弃 tick {self.suspended_ticks} 次"
+                    if self.suspended_ticks else "")
