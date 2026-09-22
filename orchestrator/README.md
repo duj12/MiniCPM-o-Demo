@@ -644,6 +644,53 @@ class Downstream(Protocol):
 
 ## 运维要点
 
+### ⭐ 更新人脸库（board-face-and-cloud-infer）后的部署流程
+
+**一条命令**（在 106 上）：
+
+```bash
+ssh 192.168.89.106
+cd /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo
+bash orchestrator/tools/deploy_g1.sh
+```
+
+它会：**备份 G1 → 重编 `.so` → 实测验证能加载 → 重启编排服务**。
+
+⚠️ **核心原则：同步源码，但绝不拷 `.so`；在目标机器上重编。**
+
+| 坑 | 说明 |
+|---|---|
+| **`.so` 是环境产物** | 仓库里那份是在**编译者那台机器**上编的，opencv 版本与 glibc 都编死在里面。实测：仓库里那份要 opencv 4.10 + glibc 2.38，而 106 只有 4.5.4 + glibc 2.35 → `libopencv_imgcodecs.so.410: cannot open shared object file`。G1 的 `build.sh` 自己也写了「Do not copy an OpenCV 4.5 build onto a 4.2 host」 |
+| **不能按目录名挑 `.so`** | 「`lib/<arch>/` 是新的」这个直觉**是错的** —— 106 上同时躺着几份产物，加载不了的那份可能恰好在 `lib/<arch>/` 下。`face/g1face_provider.py::pick_g1_lib()` 会**实测**每份候选（真 CDLL + 验 ABI），取第一份能用的；脚本沿用同一判据 |
+| **G1 不是 git 仓库** | 它是同步过来的文件，**编坏了没得回退** —— 所以脚本第一步就是备份 |
+| **改完必须重启服务** | `.so` 是**进程启动时加载**的。不重启则仍用旧库，表现为「改了参数但行为没变」（实测踩过） |
+
+**改了 C 源码（比如调阈值）的完整流程**：
+
+```bash
+# 1) 本地改 board-face → 同步工具推到 106（**排除 .so**）
+# 2) 在 106 上跑部署脚本（上面那条命令）—— 它会重编 + 重启
+# 3) 浏览器 Ctrl+Shift+R 强制刷新（HTML 会被缓存）
+```
+
+> 同步时排除 `.so` 的写法（本地打包用）：
+> ```bash
+> tar czf /tmp/g1.tgz --exclude='*.so' --exclude='*.so.*' \
+>     --exclude='__pycache__' --exclude='.ort_sdk' G1/
+> ```
+
+**怎么确认真的生效了**：
+
+```bash
+# 看服务端日志里的「人脸=」那行（每 5s 一条）—— 档位应随新阈值变化
+grep '人脸=' orch.log | tail -3
+# 例：人脸=HIGH(score=0.832, 面积=0.0359, dwell=18800ms, 身份=LOW)
+```
+
+⚠️ **`face_present_confidence` 的分档阈值在 C 侧**（`G1/src/face_recognition.cpp`
+的 `present_conf_high/mid`），不是 Python。2026-09-22 从 **0.8/0.7 调到 0.65/0.6**
+（实测该机型 BlazeFace 的 score 大多落在 0.65 附近，用 0.8 会让框长期是红的）。
+
 ### 容量
 
 实测（106，真实 AEC+ASR+OmniLLM+TTS，8s 音频/路）：
