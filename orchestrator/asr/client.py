@@ -566,8 +566,11 @@ class AsrStateTracker:
         if ts is not None:
             self._seg_open = False
             self._mark_closed()
-            if is_turnsense_complete(ts):
-                # 语义判完整 ⇒ 本段拍板（即便 offline 还没回来）
+            # ⚠️ 语义判完整 **且本段确实有转写** 才拍板。
+            #    没有转写 = 这段语音没被识别出内容（噪声/被过滤），
+            #    谈不上"说完了" —— 拍板会让 IC 判出一个**空转写的轮**。
+            #    与 `_on_offline` 里「空文本不拍板」同一口径。
+            if is_turnsense_complete(ts) and self._transcript:
                 self._segment_done = True
 
         if mode == "turnsense":
@@ -640,8 +643,27 @@ class AsrStateTracker:
         #    直接关段会让「抢=HIGH」永远观测不到（快照与关段同拍完成）。
         #    留一拍缓冲，让 IC 必然收到一次；下一拍由 expire_if_idle 清掉。
         self._pending_close = True
-        # offline 是服务端对本段**拍板**的结果 —— turn_complete 到顶。
-        self._segment_done = True
+        # ---- 是否"拍板"（turn_complete → HIGH）----
+        #
+        # ⚠️⚠️ **只有带转写的 offline 才算拍板**。
+        #
+        # 文本被服务端过滤掉（`text` 为空）时，这一轮**根本不存在** ——
+        # 那是噪声段/无效段（实测带的 `turnsense: invalid`）。若照样置
+        # `_segment_done=True`，状态会变成：
+        #
+        #     空转写 + asr_confidence=LOW + turn_complete=HIGH
+        #
+        # 而 IC 的 Policy 正是拿这个组合判「没听清」：
+        #
+        #     if fresh_turn and speech.asr_confidence == LOW:
+        #         return UTTER(sop="01", text="抱歉，我没听清，请您再说一遍。")
+        #
+        # → 用户什么也没说（或只是噪声），却被回一句「请再说一遍」。
+        # 实测 D16 就是这么复现的。
+        #
+        # 所以空文本时**不拍板**，`turn_complete` 落到 LOW（有转写才 HIGH）。
+        if text:
+            self._segment_done = True
         # 本轮出现过 VAD 切分（收到过 offline）。**按整轮累计、不清零** ——
         # 它服务于 `turn_complete`：有它才把"切分之后那段"的流式帧标成
         # MEDIUM（而不是 LOW）。
@@ -773,24 +795,34 @@ class AsrStateTracker:
     def _turn_complete_conf(self) -> str:
         """本轮是否已经说完。
 
-        无文本 ``NONE`` → 普通流式帧 ``LOW`` → **VAD 切分之后的**流式帧
-        ``MEDIUM`` → 本段已拍板 ``HIGH``。
+        ``HIGH``   本段**已拍板**（带转写的 ``2pass-offline``，或带转写的
+                   turnsense=complete）
+        ``MEDIUM`` 本轮发生过 VAD 切分，且**当前有转写**（续接段）
+        ``LOW``    **没有任何转写** —— 这段语音没被识别出内容（噪声段、
+                   或文本被置信度过滤掉了）
+        ``NONE``   （同上，``LOW`` 与 ``NONE`` 目前同义；保留 NONE 供
+                   "完全没收到过任何消息"的初始态）
 
-        「拍板」= 收到 ``2pass-offline``（服务端对该段的最终识别），或
-        turnsense 判 ``complete``。这两个都是服务端给出的硬边界，所以到
-        ``HIGH``；而 ``2pass-offline`` 本身就是每段收尾时必发的，因此
-        ``HIGH`` 是**正常可达**的终态。
+        ⚠️ **「没有转写」优先于「切过段」**：早先判据是
+        ``if _vad_split_seen: return MEDIUM`` 在前，没有先看转写 —— 于是
+        「本轮切过段，但这一段是空的」会报 ``MEDIUM``。
+        而 IC 的 Policy 对空转写有明确分支（``asr_confidence==LOW`` 时
+        走「没听清，请您再说一遍」），拿一个 MEDIUM/HIGH 的 ``turn`` 配上
+        空转写，语义上是在说"用户说完了一句空话"—— 那不存在。
 
-        更细的区分（哪个 HIGH 是语义句尾、哪个只是 VAD 切分）走
-        downstream 的 :class:`AsrTurnSense` 事件 —— 那边带 turnsense 的
-        label 与 probabilities。这里只回答「本段结束了没有」。
+        **拍板（HIGH）必须是"带转写"的**：文本被过滤掉（``text`` 为空）
+        时这一段根本没被识别出内容，谈不上"说完了"。这一条是 D16 那个
+        「用户没说有效内容、却被回『请再说一遍』」的根因。
         """
+        if not self._transcript:
+            # 没有转写 ⇒ 没有一轮可言。哪怕切过段、哪怕收到过 offline。
+            return LOW if self._segment_done or self._vad_split_seen else NONE
         if self._segment_done:
             return HIGH
         if self._vad_split_seen:
             # 本轮已经切过段，当前这段是续接的 —— 比首段更有把握一些
             return MEDIUM
-        return LOW if self._transcript else NONE
+        return LOW
 
 
 # ====================================================================== #
