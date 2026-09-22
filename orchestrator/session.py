@@ -1631,6 +1631,18 @@ class OrchestratorSession:
             lines.append(f"  指标: {self.metrics.summary_line()}")
         except Exception:  # noqa: BLE001
             pass
+        # IC 的 tick 诊断 —— 「ASR 正常但没回复」时这是**第一个该看的数**：
+        #   tick_calls 在涨而 IC → X 一条没有 ⇒ IC 一直返回 HOLD/LISTEN/WAIT
+        #   bad_ticks 在涨                  ⇒ 根本没调到 IC（未连接/未就绪）
+        #   suspended_ticks 在涨           ⇒ 被别的会话接管了（本该让位）
+        # 三者指向完全不同的故障，缺了这行就只能靠推（实测卡过很久）。
+        ic = getattr(getattr(self, "interaction", None), "ic", None)
+        if ic is not None:
+            lines.append(
+                f"  IC: tick调用={ic.tick_calls} 未调={ic.bad_ticks} "
+                f"被接管丢弃tick={ic.suspended_ticks} "
+                f"被接管丢弃写={ic.suspended_writes} "
+                f"最近决策={ic.last_action or '-'}")
         for k, v in self.stats.items():
             lines.append(f"  {k}: {v}")
         if self.aec is not None:

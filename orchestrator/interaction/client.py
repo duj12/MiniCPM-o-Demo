@@ -75,6 +75,16 @@ class InteractionClient:
         self.suspended = False
         #: 挂起后丢弃的 tick 次数（诊断用）
         self.suspended_ticks = 0
+        #: 挂起后**消费线程**丢弃的写入次数 —— 这些是接管前入队、接管后
+        #: 才被取出的"过期条目"（见 `_run` 里的第二道闸门）
+        self.suspended_writes = 0
+        #: 诊断计数 —— `tick` 是**唯一**能出决策的路径。若 `tick_calls` 在涨
+        #: 而 `IC → X` 一条都没有，说明 IC 一直返回 HOLD/LISTEN/WAIT
+        #: （看 `last_action`）；若 `bad_ticks` 在涨，说明根本没调到。
+        #: 这两个是**完全不同**的故障，不打出这个值就分不清（实测卡过）。
+        self.tick_calls = 0        # 真调到 IC 并拿到返回的次数
+        self.bad_ticks = 0         # 没调（未连接 / 未就绪）的次数
+        self.last_action = ""      # 最近一次 IC 返回的 ActionType
         #: 各方法写失败计数（按方法名）—— 持续失败必须看得见，
         #: 否则 IC 状态静静停在默认值、决策永远不变（踩过）
         self.failures: dict = {}
@@ -174,6 +184,18 @@ class InteractionClient:
             if item is None:
                 break
             method, kwargs = item
+            # ⚠️⚠️ **消费时再查一次 `suspended`** —— 这是闸门的第二道，必需。
+            #
+            # `apply()` 里的检查只管「入队那一刻」。而队列是**异步消费**的：
+            # 旧会话在被接管**之前**投进去的条目还压在队列里，接管之后才被
+            # 消费线程取出 —— 若这里不查，那些**过期条目照发不误**。
+            #
+            # 实测踩过：两个被挂起的旧会话仍在往 IC 写空转写帧，把新会话
+            # 刚写进去的 `text='你好呀，你是谁呀？'` 冲掉 → 新会话拿不到
+            # 自己的转写 → 永远出不了 ANSWER。现象是「三个会话全部零决策」。
+            if self.suspended:
+                self.suspended_writes += 1
+                continue
             fn = getattr(self._client, method, None)
             if fn is None:
                 logger.warning("InteractionCore 无此方法: %s", method)
@@ -214,15 +236,26 @@ class InteractionClient:
         被接管后必须**直接返回 None**，一次都不能发（``_dispatch(None)``
         已经是安全的空操作）。
         """
-        if not self.available or self._client is None or self.suspended:
-            if self.suspended:
-                self.suspended_ticks += 1
+        if self.suspended:
+            self.suspended_ticks += 1
+            return None
+        if not self.available or self._client is None:
+            self.bad_ticks += 1
             return None
         try:
-            return await asyncio.to_thread(self._client.tick, dt_ms)
+            action = await asyncio.to_thread(self._client.tick, dt_ms)
         except Exception as exc:  # noqa: BLE001
+            self.bad_ticks += 1
             self._mark_dead(f"tick 失败: {type(exc).__name__}: {exc}")
             return None
+        self.tick_calls += 1
+        # ⚠️ 诊断：`tick` 是**唯一**能出决策的路径。若 `tick_calls` 在涨、
+        #    但 `IC → X` 一条都没有，说明 IC 那边一直返回 HOLD/LISTEN/WAIT
+        #    （见 ``last_action``）—— 这与「tick 没调到」是**完全不同**的
+        #    两个故障，不打出这个值就分不清（实测排查时卡过）。
+        self.last_action = getattr(getattr(action, "type", None), "value",
+                                   str(getattr(action, "type", "?")))
+        return action
 
     async def snapshot(self) -> Optional[dict]:
         """读整份状态（调试/诊断用）。

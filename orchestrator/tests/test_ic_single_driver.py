@@ -46,11 +46,21 @@ class _FakeBackend:
     def __init__(self, owner: str) -> None:
         self.owner = owner
         self.ticks: list = []
+        self.applies: list = []        # 收到的 apply_* 调用（方法名）
         self.snapshot_calls: int = 0
 
     def tick(self, dt_ms=0):
         self.ticks.append(dt_ms)
         return None
+
+    # `_run` 用 getattr(self._client, method) 取方法 —— 动态接住 apply_*，
+    # 免得到测试里为每个 IC 方法都写一个桩。
+    def __getattr__(self, name):
+        if name.startswith("apply_"):
+            def _rec(**kwargs):
+                self.applies.append(name)
+            return _rec
+        raise AttributeError(name)
 
     def get_snapshot(self):
         self.snapshot_calls += 1
@@ -116,6 +126,51 @@ def test_suspended_apply_is_ignored() -> None:
     old.suspended = True
     old.apply("apply_asr", transcript="不该进队")
     check(old._q.qsize() == 1, "挂起后 apply **不再入队**（队列没变）")
+
+
+def test_queued_writes_dropped_after_takeover() -> None:
+    """**接管前入队、接管后才被消费**的过期写入必须丢掉 —— 闸门第二道。
+
+    ⚠️ 这是实测踩过的一个真实漏洞：`apply()` 里的检查只管「入队那一刻」，
+    而队列是**异步消费**的。旧会话在被接管**之前**投进去的条目还压在队列
+    里，接管之后才被消费线程取出 —— 只查入队时刻的话，这些**过期条目照发
+    不误**。
+
+    实测现象：两个被挂起的旧会话仍在往 IC 写空转写帧，把新会话刚写进去的
+    `text='你好呀，你是谁呀？'` 冲掉 → 新会话拿不到自己的转写 → 永远出不了
+    ANSWER。**三个会话全部零决策**。
+    """
+    print("\n[单驱动者] 接管前入队的写入，接管后被丢弃（闸门第二道）")
+    _reset_owner()
+    old, backend = _mk_client("old-session")
+    old.activate()
+
+    # ① 接管**之前**入队（此时闸门放行）
+    old.apply("apply_asr", transcript="接管前投的")
+    check(old._q.qsize() == 1, "接管前 apply 正常入队")
+
+    # ② 此时被接管（模拟新会话建立）
+    old.suspended = True
+
+    # ③ 起真正的消费线程（生产路径就是它）—— 过期条目不该发到 IC
+    import threading
+    old._stop.clear()
+    old._thread = threading.Thread(target=old._run, name="ic-apply-test",
+                                   daemon=True)
+    old._thread.start()
+    import time
+    time.sleep(0.5)                     # 让它把队列里那条消费掉
+    old._stop.set()
+    try:
+        old._q.put_nowait(None)         # 唤醒并退出
+    except Exception:                   # noqa: BLE001
+        pass
+    old._thread.join(timeout=2.0)
+
+    check(backend.applies == [],
+          f"过期条目**没发到 IC**（实际 {backend.applies}）")
+    check(old.suspended_writes == 1,
+          f"记了 1 次「被接管丢弃写」（实际 {old.suspended_writes}）")
 
 
 def test_suspended_tick_does_not_touch_ic() -> None:
@@ -219,6 +274,7 @@ def main() -> int:
     print("-" * 68)
     test_new_session_takes_over()
     test_suspended_apply_is_ignored()
+    test_queued_writes_dropped_after_takeover()
     test_suspended_tick_does_not_touch_ic()
     test_suspended_snapshot_returns_none()
     test_close_releases_ownership()
