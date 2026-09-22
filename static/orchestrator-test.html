@@ -979,7 +979,16 @@ async function startCapture() {
     session && session.sendChunk({
       audio: a16,
       ctxTime: ev.data.t0,                                 // 本块首采样的 ctx 时刻
-      frameBase64: grab(320, 240, 0.5),                    // 人脸 25fps
+      // ⚠️⚠️ 人脸帧尺寸**不能小** —— G1 的人脸检测分对像素尺寸极其敏感，
+      //    而 IC 的迎宾门禁要求 `face_present_confidence == HIGH`（policy.py）。
+      //    实测（同一段素材、同一张脸）：
+      //        320×240 → 检测分 0.70~0.77（MEDIUM/LOW）→ **IC 一直 HOLD**、
+      //                  永不迎宾、永不回复（排查了很久才定位到尺寸）
+      //        640×480 → 检测分 0.82~0.85（HIGH）    → 正常
+      //    宽屏摄像头按比例缩到 320 宽时实际只有 320×180，人脸更小、更糟
+      //    （实测 IC 侧直接收到 `face=NONE`）。
+      //    代价：25fps 的带宽约 85KB/s → 340KB/s，局域网可接受。
+      frameBase64: grab(640, 480, 0.5),                    // 人脸 25fps
       frameOmniBase64: frameCounter === 0 ? grab(1280, 720, 0.7) : null, // Omni 1fps
     });
   };

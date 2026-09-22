@@ -581,10 +581,25 @@ class OrchestratorSession:
         d = rt.delay_samples if rt else -1
         lo, hi = rt.buf.written_span() if rt else (None, None)
         erle = self.current_erle_db()
+        # ⚠️ **人脸档位必须打出来**。IC 的迎宾门禁要求
+        #    `face_present_confidence == HIGH`，不满足就**一直 HOLD、永不
+        #    迎宾、永不回复**—— 而这条链路（ASR 正常、转写也送进 IC 了）在
+        #    服务端日志里**完全看不出问题**。实测排查「语音没回复」时绕了
+        #    很多弯，最后是从 IC 侧快照才看到 `face=NONE/LOW`（根因是前端
+        #    抓帧尺寸太小，人脸像素不够 → 检测分掉档）。
+        #    这里每 5s 打一次，看一眼就知道门禁能不能过。
+        f = getattr(self, "_last_face", None) or {}
+        fs = getattr(self, "_last_face_state", None) or {}
+        face_info = (
+            f"人脸={fs.get('face_present_confidence', '-')}"
+            f"(score={f.get('score', '-')}, 面积={fs.get('bbox_area_ratio', '-')}, "
+            f"dwell={fs.get('dwell_ms', '-')}ms, "
+            f"身份={fs.get('identity_confidence', '-')})"
+        )
         logger.info(
             "[%s] 诊断: 音频块=%d ref推送=%d(非零 %d, %.0f%%) D=%d采样(%.0fms) "
             "锚点=%s(偏差 %.1fms, 残差 %.1fms, %d 个) "
-            "ERLE=%s 写入区间=[%s,%s] now=%d omni触发=%d",
+            "ERLE=%s 写入区间=[%s,%s] now=%d omni触发=%d %s",
             self.session_id,
             self.stats.get("audio_chunks_in", 0), total, nz,
             (100.0 * nz / total) if total else 0.0,
@@ -594,6 +609,7 @@ class OrchestratorSession:
             f"{erle:.1f}dB" if erle is not None else "n/a",
             lo, hi, self.clock.now(),
             self.stats.get("omni_triggers", 0),
+            face_info,
         )
 
     def _update_erle_window(self, frame: AudioFrame) -> None:
