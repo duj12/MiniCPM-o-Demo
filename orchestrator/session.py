@@ -121,6 +121,8 @@ class OrchestratorSession:
         # 供 `orchestrator_replay.py --video` 离线复现。
         self._raw_writer = None
         self._raw_wanted = False
+        #: 上一次转给 Omni 的会话时刻（毫秒）—— 见 `_maybe_feed_omni`
+        self._last_omni_ms = -10 ** 9
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
@@ -253,17 +255,22 @@ class OrchestratorSession:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
         n = frame.n_samples
-        # `ref is None` = 没连云端 AEC（浏览器原生模式）—— 此时没有"喂给
-        # AEC 的 farend"这回事，但要**如实落盘成静音**，而不是跳过：
-        # 跳了会让 ref/raw 的长度和 mic 对不上，离线对齐就废了。
-        self._dump_ref.append(
-            ref.reshape(-1).copy() if ref is not None
-            else np.zeros(n, dtype=np.float32))
+        # ⚠️ **browser AEC 模式下 ref/raw 恒为全静音，直接不落盘**。
+        #
+        #    `ref is None` = 没连云端 AEC（浏览器原生模式）—— 此时
+        #    `_ref_for()` 按设计返回等长静音（"给静音是物理上诚实的"）。
+        #    这个语义**是对的**，但把它写成 wav 只是 5MB 的零。
+        #    实测：browser 模式下 `-ref.wav 峰值=0.00000`、
+        #    `-raw.wav` 也没人读（它只在**算法服务 AEC** 下测 D 时才有用，
+        #    见 tests/measure_delay.py）。
+        #
+        #    所以只在**真的连了云端 AEC**时才攒这两路。落盘时按长度判空，
+        #    长度对不上的顾虑不存在 —— 它们要么整场都有、要么整场都没有。
+        if ref is not None:
+            self._dump_ref.append(ref.reshape(-1).copy())
         if self.ref_track is not None:
             self._dump_raw.append(
                 self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
-        else:
-            self._dump_raw.append(np.zeros(n, dtype=np.float32))
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
         if self._dump_path is None:
@@ -748,12 +755,17 @@ class OrchestratorSession:
         if self.face_worker is not None:
             # put_nowait：队列满则丢最旧帧（新帧对唇动状态更有价值）
             self.face_worker.offer(jpeg, self.clock.now())
+        # Omni 的 1s 帧：**复用同一份字节**，前端不再单独发一条
+        self._maybe_feed_omni(jpeg, now_ms)
 
     async def on_video_omni(self, jpeg: bytes, t_ms: int = 0) -> None:
-        """收到 OmniLLM 用视频帧（1fps）。
+        """收到 OmniLLM 用视频帧。
 
-        ⚠️ 前端 1s 那次 tick 发的是与 `on_video_face` **完全相同的字节**
-        （单路抓帧），所以这里**不再重复落盘** —— 录制已在 face 那路做完。
+        ⚠️ **现在只有 replay 工具会走这里**。真机前端**不再发 `video_omni`**
+        —— 它的 1s 帧与 `video_face` 是**同一份字节**（单路抓帧），
+        再发一遍纯属浪费上行（1s 的那一帧上行翻倍）。
+        真机路径改由 `on_video_face` 到点**直接把同一份字节转发**给 Omni，
+        Omni 看到的帧**一模一样**（见那里的 `_maybe_feed_omni`）。
         """
         if self.closed:
             return
@@ -762,6 +774,27 @@ class OrchestratorSession:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
+
+    #: Omni 抽帧间隔（毫秒）—— 与旧前端 `frameCounter === 0`（10 块 = 1s）同义
+    OMNI_INTERVAL_MS = 1000
+
+    def _maybe_feed_omni(self, jpeg: bytes, now_ms: int) -> None:
+        """按 1s 边界把**同一份字节**转给 OmniLLM。
+
+        ⚠️ 用**帧自己的会话时刻** `now_ms` 判断，不是墙上时钟 —— 这样
+        抽帧节奏与音频时间轴一致，且与旧行为（每 10 个音频块一次）等价。
+        ⚠️ 只在真机路径（`on_video_face`）调用；replay 走 `on_video_omni`。
+        """
+        if self.omni is None:
+            return
+        if now_ms - self._last_omni_ms < self.OMNI_INTERVAL_MS:
+            return
+        self._last_omni_ms = now_ms
+        self.omni.offer_frame(jpeg)
+        # 落盘保留 omni 这一路（体积小，且是"Omni 实际看到什么"的证据）
+        if self._dump_path is not None:
+            self._dump_omni.append((now_ms, jpeg))
+        self.stats["video_omni_frames"] += 1
 
     def enable_raw_record(self, on: bool) -> None:
         """`session.start` 里带 `record_raw=true` 时开。

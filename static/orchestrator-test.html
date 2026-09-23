@@ -171,7 +171,7 @@
 const $ = (id) => document.getElementById(id);
 const logEl = $('log'), statsEl = $('stats');
 let session = null, micStream = null, audioCtx = null, workletNode = null;
-let videoStream = null, running = false, frameCounter = 0;
+let videoStream = null, running = false;
 /** 采集侧 AudioContext 的代号 —— 服务端据此丢弃换 context 前的锚点 */
 let audioEpoch = 0;
 
@@ -989,7 +989,6 @@ async function startCapture() {
       log('k', `采集自检通过：收到首个音频块`
              + `（${ev.data.audio.length} 采样，AudioContext=${audioCtx.state}）`);
     }
-    frameCounter = (frameCounter + 1) % 10;   // 10 块 = 1s
     // ⚠️ **必须重采样到 16kHz 再回传**。设备不认 16kHz 的 AudioContext 时会
     //    退到 44.1k/48k，此时每块是 4410/4800 个采样，而服务端
     //    ``_normalize_chunk`` 会把超过 1600 的部分**截断** —— 时间轴整体
@@ -1027,23 +1026,18 @@ async function startCapture() {
    *  门禁要求 HIGH，这个变化**必须实测迎宾是否仍正常**。
    */
   const VIDEO_TICK_MS = 40;          // 25fps
-  let _videoTimer = null, _lastOmniAt = 0;
+  let _videoTimer = null;
   function startVideoCapture() {
     if (_videoTimer) return;
-    _lastOmniAt = 0;
-    let n = 0;
     _videoTimer = setInterval(() => {
       if (!running || !session) return;
       const frame = grab(1280, 720, 0.9);
       if (!frame) return;
-      n++;
-      // Omni 1s 一次：发的就是**同一份字节**（不重抓、不重编码）
-      const now = performance.now();
-      const omni = (now - _lastOmniAt >= 1000);
-      if (omni) _lastOmniAt = now;
+      // ⚠️ **只发这一路**。Omni 的 1s 帧与它是同一份字节，服务端到点
+      //    自己转发（`session._maybe_feed_omni`）—— 前端不再多发一条，
+      //    省掉每秒那一帧的重复上行。
       session.sendFrame({
         frameBase64: frame,
-        frameOmniBase64: omni ? frame : null,
         // 抓帧**此刻**的 AudioContext 时刻 —— 服务端据此精确落位
         ctxTime: audioCtx ? audioCtx.currentTime : 0,
       });

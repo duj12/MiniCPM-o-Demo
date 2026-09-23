@@ -675,14 +675,35 @@ def create_app(cfg: Settings):
     # 会话客户端与验证页。路径与本仓库既有约定一致（/static/...）。
     static_dir = Path(__file__).resolve().parents[1] / "static"
     if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        # ⚠️⚠️ **前端一律不缓存**（`no-store`）。这条**必须保留**。
+        #
+        # 没有它时浏览器走**启发式缓存**（按 Last-Modified 推算），安卓的
+        # Edge/WebView 尤其顽固：**普通刷新（F5）拿到的还是旧页面**。
+        # 实测踩过**两次**，第二次的教训尤其贵：
+        #     部署了新的抓帧逻辑（单路 1280×720 + record_raw 开关），
+        #     设备上却还在跑旧页面 —— 表现为 `G1 输入帧尺寸: 640x360`、
+        #     帧大小 30KB（旧 q0.5）、10fps，而且 `record_raw` 压根没上报，
+        #     于是原始视频转储**整个不启动**，日志里一行都没有。排查半天，
+        #     结论是"页面根本没换"。
+        # 这是**开发/验证页**，静态资源很小（一个 HTML + 几个小 JS），
+        # 不缓存的代价（每次重下几十 KB）远小于"改了不生效"的排查成本。
+        class _NoCacheStatic(StaticFiles):
+            def file_response(self, *args, **kwargs):  # type: ignore[override]
+                resp = super().file_response(*args, **kwargs)
+                resp.headers["Cache-Control"] = "no-store, must-revalidate"
+                return resp
+
+        app.mount("/static", _NoCacheStatic(directory=str(static_dir)),
+                  name="static")
 
         @app.get("/")
         async def index():
             from fastapi.responses import FileResponse
             page = static_dir / "orchestrator-test.html"
             if page.is_file():
-                return FileResponse(str(page))
+                return FileResponse(str(page),
+                                    headers={"Cache-Control":
+                                             "no-store, must-revalidate"})
             return {"service": "orchestrator",
                     "hint": "static/orchestrator-test.html 不存在"}
 

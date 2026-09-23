@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import queue
 import shutil
 import subprocess
@@ -53,6 +54,13 @@ RAW_TICK_MS = 40
 #: 写线程队列上限。满了**丢新帧**（不是丢旧帧）——
 #: 录制要的是"完整到最后一刻"，丢最新的会丢掉会话结尾。
 _QUEUE_MAX = 64
+
+#: mux 成功后是否保留 `-raw.mjpeg`。
+#:
+#: 默认**删**：它与 `-face.mjpeg` 逐字节相同（单路抓帧），单场就白占 740MB。
+#: 设 `ORCH_KEEP_RAW_MJPEG=1` 可保留 —— 但只在你要拿它做逐帧取证时才有必要，
+#: 正常情况下 `-face.mjpeg` 就是同一份字节。
+_KEEP_MJPEG = os.environ.get("ORCH_KEEP_RAW_MJPEG", "0") == "1"
 
 
 class RawVideoWriter:
@@ -334,6 +342,22 @@ def mux_raw_video(prefix: str, sid: str, *,
     if not out.is_file() or out.stat().st_size == 0:
         logger.warning("[%s] 合成后文件不存在或为空：%s", sid, out)
         return None
+
+    # ⚠️ **mjpeg 是 mkv 的逐字节前置**，而且与 `-face.mjpeg` **完全相同**
+    #    （前端单路抓帧，同一份字节既喂人脸又落盘 —— 见本模块 docstring）。
+    #    也就是说这 740MB 存了**两份**、且内容还能从 face.mjpeg 复原。
+    #    所以合成成功后删掉它，只留 mkv + tsv。
+    #    `-face.mjpeg` **保留**（它是"算法实际看到什么"的原始证据，
+    #    验证要用原始字节，不能拿 mkv 代替）。
+    if not _KEEP_MJPEG:
+        try:
+            mjpeg.unlink()
+            logger.info("[%s] 已删除与 face.mjpeg 重复的 -raw.mjpeg"
+                        "（省 %.0fMB；face.mjpeg 是同一份字节，仍在）",
+                        sid, mjpeg.stat().st_size / 1e6
+                        if mjpeg.exists() else 0)
+        except OSError as exc:
+            logger.warning("[%s] 删除 -raw.mjpeg 失败：%s", sid, exc)
     logger.info("[%s] ✅ 复现文件已生成：%s（%.1fMB，video=copy audio=copy，"
                 "尺寸=%s，%d 帧）。复现：python orchestrator_replay.py "
                 "--video %s --face-fps %d --omni-fps 1",

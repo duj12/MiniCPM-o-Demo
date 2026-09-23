@@ -278,10 +278,9 @@
         this._send({ type: 'video_face', frame_base64: chunk.frameBase64, t_ms: 0 });
         this.stats.faceFramesSent += 1;
       }
-      if (chunk.frameOmniBase64) {
-        this._send({ type: 'video_omni', frame_base64: chunk.frameOmniBase64, t_ms: 0 });
-        this.stats.omniFramesSent += 1;
-      }
+      // ⚠️ 这里**不再有 `frameOmniBase64` 分支** —— Omni 的 1s 帧与
+      //    `video_face` 是同一份字节，改由服务端转发（见 `sendFrame`）。
+      //    真机路径不再产生 `video_omni` 上行消息。
     }
 
     /** 送一帧视频（**独立于音频块**，25fps）。
@@ -290,6 +289,11 @@
      *  ``clock.ctx_to_sample()`` 把它精确换算到会话采样轴上。没有它，
      *  服务端只能用 ``clock.now()``（只由 100ms 音频块推进），
      *  连续 2~3 帧会拿到**同一个** t_ms，录制的时间轴就退化了。
+     *
+     *  ⚠️ **只发 `video_face` 一路**。Omni 的那 1s 帧与它是**同一份字节**
+     *  （单路抓帧），再发一遍等于每秒白翻一倍上行 —— 服务端到点会
+     *  **直接把这份字节转给 Omni**（`session._maybe_feed_omni`），
+     *  Omni 看到的帧一模一样。
      */
     sendFrame(f) {
       if (!this.ready || this.closed) return;
@@ -297,11 +301,6 @@
         this._send({ type: 'video_face', frame_base64: f.frameBase64, t_ms: 0,
                      ctx_time: f.ctxTime || 0, epoch: this.epoch || 0 });
         this.stats.faceFramesSent += 1;
-      }
-      if (f.frameOmniBase64) {
-        this._send({ type: 'video_omni', frame_base64: f.frameOmniBase64,
-                     t_ms: 0 });
-        this.stats.omniFramesSent += 1;
       }
     }
 
