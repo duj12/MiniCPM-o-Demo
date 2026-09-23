@@ -85,6 +85,8 @@ class OrchestratorSession:
             "audio_samples_in": 0,
             "video_face_frames": 0,
             "video_omni_frames": 0,
+            "video_raw_frames": 0,
+            "video_raw_dropped": 0,
             "aec_segments_out": 0,
             "aec_samples_out": 0,
             "down_dropped": 0,
@@ -114,6 +116,11 @@ class OrchestratorSession:
         # 每项 (t_ms, jpeg_bytes)，会话结束时写 .mjpeg + .tsv。
         self._dump_face: list = []
         self._dump_omni: list = []
+        # 原始视频转储（**边收边写盘**，见 raw_dump.py 的说明）：
+        # 前端 `record_raw=true` 时启用，会话结束时与 mic.wav 合成单文件
+        # 供 `orchestrator_replay.py --video` 离线复现。
+        self._raw_writer = None
+        self._raw_wanted = False
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
@@ -683,20 +690,71 @@ class OrchestratorSession:
         ref = self.ref_track.read(frame.t0, frame.n_samples)
         return ref.reshape(1, -1).astype(np.float32)
 
-    async def on_video_face(self, jpeg: bytes, t_ms: int = 0) -> None:
-        """收到人脸用视频帧（25fps）。**绝不阻塞音频路径。**"""
+    def _frame_time_ms(self, ctx_time: float = 0.0, epoch: int = 0) -> int:
+        """一帧视频的会话时刻（毫秒）。
+
+        ⚠️ **优先用 `ctx_to_sample` 换算，不要用 `clock.now()`**：
+        `clock.now()` 只由 **100ms 的音频块**推进，而视频现在跑 25fps
+        （40ms 一帧）—— 连续 2~3 帧会拿到**同一个** `clock.now()`，
+        录制的时间轴就退化成 100ms 粒度了。
+
+        `ctx_time` 是抓帧**此刻**的浏览器 AudioContext 时刻，经 AEC 那套
+        锚点拟合（`record_anchor` / `ctx_to_sample`）换算到会话采样轴，
+        精度是**采样级**的，不受音频块粒度影响。
+
+        锚点还没建立（会话刚开头的几十毫秒）时退回 `clock.now()` ——
+        此时音频也才刚开始，两者差别在 100ms 以内，可接受。
+        """
+        s = None
+        if ctx_time > 0:
+            try:
+                s = self.clock.ctx_to_sample(ctx_time, epoch)
+            except Exception:  # noqa: BLE001
+                s = None
+        if s is None:
+            s = self.clock.now()
+        # ⚠️ **别让负数溜进去**：早于第一个锚点的 `ctx_time` 会被拟合直线
+        #    **外推**到负采样位置（例如首块音频 t0=0.1s、而某帧 ctx=0.04s
+        #    时会算出 -60ms）。会话时间轴的定义是「0 = 首块音频首采样」，
+        #    负值会让 tsv 和 mux 的 tick 网格失去意义。夹到 0 即可 ——
+        #    这几帧本来就早于音频起点，归到 0 是正确语义。
+        return int(max(0, s) * 1000 // SR)
+
+    async def on_video_face(self, jpeg: bytes, t_ms: int = 0,
+                            ctx_time: float = 0.0, epoch: int = 0) -> None:
+        """收到人脸用视频帧（25fps，独立于音频块）。**绝不阻塞音频路径。**
+
+        ⚠️ 这一路同时也是**原始录制**的来源 —— 前端只抓一路帧，同一份字节
+        既喂人脸、又喂 Omni、又落盘，所以录下来的就是算法实际看到的
+        （见 `raw_dump.py` 的模块说明）。
+        """
         if self.closed:
             return
         self.stats["video_face_frames"] += 1
+        now_ms = self._frame_time_ms(ctx_time, epoch)
         if self._dump_path is not None:
             # 原样存 —— 与喂给 face_worker 的是同一份字节
-            self._dump_face.append((int(self.clock.now() * 1000 // SR), jpeg))
+            self._dump_face.append((now_ms, jpeg))
+        if self._raw_wanted:
+            w = self._raw_writer
+            if w is None:
+                # 懒建：没摄像头 / 没开开关的会话**零开销**
+                from .raw_dump import RawVideoWriter
+                w = self._raw_writer = RawVideoWriter(self._dump_path,
+                                                      self.session_id)
+                w.start()
+            w.offer(now_ms, jpeg)
+            self.stats["video_raw_frames"] += 1
         if self.face_worker is not None:
             # put_nowait：队列满则丢最旧帧（新帧对唇动状态更有价值）
             self.face_worker.offer(jpeg, self.clock.now())
 
     async def on_video_omni(self, jpeg: bytes, t_ms: int = 0) -> None:
-        """收到 OmniLLM 用视频帧（1fps）。"""
+        """收到 OmniLLM 用视频帧（1fps）。
+
+        ⚠️ 前端 1s 那次 tick 发的是与 `on_video_face` **完全相同的字节**
+        （单路抓帧），所以这里**不再重复落盘** —— 录制已在 face 那路做完。
+        """
         if self.closed:
             return
         self.stats["video_omni_frames"] += 1
@@ -704,6 +762,40 @@ class OrchestratorSession:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
+
+    def enable_raw_record(self, on: bool) -> None:
+        """`session.start` 里带 `record_raw=true` 时开。
+
+        ⚠️ 必须由**前端显式请求**，不能只看 `ORCH_DUMP_AUDIO`：replay 工具
+        也会连进来发 `video_face`，若默认开就会在复现时又写一份原始转储，
+        越滚越多。
+        """
+        self._raw_wanted = bool(on) and self._dump_path is not None
+        if on and self._dump_path is None:
+            logger.info("[%s] 请求录制原始视频，但未开 ORCH_DUMP_AUDIO "
+                        "—— 忽略（转储总开关关着）", self.session_id)
+
+    def _finish_raw_record(self) -> None:
+        """收尾：停写线程 → 合成单文件。**失败不影响会话收尾。**"""
+        w = self._raw_writer
+        if w is None:
+            return
+        self._raw_writer = None
+        self.stats["video_raw_dropped"] = w.dropped
+        try:
+            w.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 原始视频收尾失败：%s", self.session_id, exc)
+            return
+        # 合成放到后台线程，**不 await** —— ffmpeg 再慢也不能拖住收尾
+        #
+        # ⚠️ 用 `run_in_executor` 而不是 `asyncio.to_thread`：后者要
+        #    Python ≥3.9，而本模块在 3.8 上也要能导入（本地开发机就是）。
+        from .raw_dump import mux_raw_video
+        loop = asyncio.get_event_loop()
+        fut = loop.run_in_executor(None, mux_raw_video,
+                                   self._dump_path, self.session_id)
+        self._mux_task = asyncio.ensure_future(fut)
 
     async def on_playback_receipt(self, response_id: str,
                                   phase: str, ctx_time: float,
@@ -1606,6 +1698,10 @@ class OrchestratorSession:
         self.closed = True
         logger.info("会话 %s 关闭（%s）", self.session_id, reason)
         # 音视频转储落盘（默认关闭，无副作用）
+        #
+        # ⚠️ **顺序有讲究**：`flush_audio_dump()` 必须在 `_finish_raw_record()`
+        #    之前 —— 后者要把 `-mic.wav` 和 `-raw.mjpeg` 合成一个文件，
+        #    音频还没落盘就合成会拿不到音轨。
         try:
             self.flush_audio_dump()
         except Exception as exc:  # noqa: BLE001
@@ -1614,6 +1710,10 @@ class OrchestratorSession:
             self.flush_video_dump()
         except Exception as exc:  # noqa: BLE001
             logger.warning("视频转储写入失败: %s", exc)
+        try:
+            self._finish_raw_record()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("原始视频收尾失败: %s", exc)
         if self.downstream is not None:
             try:
                 await self.downstream.on_session_end(reason)

@@ -140,6 +140,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
     # 用户选择的 AEC 模式优先于 config 默认值
     if hello and hello.get("aec_mode"):
         sess.aec_mode = str(hello["aec_mode"])
+    # 原始视频录制：**只认前端显式请求**。不能默认开 —— replay 工具也会
+    # 连进来发 video_face，默认开就会在复现时又写一份原始转储，越滚越多。
+    sess.enable_raw_record(bool(hello and hello.get("record_raw")))
 
     # ---- AEC ----
     # 只有「算法服务 AEC」模式才连云端；「浏览器原生 AEC」在前端做，
@@ -614,7 +617,11 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
     elif t == "video_face":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))
-        await sess.on_video_face(raw, msg.get("t_ms", 0))
+        # ctx_time/epoch：帧的**精确**时刻。视频跑 25fps 而音频块只有 10fps，
+        # 光靠 clock.now() 会让连续几帧拿到同一时刻（见 _frame_time_ms）。
+        await sess.on_video_face(raw, msg.get("t_ms", 0),
+                                 float(msg.get("ctx_time") or 0.0),
+                                 int(msg.get("epoch") or 0))
     elif t == "video_omni":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))

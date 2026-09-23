@@ -284,6 +284,27 @@
       }
     }
 
+    /** 送一帧视频（**独立于音频块**，25fps）。
+     *
+     *  ``f.ctxTime`` 是抓帧**此刻**的 AudioContext 时刻 —— 服务端用
+     *  ``clock.ctx_to_sample()`` 把它精确换算到会话采样轴上。没有它，
+     *  服务端只能用 ``clock.now()``（只由 100ms 音频块推进），
+     *  连续 2~3 帧会拿到**同一个** t_ms，录制的时间轴就退化了。
+     */
+    sendFrame(f) {
+      if (!this.ready || this.closed) return;
+      if (f.frameBase64) {
+        this._send({ type: 'video_face', frame_base64: f.frameBase64, t_ms: 0,
+                     ctx_time: f.ctxTime || 0, epoch: this.epoch || 0 });
+        this.stats.faceFramesSent += 1;
+      }
+      if (f.frameOmniBase64) {
+        this._send({ type: 'video_omni', frame_base64: f.frameOmniBase64,
+                     t_ms: 0 });
+        this.stats.omniFramesSent += 1;
+      }
+    }
+
     /** 主动请求中断当前播报（barge-in）。 */
     cancel(reason) {
       this._send({ type: 'cancel', reason: reason || 'bargein' });

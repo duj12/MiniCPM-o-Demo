@@ -65,6 +65,15 @@
           <option value="off">不做回声消除</option>
         </select>
       </label>
+      <label style="display:flex;align-items:center;gap:8px;margin:8px 0">
+        <!-- 录制原始视频：服务端把**送给人脸/Omni 的那一路帧**原样落盘，
+             会话结束时与 mic.wav 合成单个 .mkv，供
+             `python orchestrator_replay.py --video <file>` 离线复现。
+             ⚠️ 没有第二路抓帧 —— 录的就是算法看到的，不存在格式分歧。
+             需要服务端开 ORCH_DUMP_AUDIO（否则没有落盘目录，会被忽略）。 -->
+        <input type="checkbox" id="rawRec" checked>
+        <span>录制原始视频（服务端落盘，供离线复现）</span>
+      </label>
       <button id="btnStart" class="primary">开始会话</button>
       <button id="btnStop" class="danger">停止</button>
     </div>
@@ -934,6 +943,17 @@ async function startCapture() {
 
   const cv = $('cv'), ctx2d = cv.getContext('2d'), video = $('cam');
 
+  /** 抓一帧 → JPEG base64。
+   *
+   *  ⚠️ **整个会话只抓这一路，抓一次，三处复用**：
+   *    人脸检测 / OmniLLM / 落盘录制 用的都是**同一份字节**。
+   *  这样录下来的视频**逐字节等于**服务端喂给算法的视频，离线复现时
+   *  算法看到的就是当时看到的 —— 不存在"录制一个格式、算法另一个格式"。
+   *
+   *  ⚠️ 尺寸 640×480 → **1280×720 是本次的实质变化**：G1 的检测分对像素
+   *  尺寸敏感（早先 320×240 只有 0.70~0.77、IC 迎宾门禁过不了；640×480 是
+   *  0.82~0.85）。换到 1280×720 后**必须重新实测迎宾是否还正常**。
+   */
   function grab(maxW, maxH, q) {
     if (!video.videoWidth) return null;
     const vw = video.videoWidth, vh = video.videoHeight;
@@ -976,22 +996,62 @@ async function startCapture() {
     //    错 3 倍，参考轨的锚点换算也就全废了。
     //    用跨块保持的分数相位累加器（见 resampleChunk16k），避免长期漂移。
     const a16 = resampleChunk16k(ev.data.audio, audioCtx.sampleRate);
+    // ⚠️ 视频**不在这里抓**了 —— 抓帧改由独立的 40ms 定时器驱动
+    //    （见下方的 `startVideoCapture`）。原因：帧率不该被音频块率锁死。
+    //    早先抓帧挂在本回调上，于是帧率 = 块率 = 10fps。
     session && session.sendChunk({
       audio: a16,
       ctxTime: ev.data.t0,                                 // 本块首采样的 ctx 时刻
-      // ⚠️⚠️ 人脸帧尺寸**不能小** —— G1 的人脸检测分对像素尺寸极其敏感，
-      //    而 IC 的迎宾门禁要求 `face_present_confidence == HIGH`（policy.py）。
-      //    实测（同一段素材、同一张脸）：
-      //        320×240 → 检测分 0.70~0.77（MEDIUM/LOW）→ **IC 一直 HOLD**、
-      //                  永不迎宾、永不回复（排查了很久才定位到尺寸）
-      //        640×480 → 检测分 0.82~0.85（HIGH）    → 正常
-      //    宽屏摄像头按比例缩到 320 宽时实际只有 320×180，人脸更小、更糟
-      //    （实测 IC 侧直接收到 `face=NONE`）。
-      //    代价：25fps 的带宽约 85KB/s → 340KB/s，局域网可接受。
-      frameBase64: grab(640, 480, 0.5),                    // 人脸 25fps
-      frameOmniBase64: frameCounter === 0 ? grab(1280, 720, 0.7) : null, // Omni 1fps
     });
   };
+
+  /* ---------- 视频抓帧（独立定时器，25fps）----------
+   *
+   * ⚠️ **为什么不能靠"把音频块改小"来提帧率**：服务端的音频块是写死
+   *  100ms 的（`MIC_CHUNK=1600`），`_normalize_chunk` 会把**不足 1600 的块
+   *  补齐**（session.py:333）。若让 worklet 改发 40ms 块，每块都会被补齐到
+   *  100ms —— 时钟每块前进 1600 采样、实际只有 640 采样的音频，
+   *  **音频被拉伸 2.5 倍**，AEC 和 ASR 全废。
+   *  所以音频路径**一个字都不动**，视频走自己的定时器。
+   *
+   * ⚠️ **每帧带自己的 `ctx_time`**：服务端 `clock.ctx_to_sample()` 会把
+   *  它精确换算到会话采样轴上（这套锚点映射本来是给 AEC 参考轨用的，
+   *  见 clock.py 的 `record_anchor`）。这样即使帧和音频块不同步，
+   *  每帧的时刻依然精确 —— 不存在"连续几帧拿到同一个 t_ms"的退化。
+   *
+   * ⚠️ **单路抓帧**：这一次 grab 的结果同时给人脸、给 Omni、给录制，
+   *  服务端把 `video_face` 那一路的字节直接落盘。所以录制 == 算法所见，
+   *  不存在格式分歧。
+   *
+   * ⚠️ 尺寸 **1280×720**（原 640×480）。G1 的检测分对像素敏感、IC 迎宾
+   *  门禁要求 HIGH，这个变化**必须实测迎宾是否仍正常**。
+   */
+  const VIDEO_TICK_MS = 40;          // 25fps
+  let _videoTimer = null, _lastOmniAt = 0;
+  function startVideoCapture() {
+    if (_videoTimer) return;
+    _lastOmniAt = 0;
+    let n = 0;
+    _videoTimer = setInterval(() => {
+      if (!running || !session) return;
+      const frame = grab(1280, 720, 0.9);
+      if (!frame) return;
+      n++;
+      // Omni 1s 一次：发的就是**同一份字节**（不重抓、不重编码）
+      const now = performance.now();
+      const omni = (now - _lastOmniAt >= 1000);
+      if (omni) _lastOmniAt = now;
+      session.sendFrame({
+        frameBase64: frame,
+        frameOmniBase64: omni ? frame : null,
+        // 抓帧**此刻**的 AudioContext 时刻 —— 服务端据此精确落位
+        ctxTime: audioCtx ? audioCtx.currentTime : 0,
+      });
+    }, VIDEO_TICK_MS);
+    log('k', `视频抓帧已启动：${VIDEO_TICK_MS}ms/帧（${1000 / VIDEO_TICK_MS}fps）`
+           + ` 1280×720 q0.9 —— 人脸/Omni/录制**同一份字节**`);
+  }
+  startVideoCapture();
   workletNode.port.postMessage({ command: 'start' });
 }
 
@@ -1230,6 +1290,10 @@ $('btnStart').onclick = async () => {
       // 能力位：本前端会在 tts.start 后立刻**承诺**起播时刻，服务端据此
       // 精确落位参考轨。没有这一位的客户端会让服务端退回预测落位。
       caps: ['playback_anchor'],
+      // 请服务端把原始视频落盘、会话结束时与 mic.wav 合成复现文件。
+      // ⚠️ **必须显式请求**：replay 工具也会连进来发 video_face，若默认开
+      //    就会在复现时又写一份原始转储，越滚越多。
+      record_raw: $('rawRec') ? $('rawRec').checked : false,
     };
     if (Object.keys(advAsr).length) startPayload.asr = advAsr;
     if (advPrompt) startPayload.system_prompt = advPrompt;
@@ -1302,6 +1366,7 @@ $('aecMode').onchange = () => {
 
 $('btnStop').onclick = async () => {
   running = false;
+  if (_videoTimer) { clearInterval(_videoTimer); _videoTimer = null; }
   if (workletNode) { try { workletNode.port.postMessage({ command: 'stop' }); } catch (e) {} }
   if (session) await session.stop('user_stop');
   if (micStream) micStream.getTracks().forEach(t => t.stop());
