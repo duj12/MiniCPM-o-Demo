@@ -181,7 +181,10 @@ class FaceWorker:
             #   end   —— 本次交互**持续了多久**（墙钟累计），与在场时长无关。
             self._safe(self.on_wake, WakeEvent(
                 t=obs.t, phase="begin",
-                dwell_ms=int((obs.state or {}).get("dwell_ms") or 0),
+                # ⚠️ 用 `obs.dwell_ms`（每帧实时），**不能**从 `obs.state` 取 ——
+                #    那个只有 5Hz 刷新帧才有，唤醒恰好落在非刷新帧时会得到 0，
+                #    表现为"没熬够 dwell 就唤醒了"（实测偶发）。
+                dwell_ms=int(obs.dwell_ms or 0),
                 mean_confidence=obs.score, peak_confidence=obs.score,
                 box=obs.box,
             ))

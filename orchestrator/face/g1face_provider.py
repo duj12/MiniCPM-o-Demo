@@ -450,6 +450,10 @@ class G1FaceProvider:
             speaking=bool(result["speaking"]),
             lip_state=result["lip_state"] or "SILENT",
             interacting=interacting,
+            # ⚠️ **每帧实时值**，不要从 `state` 里取 —— 那个只有 5Hz 刷新帧才有，
+            #    在非刷新帧上取会得到 0（实测：唤醒恰好落在非刷新帧时，
+            #    `begin` 事件的 dwell_ms 是 0，看起来像"没熬够就唤醒了"）。
+            dwell_ms=dwell_ms,
             person_id=self._cached_person_id,
             track_id=track_id,
             identity_state=(st or {}).get("identity_state"),

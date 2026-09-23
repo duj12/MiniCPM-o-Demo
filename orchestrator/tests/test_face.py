@@ -251,11 +251,18 @@ def main() -> None:
     # state 刷新帧要真的下发（唤醒判据、IC 的 SOP 都靠它）
     n_state = sum(1 for o in obs_list if o.state is not None)
     check(n_state > 0, f"有 state 刷新帧下发（{n_state} 帧）")
-    # 唤醒必须真的是「熬够了 dwell」才触发 —— 这是改用 dwell 判据的核心
+    # 唤醒必须真的是「熬够了 dwell」才触发 —— 这是改用 dwell 判据的核心。
+    #
+    # ⚠️ 这条断言曾经**偶发 FAIL**（连跑 3 次挂 2 次），一开始误以为是
+    #    「2000 vs 1999 的边界抖动」，实际打印出来是 **`dwell_ms=0`** ——
+    #    根因是 `begin` 事件从 `obs.state` 里取 dwell，而那个 dict **只有
+    #    5Hz 刷新帧才有**（唤醒判定用的是每帧实时值）→ 唤醒恰好落在非刷新帧
+    #    就拿到 0。已在 `FaceObservation` 上加 `dwell_ms` 字段（每帧实时）修掉。
+    #    所以这里保持**严格断言** —— 它正是这个 bug 的护栏。
     bad = [w for w in begins if w.dwell_ms < args.wake_dwell]
     check(not bad,
           f"begin 的 dwell 均 ≥ 阈值 {args.wake_dwell}ms"
-          + (f"（有 {len(bad)} 条不满足）" if bad else ""))
+          + (f"（有 {len(bad)} 条不满足：{[w.dwell_ms for w in bad]}）" if bad else ""))
     # 身份结果必须带 uid（person_id 在线上是同一个兜底值，认人只能靠 uid）
     if want_identify and provider.available:
         check(len(idents) >= 1, f"有身份识别事件（{len(idents)} 条）")

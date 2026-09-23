@@ -46,6 +46,10 @@ class FaceObservation:
     #: ⚠️ **只作参考值**：g1face 从名字正则解析 ``person_N``，而线上人脸库里
     #: 存的是真名 → 解析全失败 → 所有人都落到同一个兜底值。UI 认人请用 uid。
     person_id: int = -1
+    #: 当前 track 连续在场时长（ms）。**每帧实时值**，不随 5Hz state 快照
+    #: 推迟 —— 唤醒判据与 `begin` 事件都该用它，不要从 `state` dict 里取
+    #: （那在非刷新帧上是 None，会得到 0）。
+    dwell_ms: int = 0
     #: 视觉跟踪 id（g1face 里是字符串，如 ``"1000003"``）；无人为 None。
     track_id: Optional[str] = None
     #: 身份状态机名：recognized / enrolled / unknown / register_failed /
