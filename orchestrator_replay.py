@@ -39,7 +39,7 @@
     # 纯音频（wav，任意采样率，会重采样到 16k）
     python orchestrator_replay.py --audio assets/audio/xxx.wav
 
-    # 音视频（视频抽帧：人脸 320×240、Omni 1280×720）
+    # 音视频（视频抽帧：人脸与 Omni 都默认 1280×720、25fps / 1fps）
     python orchestrator_replay.py --video assets/video/turnbased/121.mp4
 
     # 连远程编排服务
@@ -86,14 +86,16 @@ SR = 16000              # 会话采样率（全链路统一）
 MIC_CHUNK = 1600        # 100ms —— 与服务端 protocol.MIC_CHUNK 一致
 TTS_SR = 24000          # 服务端 TTS 输出采样率
 
-# 视频帧节奏。
+# 视频帧节奏。**以下默认值一律对齐浏览器端**（web 是真源，这里只是复现它）。
 #
-# ⚠️ 视频**必须与音频块解耦**：人脸要 24fps（41.7ms 一帧）比 100ms 的音频
-#    块还密，塞在音频循环里最多只能做到 10fps。所以主循环按细粒度 tick 走，
-#    音频、人脸、Omni 各自按自己的截止时间触发。
-DEFAULT_FACE_FPS = 24.0
-DEFAULT_OMNI_FPS = 1.0
-FACE_MAX_W, FACE_MAX_H, FACE_Q = 320, 240, 0.5
+# ⚠️ 视频**必须与音频块解耦**：人脸 25fps（40ms 一帧）比 100ms 的音频块还密。
+#    塞在音频循环里最多只能做到 10fps（那正是 web 端**改之前**的形态 ——
+#    抓帧挂在音频块回调上）。所以主循环按细粒度 tick 走，音频、人脸、Omni
+#    各自按自己的截止时间触发。web 端现在也是独立 40ms 定时器，两边同构。
+DEFAULT_FACE_FPS = 25.0         # = web 的 VIDEO_TICK_MS=40（1000/40）
+DEFAULT_OMNI_FPS = 1.0          # = web 的 1s 边界
+FACE_MAX_W, FACE_MAX_H = 1280, 720      # = web 的 grab(1280, 720, 0.9)
+OMNI_MAX_W, OMNI_MAX_H = 1280, 720      # Omni 复用同一份字节
 #: 人脸抽帧尺寸可被 ``--face-size`` 覆盖（形如 ``640x480``）。
 #: ⚠️ 为什么需要这个旋钮：G1 的人脸检测分**随人脸像素尺寸下降** —— 源片
 #:    1440×1080 缩到 320 宽后，中等距离的人脸只有 ~50px，检测分落在
@@ -102,8 +104,21 @@ FACE_MAX_W, FACE_MAX_H, FACE_Q = 320, 240, 0.5
 #:    播报**，而 ASR/人脸本身都是正常的（实测踩过）。调大抽帧尺寸就能
 #:    把检测分抬上去。浏览器端发的也是缩放图，所以这只是在改"模拟哪种
 #:    摄像头画面"，不是绕过产品逻辑。
-OMNI_MAX_W, OMNI_MAX_H, OMNI_Q = 1280, 720, 0.7
-TICK_S = 0.004          # 主循环粒度（4ms）—— 足够区分 24fps 的帧间隔
+
+#: JPEG 质量。**注意刻度与 web 完全不同**：
+#:     web   是 canvas ``toDataURL('image/jpeg', q)``，q ∈ [0,1]，取 0.9
+#:     这里是 ffmpeg ``-q:v``，∈ [1,31]（**越小越好**）
+#: 所以**不能**把 web 的 0.9 直接搬过来。下面的值是**实测标定**出来的 ——
+#: 用同一张源图分别编码，比 PSNR 找最接近 canvas 0.9 的那档：
+#:     canvas q=0.9 (PIL q=90, 4:4:4)  PSNR 44.41 dB
+#:     -q:v 3                          PSNR 45.48 dB
+#:     -q:v 4                          PSNR 43.50 dB   ← 最接近（差 0.91 dB）
+#:     -q:v 5                          PSNR 42.08 dB
+#: 取 4。ffmpeg 的编码器更高效，同档质量下体积比 canvas 小约 25%，
+#: 这是编码器差异、不是质量差异。
+#: 要重新标定：换一张真实摄像头画面重跑上面这套比 PSNR 的流程即可。
+DEFAULT_JPEG_QV = 4
+TICK_S = 0.004          # 主循环粒度（4ms）—— 足够区分 25fps 的帧间隔
 
 
 def b64f32(x: np.ndarray) -> str:
@@ -340,10 +355,11 @@ class FaceOverlay:
     映射是**纯比例**、没有 letterbox 偏移（ffmpeg 的 decrease 只缩放不补边）：
         ``x = l · W / src_w``，``y = t · H / src_h``
 
-    ⚠️ 因此缩放系数要**从 src_w/src_h 读**，不能自己按 320×240 重算：
-    ffmpeg 的 `force_original_aspect_ratio=decrease` 在源比 320×240 **小**时
-    会**放大**（160×120 → 320×240），而浏览器 `grab()` 用 `Math.min(1,…)`
-    不放大。两者在这点上不一致 —— `src_w` 才是唯一可信的坐标系。
+    ⚠️ 因此缩放系数要**从 src_w/src_h 读**，不能自己按抽帧尺寸重算：
+    ffmpeg 的 `force_original_aspect_ratio=decrease` 在源比目标**小**时
+    会**放大**（如 160×120 → 320×240），而浏览器 `grab()` 用
+    `Math.min(1, …)` **不放大**。两者在这点上不一致 ——
+    `src_w` 才是唯一可信的坐标系。
     """
 
     def __init__(self, font_path: str = "", scale: float = 1.0,
@@ -436,7 +452,7 @@ class FaceOverlay:
 
         ⚠️ **只在标签那一小块上做 Pillow 往返**，不要整帧转。
         实测：对 1440×1080 整帧做 ``Image.fromarray`` + ``np.asarray``
-        要 **31ms**，而 24fps 的预算是 41.7ms —— 光这一步就吃掉 3/4，
+        要 **31ms**，而 25fps 的预算是 40ms —— 光这一步就吃掉 3/4，
         再叠上解码和 x264 编码必然掉帧（实测丢 18/220）。
         标签区域只有几百像素宽，裁出来转换快到可以忽略。
         """
@@ -521,7 +537,7 @@ class FaceOverlay:
 class FaceWindow:
     """回放时开一个窗口显示视频 + 人脸框/唇动；可选同时录成 mp4。
 
-    ⚠️ **必须跑在独立线程里**。主循环是**实时**节奏（24fps 只有 41.7ms
+    ⚠️ **必须跑在独立线程里**。主循环是**实时**节奏（25fps 只有 40ms
     预算，还要发 100ms 的音频块），而 1080p 单帧的解码+绘制+编码要
     10~20ms；塞进主循环必然掉帧，进而把音频块也发晚 —— 参考轨落位随之
     偏移，AEC 的结论就不可信了（这个工具测的是协议与对齐，不是画质）。
@@ -1580,7 +1596,7 @@ class OrchestratorReplayClient:
             if tr and tr.get("src_w"):
                 self.face_src_wh = (int(tr["src_w"]), int(tr["src_h"]))
             # 每 N 条打印一次人脸详情（默认 5 条，`--face-log-every` 可调）。
-            # 节流的原因：服务端 face.state 是 ~10Hz，24fps 的输入下每帧都打
+            # 节流的原因：服务端 face.state 是 ~10Hz，25fps 的输入下每帧都打
             # 会淹没其他日志。
             if self.verbose and self.face_states % self.face_log_every == 0:
                 print("\n  " + self._fmt_face(m, self.face_states))
@@ -1753,8 +1769,12 @@ def extract_frames(path: str, fps: float, max_w: int, max_h: int,
                    quality: int = 5) -> List[bytes]:
     """按 fps 抽 JPEG 帧，缩放到 max_w×max_h 以内。
 
-    ⚠️ 缩放是**必须**的：浏览器发的就是缩放后的图（人脸 320×240、
-    Omni 1280×720）。原图直接发会撑爆带宽与下游 KV。
+    ⚠️ 缩放是**必须**的：浏览器发的就是缩放后的图（人脸与 Omni 都是
+    ``grab(1280, 720, 0.9)`` —— **同一份字节**）。原图直接发会撑爆带宽
+    与下游 KV。
+
+    ⚠️ ``quality`` 是 ffmpeg 的 ``-q:v``（1~31，越小越好），
+    **不是** canvas 的 0~1。默认值见 ``DEFAULT_JPEG_QV``（已按 PSNR 标定）。
     """
     vf = (f"fps={fps},scale={max_w}:{max_h}:force_original_aspect_ratio=decrease"
           f":force_divisible_by=2")
@@ -1784,10 +1804,11 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                      src_speaker: Optional["Speaker"] = None,
                      play_tts: bool = True, play_src: bool = True,
                      ) -> OrchestratorReplayClient:
-    """按**真实实时节奏**回放：音频 100ms/块，人脸 24fps，Omni 1fps。
+    """按**真实实时节奏**回放：音频 100ms/块，人脸 25fps，Omni 1fps。
 
     三条流各自的节奏不同，所以用统一的 tick 循环按各自的截止时间触发 ——
-    把视频塞进音频循环里最多只能到 10fps（100ms 一块）。
+    把视频塞进音频循环里最多只能到 10fps（100ms 一块），这正是 web 端
+    改独立定时器**之前**的形态。
     """
     n_chunks = int(np.ceil(len(audio) / MIC_CHUNK))
     tail_chunks = int(args.tail_silence_s * 10)
@@ -1802,9 +1823,12 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
     print(f"  音频 {len(audio)/SR:.1f}s（{n_chunks} 块 @100ms）+ 尾静音 "
           f"{args.tail_silence_s:.1f}s")
     if face_frames:
-        print(f"  视频帧：人脸 {len(face_frames)} 帧 @{args.face_fps:.0f}fps"
-              f"（{FACE_MAX_W}×{FACE_MAX_H}）、Omni {len(omni_frames)} 帧 "
-              f"@{args.omni_fps:.0f}fps（{OMNI_MAX_W}×{OMNI_MAX_H}）")
+        # ⚠️ 打印**实际生效的值**，不是常量。早先写死 `FACE_MAX_W` 等，
+        #    于是传 `--face-size 640x480` 时实际抽的是 640×480、
+        #    屏幕上却印着 1280×720 —— 排查时会被自己的日志带偏。
+        print(f"  视频帧：人脸 {len(face_frames)} 帧 @{args.face_fps:g}fps"
+              f"（{args.face_size}）、Omni {len(omni_frames)} 帧 "
+              f"@{args.omni_fps:g}fps（{OMNI_MAX_W}×{OMNI_MAX_H}）")
     else:
         print("  视频：无（纯音频）")
     # 两个开关分别报，别再含糊地说"本地播放"
@@ -1860,7 +1884,7 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                         (chunk * 32767.0).astype(np.int16))
                 idx += 1
 
-            # ── 人脸：24fps（约 41.7ms 一帧）──
+            # ── 人脸：25fps（约 40ms 一帧）──
             while face_frames and fi * face_dt <= now_v:
                 await client.send_video_face(face_frames[fi % len(face_frames)])
                 if window is not None:
@@ -2036,10 +2060,10 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         #    —— 而主循环在**视频发完**时就停了（`fi*face_dt <= now_v` 不再
         #    成立），偏偏 TTS 是在这之后才播的。于是状态栏停在最后一帧，
         #    「TTS 播放中」永远不出现。
-        #    这里按 24fps 继续投，让字幕/状态栏跟着收尾阶段的进展走。
+        #    这里按 25fps 继续投，让字幕/状态栏跟着收尾阶段的进展走。
         if window is not None and (window.show or window.out_path):
             # 本循环 20Hz（sleep 0.05），每轮投一帧即 ~20fps —— 与主循环的
-            # 24fps 同量级，够用；再高只会把只有 8 格的渲染队列塞满、白丢帧。
+            # 25fps 同量级，够用；再高只会把只有 8 格的渲染队列塞满、白丢帧。
             #
             # ⚠️ 已知局限（用 replay 验证 IC 时必看）：这里**一直投素材的
             #    最后一帧**，而素材里人常说个不停 → `lip=HIGH` 冻在 IC 里，
@@ -2159,9 +2183,17 @@ async def main_async(args) -> int:
         except Exception:  # noqa: BLE001
             raise SystemExit(f"--face-size 格式应为 WxH（如 640x480），"
                              f"得到 {args.face_size!r}")
-        print(f"  抽帧中（ffmpeg，人脸 {fw}×{fh}）...", flush=True)
-        face_frames = extract_frames(args.video, args.face_fps, fw, fh, 5)
-        omni_frames = extract_frames(args.video, args.omni_fps, OMNI_MAX_W, OMNI_MAX_H, 5)
+        print(f"  抽帧中（ffmpeg，人脸 {fw}×{fh} q:v{DEFAULT_JPEG_QV}）...",
+              flush=True)
+        # ⚠️ 质量必须**真的传进去**。早先这里各写死一个 `5`，
+        #    而 `FACE_Q = 0.9` / `OMNI_Q = 0.9` 两个常量定义了却从没人用
+        #    —— 既有误导性（那是 canvas 的刻度，塞给 ffmpeg 是错的量纲），
+        #    又让"和 web 端一致"变成一句空话。现已按实测标定见
+        #    ``DEFAULT_JPEG_QV``。
+        face_frames = extract_frames(args.video, args.face_fps, fw, fh,
+                                     DEFAULT_JPEG_QV)
+        omni_frames = extract_frames(args.video, args.omni_fps,
+                                     OMNI_MAX_W, OMNI_MAX_H, DEFAULT_JPEG_QV)
 
     # 默认 wss（服务端现在跑 HTTPS）。要连老式明文服务用 --ws。
     scheme = "ws" if args.ws else "wss"
@@ -2367,7 +2399,7 @@ def main() -> None:
     p.add_argument("--face-size", default=f"{FACE_MAX_W}x{FACE_MAX_H}",
                    help=(
                        f"人脸帧抽帧尺寸 WxH（默认 {FACE_MAX_W}x{FACE_MAX_H}，"
-                       "与浏览器发的 320×240 一致）。"
+                       "与浏览器端 grab() 的尺寸一致）。"
                        "**人脸检测分随像素尺寸下降** —— 源片较大/人脸较远时，"
                        "320 宽下 score 会落到 0.7x（= MEDIUM），而 IC 的迎宾"
                        "门禁要求 HIGH（≥0.8）→ IC 一直 HOLD、不出 GREET、"

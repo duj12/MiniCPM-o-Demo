@@ -62,6 +62,11 @@ _QUEUE_MAX = 64
 #: 正常情况下 `-face.mjpeg` 就是同一份字节。
 _KEEP_MJPEG = os.environ.get("ORCH_KEEP_RAW_MJPEG", "0") == "1"
 
+#: 跳过原因是否要**说出来**。
+#: 在线路径（会话收尾）静默 —— 无摄像头的会话本来就该安静跳过；
+#: 离线补做（CLI）打开 —— 操作员需要知道缺的是哪个文件。
+_VERBOSE_SKIP = False
+
 
 class RawVideoWriter:
     """把原始帧追加写进 ``<prefix>-<sid>-raw.mjpeg`` + ``.tsv``。
@@ -254,7 +259,19 @@ def mux_raw_video(prefix: str, sid: str, *,
                        sid, mjpeg)
         return None
     if not mjpeg.is_file() or not tsv.is_file():
-        return None          # 没录到帧：静默（无摄像头的会话就是这条路径）
+        # 没录到帧。**在线路径**上是正常的（无摄像头的会话就是这样），
+        # 所以那里静默；但**离线补做**时操作员需要知道到底缺哪个文件，
+        # 否则只看到一句"未生成"，无从下手。
+        if _VERBOSE_SKIP:
+            missing = [str(p) for p in (mjpeg, tsv) if not p.is_file()]
+            logger.warning("[%s] 缺少原始转储文件，无法合成：%s",
+                           sid, "、".join(missing))
+            if not mjpeg.is_file():
+                logger.warning("[%s] 注意：%s **不是**缺失，而是已被删除 —— "
+                               "合成成功后会自动删它（与 face.mjpeg 重复）。"
+                               "若 mkv 已存在，说明这场早已合成完成，无需补做。",
+                               sid, mjpeg.name)
+        return None
     if not mic.is_file():
         logger.warning("[%s] 没有 mic.wav（未开音频转储？）—— 跳过 mux", sid)
         return None
@@ -364,3 +381,53 @@ def mux_raw_video(prefix: str, sid: str, *,
                 sid, out, out.stat().st_size / 1e6, dims, len(ticks), out,
                 int(round(1000.0 / RAW_TICK_MS)))
     return str(out)
+
+
+# ====================================================================== #
+#  离线补做 mux
+# ======================================================================
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    """命令行：给**已有的**转储补做 mux。
+
+    为什么需要它 —— 会话收尾**不保证**跑得到 mux 那一步：
+        `_shutdown_session` 在 drain 超时后会 `await asyncio.gather(*tasks)`，
+        若某个被取消的后台任务不响应取消，收尾协程就**永远等下去**，
+        `close()` 根本不会执行（实测踩过：会话 `7495df3d4ead` 卡在这里，
+        `close()` 一行日志都没有）。
+    **好消息是数据没丢**：`RawVideoWriter` 每帧都 flush 到盘，所以
+    `.mjpeg` + `.tsv` 是完整的、可用的 —— 只是少了 mux 这一步。
+    这条命令就是用来补那一步的。
+
+    用法：
+        python -m orchestrator.raw_dump <prefix> <sid>
+        python -m orchestrator.raw_dump /path/orchdump/s s-7495df3d4ead
+
+    完成后与自动路径**行为一致**（含删除重复的 `-raw.mjpeg`）。
+    """
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m orchestrator.raw_dump",
+        description="给已有的原始转储补做 mux（会话收尾卡住时的补救）")
+    ap.add_argument("prefix", help="转储路径前缀，如 /path/orchdump/s")
+    ap.add_argument("sid", help="会话 id（文件名的 <sid> 段）")
+    ap.add_argument("--keep-mjpeg", action="store_true",
+                    help="保留 -raw.mjpeg（默认合成成功后删除）")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s %(message)s")
+    global _KEEP_MJPEG, _VERBOSE_SKIP
+    if args.keep_mjpeg:
+        _KEEP_MJPEG = True
+    _VERBOSE_SKIP = True          # 离线时把跳过原因说清楚
+    r = mux_raw_video(args.prefix, args.sid)
+    if r is None:
+        print("未生成 mkv —— 原因见上方告警。原始文件不会被破坏，可反复重试。")
+        return 1
+    print(f"完成：{r}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
