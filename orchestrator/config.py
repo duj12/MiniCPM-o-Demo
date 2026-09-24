@@ -111,6 +111,30 @@ class Settings:
     #: 这样 web 和 python 客户端自动都具备。
     ic_grpc: str = field(default_factory=lambda: os.environ.get(
         "ORCH_IC_GRPC", "localhost:50051"))
+    #: **告诉 Agent 回连 IC 用哪个地址** —— 与 `ic_grpc` 是**两件事**。
+    #:
+    #: `ic_grpc`   是**编排服务自己去连** IC 的地址。
+    #: `ic_advertise` 是**Agent 回连** IC 的地址（Agent 在 192.168.89.102，
+    #: 它收到 IC 的 Action 后要 `POST {target}/interaction/on_*`）。
+    #:
+    #: ⚠️ 同机部署时两者可以一样（都是 localhost）。但**跨主机时不填这个就错**
+    #:    —— 实测踩过：105 把 `127.0.0.1:50051` 告诉 Agent，而这个地址从
+    #:    Agent 视角看是**它自己**，于是
+    #:      · 105 会话期间：Agent 把 Action 派到错误的地方
+    #:      · 105 会话结束归还后：留下的还是这个错地址 → **106 的会话也跟着错**
+    #:    这就是两台机器互相影响的真实通道之一。
+    #: 空 = 退回 `ic_grpc`（同机部署的常见情形，行为与旧版一致）。
+    ic_advertise: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_ADVERTISE", ""))
+    #: 会话结束时把 Agent 的 IC 目标**归还到哪** —— 应当是**大家共用的**
+    #: 那个 IC，不是本机自己的。
+    #:
+    #: ⚠️ 多机部署**必须**配它。实测踩过：105 归还成自己的地址
+    #:    （`192.168.89.105:50051`），于是 106 的下一个会话又得抢一次，
+    #:    每次都打冲突告警，而且抢的窗口内 106 的 Action 是派错的。
+    #: 空 = 退回 `ic_grpc`（单机部署语义正确：本机 IC 就是共享的那个）。
+    ic_restore: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_RESTORE", ""))
     #: Agent Platform 地址（IC 的四类 Action 派给它）
     agent_url: str = field(default_factory=lambda: os.environ.get(
         "ORCH_AGENT_URL", "http://192.168.89.102:8081"))

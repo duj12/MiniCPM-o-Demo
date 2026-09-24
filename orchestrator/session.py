@@ -106,7 +106,23 @@ class OrchestratorSession:
 
         # 音频转储（仅在 ORCH_DUMP_AUDIO 设置时开启；默认零开销）
         import os as _os
+        # `_dump_path` = **落在哪**（环境变量给的前缀）；`_dump_on` = **要不要落**。
+        #
+        # ⚠️ 这两个必须分开。早先只有 `_dump_path`，于是**任何**连进来的客户端
+        #    都会触发转储 —— 包括 replay 工具。实测踩过：在 105 上跑一轮
+        #    replay 验证，共享的 `orchdump/` 里就多出 `s-<sid>-mic.wav` /
+        #    `-raw.wav`（该会话只有音频、没有视频，所以是纯垃圾）。
+        #    多人共用一台服务时，这些噪声文件会越积越多，还容易和真实
+        #    录制产物混淆。
+        #
+        # 现在 `_dump_on` 默认 **False**，只有客户端在 `session.start` 里
+        # 显式带 `record_raw=true` 才打开（见 `enable_raw_record`）。
+        # 转储是"为复现而录制"，应当由**需要它的人**主动发起。
         self._dump_path = _os.environ.get("ORCH_DUMP_AUDIO") or None
+        #: 总开关。环境变量 `ORCH_DUMP_FORCE=1` 可强制全开（排障用，
+        #: 比如想在 replay 会话上抓一份对照数据）。
+        self._dump_on = bool(_os.environ.get("ORCH_DUMP_FORCE") == "1") \
+            and self._dump_path is not None
         self._dump_mic: list = []
         self._dump_ref: list = []
         self._dump_raw: list = []      # 未做 D 补偿的原始参考轨（测 D 用）
@@ -251,7 +267,7 @@ class OrchestratorSession:
         拿它去测 D 只能得到残差。测 D 必须用 ``-raw.wav``（未补偿的原始轨）
         —— 见 ``tests/measure_delay.py``。
         """
-        if self._dump_path is None:
+        if not self._dump_on:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
         n = frame.n_samples
@@ -273,13 +289,13 @@ class OrchestratorSession:
                 self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
-        if self._dump_path is None:
+        if not self._dump_on:
             return
         self._dump_aec.append(np.asarray(seg).reshape(-1).copy())
 
     def flush_audio_dump(self) -> None:
         """会话结束时把转储写成 wav（三路：mic / farend / aec 输出）。"""
-        if self._dump_path is None or not self._dump_mic:
+        if not self._dump_on or not self._dump_mic:
             return
         import wave
         from pathlib import Path
@@ -315,7 +331,7 @@ class OrchestratorSession:
 
         ``.tsv`` 列：``frame_index`` / ``t_ms``（会话采样轴，毫秒）/ ``bytes``。
         """
-        if self._dump_path is None:
+        if not self._dump_on:
             return
         from pathlib import Path
         for name, frames in (("face", self._dump_face),
@@ -739,7 +755,7 @@ class OrchestratorSession:
             return
         self.stats["video_face_frames"] += 1
         now_ms = self._frame_time_ms(ctx_time, epoch)
-        if self._dump_path is not None:
+        if self._dump_on:
             # 原样存 —— 与喂给 face_worker 的是同一份字节
             self._dump_face.append((now_ms, jpeg))
         if self._raw_wanted:
@@ -770,7 +786,7 @@ class OrchestratorSession:
         if self.closed:
             return
         self.stats["video_omni_frames"] += 1
-        if self._dump_path is not None:
+        if self._dump_on:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
@@ -792,21 +808,30 @@ class OrchestratorSession:
         self._last_omni_ms = now_ms
         self.omni.offer_frame(jpeg)
         # 落盘保留 omni 这一路（体积小，且是"Omni 实际看到什么"的证据）
-        if self._dump_path is not None:
+        if self._dump_on:
             self._dump_omni.append((now_ms, jpeg))
         self.stats["video_omni_frames"] += 1
 
     def enable_raw_record(self, on: bool) -> None:
-        """`session.start` 里带 `record_raw=true` 时开。
+        """客户端在 `session.start` 里带 `record_raw=true` 时开转储。
 
-        ⚠️ 必须由**前端显式请求**，不能只看 `ORCH_DUMP_AUDIO`：replay 工具
-        也会连进来发 `video_face`，若默认开就会在复现时又写一份原始转储，
-        越滚越多。
+        ⚠️ 这是**唯一**打开转储的入口。设计意图：录制是"为离线复现而抓
+        数据"，应当由**需要它的人**主动发起 —— 而不是所有连进来的客户端
+        （尤其 replay 工具）都在共享的 `orchdump/` 里留一堆垃圾。
+
+        实测踩过：105 上跑一轮 replay 验证，就在共享目录里多出
+        `s-<sid>-mic.wav` / `-raw.wav`（该会话只有音频、没有视频）。
+        多人共用一台服务时这类噪声会越积越多，还容易和真实录制混淆。
         """
-        self._raw_wanted = bool(on) and self._dump_path is not None
         if on and self._dump_path is None:
-            logger.info("[%s] 请求录制原始视频，但未开 ORCH_DUMP_AUDIO "
-                        "—— 忽略（转储总开关关着）", self.session_id)
+            logger.info("[%s] 请求录制，但未设置 ORCH_DUMP_AUDIO "
+                        "—— 不知道往哪落，忽略", self.session_id)
+            return
+        if on:
+            self._dump_on = True
+            self._raw_wanted = True
+            logger.info("[%s] 客户端请求录制 —— 转储已开（前缀 %s）",
+                        self.session_id, self._dump_path)
 
     def _finish_raw_record(self) -> None:
         """收尾：停写线程 → 合成单文件。**失败不影响会话收尾。**"""

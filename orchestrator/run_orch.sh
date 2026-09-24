@@ -58,6 +58,20 @@ export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$CODE/orchdump/s}"
 
 # ---- 人脸模块 ----
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
+
+# ---- InteractionCore ----
+# ⚠️ 这几个**必须显式设**，不能靠 `config.py` 的默认值 `localhost:50051`：
+#    这个地址会被**告诉 Agent**（Agent 在 192.168.89.102），让它回连 IC。
+#    而从 Agent 视角看 `localhost` 是**它自己** —— Action 会派错地方，
+#    而且会话结束"归还"时还把这个错地址留在共享 Agent 上，
+#    **污染另一台机器**（实测踩过，见 run_orch_105.sh 的说明）。
+#
+# `ORCH_IC_GRPC`     = 编排服务自己去连 IC（本机，localhost 没问题）
+# `ORCH_IC_ADVERTISE`= 告诉 Agent 回连的地址（**必须是外部可回连的**）
+# `ORCH_IC_RESTORE`  = 会话结束归还到哪（大家共用的那个 IC，这里就是本机）
+export ORCH_IC_GRPC="${ORCH_IC_GRPC:-localhost:50051}"
+export ORCH_IC_ADVERTISE="${ORCH_IC_ADVERTISE:-192.168.89.106:50051}"
+export ORCH_IC_RESTORE="${ORCH_IC_RESTORE:-192.168.89.106:50051}"
 # ⚠️ **默认不指定 .so 路径 —— 让代码自己挑。**
 #
 # G1 仓库里同时躺着几份 x86_64 产物，**它们不通用**：`lib/<arch>/` 那份是

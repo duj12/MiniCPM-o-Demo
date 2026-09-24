@@ -292,10 +292,20 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 ic_target, agent_target, session_id=sid,
                 on_action=_on_ic_action,
                 report_interval_s=cfg.ic_report_interval_s,
-                # 会话结束时把 Agent 的 IC 目标归还到**服务端配置的默认值**。
-                # ⚠️ 用 `cfg.ic_grpc` 而不是 `ic_target`：后者可能正是客户端
-                #    （replay）传进来的自定义地址，拿它归还等于没归还。
-                restore_ic_target=cfg.ic_grpc)
+                # 会话结束时把 Agent 的 IC 目标**归还到哪**。
+                #
+                # ⚠️⚠️ **绝不能退回 `ic_advertise`**（那是**本机**的对外地址）。
+                #    归还的语义是"还给**大家共用的**那个 IC"，不是"还给我自己"。
+                #    实测踩过：105 归还成 `192.168.89.105:50051`（它自己），
+                #    于是 106 的下一个会话又得重新抢一次、每次都打冲突告警。
+                #
+                # `ORCH_IC_RESTORE` 显式指定共享 IC 的地址（多机部署**应该**配）；
+                # 未配则退回 `ic_grpc` —— 单机部署时它就是本机 IC，语义正确，
+                # 与旧行为一致。
+                restore_ic_target=(cfg.ic_restore or cfg.ic_grpc),
+                # Agent 回连用的地址。跨机**必须**显式配；
+                # 空则退回编排服务去连 IC 的那个地址（同机部署没问题）。
+                ic_advertise=cfg.ic_advertise)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
@@ -725,7 +735,32 @@ def create_app(cfg: Settings):
     def _find_session(req) -> Optional[OrchestratorSession]:
         sid = (req.headers.get("x-session-id")
                or req.query_params.get("session_id") or "")
-        if sid and sid in REGISTRY.sessions:
+        # ⚠️ **诊断日志：Agent 到底有没有带 session 标识**。
+        #
+        # 为什么需要它：多会话并发时「回复会不会串到别的会话」**完全取决于
+        # Agent 回调时有没有带 `X-Session-Id`**（见下面 `_find_session` 的
+        # 匹配规则）。而 Agent Platform 是外部服务、源码不在本仓库，
+        # 我们只能从**进来的请求**上观察它到底传了什么。
+        #
+        # 看日志的方式：
+        #   · 有 session=xxxx 且命中 → 精确路由，并发安全
+        #   · session=（空）          → 走"唯一活跃会话"兜底；
+        #                               **多会话并存时会 404**（回复丢失）
+        #   · session=xxxx 但没命中    → Agent 传的值与本服务的不一致
+        #                              （很可能它用的是别的 id 口径）
+        active = list(REGISTRY.sessions.keys())
+        hit = bool(sid) and sid in REGISTRY.sessions
+        logger.info("[speak] 来自 %s：X-Session-Id=%r ?session_id=%r "
+                    "→ %s（本机活跃会话 %d 个：%s）",
+                    getattr(req.client, "host", "?") if req.client else "?",
+                    req.headers.get("x-session-id"),
+                    req.query_params.get("session_id"),
+                    "命中" if hit else ("空-唯一会话兜底"
+                                        if not sid and len(active) == 1
+                                        else "**未命中**"),
+                    len(active),
+                    ",".join(s[:8] for s in active[:4]) or "无")
+        if hit:
             return REGISTRY.sessions[sid]
         # 没指定就取唯一活跃会话（单会话部署的便利路径）
         if not sid and len(REGISTRY.sessions) == 1:

@@ -92,6 +92,14 @@ TTS_SR = 24000          # 服务端 TTS 输出采样率
 #    塞在音频循环里最多只能做到 10fps（那正是 web 端**改之前**的形态 ——
 #    抓帧挂在音频块回调上）。所以主循环按细粒度 tick 走，音频、人脸、Omni
 #    各自按自己的截止时间触发。web 端现在也是独立 40ms 定时器，两边同构。
+#: 编排服务地址默认值 —— **内部测试服务在 105**。
+#:
+#: ⚠️ 这里刻意不写 `127.0.0.1`：replay 通常在**开发机**上跑（Windows/别的
+#:    机器），而编排服务部署在 105。默认连本机的话每个人都要手动加
+#:    `--host 192.168.89.105`，忘一次就得到"连接被拒"，然后开始怀疑服务挂了。
+#:    要连本机（比如 105 上自测）显式传 `--host 127.0.0.1` 即可。
+DEFAULT_HOST = "192.168.89.105"
+
 DEFAULT_FACE_FPS = 25.0         # = web 的 VIDEO_TICK_MS=40（1000/40）
 DEFAULT_OMNI_FPS = 1.0          # = web 的 1s 边界
 FACE_MAX_W, FACE_MAX_H = 1280, 720      # = web 的 grab(1280, 720, 0.9)
@@ -2339,7 +2347,8 @@ def main() -> None:
                         "音频还是视频 —— 等价于 --audio/--video")
     p.add_argument("--audio", default="", help="音频文件（与 --video 二选一）")
     p.add_argument("--video", default="", help="视频文件（与 --audio 二选一）")
-    p.add_argument("--host", default="127.0.0.1", help="编排服务地址（默认本机）")
+    p.add_argument("--host", default=DEFAULT_HOST,
+                   help=f"编排服务地址（默认 {DEFAULT_HOST}，即内部测试服务）")
     p.add_argument("--port", type=int, default=8100, help="编排服务端口（默认 8100）")
     p.add_argument("--ws", action="store_true",
                    help="用明文 ws:// 连接（默认 wss://，与新服务端一致）。"

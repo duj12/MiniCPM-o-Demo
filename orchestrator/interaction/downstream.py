@@ -87,15 +87,20 @@ class InteractionDownstream:
                  session_id: str = "",
                  on_action: Optional[Any] = None,
                  report_interval_s: Optional[float] = None,
-                 restore_ic_target: str = "") -> None:
+                 restore_ic_target: str = "",
+                 ic_advertise: str = "") -> None:
         # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
         # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
         self.ic = InteractionClient(ic_target, owner_key=session_id)
         self.agent = AgentClient(agent_url)
         self.session_id = session_id
         #: 会话结束时把 Agent 的 IC 目标**归还**到哪 —— 传服务端配置里的
-        #: 默认 IC（`cfg.ic_grpc`）。空 = 不归还（调用方没给默认值）。
+        #: 默认 IC（**对外可回连的地址**）。空 = 不归还（调用方没给默认值）。
         self._restore_ic = restore_ic_target or ""
+        #: **告诉 Agent 回连哪个地址**。空 = 退回 `self.ic.target`（同机部署
+        #: 时的常见情形）。跨机部署**必须**显式给 —— 见 `config.ic_advertise`
+        #: 的说明（把 `127.0.0.1` 告诉 Agent 会派错，还会污染 106）。
+        self._ic_advertise = ic_advertise or self.ic.target
         #: 本会话是否真的设过 Agent 的目标（没设过就不该归还 —— 否则会把
         #: 别人设的值改掉）
         self._agent_ic_set_by_me = False
@@ -179,18 +184,19 @@ class InteractionDownstream:
         """
         # ⚠️ `global` 必须在**首次使用之前**声明（否则 SyntaxError）
         global _AGENT_IC_TARGET
+        want = self._ic_advertise     # 注意：不是 self.ic.target（见下）
         prev = _AGENT_IC_TARGET
-        if prev == self.ic.target:
+        if prev == want:
             return                      # 已经是本会话的地址，不必重复设
-        if prev is not None and prev != self.ic.target:
+        if prev is not None and prev != want:
             logger.warning(
                 "[%s] ⚠️ Agent(%s) 的 IC 目标正被另一个会话指向 %s，"
                 "本会话将改为 %s —— **Agent 是进程级全局单例**，"
                 "被覆盖的那一方 IC Action 会派错。并发用不同 IC 时无解，"
                 "需 Agent 侧支持每会话 target。",
-                self.session_id, self.agent.target, prev, self.ic.target)
-        if self.agent.set_ic_target(self.ic.target):
-            _AGENT_IC_TARGET = self.ic.target
+                self.session_id, self.agent.target, prev, want)
+        if self.agent.set_ic_target(want):
+            _AGENT_IC_TARGET = want
             self._agent_ic_set_by_me = True
 
     async def on_session_end(self, reason: str) -> None:
@@ -201,12 +207,23 @@ class InteractionDownstream:
         # ⚠️ **只在 Agent 当前目标仍是本会话设的**才归还 —— 否则会把
         #    别人正在用的地址改掉（那比不归还更糟）。并发下"最后关的赢"
         #    是这套全局状态的固有限制，不是这里能修的。
+        #
+        # ⚠️ 比对的是 `_ic_advertise`（本会话**设进去**的那个值），不是
+        #    `ic.target` —— 跨机部署时两者不同，拿后者比会永远不相等，
+        #    于是**永远不归还**，把错地址一直留给下一台机器（实测踩过）。
         global _AGENT_IC_TARGET
-        if self._agent_ic_set_by_me and _AGENT_IC_TARGET == self.ic.target:
-            if self.agent.set_ic_target(self._restore_ic):
-                logger.info("[%s] Agent 的 IC 目标已归还为 %s",
-                            self.session_id, self._restore_ic)
-                _AGENT_IC_TARGET = self._restore_ic
+        if self._agent_ic_set_by_me and _AGENT_IC_TARGET == self._ic_advertise:
+            if self._restore_ic:
+                if self.agent.set_ic_target(self._restore_ic):
+                    logger.info("[%s] Agent 的 IC 目标已归还为 %s",
+                                self.session_id, self._restore_ic)
+                    _AGENT_IC_TARGET = self._restore_ic
+            else:
+                # 没给归还目标 ⇒ 退回 Agent **自己的默认地址**更安全，
+                # 总比留着本会话的地址（下一台机器会派错）强。
+                logger.info("[%s] 未配置 ORCH_IC_ADVERTISE 的归还目标 —— "
+                            "Agent 的 IC 目标保留为 %s（请确认这对其他使用者正确）",
+                            self.session_id, _AGENT_IC_TARGET)
         elif self._agent_ic_set_by_me:
             logger.info("[%s] Agent 的 IC 目标已被别的会话改为 %s，"
                         "本会话不归还（避免改掉别人正在用的地址）",
