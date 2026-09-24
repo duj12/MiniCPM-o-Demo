@@ -562,6 +562,20 @@ class InteractionDownstream:
         if atype == "END":
             logger.info("[%s] IC → END（sop=%s）会话收尾", self.session_id, sop)
             self.agent.on_end()
+            # ⚠️ **按 sop 区分要不要停播** —— END 不等于"播完了"。
+            #
+            # IC 的 END 有三个 sop，语义完全不同（见 policy.py）：
+            #   · 24  人离开了（`absent_ms >= 4000`）→ **必须停播**。
+            #         实测踩过：人走了，正在播的 245 字长回复**继续对空房间
+            #         念完**，用户看到的现象是"人离开后没有停播"。
+            #   · 23  GREET 后 10s 无人应答 → 同样该停（没人听）
+            #   · 39  结束语**已经播完**了（`farewell_playback_seen`）→
+            #         不用停，播放器本来就已经停了
+            #
+            # 早先这里无条件 `return []`，等价于"END 就什么都不做" ——
+            # 对 39 碰巧是对的，对 24/23 就是**漏停播**。
+            if str(sop) in ("24", "23"):
+                return [Cancel(reason="session_end")]
             return []
 
         # ---- GREET / UTTER：IC 已给出模板文案，直接播 ----
