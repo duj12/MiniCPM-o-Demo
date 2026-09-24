@@ -157,6 +157,14 @@ class InteractionDownstream:
                 logger.warning("[%s] InteractionCore 不可用（%s）—— 无法决策",
                                self.session_id, self.ic.error)
                 return []
+        # ⚠️⚠️ **必须在任何状态写入之前清空** —— 见 `client.clear_session`
+        #    的说明。IC 的 Engine 是全局一份，`mode` 只在收到 END 时才重置；
+        #    而客户端**直接断开**不产生 END → 新会话一上来 `mode` 就不是
+        #    `IDLE` → **GREET 分支永远进不去**（实测：人站很久不迎宾、
+        #    主动提问才有反应，而人脸/ASR 全正常）。
+        #    放在这里（而不是 connect 之后立刻）是因为**这里才知道会话
+        #    真的要开始了**；早先的位置会在「连上但又没开会话」时白清一次。
+        self.ic.clear_session()
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []

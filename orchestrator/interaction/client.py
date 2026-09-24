@@ -151,6 +151,51 @@ class InteractionClient:
     #  写：非阻塞投递
     # ------------------------------------------------------------------ #
 
+    def clear_session(self) -> bool:
+        """把 IC 打回待机（清掉上一个会话的残留状态）。**同步调用**。
+
+        ## 为什么必须清
+
+        IC 的 ``Engine`` / ``InteractionState`` 是**进程级全局一份**
+        （``serve()`` 里只建一次），所以 ``session.mode`` 等状态**跨会话保留**：
+
+          · ``mode`` 只在**收到 END 动作**时才被 ``clear_session_on_end()``
+            重置回 ``IDLE``（``interactioncore/interaction/policy.py`` 的
+            ``clear_session_on_end``）
+          · 而 **GREET 的前置条件正是 ``mode == SessionMode.IDLE``**
+            （同文件里 `mode == SessionMode.IDLE` 那个 ``if`` 块，
+            它内部再判 ``greet_spoken`` / ``user_has_spoken``）
+
+        实测踩过：客户端**直接断开**（页面关掉）不产生 END → ``mode`` 停在
+        ``LISTENING`` → 下一个会话**永远不迎宾**。现象是「人站在那儿等了很久
+        也不打招呼，主动提问才有反应」，而人脸/ASR 全都正常 —— 极难定位。
+
+        ## 为什么是同步的（不走 ``apply`` 的异步队列）
+
+        调用点在 ``session.start`` **之前**，必须**清完再开始**。走异步队列
+        会和紧随其后的 ``apply_face`` / ``apply_asr`` 乱序，清掉的可能是
+        本会话刚写进去的状态。
+
+        ## 失败不阻断
+
+        IC 没这个接口（旧版本）时返回 False 并告警 —— 会话照常跑，
+        只是可能缺一次迎宾。不能因为清理失败就不让用户开会话。
+        """
+        if not self.available or self._client is None:
+            return False
+        try:
+            self._client.clear_session()
+            logger.info("InteractionCore 会话状态已清空（%s）—— "
+                        "避免上一个会话的 mode/greet 残留影响本次迎宾",
+                        self.target)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            # 老版本 IC 没有 ClearSession → UNIMPLEMENTED。只告警不阻断。
+            logger.warning("清空 InteractionCore 会话状态失败（%s）：%s —— "
+                           "若 IC 是旧版本可忽略；否则本次可能不迎宾",
+                           self.target, exc)
+            return False
+
     def apply(self, method: str, **kwargs: Any) -> None:
         """把一次 ``apply_*`` 投进队列（**立即返回**）。
 
