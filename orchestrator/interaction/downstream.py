@@ -562,18 +562,28 @@ class InteractionDownstream:
         if atype == "END":
             logger.info("[%s] IC → END（sop=%s）会话收尾", self.session_id, sop)
             self.agent.on_end()
-            # ⚠️ **按 sop 区分要不要停播** —— END 不等于"播完了"。
+            # ⚠️ **冗余保险**：按 sop 区分要不要停播。
             #
-            # IC 的 END 有三个 sop，语义完全不同（见 policy.py）：
-            #   · 24  人离开了（`absent_ms >= 4000`）→ **必须停播**。
-            #         实测踩过：人走了，正在播的 245 字长回复**继续对空房间
-            #         念完**，用户看到的现象是"人离开后没有停播"。
-            #   · 23  GREET 后 10s 无人应答 → 同样该停（没人听）
-            #   · 39  结束语**已经播完**了（`farewell_playback_seen`）→
-            #         不用停，播放器本来就已经停了
+            # ── 主路径是 IC 的 `/v1/stop`，不是这里 ──
+            # IC 判 YIELD / END 时会自己调 `ExpressionSink.stop()` →
+            # `POST /v1/stop`（见 interactioncore 的 `runtime.py._notify_sinks`），
+            # 那才是设计上"该由 IC 驱动停播"的地方。这里只是**兜底**。
             #
-            # 早先这里无条件 `return []`，等价于"END 就什么都不做" ——
-            # 对 39 碰巧是对的，对 24/23 就是**漏停播**。
+            # ── 为什么需要兜底 ──
+            # `/v1/stop` 走 HTTP，**任何一环断了它就静默失效**
+            # （证书、网络、超时、session 找不到 → 404）。而失败只记在
+            # IC 侧的日志里，编排侧完全无感。
+            #
+            # 实测踩过：证书 SAN 缺 106 → IC 的 `/v1/stop` **全部 SSL 失败**
+            # （编排日志里 `ic_stop` 从某时刻起归零），于是"人离开后
+            # 不停播"。而 YIELD 看起来正常 —— 那是因为紧接着的新 ANSWER
+            # 会触发 `superseded` 打断（**进程内调用，不走 HTTP**），
+            # 把问题掩盖了；END 之后没有新 ANSWER，就裸露出来。
+            #
+            # ── 三个 sop 的语义（见 interactioncore/interaction/policy.py）──
+            #   · 24  人离开了（`absent_ms >= 4000`）→ 必须停（对空房间说话很难堪）
+            #   · 23  GREET 后 10s 无人应答        → 同样该停（没人听）
+            #   · 39  结束语**已经播完**了          → 不用停，播放器本来已停
             if str(sop) in ("24", "23"):
                 return [Cancel(reason="session_end")]
             return []
