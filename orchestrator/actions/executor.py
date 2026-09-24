@@ -52,6 +52,9 @@ class ActionExecutor:
         # 它不能靠 playback.started/ended 判断 —— 那些只反映"音频送达"，
         # 不反映"播完"（整段是排程播放的，送达时可能才刚起播）。
         self._current_play_until: int = 0
+        #: 当前这句的**原文**。用于「同一条模板被下发了两次」的去重 ——
+        #: 见 `_is_duplicate_speak`。
+        self._current_text: str = ""
         self._tts_seq = 0
         self.speaks_done = 0
         self.cancels_done = 0
@@ -85,6 +88,54 @@ class ActionExecutor:
 
     # ------------------------------------------------------------------ #
 
+    def _is_duplicate_speak(self, act: Speak) -> bool:
+        """这条 Speak 是不是"**正在播的那句**"的重复？—— 是则跳过。
+
+        ## 为什么会有重复
+
+        IC 判 ``GREET`` / ``UTTER`` 时会做**两件事**（见 interactioncore 的
+        ``runtime.py._notify_sinks``）：
+
+          ① 把文案塞进 Action 一起返回 → 编排服务 `downstream` 收到后
+             `return [Speak(text)]` 播一遍
+          ② **另外**调 ``expression_sink.play_template()`` →
+             ``POST /v1/speak`` 再播一遍
+
+        ⚠️ ② **先于** ① 到达（``_notify_sinks`` 在 `return action` 之前调用），
+        所以实际顺序是：② 开始播 → ① 到达 → 打断②重新播 → 听感是
+        **同一句被说了两遍/带一次重启感**。
+
+        这个重复在**今天下午之前一直看不见** —— 因为那时 IC 的 HTTP 通路
+        被证书问题切断（② 静默失败），只播了 ①，**恰好是对的**。
+        证书修好后 ② 恢复，重复才暴露出来。
+
+        ## 为什么是"比对正在播的"而不是"记住播过什么"
+
+        ⚠️ **不能**做成"同样的文本播过就跳过" —— 那样会吞掉合法的
+        **重复迎宾**：会话 END 后（``clear_session_on_end`` 会清
+        ``greet_spoken``），人再回来时 IC 会合理地**再判一次 GREET**，
+        文案与上次**完全相同**。按历史去重会把这次迎宾吃掉。
+
+        所以判据限定为「与**当前正在播的这句**相同」—— 只挡"同一时刻的
+        重复下发"，对"END 之后再迎宾"没有影响（那时 `_current_text` 已被
+        `_interrupt_current` 或新一轮 Speak 覆盖/清空）。
+
+        ## 已知的边界
+
+        若 IC 真的**连着**下发两条一模一样的 Speak（不是①②重复，而是
+        有意说两遍），这里会吞掉第二条。当前 IC 的 GREET/UTTER 都有消费
+        保护（``greet_spoken`` / ``consumed_turn``），**不会**发生这种情况。
+        """
+        text = (act.text or "").strip()
+        if not text:
+            return False
+        playing = (self._current_text or "").strip()
+        if playing and text == playing:
+            logger.info("跳过重复播报（与正在播的相同，%d 字）：%s",
+                        len(text), text[:40])
+            return True
+        return False
+
     async def _speak(self, act: Speak, session: "OrchestratorSession") -> None:
         """合成并发送 TTS 音频。
 
@@ -100,6 +151,8 @@ class ActionExecutor:
         # close() 之后 TTS 的 gRPC channel 已关，再发起只会得到假错误。
         if session.closed:
             logger.info("会话已关闭，跳过 TTS 合成（%d 字）", len(act.text or ""))
+            return
+        if self._is_duplicate_speak(act):
             return
         # 流式增量：只把文本喂进流就返回。**绝不能在这里等合成** ——
         # run_downstream 是串行 await 的，占住它会让后续 delta 进不来，
@@ -169,6 +222,7 @@ class ActionExecutor:
         self._current_response_id = response_id
         self._tts_seq = 0
         self._stream_text = []
+        self._current_text = act.text or ""
 
         # ⚠️ 流式下此刻还不知道全文，text 只能给空 —— 字幕靠 tts.end 补
         await session.send_to_client(TtsStart(
@@ -295,6 +349,7 @@ class ActionExecutor:
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
+        self._current_text = act.text or ""
 
         # ⚠️ tts.start 必须在**合成之前**发 —— 浏览器要据此承诺起播时刻，
         #    而这段承诺的往返正好藏在 TTS 的合成耗时里（实测首帧 508ms）。
@@ -555,6 +610,10 @@ class ActionExecutor:
         )
         self._current_response_id = None
         self._current_play_until = 0
+        # ⚠️ **必须一起清** —— 它是 `_is_duplicate_speak` 的判据。
+        #    不清的话：打断后 IC 再下发同一句（比如 END 后人回来重新迎宾、
+        #    文案相同）会被误当成"正在播的那句"而**吞掉**。
+        self._current_text = ""
         self.cancels_done += 1
         # 打断 = 立刻不再出声，**不等浏览器回执**（那要绕一圈才回来）。
         # IC 的 SOP 07 靠这个判"用户抢话后已经停播"。
