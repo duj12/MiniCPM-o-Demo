@@ -60,6 +60,46 @@ class AgentClient:
         logger.info("Agent 投递已启动: %s", self.target)
 
     # ------------------------------------------------------------------ #
+    #  把「本会话的 IC 地址」同步给 Agent
+    # ------------------------------------------------------------------ #
+
+    def set_ic_target(self, ic_target: str) -> bool:
+        """告诉 Agent：本会话的 IC 在 ``ic_target``。
+
+        Agent 拿到 IC 的 Action 后要靠这个地址回连，**不设就会派到它自己
+        默认的那个 IC**（106）—— 于是「用别人的 IC 服务跑 replay」时，
+        replay 收不到自己的 Action（现象：IC 决策一直不对/判题全错）。
+
+        ⚠️⚠️ **这是 Agent 侧的``进程级全局``状态**（端点收的是单数
+        ``interaction_core_target``，没有 session 维度）。所以：
+            · 多人/多会话**并发**时，后设的会覆盖先设的，**最后关的赢**
+            · 这一版只做「同步 + 冲突告警」，**不**试图用锁去串行化 ——
+              本进程内的锁挡不住别人另起一个 orchestrator 实例
+        真正的解法在 Agent 侧（按 session 存 target，或让请求带上 target）。
+        在它实现之前，调用方**必须**能从日志里看出"地址被谁改了"。
+
+        返回是否设置成功。**失败只告警，不抛** —— Agent 连不上不该让会话崩
+        （与 `_post` 的失败处理一致：Agent 是可降级的旁路）。
+        """
+        url = f"{self.target}/interaction/set_target"
+        body = json.dumps({"interaction_core_target": ic_target}).encode()
+        try:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=_POST_TIMEOUT) as r:
+                r.read()          # 读掉响应体，别留连接
+            logger.info("Agent(%s) 的 IC 目标已设为 %s"
+                        "（此后 IC 的 Action 会派到这里回连）",
+                        self.target, ic_target)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("设置 Agent(%s) 的 IC 目标失败（%s）：%s —— "
+                           "IC 的 Action 可能被派到 Agent 默认的 IC 上",
+                           self.target, url, exc)
+            return False
+
+    # ------------------------------------------------------------------ #
 
     def on_answer(self, transcript: str, identity_id: Optional[str] = None,
                   display_name: Optional[str] = None) -> None:

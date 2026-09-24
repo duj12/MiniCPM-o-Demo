@@ -291,7 +291,11 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             ic_ds = InteractionDownstream(
                 ic_target, agent_target, session_id=sid,
                 on_action=_on_ic_action,
-                report_interval_s=cfg.ic_report_interval_s)
+                report_interval_s=cfg.ic_report_interval_s,
+                # 会话结束时把 Agent 的 IC 目标归还到**服务端配置的默认值**。
+                # ⚠️ 用 `cfg.ic_grpc` 而不是 `ic_target`：后者可能正是客户端
+                #    （replay）传进来的自定义地址，拿它归还等于没归还。
+                restore_ic_target=cfg.ic_grpc)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():

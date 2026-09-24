@@ -41,6 +41,15 @@ from .client import InteractionClient
 
 logger = logging.getLogger(__name__)
 
+#: **模块级**记录「Agent 当前被设成了哪个 IC 地址」。
+#:
+#: ⚠️ 必须是模块级而非实例级 —— Agent 的那个设置是**进程级全局**的
+#: （见 `AgentClient.set_ic_target`），多个会话共享同一个 Agent 状态，
+#: 每个会话各自拿实例变量记会记岔。这里只做**记账**，供
+#: 「结束时该不该归还」和「有没有被别的会话覆盖」这两处判断使用。
+#: None = 本进程还没设过（Agent 用它自己的默认值）。
+_AGENT_IC_TARGET: Optional[str] = None
+
 HIGH = "HIGH"
 MEDIUM = "MEDIUM"
 LOW = "LOW"
@@ -77,12 +86,19 @@ class InteractionDownstream:
     def __init__(self, ic_target: str, agent_url: str,
                  session_id: str = "",
                  on_action: Optional[Any] = None,
-                 report_interval_s: Optional[float] = None) -> None:
+                 report_interval_s: Optional[float] = None,
+                 restore_ic_target: str = "") -> None:
         # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
         # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
         self.ic = InteractionClient(ic_target, owner_key=session_id)
         self.agent = AgentClient(agent_url)
         self.session_id = session_id
+        #: 会话结束时把 Agent 的 IC 目标**归还**到哪 —— 传服务端配置里的
+        #: 默认 IC（`cfg.ic_grpc`）。空 = 不归还（调用方没给默认值）。
+        self._restore_ic = restore_ic_target or ""
+        #: 本会话是否真的设过 Agent 的目标（没设过就不该归还 —— 否则会把
+        #: 别人设的值改掉）
+        self._agent_ic_set_by_me = False
         #: `(action_type, sop, text)` 回调 —— 给 UI/日志用（可选）
         self._on_action = on_action
         if report_interval_s is not None:
@@ -137,13 +153,64 @@ class InteractionDownstream:
                                self.session_id, self.ic.error)
                 return []
         self.agent.start()          # 幂等（_thread 非空直接返回）
+        self._sync_agent_ic_target()
         return []
+
+    # ------------------------------------------------------------------ #
+    #  Agent 的 IC 目标同步
+    # ------------------------------------------------------------------ #
+
+    def _sync_agent_ic_target(self) -> None:
+        """把**本会话的** IC 地址告诉 Agent。
+
+        Agent 收到 IC 的 Action 后要靠这个地址回连。不同的人用不同的 IC
+        （比如别人 replay 时用自己的 IC 服务），不告诉它就会派到 Agent
+        默认的那个（106）——于是 replay 收不到自己的 Action，表现为
+        「IC 决策一直不对 / 判题全错」。
+
+        ⚠️⚠️ **Agent 的这个设置是进程级全局的**（端点收单数
+        ``interaction_core_target``，无 session 维度）。所以并发时后设的
+        覆盖先设的。这一版**只同步 + 告警**，不去串行化 —— 详见
+        ``AgentClient.set_ic_target`` 的说明。
+
+        ⚠️ 冲突**只告警不阻断**：真实部署里 106 的 IC 是共享的，两个会话
+        用同一个 IC 完全正常，那不算冲突。只有当地址**不同**时才说明
+        「Agent 只能指向其中一个」，这时另一方的 Action 一定会派错。
+        """
+        # ⚠️ `global` 必须在**首次使用之前**声明（否则 SyntaxError）
+        global _AGENT_IC_TARGET
+        prev = _AGENT_IC_TARGET
+        if prev == self.ic.target:
+            return                      # 已经是本会话的地址，不必重复设
+        if prev is not None and prev != self.ic.target:
+            logger.warning(
+                "[%s] ⚠️ Agent(%s) 的 IC 目标正被另一个会话指向 %s，"
+                "本会话将改为 %s —— **Agent 是进程级全局单例**，"
+                "被覆盖的那一方 IC Action 会派错。并发用不同 IC 时无解，"
+                "需 Agent 侧支持每会话 target。",
+                self.session_id, self.agent.target, prev, self.ic.target)
+        if self.agent.set_ic_target(self.ic.target):
+            _AGENT_IC_TARGET = self.ic.target
+            self._agent_ic_set_by_me = True
 
     async def on_session_end(self, reason: str) -> None:
         try:
             self.agent.on_end()
         except Exception:  # noqa: BLE001
             pass
+        # ⚠️ **只在 Agent 当前目标仍是本会话设的**才归还 —— 否则会把
+        #    别人正在用的地址改掉（那比不归还更糟）。并发下"最后关的赢"
+        #    是这套全局状态的固有限制，不是这里能修的。
+        global _AGENT_IC_TARGET
+        if self._agent_ic_set_by_me and _AGENT_IC_TARGET == self.ic.target:
+            if self.agent.set_ic_target(self._restore_ic):
+                logger.info("[%s] Agent 的 IC 目标已归还为 %s",
+                            self.session_id, self._restore_ic)
+                _AGENT_IC_TARGET = self._restore_ic
+        elif self._agent_ic_set_by_me:
+            logger.info("[%s] Agent 的 IC 目标已被别的会话改为 %s，"
+                        "本会话不归还（避免改掉别人正在用的地址）",
+                        self.session_id, _AGENT_IC_TARGET)
         self.agent.close()
         self.ic.close()
 
