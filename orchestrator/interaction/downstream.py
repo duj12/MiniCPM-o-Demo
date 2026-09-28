@@ -209,7 +209,11 @@ class InteractionDownstream:
 
     async def on_session_end(self, reason: str) -> None:
         try:
-            self.agent.on_end()
+            # ⚠️ 用 `engine_on_session_end()` 而不是 `on_end()` —— 后者受
+            #    `ORCH_AGENT_RELAY` 开关控制（默认不发，因为 IC 判 END 时
+            #    自己会发）。但**编排服务自己的会话收尾**是另一回事：
+            #    客户端断开 / 收尾，IC 不知道，只有我们知道，**不重复**。
+            self.agent.engine_on_session_end()
         except Exception:  # noqa: BLE001
             pass
         # ⚠️ **只在 Agent 当前目标仍是本会话设的**才归还 —— 否则会把
