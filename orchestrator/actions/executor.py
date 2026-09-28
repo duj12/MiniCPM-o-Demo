@@ -154,6 +154,20 @@ class ActionExecutor:
             return
         if self._is_duplicate_speak(act):
             return
+        # ⚠️⚠️ **判重要在设置 `_current_text` 之前，设置要在任何 await 之前。**
+        #
+        # 实测踩过：IC 对同一个 GREET 连发两次 `/v1/speak`，间隔仅 50ms，
+        # 而 `_is_duplicate_speak` **没挡住** —— 因为 `_current_text` 原先是在
+        # `_speak_inner` **内部**才赋值的，那已经是 `await` 之后了：
+        #
+        #     t=0.000  第1次 _speak → 判重（_current_text 还是 ""）→ 通过
+        #     t=0.000  → _speak_inner: await 合成 …（_current_text 尚未赋值）
+        #     t=0.050  第2次 _speak → 判重（_current_text 仍是 ""）→ 通过 ❌
+        #
+        # 结果同一句话播两遍。现在在**同步段**里立刻落值，两次调用之间
+        # 没有任何 await 点，判重一定看得到。
+        if not act.stream_id:
+            self._current_text = act.text or ""
         # 流式增量：只把文本喂进流就返回。**绝不能在这里等合成** ——
         # run_downstream 是串行 await 的，占住它会让后续 delta 进不来，
         # 而本次合成正等着那些 delta → 自锁。
