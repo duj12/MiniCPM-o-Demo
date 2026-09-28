@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import threading
 import urllib.error
@@ -34,30 +33,6 @@ DEFAULT_AGENT_URL = "http://192.168.89.102:8081"
 
 _QUEUE_MAX = 64
 _POST_TIMEOUT = 5.0
-
-#: 编排服务是否**也**把 Action 转发给 Agent（默认关）。
-#:
-#: ## 为什么默认关
-#:
-#: IC 判出 ANSWER / INSERT / YIELD / END 时，**IC 自己**就会经
-#: ``AgentSink`` 把这些事件 POST 给 Agent（见 interactioncore 的
-#: ``runtime.py._notify_sinks``）。编排服务这边**也**做一遍是**重复投递** ——
-#: Agent 会收到两份 ``on_answer``（一份来自 IC、一份来自这里），
-#: 行为变成**取决于 Agent 内部如何处置重复**（去重？覆盖？都处理？），
-#: 而不是我们能保证的。实测确认过两份都发出去了。
-#:
-#: ## 那为什么还留着这个开关，而不是直接删掉
-#:
-#: 因为它曾经是**唯一的通路**：IC 的 HTTP 回调用的是和 ``/v1/speak`` /
-#: ``/v1/stop`` 同一套机制，而那条通路实测会因为**证书 / 网络 / 找不到
-#: session(404) 静默失效**（失败只记在 IC 侧日志，编排侧完全无感）。
-#: 那时编排侧的这份转发就是**兜底**。
-#:
-#: 直接删掉 ⇒ 万一 IC 通路再出问题，现象是「**完全没有回复**」且日志干净，
-#: 比"重复投递"难查得多。所以留成开关：
-#:     ORCH_AGENT_RELAY=1    打开兜底（IC 通路有问题时用）
-#:     未设置 / 0            只靠 IC（默认，正常部署就该这样）
-_AGENT_RELAY = os.environ.get("ORCH_AGENT_RELAY", "0") == "1"
 
 
 class AgentClient:
@@ -126,45 +101,22 @@ class AgentClient:
 
     # ------------------------------------------------------------------ #
 
-    # ⚠️ 下面四个 ``on_*`` 默认**不发**（`_AGENT_RELAY=0`）—— IC 自己会发。
-    #    同一个 Action 在这里再发一次就是**重复投递**，见 `_AGENT_RELAY` 的说明。
-    #    只有把 `ORCH_AGENT_RELAY=1` 打开时才真的投递（IC 通路出问题时的兜底）。
-
-    def on_answer(self, transcript: str, identity_id: Optional[str] = None,
-                  display_name: Optional[str] = None) -> None:
-        if not _AGENT_RELAY:
-            return
-        self._post("on_answer", {
-            "transcript": transcript or "",
-            "identity_id": identity_id,
-            "display_name": display_name,
-        })
-
-    def on_insert(self) -> None:
-        if not _AGENT_RELAY:
-            return
-        self._post("on_insert", {})
-
-    def on_yield(self) -> None:
-        if not _AGENT_RELAY:
-            return
-        self._post("on_yield", {})
-
-    def on_end(self) -> None:
-        # ⚠️ `on_session_end`（会话真正收尾）也调这一个 —— 那条路径**不是**
-        #    重复（IC 没有"编排服务会话结束"这个概念），所以它**不受**开关
-        #    影响：见 `engine_on_session_end()`。
-        if not _AGENT_RELAY:
-            return
-        self._post("on_end", {})
+    # ⚠️ **这里只有 Agent 的"寻址/生命周期"职责，没有事件转发。**
+    #
+    # 四个 Action 事件（on_answer / on_insert / on_yield / on_end）
+    # **一律由 IC 自己发**（interactioncore 的 `AgentSink`，走
+    # `runtime.py._notify_sinks`），而且它带的字段更全（从 IC 的 state 读）。
+    # 编排侧曾也有一份（`ORCH_AGENT_RELAY` 开关），那和 IC 是**同一件事做两遍**
+    # —— Agent 会收到两份 `on_answer`，行为变成"取决于 Agent 如何处置重复"。
+    # 已整个删除：**编排侧只做编排**。
 
     def engine_on_session_end(self) -> None:
-        """**编排服务会话收尾**专用 —— 不受 `_AGENT_RELAY` 开关影响。
+        """**编排服务会话收尾**通知 Agent。
 
-        `downstream.on_session_end` 里调的 `on_end` 与 IC 判 END 是**两件事**：
+        这是本类**唯一**的事件投递，且它**不是**重复 —— 与 IC 判 END 是两件事：
           · IC 判 END  = "IC 认为这轮交互结束"（IC 自己会通知 Agent）
           · 这里       = "编排服务这一路会话真的要关了"（客户端断开 / 收尾）
-        后者只有编排服务知道，**不重复**，所以无论如何都要发。
+        后者只有编排服务知道。
         """
         self._post("on_end", {})
 

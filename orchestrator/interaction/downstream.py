@@ -557,21 +557,23 @@ class InteractionDownstream:
         self._last_action_key = key
 
         if atype == "ANSWER":
-            if not fresh:
-                return []
-            logger.info("[%s] IC → ANSWER（sop=%s）转写=%r", self.session_id,
-                        sop, (getattr(action, "transcript", "") or "")[:40])
-            # 交给 Agent —— 它生成后调 /v1/speak 回来
-            self.agent.on_answer(
-                transcript=getattr(action, "transcript", None) or self._transcript,
-                identity_id=self._identity_id,
-                display_name=self._display_name,
-            )
+            logger.info("[%s] IC → ANSWER（sop=%s）转写=%r（由 IC 派给 Agent）",
+                        self.session_id, sop,
+                        (getattr(action, "transcript", "") or "")[:40])
+            # ⚠️ **编排侧不转发给 Agent** —— IC 自己会发。
+            #
+            # IC 判 ANSWER 时经 `AgentSink.on_answer()` POST 到 Agent
+            # （interactioncore 的 `runtime.py._notify_sinks`），且**字段更全**
+            # （从 IC 的 state 读 identity_id / display_name / transcript）。
+            # 编排侧再发一份 ⇒ Agent 收到**两份 on_answer**，行为变成
+            # "取决于 Agent 内部如何处置重复"，而不是我们能保证的。
+            #
+            # 早先这里是兜底（`ORCH_AGENT_RELAY`，默认已是关的），现已整个删除。
             return []
 
         if atype == "INSERT":
-            logger.info("[%s] IC → INSERT（sop=%s）放行慢结果", self.session_id, sop)
-            self.agent.on_insert()
+            logger.info("[%s] IC → INSERT（sop=%s）放行慢结果（由 IC 派给 Agent）",
+                        self.session_id, sop)
             return []
 
         if atype == "YIELD":
@@ -593,39 +595,21 @@ class InteractionDownstream:
             return []
 
         if atype == "END":
-            logger.info("[%s] IC → END（sop=%s）会话收尾", self.session_id, sop)
-            self.agent.on_end()
-            # ⚠️ **冗余保险**：按 sop 区分要不要停播。
+            logger.info("[%s] IC → END（sop=%s）会话收尾（停播由 IC 发起）",
+                        self.session_id, sop)
+            # ⚠️ **编排侧不转发、不主动停播** —— IC 自己会做两件事
+            #    （interactioncore 的 `runtime.py._notify_sinks`）：
+            #      · `AgentSink.on_end()`      → 通知 Agent
+            #      · `ExpressionSink.stop()`   → `POST /v1/stop` 停播
             #
-            # ── 主路径是 IC 的 `/v1/stop`，不是这里 ──
-            # IC 判 YIELD / END 时会自己调 `ExpressionSink.stop()` →
-            # `POST /v1/stop`（见 interactioncore 的 `runtime.py._notify_sinks`），
-            # 那才是设计上"该由 IC 驱动停播"的地方。这里只是**兜底**。
-            #
-            # ── 为什么需要兜底 ──
-            # `/v1/stop` 走 HTTP，**任何一环断了它就静默失效**
-            # （证书、网络、超时、session 找不到 → 404）。而失败只记在
-            # IC 侧的日志里，编排侧完全无感。
-            #
-            # 实测踩过：证书 SAN 缺 106 → IC 的 `/v1/stop` **全部 SSL 失败**
-            # （编排日志里 `ic_stop` 从某时刻起归零），于是"人离开后
-            # 不停播"。而 YIELD 看起来正常 —— 那是因为紧接着的新 ANSWER
-            # 会触发 `superseded` 打断（**进程内调用，不走 HTTP**），
-            # 把问题掩盖了；END 之后没有新 ANSWER，就裸露出来。
-            #
-            # ⚠️ **编排侧不主动停播** —— 同 YIELD：IC 判 END 时会自己调
-            #    `ExpressionSink.stop()` → `POST /v1/stop`。
-            #
-            # 早先按 sop 区分（24/23 停、39 不停）是**兜底**：
-            #   · 24  人离开了（`absent_ms >= 4000`）→ 该停
-            #   · 23  GREET 后 10s 无人应答          → 该停
-            #   · 39  结束语已播完                    → 不用停
-            # 那是 IC 的 HTTP 通路曾因证书静默失效时的补救（实测「人走了
-            # 还在对空房间念完 245 字」）。现在按职责划分去掉 ——
-            # IC 的 `/v1/stop` 已实测恢复正常（`reason=ic_stop` 到达并执行）。
-            # 需要恢复兜底时：把下面两行取消注释。
-            # if str(sop) in ("24", "23"):
-            #     return [Cancel(reason="session_end")]
+            # 历史（别再往回退）：
+            #   · 早先这里 `self.agent.on_end()` + `return [Cancel]`，与 IC
+            #     **完全重复**。
+            #   · 9-24 我一度以为 IC 没有停播机制，按 sop 给 24/23 加了
+            #     Cancel 兜底 —— 诊断是错的：IC 一直有，只是它的 HTTP 通路
+            #     被证书问题切断（证书 SAN 缺 106），编排日志里 `ic_stop`
+            #     从 15 次归零。证书修好后实测已恢复：
+            #         `外部请求停播（reason=ic_stop）` → `打断 ...（ic_stop）`
             return []
 
         # ---- GREET / UTTER：**编排侧不播**，由 IC 自己下发 ----
