@@ -10,17 +10,30 @@
                                         ▼
                         Agent POST /v1/speak ──▶ Speak ──▶ TTS
 
-**本类不产生 Speak** —— 回复文本由 Agent 通过 HTTP 回调送进来（见
-``main.py`` 的 ``/v1/speak``）。这里只负责：
+**本类不产生 Speak，也不主动 Cancel** —— 播报与打断**全部**由 IC / Agent
+通过 HTTP 主动调用（见 ``main.py`` 的 ``/v1/speak`` 与 ``/v1/stop``）。
+
+> ⚠️ 这是**刻意的职责划分**，别再往这里加播报/打断：
+>   · **IC**    判 GREET/UTTER → `ExpressionSink.play_template` → `/v1/speak`
+>   · **IC**    判 YIELD/END   → `ExpressionSink.stop`         → `/v1/stop`
+>   · **Agent** 生成完回复     → `/v1/speak`（整段或流式）
+>
+> 早先本类**也**做这些（`return [Speak]` / `return [Cancel]`），结果是
+> 同一句话被播两遍、同一次打断被执行两次，靠去重和"后到的 Cancel 作用在
+> 已截断的轨上"掩盖着。**从源头去掉**才是干净的 —— 去重保留，但降级为
+> 纯粹的防御性检查（见 `executor._is_duplicate_speak`）。
+
+这里只负责：
 
   1. 把感知事件喂给 IC（非阻塞）
-  2. 每个 Tick 向 IC 要一次决策，把 Action 翻译成「通知 Agent / 停播 / 收尾」
-  3. ``GREET`` / ``UTTER`` 直接用 IC 给的模板文案 Speak（不用等 Agent）
+  2. 每个 Tick 向 IC 要一次决策，把 Action 翻译成「通知 Agent / 记日志 / 收尾」
+  3. ``GREET`` / ``UTTER`` 只记日志（播报由 IC 自己发起）
 
 ⚠️ **IC 的 Action 有 9 种**（不只是 4 种）：
 
-    ANSWER / INSERT / YIELD / END   → 派给 Agent
-    GREET  / UTTER                  → 模板文案，直接 Speak
+    ANSWER / INSERT / YIELD / END   → 事件派给 Agent（默认关，见
+                                      `agent._AGENT_RELAY`）
+    GREET  / UTTER                  → 只记日志；播报由 IC 自己发起
     LISTEN / WAIT / HOLD            → 不动（继续听）
 
 ⚠️ IC 的状态是**服务端全局一份**（没有 session 概念），所以一个进程里
@@ -32,9 +45,13 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..downstream.interface import (
-    AsrFinal, AsrPartial, AsrStateUpdate, Cancel, DownstreamAction,
+    AsrFinal, AsrPartial, AsrStateUpdate, DownstreamAction,
     DownstreamEvent, FaceIdentity, FaceLipState, FaceState, FaceWake,
-    PlaybackReceipt, Speak, Tick,
+    PlaybackReceipt, Tick,
+    # ⚠️ `Speak` / `Cancel` **当前没有代码使用** —— 编排侧不再主动播报/打断
+    #    （见上面的类文档）。它们被注释掉的兜底分支引用着，取消注释时要用，
+    #    所以**留着 import**；`flake8` 若报 F401 属预期，别顺手删。
+    Speak, Cancel,
 )
 from .agent import AgentClient
 from .client import InteractionClient
@@ -559,9 +576,21 @@ class InteractionDownstream:
 
         if atype == "YIELD":
             logger.info("[%s] IC → YIELD（sop=%s）用户抢话，停播", self.session_id, sop)
-            self.agent.on_yield()
-            # 真正停播 —— 复用既有的 Cancel 链路（掐断浏览器 + 截参考轨）
-            return [Cancel(reason="barge_in")]
+            # ⚠️ **编排侧不主动停播** —— 由 IC 自己调 `POST /v1/stop` 完成。
+            #
+            # IC 判 YIELD 时会经 `ExpressionSink.stop()` 发 `/v1/stop`
+            # （interactioncore 的 `runtime.py._notify_sinks`），那才是
+            # 设计上该驱动停播的地方。编排侧再 `return [Cancel]` 就是
+            # **同一件事做两遍**：两条 Cancel 都会掐断浏览器 + 截参考轨，
+            # 后到的那条作用在已被截断的轨上（`ref 清 0 采样`）。
+            #
+            # 早先这里返回 Cancel 是**兜底**（IC 的 HTTP 通路曾因证书
+            # 静默失效，见 `_is_duplicate_speak` 的说明）。现在按
+            # 「编排侧只做编排，播报/打断由 IC 与 Agent 主动调用」的划分
+            # 去掉 —— 重复比兜底的收益更明确。
+            # 需要恢复兜底时：把下面这行取消注释。
+            # return [Cancel(reason="barge_in")]
+            return []
 
         if atype == "END":
             logger.info("[%s] IC → END（sop=%s）会话收尾", self.session_id, sop)
@@ -584,21 +613,39 @@ class InteractionDownstream:
             # 会触发 `superseded` 打断（**进程内调用，不走 HTTP**），
             # 把问题掩盖了；END 之后没有新 ANSWER，就裸露出来。
             #
-            # ── 三个 sop 的语义（见 interactioncore/interaction/policy.py）──
-            #   · 24  人离开了（`absent_ms >= 4000`）→ 必须停（对空房间说话很难堪）
-            #   · 23  GREET 后 10s 无人应答        → 同样该停（没人听）
-            #   · 39  结束语**已经播完**了          → 不用停，播放器本来已停
-            if str(sop) in ("24", "23"):
-                return [Cancel(reason="session_end")]
+            # ⚠️ **编排侧不主动停播** —— 同 YIELD：IC 判 END 时会自己调
+            #    `ExpressionSink.stop()` → `POST /v1/stop`。
+            #
+            # 早先按 sop 区分（24/23 停、39 不停）是**兜底**：
+            #   · 24  人离开了（`absent_ms >= 4000`）→ 该停
+            #   · 23  GREET 后 10s 无人应答          → 该停
+            #   · 39  结束语已播完                    → 不用停
+            # 那是 IC 的 HTTP 通路曾因证书静默失效时的补救（实测「人走了
+            # 还在对空房间念完 245 字」）。现在按职责划分去掉 ——
+            # IC 的 `/v1/stop` 已实测恢复正常（`reason=ic_stop` 到达并执行）。
+            # 需要恢复兜底时：把下面两行取消注释。
+            # if str(sop) in ("24", "23"):
+            #     return [Cancel(reason="session_end")]
             return []
 
-        # ---- GREET / UTTER：IC 已给出模板文案，直接播 ----
-        text = getattr(action, "text", None)
-        if atype in ("GREET", "UTTER") and text:
-            logger.info("[%s] IC → %s（sop=%s）: %s",
-                        self.session_id, atype, sop, text)
-            return [Speak(text=text)]
+        # ---- GREET / UTTER：**编排侧不播**，由 IC 自己下发 ----
+        #
+        # IC 判出 GREET/UTTER 时会调 `ExpressionSink.play_template(text)`
+        # → `POST /v1/speak`（interactioncore 的 `runtime.py._notify_sinks`）。
+        # 那才是播报的**唯一**来源。
+        #
+        # ⚠️ 早先这里 `return [Speak(text)]`，于是同一句话被播**两遍**
+        #    （IC 一份 + 这里一份），靠 `_is_duplicate_speak` 去重挡住第二遍。
+        #    那是"事后补救"：重复依然产生，只是被拦下。
+        #    现在按「编排侧只做编排，播报/打断由 IC 与 Agent 主动调用」的
+        #    划分去掉 —— 从源头不再产生重复，去重也随之成为纯粹的防御。
+        #
+        # ⚠️ 代价：迎宾/切句提示**完全依赖 IC 的 HTTP 通路**。该通路实测会因
+        #    证书 / 网络 / 找不到 session(404) 静默失效（失败只记 IC 侧日志）。
+        #    恢复兜底：把下面 `return [Speak(...)]` 取消注释。
         if atype in ("GREET", "UTTER"):
-            logger.warning("[%s] IC → %s 但没有文案（text 为空），跳过",
-                           self.session_id, atype)
+            text = getattr(action, "text", None)
+            logger.info("[%s] IC → %s（sop=%s）: %s（由 IC 自行播报）",
+                        self.session_id, atype, sop, (text or "")[:40])
+            # return [Speak(text=text)]        # ← 兜底，默认关
         return []
