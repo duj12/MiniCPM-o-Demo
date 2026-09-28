@@ -109,7 +109,10 @@ class InteractionDownstream:
         # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
         # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
         self.ic = InteractionClient(ic_target, owner_key=session_id)
-        self.agent = AgentClient(agent_url)
+        # ⚠️ `session_id` 必须传进去 —— 会话收尾的 `on_end` 要带上它，
+        #    否则 Agent 分不清是哪一路会话结束，会**跨会话误杀**
+        #    （见 `AgentClient.engine_on_session_end` 的实测证据）。
+        self.agent = AgentClient(agent_url, session_id=session_id)
         self.session_id = session_id
         #: 会话结束时把 Agent 的 IC 目标**归还**到哪 —— 传服务端配置里的
         #: 默认 IC（**对外可回连的地址**）。空 = 不归还（调用方没给默认值）。

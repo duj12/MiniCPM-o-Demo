@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import urllib.error
@@ -34,12 +35,26 @@ DEFAULT_AGENT_URL = "http://192.168.89.102:8081"
 _QUEUE_MAX = 64
 _POST_TIMEOUT = 5.0
 
+#: 会话收尾时是否通知 Agent（默认**关**）。
+#:
+#: ⚠️ 默认关是因为这个通知会**跨会话误杀** —— 详见
+#: `AgentClient.engine_on_session_end` 的说明（实测：旧会话迟到的 on_end
+#: 撞上新会话，新会话播报中被打断）。
+#:
+#: 等 Agent 侧支持按 `session_id` 区分后，设 `ORCH_AGENT_END_NOTIFY=1` 打开
+#: —— payload 里已经带了 `session_id`。
+_END_NOTIFY = os.environ.get("ORCH_AGENT_END_NOTIFY", "0") == "1"
+
 
 class AgentClient:
     """一路会话一个实例。所有投递非阻塞，失败只告警。"""
 
-    def __init__(self, target: str = DEFAULT_AGENT_URL) -> None:
+    def __init__(self, target: str = DEFAULT_AGENT_URL,
+                 session_id: str = "") -> None:
         self.target = (target or DEFAULT_AGENT_URL).rstrip("/")
+        #: 本会话 id。**必须随每个请求带给 Agent** —— 见 `engine_on_session_end`
+        #: 的说明（不带它 = Agent 分不清这是哪一路会话的结束，会**跨会话误杀**）。
+        self.session_id = session_id or ""
         self._q: "queue.Queue" = queue.Queue(maxsize=_QUEUE_MAX)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -113,12 +128,42 @@ class AgentClient:
     def engine_on_session_end(self) -> None:
         """**编排服务会话收尾**通知 Agent。
 
-        这是本类**唯一**的事件投递，且它**不是**重复 —— 与 IC 判 END 是两件事：
+        与 IC 判 END 是两件事（IC 不知道"编排服务这一路要关了"）：
           · IC 判 END  = "IC 认为这轮交互结束"（IC 自己会通知 Agent）
           · 这里       = "编排服务这一路会话真的要关了"（客户端断开 / 收尾）
-        后者只有编排服务知道。
+
+        ## ⚠️⚠️ 默认**不发**（`ORCH_AGENT_END_NOTIFY=1` 才发）
+
+        原因：**不带会话标识的 `on_end` 会跨会话误杀**。实测证据（106）：
+
+            17:19:14  旧会话 3ecc03385b5c: IC → END(24)（人走了，开始收尾）
+            17:19:21  新会话 5d42831a19e5 启动  ← 用户开了新会话
+            17:19:27  新会话正在播报「好嘞，帮你去知识库里翻翻魔珐科技介绍～」
+            17:19:31  旧会话收尾超时（20s），强制关闭   ← 收尾慢，on_end 迟到
+            17:19:32  旧会话的 on_end 发出（成功 1）
+            17:19:32  **新会话立刻"身份识别收尾落地"** ← 同一秒，被误杀
+
+        两个原因叠加：
+          ① `on_end` 原先 payload 是**空的 `{}`**、请求头只有 Content-Type
+             —— Agent **无法区分**这是哪一路会话的结束（对比 IC 的
+             `ExpressionSink` 会注入 `X-Session-Id`）；
+          ② **收尾要等 20s 超时**才结束，`on_end` 因此**迟到**，正好撞上
+             用户刚开的新会话。
+
+        每场会话都发生（24 场 = 24 次 `成功 1`），很可能是「会话被切得很碎」
+        的原因之一。
+
+        ## 恢复方式
+
+        等 Agent 侧支持按会话区分后：把 `ORCH_AGENT_END_NOTIFY=1` 打开即可
+        —— payload 里已经带了 `session_id`，届时 Agent 直接可用。
         """
-        self._post("on_end", {})
+        if not _END_NOTIFY:
+            logger.debug("跳过 on_end 通知（%s）—— 未带会话标识会误杀其他会话，"
+                         "需 Agent 支持后设 ORCH_AGENT_END_NOTIFY=1 打开",
+                         self.session_id or "?")
+            return
+        self._post("on_end", {"session_id": self.session_id})
 
     # ------------------------------------------------------------------ #
 
