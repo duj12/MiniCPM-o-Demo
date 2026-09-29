@@ -151,24 +151,25 @@ class InteractionClient:
     #  写：非阻塞投递
     # ------------------------------------------------------------------ #
 
-    def clear_session(self) -> bool:
-        """把 IC 打回待机（清掉上一个会话的残留状态）。**同步调用**。
-
-        ## 为什么必须清
+    def reset_session(self) -> bool:
+        """**新会话开始**：把 IC 全部交互状态重置。**同步调用**。
 
         IC 的 ``Engine`` / ``InteractionState`` 是**进程级全局一份**
-        （``serve()`` 里只建一次），所以 ``session.mode`` 等状态**跨会话保留**：
+        （``serve()`` 里只建一次），状态**跨会话保留** —— 不清就会：
 
-          · ``mode`` 只在**收到 END 动作**时才被 ``clear_session_on_end()``
-            重置回 ``IDLE``（``interactioncore/interaction/policy.py`` 的
-            ``clear_session_on_end``）
-          · 而 **GREET 的前置条件正是 ``mode == SessionMode.IDLE``**
-            （同文件里 `mode == SessionMode.IDLE` 那个 ``if`` 块，
-            它内部再判 ``greet_spoken`` / ``user_has_spoken``）
+          · ``mode`` 停在 ``LISTENING`` → **永远不迎宾**
+            （GREET 的前置条件是 ``mode == SessionMode.IDLE``）
+          · ``speech.user_speaking`` 残留 → 新会话刚开口就被判
+            **"用户抢话" (YIELD)** → ``ic_stop`` → **播报被打断**
+            （实测：刷新页面后新会话的播报立刻被停）
 
-        实测踩过：客户端**直接断开**（页面关掉）不产生 END → ``mode`` 停在
-        ``LISTENING`` → 下一个会话**永远不迎宾**。现象是「人站在那儿等了很久
-        也不打招呼，主动提问才有反应」，而人脸/ASR 全都正常 —— 极难定位。
+        ``reset_all_state`` 是**整体替换** ``session`` / ``person`` /
+        ``speech`` / ``agent``（不是逐字段清），所以不会漏。
+
+        ## 与 `end_session` 的分工（**别混用**）
+
+            reset_session  新会话开始（本方法）—— **不通知** agent / TTS
+            end_session    用户主动结束          —— **通知** agent / TTS
 
         ## 为什么是同步的（不走 ``apply`` 的异步队列）
 
@@ -184,15 +185,47 @@ class InteractionClient:
         if not self.available or self._client is None:
             return False
         try:
-            self._client.clear_session()
-            logger.info("InteractionCore 会话状态已清空（%s）—— "
-                        "避免上一个会话的 mode/greet 残留影响本次迎宾",
+            self._client.reset_session()
+            logger.info("InteractionCore 会话状态已重置（%s）—— "
+                        "避免上一个会话的 mode/greet/说话的残留影响本次",
                         self.target)
             return True
         except Exception as exc:  # noqa: BLE001
-            # 老版本 IC 没有 ClearSession → UNIMPLEMENTED。只告警不阻断。
-            logger.warning("清空 InteractionCore 会话状态失败（%s）：%s —— "
-                           "若 IC 是旧版本可忽略；否则本次可能不迎宾",
+            logger.warning("重置 InteractionCore 会话状态失败（%s）：%s —— "
+                           "若 IC 是旧版本可忽略；否则本次可能不迎宾、"
+                           "或播报刚开口就被误判抢话",
+                           self.target, exc)
+            return False
+
+    def end_session(self) -> bool:
+        """**用户主动结束**：让 IC 收尾（**通知 agent / TTS**，再清状态）。
+
+        与 `reset_session` 的关键区别是**它会对外通知**：
+
+            IC.end_session() → AgentSink.on_end()     → 通知 Agent
+                            → ExpressionSink.stop()   → `POST /v1/stop` 停播
+                            → reset_all_state()
+
+        所以**编排侧不需要再自己通知 Agent / 停播** —— 那些都归 IC 管
+        （编排服务的定位是"只做编排"，播报/打断/通知一律由 IC 与 Agent
+        自己发起）。
+
+        ⚠️ 调用时机：**客户端断开 / 点停止**（`on_session_end`）。
+        ⚠️ **不要**在 IC 自己判 END 时调 —— 那是 IC 内部的行为，
+        它自己会走 `clear_session_on_end`。
+
+        失败不阻断收尾（IC 挂了不该让会话关不掉）。
+        """
+        if not self.available or self._client is None:
+            return False
+        try:
+            self._client.end_session()
+            logger.info("InteractionCore 已收尾（%s）—— IC 会通知 Agent "
+                        "并停播，编排侧不再单独做这些", self.target)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("InteractionCore 收尾调用失败（%s）：%s —— "
+                           "会话照常关闭，但 Agent 可能收不到结束通知",
                            self.target, exc)
             return False
 

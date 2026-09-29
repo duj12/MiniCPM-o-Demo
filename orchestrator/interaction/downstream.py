@@ -177,14 +177,14 @@ class InteractionDownstream:
                 logger.warning("[%s] InteractionCore 不可用（%s）—— 无法决策",
                                self.session_id, self.ic.error)
                 return []
-        # ⚠️⚠️ **必须在任何状态写入之前清空** —— 见 `client.clear_session`
-        #    的说明。IC 的 Engine 是全局一份，`mode` 只在收到 END 时才重置；
-        #    而客户端**直接断开**不产生 END → 新会话一上来 `mode` 就不是
-        #    `IDLE` → **GREET 分支永远进不去**（实测：人站很久不迎宾、
-        #    主动提问才有反应，而人脸/ASR 全正常）。
-        #    放在这里（而不是 connect 之后立刻）是因为**这里才知道会话
-        #    真的要开始了**；早先的位置会在「连上但又没开会话」时白清一次。
-        self.ic.clear_session()
+        # ⚠️⚠️ **必须在任何状态写入之前重置** —— 见 `client.reset_session`。
+        #    IC 的 Engine 是全局一份，状态跨会话保留。不清就会：
+        #      · `mode` 停在 LISTENING → **永远不迎宾**
+        #      · `speech.user_speaking` 残留 → 新会话刚开口被判**抢话**
+        #        → `ic_stop` → **播报刚出声就被打断**（实测：刷新页面后）
+        #    ⚠️ 用 `reset_session`（**不通知** agent/TTS），不是 `end_session`
+        #       —— 后者是"用户主动结束"用的。
+        self.ic.reset_session()
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []
@@ -228,38 +228,27 @@ class InteractionDownstream:
             self._agent_ic_set_by_me = True
 
     async def on_session_end(self, reason: str) -> None:
-        try:
-            # ⚠️ 用 `engine_on_session_end()` 而不是 `on_end()` —— 后者受
-            #    `ORCH_AGENT_RELAY` 开关控制（默认不发，因为 IC 判 END 时
-            #    自己会发）。但**编排服务自己的会话收尾**是另一回事：
-            #    客户端断开 / 收尾，IC 不知道，只有我们知道，**不重复**。
-            self.agent.engine_on_session_end()
-        except Exception:  # noqa: BLE001
-            pass
-        # ⚠️ **只在 Agent 当前目标仍是本会话设的**才归还 —— 否则会把
-        #    别人正在用的地址改掉（那比不归还更糟）。并发下"最后关的赢"
-        #    是这套全局状态的固有限制，不是这里能修的。
-        #
-        # ⚠️ 比对的是 `_ic_advertise`（本会话**设进去**的那个值），不是
-        #    `ic.target` —— 跨机部署时两者不同，拿后者比会永远不相等，
-        #    于是**永远不归还**，把错地址一直留给下一台机器（实测踩过）。
-        global _AGENT_IC_TARGET
-        if self._agent_ic_set_by_me and _AGENT_IC_TARGET == self._ic_advertise:
-            if self._restore_ic:
-                if self.agent.set_ic_target(self._restore_ic):
-                    logger.info("[%s] Agent 的 IC 目标已归还为 %s",
-                                self.session_id, self._restore_ic)
-                    _AGENT_IC_TARGET = self._restore_ic
-            else:
-                # 没给归还目标 ⇒ 退回 Agent **自己的默认地址**更安全，
-                # 总比留着本会话的地址（下一台机器会派错）强。
-                logger.info("[%s] 未配置 ORCH_IC_ADVERTISE 的归还目标 —— "
-                            "Agent 的 IC 目标保留为 %s（请确认这对其他使用者正确）",
-                            self.session_id, _AGENT_IC_TARGET)
-        elif self._agent_ic_set_by_me:
-            logger.info("[%s] Agent 的 IC 目标已被别的会话改为 %s，"
-                        "本会话不归还（避免改掉别人正在用的地址）",
-                        self.session_id, _AGENT_IC_TARGET)
+        """会话收尾（客户端断开 / 点停止）。
+
+        ## ⚠️ 只调 `IC.end_session()`，**编排侧不再做别的**
+
+        IC 的 ``end_session()`` 内部会一次做完三件事
+        （见 interactioncore 的 ``runtime.py``）：
+            · ``AgentSink.on_end()``      → 通知 Agent 结束
+            · ``ExpressionSink.stop()``   → `POST /v1/stop` 停播
+            · ``reset_all_state()``       → 清状态
+
+        所以编排侧**不需要**、也**不应该**再自己：
+            · 通知 Agent（`engine_on_session_end` —— 已删）
+            · 归还 Agent 的 IC 目标（`set_ic_target` —— 已删）
+        那些是跟 IC 重复的第二份，且**跨机时会互相踩**
+        （Agent 的 `interaction_core_target` 是进程级全局单例）。
+
+        编排服务的定位是「**只做编排**」：播报、打断、通知 Agent 一律
+        由 IC 与 Agent 自己发起。
+        """
+        # ⚠️ 必须在 `ic.close()` **之前**调 —— 它要发 gRPC。
+        self.ic.end_session()
         self.agent.close()
         self.ic.close()
 
