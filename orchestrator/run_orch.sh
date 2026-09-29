@@ -59,6 +59,17 @@ export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$CODE/orchdump/s}"
 # ---- 人脸模块 ----
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
 
+# **人脸服务化开关**：设了就改走 HTTP 调远端人脸服务，**完全不加载 .so**
+# （不需要 OpenCV / libstdc++ / libffi 匹配，也不需要本地模型与人脸库）。
+#
+# ⚠️ 默认**不设** = 保持本地 CDLL 模式 —— 现有部署（106）行为不变。
+#    设备端/机器人上本地直调延迟更低，那条路要一直留着。
+#
+# 105 已部署：http://192.168.89.105:8767（见
+# board-face-and-cloud-infer/G1/服务使用与更新.md；max_sessions=4、TTL=300s）
+# export ORCH_FACE_SERVICE_URL="http://192.168.89.105:8767"
+# export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
+
 # ---- InteractionCore ----
 # ⚠️ 这几个**必须显式设**，不能靠 `config.py` 的默认值 `localhost:50051`：
 #    这个地址会被**告诉 Agent**（Agent 在 192.168.89.102），让它回连 IC。

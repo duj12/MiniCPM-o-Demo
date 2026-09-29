@@ -41,6 +41,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -105,10 +106,31 @@ class InteractionDownstream:
                  on_action: Optional[Any] = None,
                  report_interval_s: Optional[float] = None,
                  restore_ic_target: str = "",
-                 ic_advertise: str = "") -> None:
-        # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
-        # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
-        self.ic = InteractionClient(ic_target, owner_key=session_id)
+                 ic_advertise: str = "",
+                 ic_mode: str = "grpc",
+                 ic_expression_url: str = "",
+                 ic_expression_ca: Optional[str] = None,
+                 ic_callback_ic: Optional[str] = None,
+                 agent_set_target: bool = True) -> None:
+        self.ic_mode = (ic_mode or "grpc").strip().lower()
+        if self.ic_mode == "inprocess":
+            #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
+            from .inprocess import InProcessICClient
+            self.ic = InProcessICClient(
+                session_id,
+                expression_url=ic_expression_url,
+                agent_url=agent_url,
+                expression_ca=ic_expression_ca,
+                callback_ic=ic_callback_ic,
+            )
+            logger.info("[%s] IC 模式=进程内 Engine（本会话独占，无单例限制）",
+                        session_id or "?")
+        else:
+            # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
+            # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
+            self.ic = InteractionClient(ic_target, owner_key=session_id)
+        #: 过渡开关：Agent 尚未支持从 payload 读 callback_ic 时保留 set_target
+        self._agent_set_target = bool(agent_set_target)
         # ⚠️ `session_id` 必须传进去 —— 会话收尾的 `on_end` 要带上它，
         #    否则 Agent 分不清是哪一路会话结束，会**跨会话误杀**
         #    （见 `AgentClient.engine_on_session_end` 的实测证据）。
@@ -210,6 +232,12 @@ class InteractionDownstream:
         用同一个 IC 完全正常，那不算冲突。只有当地址**不同**时才说明
         「Agent 只能指向其中一个」，这时另一方的 Action 一定会派错。
         """
+        # 过渡开关：Agent 已能读 payload 里的 callback_ic 时关掉这里
+        if not self._agent_set_target:
+            logger.info("[%s] 跳过 Agent 的 set_target（ORCH_AGENT_SET_TARGET=0）"
+                        "—— 改由 IC 在 AgentSink payload 里带 callback_ic",
+                        self.session_id)
+            return
         # ⚠️ `global` 必须在**首次使用之前**声明（否则 SyntaxError）
         global _AGENT_IC_TARGET
         want = self._ic_advertise     # 注意：不是 self.ic.target（见下）
@@ -247,10 +275,45 @@ class InteractionDownstream:
         编排服务的定位是「**只做编排**」：播报、打断、通知 Agent 一律
         由 IC 与 Agent 自己发起。
         """
-        # ⚠️ 必须在 `ic.close()` **之前**调 —— 它要发 gRPC。
+        # ⚠️ 必须在 `ic.close()` **之前**调 —— 它要发 gRPC / HTTP。
+        #
+        # ⚠️⚠️ **必须 off-loop**：进程内模式下 `end_session()` 里有**同步 HTTP**
+        #     （`ExpressionSink.stop` 打 `/v1/stop`，超时 1s），`close()` 还要
+        #     flush + join 两个 sink 的 worker 线程（各 2s）。走 gRPC 时这些都
+        #     在服务端线程上，编排侧无感；进程内会**阻塞事件循环**，把同一
+        #     loop 上其他会话的 tick / 音频路径一起卡住。
+        await asyncio.to_thread(self._end_and_close)
+
+    def _end_and_close(self) -> None:
+        """收尾的**同步**部分 —— 由 `on_session_end` 放进线程里跑。"""
         self.ic.end_session()
         self.agent.close()
         self.ic.close()
+
+    # ------------------------------------------------------------------ #
+    #  Agent → IC：apply_agent（智脑薄投影）
+    # ------------------------------------------------------------------ #
+
+    def apply_agent(self, status: Optional[str] = None,
+                    session_end_pending: Optional[bool] = None) -> None:
+        """Agent 写 `agent.status` / `session_end_pending`。
+
+        由 `main.py` 的 ``POST /v1/ic/apply_agent`` 路由过来（Agent 从 IC 的
+        payload 里拿到 `callback_ic` 后就把写入投到这里）。
+
+        ⚠️ 这一步是 `ORCH_IC_MODE=inprocess` 的**硬前置**：Engine 进了编排
+        进程之后，Agent 原来直连 IC gRPC `ApplyAgent` 的那条路就不存在了。
+        Agent 不改，`agent.status` / `session_end_pending` 永远写不进去
+        ⇒ **SOP 39 与 PENDING_ANNOUNCE 两条分支失效**。
+
+        两种模式**同名同语义**（`InProcessICClient` / `InteractionClient` 都
+        实现 `apply_agent`），所以调用方不必按模式分支。
+
+        ⚠️ **同步**（grpc 模式是一次 gRPC 往返）—— 调用方要 off-loop。
+        """
+        self.ic.apply_agent(status=status, session_end_pending=session_end_pending)
+        logger.info("[%s] Agent → IC: apply_agent(status=%s end_pending=%s)",
+                    self.session_id, status, session_end_pending)
 
     @property
     def available(self) -> bool:

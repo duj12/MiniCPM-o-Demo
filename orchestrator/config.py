@@ -135,6 +135,41 @@ class Settings:
     #: 空 = 退回 `ic_grpc`（单机部署语义正确：本机 IC 就是共享的那个）。
     ic_restore: str = field(default_factory=lambda: os.environ.get(
         "ORCH_IC_RESTORE", ""))
+
+    # ---- IC 部署模式：远端 gRPC 服务 vs 进程内 Engine ----
+    #
+    #   "grpc"      远端 InteractionCore 服务（**今天的行为，默认**）
+    #   "inprocess" 每路会话在编排进程内**独占**一份 `interaction.runtime.Engine`
+    #
+    # 为什么要有 inprocess：远端 IC 的 `InteractionState` 是**进程内全局一份**，
+    # 多会话同时驱动会互相覆盖（现象是「ASR 识别完美却零决策」）。进程内
+    # Engine 把并发问题从根上消掉 —— 每路会话一份状态机，不需要 session 路由，
+    # 也不需要单独的 IC 进程。
+    #
+    # ⚠️ **切换前置条件**：Agent Platform 必须能按 `callback_ic` 把
+    # `apply_agent`（写 agent.status / session_end_pending）投回编排服务的
+    # `POST /v1/ic/apply_agent`。它现在走的是 IC 的 gRPC `ApplyAgent`，
+    # Agent 不改就会丢掉 SOP 39 / PENDING_ANNOUNCE 两条分支。
+    ic_mode: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_MODE", "grpc"))
+    #: inprocess 模式下告诉 Agent 的 IC 回调根地址（本编排服务的**对外**地址）。
+    #: 空 = 由 `ic_advertise` 的 host 推导（`https://<host>:<port>/v1/ic`）。
+    ic_callback_base: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_CALLBACK_BASE", ""))
+    #: inprocess 模式下 `ExpressionSink` 打自己 `/v1/speak` 用的基地址。
+    #: 空 = `https://127.0.0.1:<port>`（本机自调）。
+    #: ⚠️ 依赖证书 SAN 含该地址；不匹配时校验失败，而失败**只记 IC 侧日志**
+    #:    （历史上表现为「IC 判了 GREET 但没人播」，极难排查）。
+    ic_expression_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_EXPRESSION_URL", ""))
+    #: inprocess 模式下 ExpressionSink 校验用的 CA。空 = 用编排服务自己的
+    #: 自签证书（`certs/cert.pem`，自签证书的签发者就是自己）。
+    ic_expression_ca: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_IC_EXPRESSION_CA", ""))
+    #: 过渡开关：是否继续调 Agent 的 `set_ic_target`（默认 1 = 今天的行为）。
+    #: 置 0 的前提是 Agent 已改为从 payload 里读 `callback_ic`。
+    agent_set_target: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_AGENT_SET_TARGET", "1") not in ("0", "false", "False", ""))
     #: Agent Platform 地址（IC 的四类 Action 派给它）
     agent_url: str = field(default_factory=lambda: os.environ.get(
         "ORCH_AGENT_URL", "http://192.168.89.102:8081"))
@@ -215,6 +250,21 @@ class Settings:
     #: 识别阈值（LOW/MEDIUM 分界）。0.36 来自上游 100 轮交叉验证。
     face_threshold: float = field(default_factory=lambda: float(os.environ.get(
         "ORCH_FACE_THRESHOLD", "0.36")))
+
+    #: **人脸服务化**：远端 G1 人脸服务基地址（如 http://192.168.89.105:8767）。
+    #:
+    #: 设了 ⇒ 走 ``RemoteFaceProvider``（HTTP，**不** CDLL、不需要 .so /
+    #: OpenCV / 本地模型 / 人脸库）；空 ⇒ 本地 ``G1FaceProvider``（现状）。
+    #: 两种模式并存不是过渡 —— 设备端/机器人本地直调延迟更低（省一次网络
+    #: 往返 + JPEG 编解码），云端/测试环境才走服务化。
+    #:
+    #: 105 上的服务见 board-face-and-cloud-infer/G1/服务使用与更新.md。
+    face_service_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_SERVICE_URL", ""))
+    #: 远端单帧 HTTP 往返超时（秒）。超时只丢这一帧 + 重连，
+    #: **不阻塞音频路径**（``FaceWorker.offer`` 是 put_nowait）。
+    face_service_timeout_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_FACE_SERVICE_TIMEOUT_S", "2.0")))
 
     # 调参
     tick_interval_s: float = 0.05

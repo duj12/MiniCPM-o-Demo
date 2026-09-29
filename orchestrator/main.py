@@ -305,15 +305,23 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 restore_ic_target=(cfg.ic_restore or cfg.ic_grpc),
                 # Agent 回连用的地址。跨机**必须**显式配；
                 # 空则退回编排服务去连 IC 的那个地址（同机部署没问题）。
-                ic_advertise=cfg.ic_advertise)
+                ic_advertise=cfg.ic_advertise,
+                ic_mode=cfg.ic_mode,
+                # inprocess 模式下 ExpressionSink 打本机 /v1/speak 的地址与 CA。
+                # 空地址 ⇒ 由端口推导；空 CA ⇒ 用编排自己的自签证书当 CA。
+                ic_expression_url=_resolve_ic_expression_url(cfg),
+                ic_expression_ca=(cfg.ic_expression_ca or _orch_cert_path()),
+                # Agent 写 apply_agent 的回调根地址（转发给 Agent 用）。
+                ic_callback_ic=_resolve_ic_callback_base(cfg),
+                agent_set_target=cfg.agent_set_target)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
                 ic_ds.agent.start()
                 sess.downstream = ic_ds
                 sess.interaction = ic_ds
-                logger.info("[%s] InteractionCore + Agent 已接管"
-                            "（ic=%s agent=%s）", sid, ic_target, agent_target)
+                logger.info("[%s] IC + Agent 已接管（mode=%s ic=%s agent=%s）",
+                            sid, cfg.ic_mode, ic_target, agent_target)
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
@@ -339,14 +347,48 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
     return sess
 
 
+def _preflight_remote_face(cfg: Settings) -> bool:
+    """远端模式的预检：只打一次 ``GET /health``。
+
+    ⚠️ **必须完全跳过** ``resolve_g1_root`` / ``pick_g1_lib`` / 模型文件 /
+    人脸库检查 —— 那些资产在服务端，调用方一台机器上都不需要。
+    这正是服务化的收益：105 从此不装 OpenCV、不编 `.so`。剩下唯一的
+    风险是「服务没起来 / 地址配错」，所以这里只验这一件事。
+    """
+    import json
+    import urllib.request
+
+    url = cfg.face_service_url.rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(url, timeout=2.0) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("人脸预检失败（远端模式 %s）：%s —— 会话将降级为无人脸",
+                     cfg.face_service_url, exc)
+        return False
+    logger.info(
+        "人脸预检通过（远端）: %s  sessions=%s/%s  ttl=%ss  enroll=%s",
+        cfg.face_service_url, body.get("sessions"), body.get("max_sessions"),
+        body.get("session_ttl_seconds"), body.get("allow_enroll"),
+    )
+    return True
+
+
 def preflight_face(cfg: Settings) -> bool:
     """启动期人脸预检：只验证资产存在，**不加载模型/不 CDLL**（避免空跑占 GPU）。
 
     为什么需要：人脸是会话建立时才懒加载的，如果路径配错，服务能正常
     起来、直到第一个用户连进来才失败 —— 那是很差的失败模式。这里在
     启动时就把问题暴露出来。
+
+    远端模式（``face_service_url`` 非空）走上面那个分支 —— 那边没有任何
+    本地资产要验。
     """
     import os
+
+    if cfg.face_service_url:
+        return _preflight_remote_face(cfg)
+
     from orchestrator.face.g1face_provider import resolve_g1_root
 
     g1_root, how = resolve_g1_root(cfg)
@@ -412,29 +454,56 @@ def preflight_face(cfg: Settings) -> bool:
 def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
     """装配人脸模块。任一前置缺失时**降级而非整体失败**。
 
-    实现全部沿用 G1 仓库的官方 ``g1face`` 包（见 ``face/g1face_provider.py``）。
+    两种模式（由 ``cfg.face_service_url`` 选）：
+
+      · **远端** —— HTTP 调 105 上的人脸服务。调用方不需要 .so / OpenCV /
+        模型 / 人脸库。见 ``face/remote_provider.py``。
+      · **本地** —— CDLL 直调 ``libsdk_stream.so``，沿用 G1 官方 ``g1face``
+        包。设备端/机器人上延迟更低。见 ``face/g1face_provider.py``。
+
+    两条路的 provider 接口一致，所以下面的 ``FaceWorker`` 装配**共用**。
     """
-    from orchestrator.face.g1face_provider import G1FaceProvider, resolve_g1_root
     from orchestrator.face.worker import FaceWorker
 
-    g1_root, how = resolve_g1_root(cfg)
-    try:
-        provider = G1FaceProvider(
-            str(g1_root),
-            model_dir=cfg.face_model_dir,
-            lib_path=cfg.face_lib_path,
-            db_path=cfg.face_db_path,
-            identify=cfg.face_identify,
-            no_enroll=cfg.face_no_enroll,
-            threshold=cfg.face_threshold,
-            wake_dwell_ms=cfg.face_wake_dwell_ms,
-            debug=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        # 降级而非整体失败 —— 会话照跑，只是没有人脸信号
-        logger.error("人脸模块装配失败（%s: %s）—— 本会话降级为无人脸",
-                     type(exc).__name__, exc)
-        return
+    if cfg.face_service_url:
+        from orchestrator.face.remote_provider import RemoteFaceProvider
+        try:
+            provider = RemoteFaceProvider(
+                cfg.face_service_url,
+                session_id=sess.session_id,
+                wake_dwell_ms=cfg.face_wake_dwell_ms,
+                timeout_s=cfg.face_service_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("远端人脸装配失败（%s: %s）—— 本会话降级为无人脸",
+                         type(exc).__name__, exc)
+            return
+        logger.info("人脸模块已装配（远端 %s session=%s 唤醒阈值=%dms）",
+                    cfg.face_service_url, sess.session_id,
+                    provider.wake_dwell_ms)
+    else:
+        from orchestrator.face.g1face_provider import (G1FaceProvider,
+                                                       resolve_g1_root)
+        g1_root, how = resolve_g1_root(cfg)
+        try:
+            provider = G1FaceProvider(
+                str(g1_root),
+                model_dir=cfg.face_model_dir,
+                lib_path=cfg.face_lib_path,
+                db_path=cfg.face_db_path,
+                identify=cfg.face_identify,
+                no_enroll=cfg.face_no_enroll,
+                threshold=cfg.face_threshold,
+                wake_dwell_ms=cfg.face_wake_dwell_ms,
+                debug=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 降级而非整体失败 —— 会话照跑，只是没有人脸信号
+            logger.error("人脸模块装配失败（%s: %s）—— 本会话降级为无人脸",
+                         type(exc).__name__, exc)
+            return
+        logger.info("人脸模块已装配（g1_root=%s 来源=%s 身份识别=%s 唤醒阈值=%dms）",
+                    g1_root, how, provider.available, provider.wake_dwell_ms)
 
     sess.face_worker = FaceWorker(
         provider,
@@ -443,8 +512,6 @@ def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
         on_identity=sess._face_cb("identity"),
         on_obs=sess._face_cb("obs"),      # 每帧观测，供 UI 叠加
     )
-    logger.info("人脸模块已装配（g1_root=%s 来源=%s 身份识别=%s 唤醒阈值=%dms）",
-                g1_root, how, provider.available, provider.wake_dwell_ms)
 
 
 # ====================================================================== #
@@ -678,6 +745,50 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
 #  FastAPI app
 # ====================================================================== #
 
+def _orch_cert_path() -> Optional[str]:
+    """编排服务自己的自签证书路径（当 CA 用）。
+
+    自签证书的签发者就是它自己，所以 `cafile=<它>` 能校验通过 ——
+    IC 侧 `scripts/run_ic.sh` 一直就是这么做的（`INTERACTION_EXPRESSION_CA`）。
+    """
+    from pathlib import Path
+    p = Path(__file__).resolve().parents[1] / "certs" / "cert.pem"
+    return str(p) if p.is_file() else None
+
+
+def _resolve_ic_expression_url(cfg: Settings) -> str:
+    """`inprocess` 模式下 ExpressionSink 打哪 —— 本编排服务的 `/v1/speak`。
+
+    默认 `https://127.0.0.1:<port>`：IC 与编排在**同一个进程**里，走本机回环
+    最省事，也避免"告诉自己要经过网关"的绕路。
+
+    ⚠️ 依赖证书 SAN 含 `127.0.0.1`。不匹配时校验会失败，而失败**只记在 IC 侧
+    日志里**（历史上表现为「IC 判了 GREET 但没人播」，排查很久）。
+    所以这里给出警告，让配置问题在启动时就能看见。
+    """
+    if cfg.ic_expression_url:
+        return cfg.ic_expression_url
+    return f"https://127.0.0.1:{cfg.port}"
+
+
+def _resolve_ic_callback_base(cfg: Settings) -> Optional[str]:
+    """`inprocess` 模式下告诉 Agent 的回调根地址。
+
+    优先用显式的 `ORCH_IC_CALLBACK_BASE`；否则从 `ic_advertise`
+    （形如 `192.168.89.105:50051`）取主机部分拼出来 —— 那本来就是这个
+    编排服务对外可回连的地址，语义正好。
+    """
+    if cfg.ic_callback_base:
+        return cfg.ic_callback_base.rstrip("/")
+    host = (cfg.ic_advertise or "").strip()
+    if host:
+        host = host.split("://", 1)[-1].split("/", 1)[0]
+        host = host.split(":", 1)[0]
+    if not host:
+        return None
+    return f"https://{host}:{cfg.port}/v1/ic"
+
+
 def create_app(cfg: Settings):
     from fastapi import FastAPI
     from fastapi.staticfiles import StaticFiles
@@ -897,6 +1008,60 @@ def create_app(cfg: Settings):
                     "（来源不问：IC 模板与 Agent 回复一视同仁）",
                     sess.session_id, reason)
         return {"ok": True, "session_id": sess.session_id, "reason": reason}
+
+    @app.post("/v1/ic/apply_agent")
+    async def ic_apply_agent(request: Request):
+        """**Agent → IC**：写智脑薄投影（`agent.status` / `session_end_pending`）。
+
+        语义与 InteractionCore 的 gRPC ``ApplyAgent`` **逐字对齐**：
+        省略字段 = 不改该字段。
+
+        ## 为什么有这个端点
+
+        进程内模式（`ORCH_IC_MODE=inprocess`）下每路会话的 `Engine` 在**本进程
+        里**，没有 gRPC 端口可连 —— Agent 原来直连 IC 的 ``ApplyAgent`` 那条路
+        就不存在了。Agent 从 IC 的 Action payload 里拿到 `callback_ic` 之后，
+        把写入投到这里即可。
+
+        ⚠️ **这是切换的硬前置**。Agent 不改，`agent.status` /
+        `session_end_pending` 永远写不进去 ⇒ Policy 的 **SOP 39 与
+        PENDING_ANNOUNCE 两条分支失效**。
+
+        ## grpc 模式下会转发
+
+        `ORCH_IC_MODE=grpc` 时这里**转发**到远端 IC 的 gRPC ``ApplyAgent``
+        —— 于是这个端点在切换**之前**就能上线、能灰度、能用同一份 curl 验证，
+        而不必等到 Agent 改完。
+        """
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            pass
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        # body 里的 session_id 只是给日志/诊断用的；**路由以 header 为准**
+        # （与 /v1/speak 一致 —— 两处口径不同会让 404 变得莫名其妙）
+        status = str(body.get("status") or "").strip() or None
+        sep = body.get("session_end_pending")
+        end_pending = None if sep is None else bool(sep)
+
+        ic_ds = getattr(sess, "interaction", None)
+        if ic_ds is None:
+            return {"ok": False,
+                    "error": "本会话没有 IC 决策链路（未启用或已降级）"}
+        # ⚠️ **必须 off-loop**：grpc 模式是一次 gRPC 往返，进程内模式虽然
+        #    是纯内存操作，但走同一条路径 —— 统一丢线程里最省心，
+        #    也免得「换模式后这里突然阻塞事件循环」。
+        await asyncio.to_thread(
+            ic_ds.apply_agent, status=status,
+            session_end_pending=end_pending)
+        return {"ok": True, "session_id": sess.session_id,
+                "mode": getattr(ic_ds, "ic_mode", "grpc")}
 
     @app.get("/healthz")
     async def healthz():
