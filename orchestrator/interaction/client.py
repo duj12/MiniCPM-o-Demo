@@ -33,6 +33,56 @@ _QUEUE_MAX = 256
 _CALL_TIMEOUT = 2.0
 
 
+def normalize_agent_status(raw):
+    """把大小写不限的 status 字串归一到 `AgentStatus` 枚举；非法返回 None。
+
+    ⚠️ **必须映射到枚举，不能只把字符串大写。** IC 里两个枚举的大小写约定
+    是**相反**的（实测）：
+
+        Confidence   值是大写   NONE / LOW / MEDIUM / HIGH
+        AgentStatus  值是**小写** idle / busy / pending_announce
+
+    而 `policy.py` 是拿 `== AgentStatus.PENDING_ANNOUNCE` 判的。往状态里存
+    一个大写字串 `'PENDING_ANNOUNCE'`，比较就是 **False**
+    （`'PENDING_ANNOUNCE' != 'pending_announce'`）—— 不报错、不告警，
+    **SOP 39 只是永远不生效**。另一个方向更直接：`AgentStatus('BUSY')`
+    会抛 `ValueError`，把整次写入打掉。
+
+    所以统一走枚举反查：大小写两种写法都能对，且写进去的一定是枚举成员。
+    """
+    try:
+        from interaction.state import AgentStatus
+    except ImportError:      # interaction 包没装 —— 调用方会降级
+        return None
+    key = str(raw).strip().upper()
+    for member in AgentStatus:
+        if member.name.upper() == key:
+            return member
+    return None
+
+
+def agent_patch_kwargs(status=None, session_end_pending=None) -> dict:
+    """把 `apply_agent` 的两个入参归一成 `Engine.apply_agent` 的 kwargs。
+
+    语义与 proto 的 `ApplyAgent` 逐字对齐：**省略（None）= 不改该字段**。
+    非法 status 归一为「不改」而不是抛 —— 一个坏字段不该把整次写入打掉。
+    """
+    import logging
+
+    kwargs = {}
+    if status:
+        norm = normalize_agent_status(status)
+        if norm is None:
+            logging.getLogger(__name__).warning(
+                "apply_agent 收到未知 status=%r —— 已忽略该字段"
+                "（合法值 IDLE/BUSY/PENDING_ANNOUNCE，大小写不限）", status)
+        else:
+            kwargs["status"] = norm
+    if session_end_pending is not None:
+        kwargs["session_end_pending"] = bool(session_end_pending)
+    return kwargs
+
+
 #: 当前**唯一**被允许驱动 IC 的客户端实例（模块级单例）。
 #:
 #: ⚠️ IC 的 ``InteractionState`` 是服务端**全局一份**，没有 session 概念 ——
@@ -184,6 +234,14 @@ class InteractionClient:
         """
         if not self.available or self._client is None:
             return False
+        if self.suspended:
+            # 与 `end_session` 同理：被接管后 IC 归别人驱动，不该由我们清。
+            # 当前调用点（`on_session_start`）不会走到这里 —— 那时本会话
+            # 刚 `activate()`，`suspended` 必为 False。留这道闸门是防御：
+            # 将来若有人从别处调，不至于跨会话清掉别人的状态。
+            logger.info("跳过 IC 状态重置（%s）—— 本会话已被别的会话接管",
+                        self.owner_key)
+            return False
         try:
             self._client.reset_session()
             logger.info("InteractionCore 会话状态已重置（%s）—— "
@@ -214,9 +272,35 @@ class InteractionClient:
         ⚠️ **不要**在 IC 自己判 END 时调 —— 那是 IC 内部的行为，
         它自己会走 `clear_session_on_end`。
 
+        ## ⚠️⚠️ `suspended` 时**绝不能调** —— 会跨会话误杀
+
+        `end_session()` 是**进程级全局**操作（清 IC 全部状态 + 全局停播 +
+        通知 Agent）。而**旧会话收尾很慢**（等 ASR/Omni drain，10~20 秒），
+        期间新会话往往已经接管 IC 并在正常对话了。
+
+        实测踩过（106，15:17）：
+
+            15:17:09  IC 被会话 021a66846f54 接管 —— 1eb85ade38db 暂停驱动
+            15:17:36  两个旧会话客户端断开（收尾转入后台）
+            15:17:47  IC 被新会话 55ca1168ca7f 接管
+            15:17:51  新会话播报 GREET「您好，金涵，欢迎光临。」
+            15:17:57  **被挂起的旧会话调了 end_session** → 清空 IC 状态
+            15:17:59  新会话重新 GREET（状态没了）→ 打断 91b24373（superseded）
+            15:17:59  ic_stop → **新会话的播报被打断** ❌
+
+        `apply()` / `tick()` 早就有这个闸门（见各自的 `suspended` 判断），
+        `end_session` 当时漏了 —— 收尾路径不在"驱动 IC"的直觉范围内，
+        但 `end_session` 恰恰是**动作最重**的那个。
+
         失败不阻断收尾（IC 挂了不该让会话关不掉）。
         """
         if not self.available or self._client is None:
+            return False
+        if self.suspended:
+            # 本会话已被接管 —— IC 现在归别人驱动，它的状态不属于我们，
+            # 我们没有资格去清空/停播（见上面 15:17 的实测）。
+            logger.info("跳过 IC 收尾（%s）—— 本会话已被别的会话接管，"
+                        "IC 状态归当前驱动者所有", self.owner_key)
             return False
         try:
             self._client.end_session()
@@ -228,6 +312,25 @@ class InteractionClient:
                            "会话照常关闭，但 Agent 可能收不到结束通知",
                            self.target, exc)
             return False
+
+    def apply_agent(self, status=None, session_end_pending=None) -> None:
+        """智脑薄投影 —— Agent 写 `agent.status` / `session_end_pending`。
+
+        走 `grpc` 模式时 IC 在**远端**，这条写入要经过 gRPC 的
+        ``ApplyAgent``。与进程内模式（``InProcessICClient.apply_agent``）
+        **同名同语义** —— 于是 `main.py` 的 ``/v1/ic/apply_agent`` 端点
+        不必按模式分支，两种模式一条路。
+
+        ⚠️ **同步调用**（gRPC 往返）—— 调用方必须 off-loop，别在事件循环里调。
+        """
+        kwargs = agent_patch_kwargs(status, session_end_pending)
+        if not kwargs or self._client is None:
+            return
+        try:
+            self._client.apply_agent(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apply_agent 失败（%s）：%s —— 已忽略",
+                           self.target, exc)
 
     def apply(self, method: str, **kwargs: Any) -> None:
         """把一次 ``apply_*`` 投进队列（**立即返回**）。
