@@ -251,6 +251,24 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         ic_cfg = (hello or {}).get("ic") or {}
         ic_target = str(ic_cfg.get("grpc") or cfg.ic_grpc)
         agent_target = str(ic_cfg.get("agent_url") or cfg.agent_url)
+
+        # ⚠️⚠️ **IC 模式也要能让客户端按会话指定**，否则 IC 开发人员那套
+        #     「replay 带 --ic-grpc 指定自己的 IC」会**静默失效**。
+        #
+        #     模式本身是全局配置（`ORCH_IC_MODE`），但 `ic.grpc` 是**按会话**
+        #     传进来的，语义就是「这一路要连我指定的那个远端 IC」。若只看全局
+        #     模式，在 `inprocess` 部署上会**忽略它、改跑进程内 Engine** ——
+        #     不报错、不告警，只是被测的不是他那份 IC（判题全错而看不出原因）。
+        #
+        #     优先级：显式给了 `ic.grpc` ⇒ 按客户端说的用 grpc（远端 IC）；
+        #     没给 ⇒ 跟随全局 `ORCH_IC_MODE`（默认行为不变）。
+        ic_mode = cfg.ic_mode
+        if ic_cfg.get("grpc") and (ic_mode or "").strip().lower() != "grpc":
+            ic_mode = "grpc"
+            logger.info(
+                "[%s] 客户端在 session.start 里指定了 ic.grpc=%s —— "
+                "本会话改用**远端 IC**（覆盖全局 ORCH_IC_MODE=%s）",
+                sid, ic_target, cfg.ic_mode)
         # ⚠️ `echo` 模式保持纯桩 —— test_duplex_sim 靠它起一个"永不 Speak"
         #    的服务再自己替换 downstream，不能被 IC 抢走。
         # 客户端可显式覆盖（`ic.enabled`）—— replay 的 --no-ic 走这条。
@@ -306,7 +324,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 # Agent 回连用的地址。跨机**必须**显式配；
                 # 空则退回编排服务去连 IC 的那个地址（同机部署没问题）。
                 ic_advertise=cfg.ic_advertise,
-                ic_mode=cfg.ic_mode,
+                ic_mode=ic_mode,
                 # inprocess 模式下 ExpressionSink 打本机 /v1/speak 的地址与 CA。
                 # 空地址 ⇒ 由端口推导；空 CA ⇒ 用编排自己的自签证书当 CA。
                 ic_expression_url=_resolve_ic_expression_url(cfg),
@@ -321,7 +339,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 sess.downstream = ic_ds
                 sess.interaction = ic_ds
                 logger.info("[%s] IC + Agent 已接管（mode=%s ic=%s agent=%s）",
-                            sid, cfg.ic_mode, ic_target, agent_target)
+                            sid, ic_mode, ic_target, agent_target)
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
