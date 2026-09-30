@@ -129,6 +129,29 @@ DEFAULT_JPEG_QV = 4
 TICK_S = 0.004          # 主循环粒度（4ms）—— 足够区分 25fps 的帧间隔
 
 
+#: `scale` 的「保比例 + 取偶数边」写法 —— **刻意用两段 scale，而不是
+#: `force_divisible_by=2`**。
+#:
+#: 为什么：`force_divisible_by` 是 **ffmpeg 4.4 才有**的选项。105（Ubuntu
+#: 20.04）自带 **4.2.7**，传了它会直接
+#:
+#:     [Parsed_scale_1] Option 'force_divisible_by' not found
+#:     Error reinitializing filters!  → Conversion failed!
+#:
+#: 而 `extract_frames` 把非零退出吞成「返回空列表」，于是
+#:
+#:     replay 打印「视频：无（纯音频）」
+#:     → 人脸一帧都收不到（face: 帧 sent=0）→ 不唤醒 → 无 GREET → 无 ANSWER
+#:
+#: **全程不报错**，只是静默退化成纯音频 —— 极难往 ffmpeg 版本上想
+#: （本地是 4.4.1、106 是 4.4.2，都复现不出来；实测在 105 上排查了很久）。
+#:
+#: 两段写法在 4.2 / 4.4 上都验证过：输出同为 640×480、帧数与字节数一致，
+#: 只差 JPEG 重量化的噪声（SSIM 0.957）。所以不需要按版本分支。
+_SCALE_KEEP_EVEN = ("scale={w}:{h}:force_original_aspect_ratio=decrease"
+                    ",scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+
 def b64f32(x: np.ndarray) -> str:
     """float32 [-1,1] → base64（服务端 decode_audio_b64 按 float32 解析）。"""
     return base64.b64encode(np.ascontiguousarray(x, dtype=np.float32).tobytes()).decode()
@@ -1784,8 +1807,7 @@ def extract_frames(path: str, fps: float, max_w: int, max_h: int,
     ⚠️ ``quality`` 是 ffmpeg 的 ``-q:v``（1~31，越小越好），
     **不是** canvas 的 0~1。默认值见 ``DEFAULT_JPEG_QV``（已按 PSNR 标定）。
     """
-    vf = (f"fps={fps},scale={max_w}:{max_h}:force_original_aspect_ratio=decrease"
-          f":force_divisible_by=2")
+    vf = f"fps={fps}," + _SCALE_KEEP_EVEN.format(w=max_w, h=max_h)
     cmd = ["ffmpeg", "-y", "-i", path, "-vf", vf, "-q:v", str(quality),
            "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
     try:
