@@ -73,6 +73,35 @@ def _is_rejected(resp: dict) -> bool:
     return False
 
 
+def _read_wav(path: str):
+    """读单声道 float32 波形 + 采样率。
+
+    ⚠️ 优先 `soundfile`，但它在编排服务的运行环境里**不一定装**（orch105 就
+    没有）。测试不该为了读一个 wav 去往生产环境装依赖 —— 没有就退回标准库
+    `wave`（只支持 16-bit PCM，够用）。
+    """
+    try:
+        import soundfile as sf  # type: ignore
+        data, sr = sf.read(path, dtype="float32")
+        return data, sr
+    except ImportError:
+        pass
+
+    import wave
+
+    import numpy as np
+
+    with wave.open(path, "rb") as w:
+        sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    if sw != 2:
+        raise SystemExit(f"只支持 16-bit PCM wav（实际 {sw * 8}-bit）: {path}")
+    a = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1)
+    return a, sr
+
+
 async def open_session(ws_url: str, tag: str, sink: dict) -> object:
     """开一条会话，等 `session.ready`，把收到的消息记进 sink。"""
     import websockets
@@ -189,10 +218,9 @@ async def main() -> int:
     if args.wav:
         print(f"== 4. 推流 {args.seconds}s（两路同时）==")
         import numpy as np
-        import soundfile as sf  # type: ignore
         from orchestrator.protocol import MIC_CHUNK, SR
 
-        data, sr = sf.read(args.wav, dtype="float32")
+        data, sr = _read_wav(args.wav)
         if data.ndim > 1:
             data = data.mean(axis=1)
         if sr != SR:

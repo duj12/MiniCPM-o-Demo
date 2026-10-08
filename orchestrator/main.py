@@ -85,6 +85,34 @@ SHUTDOWN_TASKS: set = set()
 from orchestrator.delay_store import DelayStore  # noqa: E402
 DELAY_STORE = DelayStore()
 
+#: 后台任务取消后最多等多久才放弃（见 `_shutdown_session`）。
+_TASK_CANCEL_TIMEOUT_S = 5.0
+
+
+def _describe_task(t: "asyncio.Task") -> str:
+    """给后台任务一个**看得懂**的名字 —— 卡住时用来指认是谁。
+
+    建任务时没起名（`create_task` 不命名就只有 "Task-37" 这种），真正的
+    信息在协程上：`run_tick` / `run_asr_recv` / `OmniClient.recv_loop` …
+    """
+    try:
+        coro = t.get_coro()
+    except Exception:  # noqa: BLE001
+        return repr(t)
+    name = (getattr(coro, "__qualname__", None)
+            or getattr(coro, "__name__", None)
+            or type(coro).__name__)
+    return f"{name}({t.get_name()})"
+
+
+def _retrieve_quietly(fut: "asyncio.Future") -> None:
+    """取走异常，免得解释器打 "Task exception was never retrieved" 噪声。
+
+    给放弃等待的任务挂 done 回调用：它们退出时已经没人 await 了。
+    """
+    if not fut.cancelled():
+        fut.exception()
+
 
 async def _shutdown_session(sess: OrchestratorSession, sid: str,
                             cfg: Settings, tasks: list) -> None:
@@ -108,7 +136,35 @@ async def _shutdown_session(sess: OrchestratorSession, sid: str,
     for t in tasks:
         t.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # ⚠️⚠️ **不能裸 `await gather`**。
+        #
+        # `Task.cancel()` 只是**请求**取消。只要有一个后台任务赖着不退
+        # （阻塞在同步 I/O、吞掉 CancelledError、卡在 finally 的 await 上），
+        # 裸 gather 就**永远等下去** —— 而 `sess.close()` 在它后面，于是整条
+        # 收尾链断在这里，而且**一行日志都不会有**（`close()` 的第一句才是
+        # 第一条日志）。后果：
+        #   · 远端人脸会话不释放 ⇒ 占着 `G1_FACE_MAX_SESSIONS` 槽位挂到
+        #     300s TTL（105 上泄漏满 4 个，之后每路吃 503、整场没有人脸）
+        #   · 进程内 IC Engine 不关闭，`[sid] 会话结束` 永不打印
+        #   · `SHUTDOWN_TASKS` 永久持有这个卡住的任务
+        #
+        # 实测（2026-10-08）：105 上 10 个走到「强制关闭」的会话里卡死 2 个；
+        # 106 旧 grpc 版也卡过 1 个，**且那两次收尾并没有重叠** —— 所以这
+        # 与 IC 模式、与是否并发都无关。判据：日志里只有
+        # 「收尾超时（20s），强制关闭」，没有「会话 <sid> 关闭（client_disconnect）」。
+        #
+        # 这里给它一个**上限**：超时就带着没退出的任务继续往下走。它们仍在
+        # 泄漏，但收尾能走完 —— 宁可少收一个后台任务，也不能不解人脸会话。
+        _done, pending = await asyncio.wait(
+            tasks, timeout=_TASK_CANCEL_TIMEOUT_S)
+        if pending:
+            for t in pending:
+                t.add_done_callback(_retrieve_quietly)
+            logger.warning(
+                "[%s] %d/%d 个后台任务取消后未退出（>%gs），"
+                "带着它们继续收尾 —— 未退出: %s",
+                sid, len(pending), len(tasks), _TASK_CANCEL_TIMEOUT_S,
+                ", ".join(sorted(_describe_task(t) for t in pending)))
 
     try:
         await sess.close("client_disconnect")
