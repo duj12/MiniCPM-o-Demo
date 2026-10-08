@@ -118,6 +118,24 @@ SSL_KEY="${ORCH_SSL_KEY:-$REPO/certs/key.pem}"
 SSL_ARGS=()
 [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ] && SSL_ARGS=(--ssl-cert "$SSL_CERT" --ssl-key "$SSL_KEY")
 
+# ---- VLM 描述（两阶段）----
+#
+# ⚠️ **只有 105 这一台开**。`run_orch_106.sh` 保持关（0 / legacy）—— 那边的
+#    102 Agent 还没确认能接 `content` 字段，而 `orchestrator/` 是两台共用的
+#    一份代码，`config.py` 里的**默认值就是 106 下次重启后的行为**。
+#    ⇒ 要开只能落在这个**本机专属**脚本里，`config.py` 的默认不许动；
+#      这样「哪台开了」在启动横幅上一眼可见（下两行 echo 的就是这里的值）。
+#
+#   `dual`   = **纯增量**：`transcript` 仍是字符串，只多一个
+#              `content={ASR,VLM}` 键 ⇒ 对没改过的老 Agent 向后兼容
+#              （多出来的键被忽略）。105 走 103 的 Agent，2026-10-08 起用这个。
+#   `dict`   = `transcript` 变 dict，**要 Agent 侧先改好**才能翻。
+#   `legacy` = 连子类都不装，payload 逐字节等于旧版（回退用）。
+#
+# 回退：`ORCH_AGENT_TRANSCRIPT_MODE=legacy ORCH_OMNI_DESCRIBE=0 bash orchestrator/run_orch_105.sh`
+export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
+export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
+
 # 生效配置落日志 —— 回退/切换后**第一眼看这里**，别靠猜
 echo "105 编排：IC 模式 = $ORCH_IC_MODE" >&2
 if [ "$ORCH_IC_MODE" = "grpc" ]; then
@@ -131,12 +149,11 @@ echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）
 echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
 echo "  python          = $ORCH_PY" >&2
 # VLM 描述（两阶段）生效值 —— **这行是「有没有碰过本机 Agent 协议」的唯一
-# 硬证据**（见 config.py 里 `omni_describe` / `agent_transcript_mode` 的说明：
-# 默认值就是 106 下次重启后的行为，所以默认必须显示「关 / legacy」）。
-# 取的默认值与 config.py 保持一致；真要改默认，**两处一起改**。
-echo "  VLM 描述        = ${ORCH_OMNI_DESCRIBE:-0}（0=关，omni 当对话方）" >&2
-echo "  Agent 载荷      = ${ORCH_AGENT_TRANSCRIPT_MODE:-legacy}" \
-     "（legacy=与旧版逐字节一致）" >&2
+# 硬证据**。105 期望看到「1 / dual」（见上面 export 块）；**106 期望看到
+# 「0 / legacy」**，哪天在 106 的日志里看到 dual，就是有人改了共享的默认值。
+echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
+echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
+     "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \
