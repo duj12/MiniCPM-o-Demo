@@ -1,0 +1,11 @@
+# 这个仓库的代码**同时**跑在 Windows 工作区和 Linux 共享树
+# （`/data/megastore/Projects/DuJing/code`，105/106 都读它）。
+#
+# Windows 侧 `core.autocrlf=true` 会把工作区写成 CRLF，而 shell 脚本带上
+# `\r` 拷到 Linux 就是 `bash: /bin/bash^M: bad interpreter` —— 报错信息还
+# 指向解释器，很容易误判成"脚本没权限"或"bash 坏了"。显式钉死 LF，
+# 让工作区与共享树、与 git blob 三者一致。
+#
+# 顺带的好处：以前 `diff 本地 远端` 会显示"整个文件全变了"（其实只是行尾），
+# 钉死之后这类假差异消失，真差异才看得见。
+*.sh text eol=lf
