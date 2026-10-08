@@ -75,6 +75,19 @@ class OmniClient:
         #: 连续发送失败计数（用于"第一次告警 + 判定断线"，避免刷屏）
         self._send_errors = 0
 
+        # ---- 换人设重连（`switch_system_prompt`）--------------------------
+        #
+        # ⚠️ `main.py` 只为 `recv_loop` 起**一个** task，所以重连之后必须
+        #    由它自己接着收新连接。下面两个字段就是"这条连接是被我们自己
+        #    换掉的，不是断线"的判据（缺了它们，重连会表现为"新连接起来了
+        #    但永远收不到 response.done"）。
+        #: **连接代数** —— 每换一次连接 +1。`recv_loop` 在旧连接的收尾处
+        #: 比对它：变了 ⇒ 是我们换的，接着收新的；没变 ⇒ 真断线，收摊。
+        #: （只靠 `_switching` 不够：旧连接的收尾可能发生在新连接装好**之后**。）
+        self._conn_gen = 0
+        #: 换人设**正在进行中**（旧连接已摘掉、新连接还没装好）。
+        self._switching = False
+
         # 待发送的视频帧（1fps）。用最新的替换旧的 —— 旧画面没有价值。
         self._pending_frame: Optional[str] = None
         # 音频缓冲：凑够 1s 再发（StreamingChatClient 的节奏）
@@ -94,6 +107,11 @@ class OmniClient:
 
     async def connect(self) -> None:
         from streaming_chat_demo import StreamingChatClient  # type: ignore
+
+        # ⚠️ 换人设重连会**再次**走这里 —— 断线标记必须复位，否则新连接
+        #    看起来是通的，`trigger_reply` 却因为 `dead=True` 一直短路。
+        self.dead = False
+        self._send_errors = 0
 
         # gateway 用自签证书（config.json 里 gateway 跑 https/wss），
         # 需要跳过校验。公网部署应改为带 CA 的正规校验。
@@ -126,6 +144,81 @@ class OmniClient:
         self.backend = self.client.backend
         logger.info("OmniLLM 已连接: session=%s backend=%s",
                     self.session_id, self.backend)
+
+    async def switch_system_prompt(self, system_prompt: str) -> bool:
+        """**关掉当前连接、用新的人设重开一条。**
+
+        这是换 `system_prompt` 的**唯一**途径（也是描述链路"全量分条 ⇒
+        增量简短"那一段的落点，见 `omni/describe.py` 的模块文档）。
+
+        ## 为什么必须重连
+
+        `system_prompt` 只在 `session.init` 时提交一次，`input.append` 没有
+        逐轮 prompt。而服务端**不支持一条连接上第二次 init** —— 2026-10-08
+        探针实测：同一条 ws 上再 init 直接 `ConnectionClosedOK: received
+        1000 (OK)`。所以换人设 = 关掉重开。
+
+        ## 为什么不是"开第二条、再关第一条"
+
+        同一时刻只允许**一条**连接活着（106:8006 上每路会话都占 KV 与共享
+        decode 队列）。先关后开 ⇒ 峰值仍是一条。
+
+        ## 代价（说清楚，不藏）
+
+        * 新连接的视听 KV 是**空的**：重连后第一次生成要重新热起来，
+          比同一条连接上的后续增量慢。所以调用方（`session`）会给换连接
+          后的**第一条**增量带上「上一轮描述」当参照物；
+        * 重连窗口（~1~3s）里 `push_audio`/帧推送见 `client is None`
+          **直接返回**，omni 少听少看这一小段。对产品无影响：ASR 是独立
+          服务，转写一个字不丢。
+
+        返回是否成功。**失败不抛** —— 换人设失败不该把这个会话打断：
+        调用方按"描述链路退化成常驻人设"继续跑（`dead` 已置位，后续触发
+        会被短路并告警）。
+        """
+        if self.closed:
+            return False
+        old = self.client
+        # ⚠️ 摘引用与 +1 代数之间**不能有 await** —— `recv_loop` 要能一眼
+        #    看出"这条连接是我们自己换掉的"（见那里的 `_conn_gen` 判据）。
+        self.client = None
+        self._conn_gen += 1
+        self._switching = True
+        if old is not None:
+            try:
+                await old.close(reason="persona_switch")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OmniLLM 旧连接关闭异常（继续重连）: %s", exc)
+        # 残留的半秒音频属于上一条连接，别带过去
+        self._audio_buf = []
+        self._audio_len = 0
+        self.system_prompt = system_prompt
+        try:
+            await asyncio.wait_for(self.connect(), timeout=self.connect_timeout)
+        except Exception as exc:  # noqa: BLE001
+            self.dead = True
+            logger.warning(
+                "OmniLLM 换人设重连**失败**（新 system_prompt %d 字）: %s"
+                " —— 描述链路退化：后续触发会被短路",
+                len(system_prompt), exc)
+            return False
+        finally:
+            self._switching = False
+        if self.closed:
+            # ⚠️ 重连**期间**会话收尾了：`close()` 那会儿 `self.client` 还是
+            #    None，它什么都没关。这条新连接得我们自己收掉 —— 否则它在
+            #    106:8006 上**泄漏一路会话**（KV/显存不释放，还占着并发额度），
+            #    而编排这边完全看不出来。
+            logger.info("OmniLLM 重连完成时发现会话已收尾 —— 关掉新连接")
+            try:
+                await self.client.close(reason="persona_switch_aborted")
+            except Exception:  # noqa: BLE001
+                pass
+            self.client = None
+            return False
+        logger.info("OmniLLM 已按新人设重连: session=%s backend=%s（system_prompt %d 字）",
+                    self.session_id, self.backend, len(system_prompt))
+        return True
 
     def offer_frame(self, jpeg: bytes) -> None:
         """登记一帧待发的视频（1fps）。只保留最新的一帧。"""
@@ -204,7 +297,10 @@ class OmniClient:
         try:
             await self.client.send_input(text=text, force_listen=False)
             self.triggers += 1
-            logger.info("ASR 触发回复 #%d%s", self.triggers,
+            # ⚠️ 文案别写死"ASR 触发回复"：描述模式下这条路径是**描述**
+            #    触发的（`session._do_describe`），照样会走到这里。触发源
+            #    由调用方自己打（见 `触发全量描述/增量描述`）。
+            logger.info("OmniLLM 触发 #%d%s", self.triggers,
                         f"（附文本 {len(text)} 字）" if text else "")
             return True
         except Exception as exc:  # noqa: BLE001
@@ -220,23 +316,50 @@ class OmniClient:
     # ------------------------------------------------------------------ #
 
     async def recv_loop(self) -> None:
-        """接收事件并转成 downstream 事件。
+        """接收事件并转成 downstream 事件。**跨换人设重连续跑**。
 
         直接复用 ``StreamingChatClient.handle_event`` 的判定逻辑，只在其
         基础上旁路出 downstream 事件 —— 避免重新实现那套易错的语义。
+
+        ## 为什么要写成循环
+
+        `main.py` 只为它起**一个** task。换人设（`switch_system_prompt`）
+        会把 `self.client` 换掉 —— 如果这里只 await 一次，新连接就**再也
+        没人收**，症状是"重连日志成功了、描述却永远不更新"。
+
+        判据是 `_conn_gen`：变了 ⇒ 我们自己换的，接着收新连接；没变 ⇒
+        真断线，**照旧不自动重连**（保持今天的行为，由编排决定收尾）。
         """
-        if self.client is None:
-            return
-        orig = self.client.handle_event
+        while not self.closed:
+            client = self.client
+            if client is None:
+                # 换人设的空档：旧连接已摘、新连接还没装好。等一小会儿再看。
+                # ⚠️ 没有 `_switching` 就是"重连**失败**了"（`client` 不会
+                #    再被装回来）—— 那就收摊，别空转。
+                if not self._switching:
+                    return
+                await asyncio.sleep(0.05)
+                continue
+            gen = self._conn_gen
+            orig = client.handle_event
 
-        def hooked(ev: dict) -> bool:
-            self._emit(ev)
-            return orig(ev)
+            # ⚠️ 默认参数把 `orig` 绑死在这一轮的闭包上 —— 写成裸闭包的话
+            #    循环第二轮会拿到**最后**一个 client 的 handle_event。
+            def hooked(ev: dict, _orig=orig) -> bool:
+                self._emit(ev)
+                return _orig(ev)
 
-        self.client.handle_event = hooked  # type: ignore[assignment]
-        try:
-            await self.client.receive_loop()
-        finally:
+            client.handle_event = hooked  # type: ignore[assignment]
+            try:
+                await client.receive_loop()
+            except asyncio.CancelledError:
+                raise                      # 会话收尾取消 —— 别吞
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OmniLLM 接收循环异常: %s", exc)
+            if self.closed:
+                return
+            if self._conn_gen != gen:
+                continue                   # 是我们自己换掉的 ⇒ 接着收新连接
             # ⚠️ **连接断了必须记下来**。早先这里什么都不做：`self.closed`
             #    仍是 False，`send_input` 也不检查连接 —— 于是往一条死连接上
             #    每秒发一次音频，异常只打个 warning，**永远不恢复**。
@@ -244,11 +367,11 @@ class OmniClient:
             #    再也不回复（日志里一秒一条 "send_input 失败"）。
             #    这里置位后，`send_input`/`trigger_reply` 会立刻短路，
             #    由编排服务决定是重连还是收尾。
-            if not self.closed:
-                self.dead = True
-                logger.warning(
-                    "OmniLLM 接收循环已退出（连接断开）—— "
-                    "后续 send_input/触发将直接短路，不会静默堆积")
+            self.dead = True
+            logger.warning(
+                "OmniLLM 接收循环已退出（连接断开）—— "
+                "后续 send_input/触发将直接短路，不会静默堆积")
+            return
 
     def _emit(self, ev: dict) -> None:
         if self.on_event is None:

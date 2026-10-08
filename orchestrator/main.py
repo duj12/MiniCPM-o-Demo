@@ -260,7 +260,14 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 #    时不该让整个 omni 回调炸掉 —— 那会让**所有** omni 事件
                 #    都断掉）。
                 take = getattr(sess, "take_omni_stage", None)
-                stage = take() if take is not None else ""
+                try:
+                    # 传 text：session 用**描述轮的完整文本**记「上一轮描述」
+                    # —— 换人设重连后第一条增量要靠它当参照物（见
+                    # `session._desc_needs_context`）。老版本 session 的方法
+                    # 不收参数 ⇒ 退回无参调用（与上面 getattr 同款兜底）。
+                    stage = take(text) if take is not None else ""
+                except TypeError:
+                    stage = take() if take is not None else ""
                 if stage:
                     sess.post_downstream(OmniDescription(
                         t=now, stage=stage, text=text, response_id=response_id,
@@ -455,8 +462,11 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 if cfg.omni_describe:
                     logger.info(
                         "[%s] VLM 描述已开：transcript 模式=%s；"
-                        "全量描述挂 IC 的 GREET，增量每 %.1fs 滚动",
-                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s)
+                        "全量描述挂 IC 的 GREET，增量每 %.1fs 滚动%s",
+                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s,
+                        "；增量用短人设（全量做完后**关掉重连一次**）"
+                        if cfg.omni_delta_persona else
+                        "（增量与全量共用一条连接/一个 system prompt）")
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，

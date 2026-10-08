@@ -255,6 +255,21 @@ class Settings:
     #: 代价是 omni 更吃算力（不重叠 ⇒ 调小不会自激，只会更频繁）。
     omni_delta_interval_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "2.0")))
+    #: **增量换人设**（`ORCH_OMNI_DELTA_PERSONA=1`，默认关）。
+    #:
+    #: 开了之后：全量描述在 `DESCRIBE_SYSTEM_PROMPT` 的连接上做完 ⇒ **关掉
+    #: 重连** ⇒ 用 `DELTA_SYSTEM_PROMPT`（只报变化、无八类清单）接着跑增量。
+    #: 为什么非这样不可（每轮 prompt 试过、压不住）记在
+    #: `orchestrator/omni/describe.py` 的模块文档「为什么增量轮压不短」。
+    #:
+    #: 代价：①整个会话多一次重连（~1~3s），窗口内 omni 少听少看一小段；
+    #: ②新连接 KV 空，第一条增量要重新热（所以它会带上「上一轮描述」）；
+    #: ③106:8006 上仍是**一条**连接（先关后开），不多占并发。
+    #:
+    #: 默认关的理由与 `omni_describe` 同款：**编排代码 105/106 共用**，
+    #: 默认值就是 106 下次重启后的行为。要开请在**那一台的启动脚本**里开。
+    omni_delta_persona: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DELTA_PERSONA", "0") not in ("0", "false", "False", ""))
     #: 三段模板都可整体覆盖（改措辞不用动代码，与 `ORCH_OMNI_SYSTEM_PROMPT`
     #: 同款）。空 = 用 `omni/describe.py` 里的默认。
     omni_describe_system_prompt: str = field(default_factory=lambda: os.environ.get(

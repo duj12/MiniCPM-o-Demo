@@ -177,6 +177,26 @@ class OrchestratorSession:
         #: "是我们请求的"推出这一轮是描述（服务端不区分，见 plan）。
         self._omni_stage = ""
 
+        #: 换人设重连（`ORCH_OMNI_DELTA_PERSONA=1`，默认关）。开了之后：
+        #: 全量在 `DESCRIBE_SYSTEM_PROMPT` 的连接上做完 ⇒ 关掉重连 ⇒ 换成
+        #: `DELTA_SYSTEM_PROMPT` 接着跑增量。见 `omni/describe.py` 模块文档
+        #: 「为什么增量轮压不短」——那是**为什么非开不可**的原因。
+        self._delta_persona_enabled = bool(config.get("omni_delta_persona", False))
+        #: 本会话**已经换过**人设（整个会话只换一次）。失败也算换过 ——
+        #: 否则每次全量描述都会重试一次重连，把 omni 反复打断。
+        self._persona_switched = False
+        #: 换连接后的**第一条**增量要带上「上一轮描述」（新连接 KV 是空的，
+        #: 模型不知道"相对什么"在变）。用掉即清。
+        self._desc_needs_context = False
+        #: 最近一份完整描述 —— 只给 `_desc_needs_context` 那条用。
+        #: 由 `take_omni_stage(text=…)` 记（`main.py` 手上才有 text）。
+        self._desc_last_text = ""
+        #: 换人设重连**期间**暂停滚动循环：空档里发触发必然失败，只会白刷
+        #: `omni_desc_failed`。配一个上限（见 `_desc_loop`）防"重连卡死
+        #: ⇒ 描述链路一起卡死"。
+        self._desc_paused = False
+        self._desc_paused_at = 0.0
+
         # 回声消除模式：browser | service | off（可被 session.start 覆盖）
         self.aec_mode = str(config.get("aec_mode") or "browser")
         # 声学延迟：优先用该设备的历史记录，没有则用配置默认值
@@ -1349,12 +1369,17 @@ class OrchestratorSession:
                     self.session_id, len(text))
         self._desc_task = asyncio.create_task(self._do_describe("full"))
 
-    def take_omni_stage(self) -> str:
+    def take_omni_stage(self, text: str = "") -> str:
         """读走「当前这一轮是不是我们请求的描述轮」，并清零。
 
         `main.py` 的 `on_omni_event` 在 `response.done` 时调它：
         非空 ⇒ 这一轮是描述 ⇒ 发出 `OmniDescription`；空 ⇒ 是对话回复 ⇒
         照旧发 `OmniResponseDone`。**读走即清零**，两条路互斥。
+
+        ``text`` 是这一轮的完整文本（`response.done.text`）。只有**描述轮**
+        才用它，且只干两件事：记成「最近一份描述」（换人设重连后的第一条
+        增量要拿它当参照物），以及在全量做完时**点火换人设**。空 / 「无
+        变化」不算 —— 它们意味着上一份描述仍然成立。
 
         ⚠️ 这里**必须**顺手清 `_desc_inflight` —— 它是滚动循环"上一轮完了"
         的唯一信号。漏了它，循环会一直以为有生成在途，描述再也不会刷新
@@ -1364,7 +1389,71 @@ class OrchestratorSession:
         self._omni_stage = ""
         self._desc_inflight = False
         self._desc_last_done_at = time.monotonic()
+        if stage and text and text.strip():
+            from .omni.describe import is_no_change
+            if not is_no_change(text):
+                self._desc_last_text = text
+        if stage == "full":
+            # 全量做完 = 唯一一次换人设的时机（换早了全量就没八类清单了）。
+            self._maybe_switch_delta_persona()
         return stage
+
+    def _maybe_switch_delta_persona(self) -> None:
+        """全量描述**刚拿到** ⇒ 换成"只报变化"的短人设（重连一次）。
+
+        幂等：`_persona_switched` 一旦置位就不再进（含**失败**——否则每次
+        全量都会重连一次，把 omni 反复打断）。
+
+        换人设要花 ~1~3s，所以挂在**任务**上，不阻塞 `on_omni_event`
+        （那是 omni 的接收回调，堵住它会连带卡住所有 omni 事件）。
+        """
+        if not (self._delta_persona_enabled and self._desc_enabled):
+            return
+        if self._persona_switched or self.omni is None:
+            return
+        self._persona_switched = True
+        # ⚠️ 暂停**必须在这里同步置位**，不能等 `_switch_delta_persona`
+        #    跑起来再置 —— `create_task` 只是排进队列，而全量 done 刚把
+        #    `_desc_inflight` 清掉、`_desc_last_done_at` 刷成"现在"，滚动
+        #    循环下一次轮询（250ms）就会发出一条增量。那条增量落在**旧**
+        #    连接上，随即被重连掐断，它的 done 永远不来 ⇒ 在途标记挂到
+        #    超时（10s）才自愈，缓存里这 10s 描述不更新。
+        self._desc_paused = True
+        self._desc_paused_at = time.monotonic()
+        self._desc_task = asyncio.create_task(self._switch_delta_persona())
+
+    async def _switch_delta_persona(self) -> None:
+        """关掉重连、换短人设；给下一条增量挂上「上一轮描述」。
+
+        失败**不抛**（`switch_system_prompt` 自己兜了）：退化成"原人设常驻"
+        —— 增量照旧长，但链路不塌。
+        """
+        from .omni.describe import DELTA_SYSTEM_PROMPT
+        try:
+            ok = await self.omni.switch_system_prompt(DELTA_SYSTEM_PROMPT)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 换短人设异常: %s", self.session_id, exc)
+            ok = False
+        finally:
+            self._desc_paused = False
+            # 换连接前可能有哪条增量已经发出去了（暂停与发出之间没有 await
+            # 能保证互斥，见 `_maybe_switch_delta_persona` 的注释）——旧连接
+            # 已经不在了，它的 done 永远不会来。**主动放掉在途标记**，否则
+            # 滚动循环要空等满超时（10s）才自愈。
+            self._desc_inflight = False
+            self._omni_stage = ""
+        # 新连接的 KV 是空的 ⇒ 第一条增量必须自带参照物
+        self._desc_needs_context = ok
+        # 重连本身也花时间，别紧接着又触发一条（间隔从**现在**起算）
+        self._desc_last_done_at = time.monotonic()
+        self.stats["omni_persona_switch"] = self.stats.get("omni_persona_switch", 0) + 1
+        if ok:
+            logger.info("[%s] 已换成「只报变化」短人设（关掉重连一次）—— "
+                        "后续增量在这条连接上滚动，首条会带上上一轮描述",
+                        self.session_id)
+        else:
+            logger.warning("[%s] 换短人设**失败** —— 保持原人设继续跑："
+                           "增量仍按八类分条（能跑，只是长）", self.session_id)
 
     async def _do_describe(self, stage: str) -> None:
         """真的发一次描述触发（异步任务，不阻塞调用方）。"""
@@ -1373,6 +1462,14 @@ class OrchestratorSession:
             return
         from .omni.describe import DELTA_INSTRUCTION, FULL_INSTRUCTION
         instruction = FULL_INSTRUCTION if stage == "full" else DELTA_INSTRUCTION
+        if stage != "full" and self._desc_needs_context:
+            # 换人设后的**第一条**增量：新连接的 KV 是空的，模型不知道
+            # "相对什么"在变 —— 不带上参照物，它要么把画面从头描述一遍，
+            # 要么直接编。用掉即清（之后同一连接上它自己有上下文）。
+            self._desc_needs_context = False
+            if self._desc_last_text:
+                instruction = ("上一轮描述（供你判断什么变了）：\n"
+                               f"{self._desc_last_text}\n\n" + instruction)
         self.stats["omni_desc_triggers"] = self.stats.get("omni_desc_triggers", 0) + 1
         # 标记在途**必须在 create_task 之前** —— 循环下一次轮询要看它
         self._desc_inflight = True
@@ -1431,6 +1528,16 @@ class OrchestratorSession:
             if not self._desc_started or self.omni is None:
                 continue
             now = _time.monotonic()
+            if self._desc_paused:
+                # 换人设重连的空档 —— 发了也送不出去，只会白刷
+                # `omni_desc_failed`。给个上限防呆：重连卡死时**不能**把
+                # 整条描述链路一起卡住（与下面"在途超时"同一个道理）。
+                if now - self._desc_paused_at <= stale_s:
+                    continue
+                logger.warning("[%s] 换人设重连超过 %.0fs 未结束 —— "
+                               "解除暂停、恢复滚动（查 OmniLLM 连接）",
+                               self.session_id, stale_s)
+                self._desc_paused = False
             if self._desc_inflight:
                 if now - self._desc_inflight_at <= stale_s:
                     continue

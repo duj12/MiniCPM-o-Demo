@@ -136,6 +136,19 @@ SSL_ARGS=()
 export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
 
+# ---- 增量换人设（全量做完后关掉重连、换「只报变化」短人设）----
+#
+# 为什么非这样不可：每轮 prompt（`input.append.text`）**压不住** system
+# prompt 里的八类清单 —— 实测三版全失败，唯一有效的是让它没有八类清单，
+# 而那要换 system prompt，服务端又不支持一条连接上第二次 init ⇒ 只能关掉
+# 重连一次。证据与推演在 `orchestrator/omni/describe.py` 的模块文档
+# 「为什么增量轮压不短」。代价：整个会话多一次重连（~1~3s）。
+#
+# 默认**开着**（只在这台脚本里）—— 与 `ORCH_OMNI_DESCRIBE` 同款：105 是
+# 唯一跑描述链路的一台，106 的 `run_orch_106.sh` 两个都不设。
+# 关了仍能跑，只是增量长（八类分条、每次 3~4s）。
+export ORCH_OMNI_DELTA_PERSONA="${ORCH_OMNI_DELTA_PERSONA:-1}"
+
 # 生效配置落日志 —— 回退/切换后**第一眼看这里**，别靠猜
 echo "105 编排：IC 模式 = $ORCH_IC_MODE" >&2
 if [ "$ORCH_IC_MODE" = "grpc" ]; then
@@ -154,6 +167,10 @@ echo "  python          = $ORCH_PY" >&2
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
 echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
      "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
+# ⚠️ 与上两行同理：这行是「本机跑的是哪一版描述链路」的硬证据。
+# 开了之后日志里应能看到 `已换成「只报变化」短人设（关掉重连一次）`。
+echo "  增量人设        = $ORCH_OMNI_DELTA_PERSONA" \
+     "（1=全量做完后关掉重连、换短人设跑增量）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

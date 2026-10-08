@@ -592,12 +592,24 @@ class FakeOmni:
     def __init__(self) -> None:
         self.reqs: list = []
         self.alive = True
+        #: 换人设调用记录（真实现是"关掉重连"，这里只记 system_prompt）
+        self.switches: list = []
+        #: 换人设会不会成功（测失败降级用）
+        self.switch_ok = True
+        #: 每次 switch 的模拟耗时（秒）—— 用来验"重连期间暂停滚动"
+        self.switch_delay = 0.0
 
     async def trigger_reply(self, text: str, **kw) -> bool:
         if not self.alive:
             return False
         self.reqs.append((time.monotonic(), text))
         return True
+
+    async def switch_system_prompt(self, system_prompt: str) -> bool:
+        self.switches.append(system_prompt)
+        if self.switch_delay:
+            await asyncio.sleep(self.switch_delay)
+        return self.switch_ok
 
 
 def test_two_stage_prompts_and_loop() -> None:
@@ -770,8 +782,176 @@ def test_describe_prompt_matches_demo() -> None:
     check("不要与用户对话" in DESCRIBE_SYSTEM_PROMPT,
           "system prompt 里有'不要对话'护栏（第一版走样的教训）")
 
+    # `DELTA_SYSTEM_PROMPT`（换人设重连后的新人设）—— 它的价值全在
+    # **没有什么**上面，所以这几条是断言"缺席"的。
+    from orchestrator.omni.describe import (
+        DELTA_INSTRUCTION, DELTA_SYSTEM_PROMPT)
+    check("【P0" not in DELTA_SYSTEM_PROMPT
+          and "【P1" not in DELTA_SYSTEM_PROMPT
+          and "【P2" not in DELTA_SYSTEM_PROMPT,
+          "DELTA_SYSTEM_PROMPT **不含八类清单** —— 它正是增量轮压不短的"
+          "源头（2026-10-08 实测 3 版）；留着它换人设就白换了")
+    check("不要与用户对话" in DELTA_SYSTEM_PROMPT,
+          "DELTA_SYSTEM_PROMPT 保留'不要对话'护栏（口吻的锚，不是格式的锚）")
+    check("视频监控/行为分析助手" in DELTA_SYSTEM_PROMPT,
+          "DELTA_SYSTEM_PROMPT 保留身份句 —— 抽象人设会让模型回"
+          "'好的，现在开始录音。'（第一版走样的教训）")
+    check(len(DELTA_SYSTEM_PROMPT) < len(DESCRIBE_SYSTEM_PROMPT),
+          f"DELTA_SYSTEM_PROMPT 比全量那份短"
+          f"（{len(DELTA_SYSTEM_PROMPT)} < {len(DESCRIBE_SYSTEM_PROMPT)} 字）")
+    check(DELTA_SYSTEM_PROMPT != DESCRIBE_SYSTEM_PROMPT
+          and DELTA_INSTRUCTION != DELTA_SYSTEM_PROMPT,
+          "三份提示词互不相同（少抄/抄错都会在这里露出来）")
+
+
+def test_delta_persona_switch() -> None:
+    """`ORCH_OMNI_DELTA_PERSONA=1`：全量做完**关掉重连**换短人设。
+
+    为什么非换不可（每轮 prompt 试过三版全压不住）见
+    `omni/describe.py` 的模块文档「为什么增量轮压不短」。这里只验编排侧
+    那几步**必须**做到位，否则现象会很难归因：
+
+    * 换人设**只在全量之后**（换早了全量就没有八类清单了）；
+    * 整个会话**只换一次**（换人设失败也算换过 —— 否则每次全量都会把
+      omni 重连打断一遍）；
+    * 重连窗口里**一次触发都不许发**（发了也送不出去，白刷
+      `omni_desc_failed`）；且窗口结束后在途标记要**主动**放掉 ——
+      否则滚动循环空等满超时（10s），这 10s 缓存里描述不更新；
+    * 换连接后的**第一条**增量带上「上一轮描述」（新连接 KV 是空的，
+      模型不知道"相对什么"在变），**第二条起不带**。
+    """
+    from orchestrator.omni.describe import (
+        DELTA_INSTRUCTION, DELTA_SYSTEM_PROMPT, FULL_INSTRUCTION)
+    from orchestrator.session import OrchestratorSession
+
+    print("\n[人设] 全量做完 ⇒ 关掉重连换短人设（首条增量带上一轮描述）")
+    sess = OrchestratorSession("t-persona",
+                               {"omni_describe": True,
+                                "omni_delta_interval_s": 0.2,
+                                "omni_delta_persona": True})
+    omni = FakeOmni()
+    omni.switch_delay = 0.6          # 比间隔长 ⇒ 能验"重连期间暂停滚动"
+    sess.omni = omni
+
+    async def _drive():
+        # ① IC 判 GREET ⇒ 全量（等价于 Describe("full") 走到 executor）
+        await sess.request_omni_description("full")
+        await asyncio.sleep(0.05)
+        # ② 全量的 `response.done` 到达 —— main.py 那一步（传 text！）
+        stage_full = sess.take_omni_stage(DESC_FULL)
+        # ③ 重连窗口（0.6s）内不许有触发；此刻只有那次全量
+        await asyncio.sleep(0.9)
+        n_during, n_switch = len(omni.reqs), len(omni.switches)
+        # ④ 等第一条增量
+        await asyncio.sleep(0.9)
+        first_delta = omni.reqs[1][1] if len(omni.reqs) > 1 else ""
+        # ⑤ 回灌它的 done（顺带用「无变化」验它不覆盖参照物）⇒ 第二条增量
+        sess.take_omni_stage("无变化")
+        await asyncio.sleep(0.8)
+        # ⑥ 再来一次"全量 done"（重迎宾）—— 不许再换一次人设
+        sess._omni_stage = "full"
+        sess.take_omni_stage(DESC_FULL)
+        await asyncio.sleep(0.3)
+        return stage_full, n_during, n_switch, first_delta
+
+    stage_full, n_during, n_switch, first_delta = asyncio.run(_drive())
+    sess._stop_desc_loop()
+
+    check(stage_full == "full", f"take 读走的是 full（实际 {stage_full!r}）")
+    check(n_switch == 1, f"恰好换 1 次人设（实际 {n_switch}）")
+    check(omni.switches == [DELTA_SYSTEM_PROMPT],
+          "换的是 DELTA_SYSTEM_PROMPT（不是全量那份）")
+    check(n_during == 1,
+          f"重连窗口里**没有**发出任何描述触发（{n_during} 次 —— 应当只有 "
+          f"最初那次全量）")
+    check(omni.reqs and omni.reqs[0][1] == FULL_INSTRUCTION,
+          "第 1 次注入的是**全量**指令")
+    check(first_delta.endswith(DELTA_INSTRUCTION)
+          and first_delta.startswith("上一轮描述"),
+          "换连接后的**第一条**增量带上了「上一轮描述」当参照物")
+    check(DESC_FULL in first_delta,
+          "……而且带的就是那份全量描述原文")
+    reqs = [t for _, t in omni.reqs]
+    check(len(reqs) >= 3 and reqs[2] == DELTA_INSTRUCTION,
+          f"**第二条**增量不再带参照物（第 3 次注入是否等于裸增量指令："
+          f"{len(reqs) >= 3 and reqs[2] == DELTA_INSTRUCTION}）")
+    check(sess._desc_last_text == DESC_FULL,
+          "「无变化」没把参照物覆盖掉（它意味着上一份仍然成立）")
+    sess.closed = True
+
+
+def test_delta_persona_off_and_fail() -> None:
+    """换人设**默认关**；开了但换失败要降级、不能把会话带塌。
+
+    默认关的理由与 `ORCH_OMNI_DESCRIBE` 同款：编排代码 105/106 共用，
+    默认值就是 106 下次重启后的行为。
+    """
+    from orchestrator.config import Settings
+    from orchestrator.omni.describe import DELTA_INSTRUCTION
+    from orchestrator.session import OrchestratorSession
+
+    print("\n[人设] 默认关 / 换失败降级")
+    import os
+    for k in ("ORCH_OMNI_DELTA_PERSONA", "ORCH_OMNI_DESCRIBE"):
+        os.environ.pop(k, None)
+    check(Settings().omni_delta_persona is False,
+          "ORCH_OMNI_DELTA_PERSONA 不设时默认 **False**（安全侧）")
+
+    # ---- ① 默认关：不换人设，两阶段仍靠同一条连接上的注入指令区分 ----
+    sess = OrchestratorSession("t-persona-off",
+                               {"omni_describe": True,
+                                "omni_delta_interval_s": 0.2})
+    omni = FakeOmni()
+    sess.omni = omni
+
+    async def _off():
+        await sess.request_omni_description("full")
+        await asyncio.sleep(0.05)
+        sess.take_omni_stage(DESC_FULL)
+        await asyncio.sleep(0.9)
+        return omni.switches[:], [t for _, t in omni.reqs]
+
+    switches, reqs = asyncio.run(_off())
+    sess._stop_desc_loop()
+    sess.closed = True
+    check(switches == [], "默认关时**一次都不换**人设")
+    check(len(reqs) >= 2 and reqs[1] == DELTA_INSTRUCTION,
+          "……增量仍是那条连接的裸增量指令（不带参照物）")
+
+    # ---- ② 开了但换失败：降级成"原人设常驻"，不抛、不重试 ----
+    sess2 = OrchestratorSession("t-persona-fail",
+                                {"omni_describe": True,
+                                 "omni_delta_interval_s": 0.2,
+                                 "omni_delta_persona": True})
+    omni2 = FakeOmni()
+    omni2.switch_ok = False
+    sess2.omni = omni2
+
+    async def _fail():
+        await sess2.request_omni_description("full")
+        await asyncio.sleep(0.05)
+        sess2.take_omni_stage(DESC_FULL)
+        await asyncio.sleep(0.6)
+        sess2._omni_stage = "full"          # 重迎宾 ⇒ 不许重试换人设
+        sess2.take_omni_stage(DESC_FULL)
+        await asyncio.sleep(0.3)
+        return [t for _, t in omni2.reqs]
+
+    reqs2 = asyncio.run(_fail())
+    sess2._stop_desc_loop()
+    sess2.closed = True
+    check(len(omni2.switches) == 1,
+          f"换失败也只尝试**一次**（实际 {len(omni2.switches)}）")
+    check(sess2._desc_needs_context is False,
+          "换失败 ⇒ 不挂参照物（新连接压根没建起来）")
+    check(reqs2 and all(t != "" for t in reqs2),
+          "换失败后链路照跑（注入的是非空指令）")
+    check(len(reqs2) >= 2 and reqs2[1] == DELTA_INSTRUCTION,
+          "……增量退回裸增量指令（退化成'原人设常驻'，能跑只是长）")
+
 
 def check_ic(d) -> bool:
+
     """连进程内 IC；连不上（没装 interaction 包）就明确报失败。"""
     if d.ic.connect():
         return True
@@ -803,6 +983,8 @@ def main() -> int:
         test_describe_prompt_matches_demo()
         test_two_stage_prompts_and_loop()
         test_answer_path_starts_desc_without_greet()
+        test_delta_persona_switch()
+        test_delta_persona_off_and_fail()
     finally:
         srv.shutdown()
     print("=" * 68)
