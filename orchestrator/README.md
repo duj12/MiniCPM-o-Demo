@@ -50,28 +50,44 @@ pip install grpcio protobuf
 
 ## 启动服务
 
-### 生产：用 `orchestrator/run_orch.sh`
+### 生产：用对应的启动脚本
 
-**推荐用脚本，不要手工 `nohup`** —— 人脸相关的环境变量漏一个，
-表现就是"人脸模块突然没了"（`face=False`），很难查。
+**推荐用脚本，不要手工 `nohup`** —— 人脸 / IC 相关的环境变量漏一个，
+表现往往**不报错**：人脸模块突然没了（`face=False`），或 Agent 的 Action
+派到别的机器上。
+
+| 脚本 | 用途 |
+|---|---|
+| `orchestrator/run_orch_105.sh` / `run_orch_106.sh` | 105 / 106 的编排（生产） |
+| `orchestrator/run_ic_105.sh` / `run_ic_106.sh` | 本机 IC gRPC 服务（`:50051`）。**平时不参与业务**（编排走进程内 IC），仅作 `ORCH_IC_MODE=grpc` 的**回退依赖** —— **别停它** |
+| 真机/设备端（本地 `.so` 人脸） | 见 `run_orch_106.sh` 里「本地 .so 退路」那段注释 |
 
 ```bash
-cd MiniCPM-o-Demo
-setsid nohup bash orchestrator/run_orch.sh </dev/null >orch.log 2>&1 &
+# 路径都写死在脚本里（共享树），从哪个目录跑都行
+setsid nohup bash orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
+
+# 影子实例：换个端口就自洽 —— 回调地址与 IC 播报地址都跟着 ORCH_PORT 走
+ORCH_PORT=8101 bash orchestrator/run_orch_106.sh
 ```
 
-⚠️ **从哪个目录跑都行** —— 脚本按自身位置推导 `REPO` 与 `CODE`
-（`CODE` = 与 `MiniCPM-o-Demo` 同级，`board-face-and-cloud-infer` /
-`faceidentification` 都在那里）。
+两个生产脚本**结构完全相同**，只有地址/环境不同；两个模式开关都在脚本里：
 
-脚本集中管理了：算法 AEC 的延迟 D、音视频转储、人脸模块、HTTPS 证书。
-每个变量都可用环境变量覆盖（如 `ORCH_PORT=9000 bash orchestrator/run_orch.sh`），
-`ORCH_PY` 可换 Python 解释器。
+| 想切什么 | 怎么切 |
+|---|---|
+| IC：进程内 Engine（默认，支持并发） ↔ 独立 gRPC IC 服务 | `ORCH_IC_MODE=inprocess` / `grpc` |
+| 人脸：远端服务（105:8767） ↔ 本地 `.so` | `ORCH_FACE_SERVICE_URL` 非空 / **显式置空** |
 
-看启动结果：
+⚠️ 为什么不能只翻 `ORCH_IC_MODE`（`ORCH_IC_ADVERTISE` 必须一起变）、
+人脸为什么必须服务化、`ORCH_FACE_SERVICE_URL=` 为什么要写成**显式空值**
+—— 都在两个脚本的头注释里，别绕过它们手工拼命令行。
+脚本里还集中管理了算法 AEC 的延迟 D、音视频转储、HTTPS 证书；
+`ORCH_PY` 可换解释器。
+
+看启动结果（日志由**脚本自己**落盘，不需要调用方重定向）：
 
 ```bash
-tail -5 orch.log
+tail -20 /data/megastore/Projects/DuJing/code/orch-dumps/105/orch105.log   # 105
+tail -20 /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/orch106-8100.log  # 106
 # 期望：能力: aec=True asr=True omni=True tts=True face=True downstream=omni
 #       HTTPS 已启用：https://0.0.0.0:8100
 ```
@@ -683,7 +699,7 @@ bash orchestrator/tools/deploy_g1.sh
 
 ```bash
 # 看服务端日志里的「人脸=」那行（每 5s 一条）—— 档位应随新阈值变化
-grep '人脸=' orch.log | tail -3
+grep '人脸=' /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/orch106-8100.log | tail -3
 # 例：人脸=HIGH(score=0.832, 面积=0.0359, dwell=18800ms, 身份=LOW)
 ```
 

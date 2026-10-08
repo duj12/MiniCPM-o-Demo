@@ -109,11 +109,12 @@ say "重启编排服务..."
 pkill -9 -f 'python -u -m orchestrator.main' 2>/dev/null || true
 sleep 2
 cd "$REPO"
-setsid bash orchestrator/run_orch.sh </dev/null >orch.log 2>&1 &
+# 106 的生产启动脚本（日志由脚本自己落盘到 $REPO/orch106-8100.log）
+setsid bash orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
 sleep 14
 if curl -sk --max-time 5 https://127.0.0.1:"${ORCH_PORT:-8100}"/healthz; then
   echo
   say "完成。注意：**浏览器要 Ctrl+Shift+R 强制刷新**（HTML 会被缓存）"
 else
-  die "服务未起来 —— 看 $REPO/orch.log"
+  die "服务未起来 —— 看 $REPO/orch106-${ORCH_PORT:-8100}.log"
 fi
