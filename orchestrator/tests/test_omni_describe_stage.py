@@ -950,7 +950,152 @@ def test_delta_persona_off_and_fail() -> None:
           "……增量退回裸增量指令（退化成'原人设常驻'，能跑只是长）")
 
 
+class _FakeSCC:
+    """假 `StreamingChatClient` —— 只模拟「握手窗口」这一段时序。
+
+    `connect()` 里要等 gateway 的 `queue_done`（真实现是 `await ws.recv()`），
+    这里用 `await asyncio.sleep()` 顶替，并把「握手期间有没有别人来 recv」
+    记下来 —— 那正是 2026-10-08 那个 bug 的判据。
+    """
+
+    made: list = []
+
+    def __init__(self, url, ssl_ctx=None, echo=False) -> None:
+        self.url = url
+        self.session_id = f"fake-{len(_FakeSCC.made)}"
+        self.backend = "fake"
+        self.closed = False
+        self.recv_calls = 0
+        #: 握手结束那一刻 `recv_calls` 的值 —— **必须为 0**
+        self.recv_at_handshake = -1
+        self._stop = asyncio.Event()
+        _FakeSCC.made.append(self)
+
+    def handle_event(self, ev: dict) -> bool:      # 真实现是方法，这里可替换
+        return True
+
+    async def connect(self) -> None:
+        await asyncio.sleep(0.25)                  # ⇐ 握手窗口
+        self.recv_at_handshake = self.recv_calls
+
+    async def init(self, **kw) -> dict:
+        await asyncio.sleep(0.1)
+        self.init_kw = kw
+        return {"type": "session.created"}
+
+    async def receive_loop(self) -> None:
+        self.recv_calls += 1
+        await self._stop.wait()
+        self.closed = True
+
+    async def close(self, reason: str = "") -> None:
+        self.closed = True
+        self._stop.set()
+
+    async def send_input(self, **kw) -> None:
+        self.sent = getattr(self, "sent", 0) + 1
+
+
+def test_connect_publishes_client_last() -> None:
+    """`connect()` 必须**最后**才发布 `self.client`（2026-10-08 实测的坑）。
+
+    早发布 ⇒ `recv_loop` 抢在 `connect()`/`init()` 的 `ws.recv()` 之前对
+    **同一个 ws** 再 recv 一次 ⇒ websockets 抛 "cannot call recv while
+    another coroutine is already waiting" ⇒ 被 `StreamingChatClient.
+    receive_loop` 的 `except Exception: break` **静默吞掉** ⇒ recv_loop 看到
+    连接代数没变，判成"真断线"（`dead=True` + "接收循环已退出"），而
+    `connect()` 随后照样跑完并打出"**已连接**"。
+
+    ⇒ 最坏的一种失效：**日志说连上了，整条链路其实已经死了** —— 之后每次
+    触发都被短路（"连接已断，触发被跳过"），描述再也不更新。真机上正是
+    这么表现的，而且只在**换人设重连**时才会触发（启动时 `recv_loop` 还没起）。
+    """
+    import streaming_chat_demo
+    from orchestrator.omni.client import OmniClient
+
+    print("\n[重连] connect() 最后才发布 client（否则 recv_loop 与握手抢 recv）")
+    real = getattr(streaming_chat_demo, "StreamingChatClient", None)
+    if real is None:
+        check(False, "streaming_chat_demo 里没有 StreamingChatClient（改名了？）")
+        return
+    _FakeSCC.made = []
+    streaming_chat_demo.StreamingChatClient = _FakeSCC
+
+    async def _drive():
+        omni = OmniClient("wss://fake/realtime", system_prompt="A")
+        await omni.connect()
+        task = asyncio.create_task(omni.recv_loop())
+        await asyncio.sleep(0.05)                  # 让它挂到第一条连接上
+        after_first = _FakeSCC.made[0].recv_calls
+        ok = await omni.switch_system_prompt("B")  # ← 换人设：这里最容易踩
+        await asyncio.sleep(0.05)                  # 让 recv_loop 接上新连接
+        cur = _FakeSCC.made[-1]
+        triggers = await omni.trigger_reply("x")
+        alive = not omni.dead
+        omni.closed = True
+        for c in _FakeSCC.made:
+            await c.close()
+        task.cancel()
+        return after_first, ok, alive, triggers, omni, cur
+
+    try:
+        after_first, ok, alive, triggers, omni, cur = asyncio.run(_drive())
+    finally:
+        streaming_chat_demo.StreamingChatClient = real
+
+    check(len(_FakeSCC.made) == 2,
+          f"换人设真的重开了一条连接（实际 {len(_FakeSCC.made)} 条）")
+    check(after_first == 1, "recv_loop 挂上了第一条连接")
+    check(cur.recv_at_handshake == 0,
+          f"**新连接的握手窗口里没有别的 coroutine 抢 recv**"
+          f"（实际 {cur.recv_at_handshake} 次 —— 非 0 就是 connect() 发布早了）")
+    check(ok and alive,
+          "重连后 `dead` 必须是 False —— 为 True 说明 recv_loop 把"
+          "「自己换掉的连接」误判成了断线，之后所有触发都会被短路")
+    check(triggers, "重连后 trigger_reply 送得出去（链路真的活着）")
+
+
+def test_desc_loop_rate_limits_failures() -> None:
+    """触发送不出去时，滚动循环必须按**间隔**重试，不能按轮询步长空转。
+
+    放掉在途标记是必要的（否则要空等满超时），但**同时必须推进
+    `_desc_last_done_at`** —— 否则间隔判据永远成立，循环会以 250ms 的轮询
+    步长疯狂重试。真机实测（2026-10-08，omni 连接断掉时）：每 250ms 一对
+    `触发增量描述` + `触发未能送出`，四秒上百行，把有用的信息全冲掉。
+    """
+    from orchestrator.session import OrchestratorSession
+
+    print("\n[限流] 触发失败时按间隔重试（不按 250ms 轮询步长空转）")
+    sess = OrchestratorSession("t-rate",
+                               {"omni_describe": True,
+                                "omni_delta_interval_s": 1.0})
+    omni = FakeOmni()
+    omni.alive = False                 # 每条触发都送不出去
+    sess.omni = omni
+
+    async def _drive() -> int:
+        await sess.request_omni_description("full")
+        # 起步就排空（全量那次也送不出去）
+        sess.take_omni_stage("")
+        await asyncio.sleep(2.4)
+        return len(omni.reqs)
+
+    # `FakeOmni.trigger_reply` 在 alive=False 时**不记** reqs —— 数不到。
+    # 改成数 `omni_desc_failed`（session 每次失败 +1），那才是"真的尝试了"。
+    n_calls = asyncio.run(_drive())
+    sess._stop_desc_loop()
+    sess.closed = True
+    failed = sess.stats.get("omni_desc_failed", 0)
+    # 1.0s 间隔 / 2.4s 窗口 ⇒ 期望 ≈3 次；没有限流会是 ~10 次（250ms 一次）
+    check(failed <= 5,
+          f"2.4s 内失败重试 {failed} 次 —— 应按 1.0s 间隔（≈3），"
+          f"按轮询步长会是 ~10")
+    check(failed >= 2, f"……而且**确实**在重试（{failed} 次，不是 0）")
+    check(n_calls == 0, "触发根本没送出去（FakeOmni 已断）")
+
+
 def check_ic(d) -> bool:
+
 
     """连进程内 IC；连不上（没装 interaction 包）就明确报失败。"""
     if d.ic.connect():
@@ -985,6 +1130,8 @@ def main() -> int:
         test_answer_path_starts_desc_without_greet()
         test_delta_persona_switch()
         test_delta_persona_off_and_fail()
+        test_connect_publishes_client_last()
+        test_desc_loop_rate_limits_failures()
     finally:
         srv.shutdown()
     print("=" * 68)

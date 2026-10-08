@@ -1484,18 +1484,35 @@ class OrchestratorSession:
                         self.stats.get("omni_desc_failed", 0) + 1
                     logger.warning("[%s] 描述触发未能送出（OmniLLM 连接可能已断）"
                                    "—— stage=%s", self.session_id, stage)
-                    # 送不出去 ⇒ 不会有 done ⇒ 立刻放掉在途标记，让循环重试
-                    self._desc_inflight = False
-                    self._omni_stage = ""
+                    self._release_desc_attempt()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[%s] 触发描述失败（stage=%s）: %s",
                                self.session_id, stage, exc)
-                self._desc_inflight = False
-                self._omni_stage = ""
+                self._release_desc_attempt()
 
         logger.info("[%s] 触发%s描述", self.session_id,
                     "全量" if stage == "full" else "增量")
         self._desc_task = asyncio.create_task(_do())
+
+    def _release_desc_attempt(self) -> None:
+        """这一轮描述**没送出去**（连接断了/抛异常）：收尾并**照常计时**。
+
+        ⚠️ 两件事必须一起做，缺一个都会出问题：
+
+        * 放掉 `_desc_inflight` —— 否则滚动循环以为还有一轮在途，要空等满
+          超时（10s）才恢复；
+        * **推进 `_desc_last_done_at`** —— 否则间隔判据（`now -
+          _desc_last_done_at < interval`）永远成立，循环会以轮询步长
+          （250ms）疯狂重试。真机实测（2026-10-08，omni 连接断掉时）：
+          日志被 `触发增量描述` + `触发未能送出` 刷成每 250ms 一对，
+          四秒上百行，把真正有用的信息冲掉了。
+
+        推进之后重试频率就等于配置的 `ORCH_OMNI_DELTA_INTERVAL_S` ——
+        连接真断了也只是一条告警/间隔，而不是热循环。
+        """
+        self._desc_inflight = False
+        self._omni_stage = ""
+        self._desc_last_done_at = time.monotonic()
 
     def _ensure_desc_loop(self) -> None:
         """起滚动循环（幂等）。"""

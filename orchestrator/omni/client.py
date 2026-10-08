@@ -123,14 +123,14 @@ class OmniClient:
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = _ssl.CERT_NONE
 
-        self.client = StreamingChatClient(self.url, ssl_ctx=ssl_ctx, echo=False)
-        await self.client.connect()
+        client = StreamingChatClient(self.url, ssl_ctx=ssl_ctx, echo=False)
+        await client.connect()
         # turn_trigger="asr" 时显式请求 "model"（穿透）—— 服务端就不会包
         # HalfDuplexSession，也就不会自注入触发；触发权完全归我方。
         init_kw = {}
         if self.turn_trigger == "asr":
             init_kw["turn_decision"] = "model"
-        ev = await self.client.init(
+        ev = await client.init(
             mode="full_duplex",
             # 兜底与 `config.omni_system_prompt` 的默认值保持一致 ——
             # 两处不一致时，"谁生效"会变得难以捉摸
@@ -140,8 +140,23 @@ class OmniClient:
                 "请始终使用中文普通话回复，不要使用英文。"),
             **init_kw,
         )
-        self.session_id = self.client.session_id
-        self.backend = self.client.backend
+        # ⚠️⚠️ `self.client` **必须最后发布**，不能像早先那样在第一行就赋值。
+        #
+        # `recv_loop` 是靠 `self.client` 非空来决定"可以开始收了"的，而上面
+        # `connect()`/`init()` 自己就在 `await ws.recv()`（等 queue_done）。
+        # 早一步发布 ⇒ recv_loop 抢进来对**同一个 ws** 再发一次 `recv()` ⇒
+        # websockets 抛 "cannot call recv while another coroutine is already
+        # waiting" ⇒ 被 `StreamingChatClient.receive_loop` 的
+        # `except Exception: break` **静默吞掉** ⇒ recv_loop 看到连接的代数
+        # 没变，判成"真断线"：`dead=True` + 日志"接收循环已退出（连接断开）"，
+        # 而此刻 `connect()` 还会继续跑完并打出"已连接"。
+        #
+        # 结果是最坏的一种：**日志说连上了，实际整条链路已经死了** ——
+        # 后续每一次触发都被短路（"连接已断，触发被跳过"），描述再也不更新。
+        # 2026-10-08 换人设重连时实测踩到，现象正是这样。
+        self.client = client
+        self.session_id = client.session_id
+        self.backend = client.backend
         logger.info("OmniLLM 已连接: session=%s backend=%s",
                     self.session_id, self.backend)
 
@@ -210,11 +225,11 @@ class OmniClient:
             #    106:8006 上**泄漏一路会话**（KV/显存不释放，还占着并发额度），
             #    而编排这边完全看不出来。
             logger.info("OmniLLM 重连完成时发现会话已收尾 —— 关掉新连接")
+            client, self.client = self.client, None
             try:
-                await self.client.close(reason="persona_switch_aborted")
+                await client.close(reason="persona_switch_aborted")
             except Exception:  # noqa: BLE001
                 pass
-            self.client = None
             return False
         logger.info("OmniLLM 已按新人设重连: session=%s backend=%s（system_prompt %d 字）",
                     self.session_id, self.backend, len(system_prompt))
