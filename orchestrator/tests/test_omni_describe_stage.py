@@ -24,6 +24,7 @@ OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`），而 interactionc
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import sys
@@ -719,6 +720,57 @@ def test_answer_path_starts_desc_without_greet() -> None:
     sess2.closed = True
 
 
+def test_describe_prompt_matches_demo() -> None:
+    """提示词与 `streaming_chat_demo.py` 的分工**不许漂移**。
+
+    约定（见 `omni/describe.py` 的模块文档）：
+
+    * `DEMO_DESCRIBE_PROMPT` == demo 的 `DESCRIBE_SYSTEM_PROMPT`，**逐字**；
+    * `FULL_INSTRUCTION` 以它结尾 ⇒ **全量阶段用的就是 demo 那份原文**；
+    * `DESCRIBE_SYSTEM_PROMPT` 的**前两行**逐字取自 demo（身份句 + 要求句），
+      但**不带**八类清单与"输出：分条" —— 那两句是格式要求，
+      system prompt 每轮重发，待在里头会把增量轮也顶成八类清单
+      （2026-10-08 实测：增量轮 311~679 字，注入指令压不回来）。
+    """
+    print("\n[提示词] 与 demo 的分工不许漂移")
+    from orchestrator.omni.describe import (
+        DEMO_DESCRIBE_PROMPT, DESCRIBE_SYSTEM_PROMPT, FULL_FORMAT_LINE,
+        FULL_INSTRUCTION,
+    )
+
+    demo_file = Path(__file__).resolve().parents[2] / "streaming_chat_demo.py"
+    if not demo_file.exists():
+        check(False, f"找不到 {demo_file} —— 这条断言失去意义，别静默跳过")
+        return
+    tree = ast.parse(demo_file.read_text(encoding="utf-8"))
+    demo = None
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "DESCRIBE_SYSTEM_PROMPT"
+                        for t in node.targets)):
+            demo = ast.literal_eval(node.value)
+    check(demo is not None, "demo 里仍有 DESCRIBE_SYSTEM_PROMPT（改名了？）")
+    if demo is None:
+        return
+
+    check(DEMO_DESCRIBE_PROMPT == demo,
+          f"DEMO_DESCRIBE_PROMPT 与 demo 逐字一致（demo {len(demo)} 字 / "
+          f"本模块 {len(DEMO_DESCRIBE_PROMPT)} 字）—— 不一致就是只改了一边")
+    check(FULL_INSTRUCTION.endswith(DEMO_DESCRIBE_PROMPT),
+          "FULL_INSTRUCTION 以 demo 原文结尾 ⇒ **全量阶段用的就是那份**")
+    check(FULL_INSTRUCTION.startswith("直接输出"),
+          "全量指令开头是那句针对'模型回好的'的护栏")
+    sys_lines = DESCRIBE_SYSTEM_PROMPT.split("\n")
+    check(sys_lines[:2] == demo.split("\n")[:2],
+          "system prompt 前两行（身份句 + 要求句）逐字取自 demo")
+    check("【P0" in DESCRIBE_SYSTEM_PROMPT,
+          "system prompt **保留**八类清单 —— 摘掉它全量轮就不分条了（实测）")
+    check(FULL_FORMAT_LINE not in DESCRIBE_SYSTEM_PROMPT,
+          "system prompt **摘掉**'输出：按上述八类分条' —— 留着增量轮会被顶回长格式")
+    check("不要与用户对话" in DESCRIBE_SYSTEM_PROMPT,
+          "system prompt 里有'不要对话'护栏（第一版走样的教训）")
+
+
 def check_ic(d) -> bool:
     """连进程内 IC；连不上（没装 interaction 包）就明确报失败。"""
     if d.ic.connect():
@@ -748,6 +800,7 @@ def main() -> int:
         test_legacy_mode_with_describe_on(url)
         test_illegal_mode_falls_back_to_legacy(url)
         test_contract_drift(url)
+        test_describe_prompt_matches_demo()
         test_two_stage_prompts_and_loop()
         test_answer_path_starts_desc_without_greet()
     finally:
