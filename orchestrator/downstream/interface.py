@@ -120,6 +120,30 @@ class OmniResponseDone:
 
 
 @dataclass(frozen=True)
+class OmniDescription:
+    """OmniLLM 产出的一整段**描述**（两阶段：全量 / 增量）。
+
+    ⚠️ 与 `OmniDelta` 的分工**必须分清**：
+
+      · `OmniDelta`        —— token 流增量，任一时刻都是**半句话**
+      · `OmniDescription`  —— **只在 `response.done` 产出**，带生成完的整段
+
+    只有后者允许进 `on_answer` 的 ``content.VLM``。拿 token 流去拼当前文本
+    会随 ASR 发出一句被切断的描述 —— 而这条链路上**没有截断**了，
+    半句话会**原样**到 Agent 手里。
+
+    与 `OmniResponseDone` 是**互斥**的两条路（见 `main.py` 的
+    `on_omni_event`）：一轮生成要么是"描述"（本事件），要么是"对话回复"。
+    靠 `session.take_omni_stage()` 区分 —— 我们**主动触发的**那轮才是描述。
+    """
+    t: int
+    stage: Literal["full", "delta"]
+    text: str
+    response_id: str = ""
+    kind: Literal["omni.description"] = "omni.description"
+
+
+@dataclass(frozen=True)
 class FaceWake:
     """人脸唤醒（G1 库的 ``interacting``）。"""
     t: int
@@ -215,7 +239,7 @@ class Tick:
 
 DownstreamEvent = Union[
     AsrPartial, AsrFinal, AsrTurnSense, AsrStateUpdate,
-    OmniTurnSense, OmniDelta, OmniResponseDone,
+    OmniTurnSense, OmniDelta, OmniResponseDone, OmniDescription,
     FaceWake, FaceIdentity, FaceLipState, FaceState,
     PlaybackReceipt, Tick,
 ]
@@ -273,6 +297,23 @@ class SendToOmni:
 
 
 @dataclass(frozen=True)
+class Describe:
+    """请求 OmniLLM **产一次描述**（`stage` = full | delta）。
+
+    「**何时**描述」是下游的纯决策（GREET ⇒ full；对话中滚动 ⇒ delta），
+    「**怎么**调 OmniLLM」由 session 执行（拼指令 + `trigger_reply`）——
+    与 `SendToOmni` 同款划分（下游不碰传输层）。
+
+    ⚠️ 与 `SendToOmni` 的区别不是"发什么"，而是**语义**：那条路是
+    "把这段文本/音频喂给 OmniLLM 当输入"，本动作是"让 OmniLLM 为一个
+    **已知用途**（描述）生成一轮"。描述轮的产出会被标成
+    `OmniDescription` 而不是 `OmniResponseDone` —— 见 `session.take_omni_stage`。
+    """
+    stage: Literal["full", "delta"] = "delta"
+    kind: Literal["describe"] = "describe"
+
+
+@dataclass(frozen=True)
 class Emit:
     """遥测 / UI 事件（不参与控制流）。"""
     channel: str
@@ -280,7 +321,7 @@ class Emit:
     kind: Literal["emit"] = "emit"
 
 
-DownstreamAction = Union[Speak, Cancel, SendToOmni, Emit]
+DownstreamAction = Union[Speak, Cancel, SendToOmni, Describe, Emit]
 
 
 # ====================================================================== #

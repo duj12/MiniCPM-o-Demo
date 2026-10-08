@@ -230,7 +230,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
     if cfg.enable_omni:
         from orchestrator.omni.client import OmniClient
         from orchestrator.downstream.interface import (
-            OmniDelta, OmniResponseDone, OmniTurnSense,
+            OmniDelta, OmniDescription, OmniResponseDone, OmniTurnSense,
         )
 
         def on_omni_event(ev: dict) -> None:
@@ -249,18 +249,56 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 # 计数器供 drain 观察「本轮是否已结束」——不去窥探事件队列
                 # （run_downstream 是同一队列的消费者，会互抢）
                 sess.stats["omni_done"] = sess.stats.get("omni_done", 0) + 1
-                sess.post_downstream(OmniResponseDone(
-                    t=now,
-                    response_id=str(ev.get("response_id") or ""),
-                    text=ev.get("text", "") or "",
-                ))
+                text = ev.get("text", "") or ""
+                response_id = str(ev.get("response_id") or "")
+                # ⚠️ **分流**：这一轮是我们主动请求的"描述"还是"对话回复"？
+                #    服务端不区分（同一条连接、同一个 API），只有我们知道自己
+                #    发过 `Describe` ⇒ 由 `take_omni_stage()` 回答（**读走即清**，
+                #    两条路互斥）。
+                #
+                #    getattr 兜底：老版本 session 没有这个方法（两个文件不同步
+                #    时不该让整个 omni 回调炸掉 —— 那会让**所有** omni 事件
+                #    都断掉）。
+                take = getattr(sess, "take_omni_stage", None)
+                stage = take() if take is not None else ""
+                if stage:
+                    sess.post_downstream(OmniDescription(
+                        t=now, stage=stage, text=text, response_id=response_id,
+                    ))
+                else:
+                    sess.post_downstream(OmniResponseDone(
+                        t=now, response_id=response_id, text=text,
+                    ))
 
         # ⚠️ 客户端传来的 system_prompt **优先于** config 默认值。
         #    早先这里只读 cfg，而 `hello["system_prompt"]` 那条路是个
         #    `pass` 空实现 —— 前端传了也没用。而且顺序本身也是错的：
         #    OmniClient 在这里创建，之后再想覆盖已经来不及了。
         omni_prompt = cfg.omni_system_prompt
-        if hello and (hello.get("system_prompt") or "").strip():
+        # ---- 描述模式下**换人设** ------------------------------------------ #
+        # `ORCH_OMNI_DESCRIBE=1` 时 OmniLLM 不再是"对话方"，而是**描述助手**
+        # （产出画面/语音描述给 Agent，见 `omni/describe.py`）。
+        #
+        # ⚠️ 只在 `downstream_mode == "omni"` 时换：那两个桩模式
+        #    （asr/echo）根本不走 OmniLLM 的产出，换了也没用；`none` 同理。
+        #
+        # ⚠️⚠️ **描述模式下客户端不能覆盖人设**（与下面那条 else 相反）。
+        #    这是**部署级**的决定：人设错了，模型会开始跟用户对话，而那段
+        #    "回话"会被当作画面描述发给 Agent。web 前端传的永远是对话型
+        #    prompt ⇒ 必须挡住并说出来，不能静默照用。
+        if cfg.omni_describe and cfg.downstream_mode == "omni":
+            from orchestrator.omni.describe import DESCRIBE_SYSTEM_PROMPT
+            omni_prompt = (cfg.omni_describe_system_prompt
+                           or DESCRIBE_SYSTEM_PROMPT)
+            if hello and (hello.get("system_prompt") or "").strip():
+                logger.warning(
+                    "[%s] 描述模式生效（ORCH_OMNI_DESCRIBE=1）—— **忽略**客户端"
+                    "传来的 system_prompt（%d 字）：人设由部署决定，否则模型会"
+                    "跟用户对话、把回话当成画面描述发给 Agent",
+                    sid, len(str(hello["system_prompt"]).strip()))
+            logger.info("[%s] OmniLLM 人设 = 描述助手（%d 字）",
+                        sid, len(omni_prompt))
+        elif hello and (hello.get("system_prompt") or "").strip():
             omni_prompt = str(hello["system_prompt"]).strip()
             logger.info("[%s] OmniLLM 系统提示词被客户端覆盖（%d 字）",
                         sid, len(omni_prompt))
@@ -332,6 +370,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         ic_on = bool(cfg.interaction_enabled) if ic_on is None else bool(ic_on)
         want_ic = ic_on and mode != "echo"
 
+        if not want_ic and cfg.omni_describe:
+            # ⚠️ 描述模式**依赖 IC** 提供两个触发点：全量描述挂 IC 的 GREET、
+            #    增量滚动由 session 在 GREET 之后接管。没有 IC ⇒ 一个都不会
+            #    发生：omni 被设成"描述助手"（不对话）却没人让它描述 ——
+            #    现象是「能识别、什么都不产出」，而且**一声不响**地发生。
+            logger.error(
+                "[%s] ⚠️ 描述模式已开（ORCH_OMNI_DESCRIBE=1）但本会话**不走 IC**"
+                "（interaction_enabled=%s mode=%s）—— 描述一次都不会触发。"
+                "要么开 IC，要么设 ORCH_OMNI_DESCRIBE=0",
+                sid, cfg.interaction_enabled, mode)
+
         if want_ic:
             from orchestrator.interaction import InteractionDownstream
             from orchestrator.protocol import IcDisplay
@@ -387,7 +436,14 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 ic_expression_ca=(cfg.ic_expression_ca or _orch_cert_path()),
                 # Agent 写 apply_agent 的回调根地址（转发给 Agent 用）。
                 ic_callback_ic=_resolve_ic_callback_base(cfg),
-                agent_set_target=cfg.agent_set_target)
+                agent_set_target=cfg.agent_set_target,
+                # VLM 描述（两阶段）：`omni_describe` 决定 IC 判 GREET 时要不
+                # 要派 `Describe("full")`，`agent_transcript_mode` 决定 Agent
+                # 收到的 payload 形态。**两个默认值都是关/legacy**（见
+                # config 的说明：编排代码 105/106 共用，默认值就是 106 下次
+                # 重启后的行为）。
+                omni_describe=cfg.omni_describe,
+                agent_transcript_mode=cfg.agent_transcript_mode)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
@@ -396,6 +452,11 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 sess.interaction = ic_ds
                 logger.info("[%s] IC + Agent 已接管（mode=%s ic=%s agent=%s）",
                             sid, ic_mode, ic_target, agent_target)
+                if cfg.omni_describe:
+                    logger.info(
+                        "[%s] VLM 描述已开：transcript 模式=%s；"
+                        "全量描述挂 IC 的 GREET，增量每 %.1fs 滚动",
+                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s)
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
@@ -403,6 +464,18 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 logger.warning(
                     "[%s] InteractionCore 不可用（%s：%s）"
                     "—— 降级为 OmniLLM 回复", sid, ic_target, ic_ds.ic.error)
+                if cfg.omni_describe:
+                    # ⚠️⚠️ 这条必须刺眼。描述模式下 omni 的人设已经是"描述
+                    #   助手"（不对话），而 IC 没了 ⇒ **没有任何东西会派
+                    #   全量描述**（GREET 来自 IC），降级到的
+                    #   `PassthroughDownstream` 又指望 omni 回复用户。
+                    #    结果是「能识别、永远不回复」—— 与之前 OmniLLM 断线
+                    #    那个 bug 同一病理，只看日志很难归因到 IC 上。
+                    logger.error(
+                        "[%s] ⚠️ 描述模式与 IC 降级**互相冲突**：omni 已被设成"
+                        "描述助手（不对话），IC 又不可用 ⇒ 本轮会话**不会有人**"
+                        "触发全量描述、也不会有回复。请恢复 IC，或设 "
+                        "ORCH_OMNI_DESCRIBE=0 回到对话模式", sid)
 
         if sess.downstream is None:
             sess.downstream = PassthroughDownstream(

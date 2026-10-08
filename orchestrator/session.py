@@ -142,6 +142,41 @@ class OrchestratorSession:
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
+        # ---- VLM 描述（两阶段）--------------------------------------------
+        #
+        # `ORCH_OMNI_DESCRIBE=1` 时 OmniLLM 不再当"对话方"，而是当**描述
+        # 助手**：全量描述挂 IC 的 GREET（见 `interaction/downstream.py`），
+        # 增量描述由 `_desc_loop` 滚动刷。产出的文本经 `OmniDescription`
+        # 事件落进下游的 `_vlm` 缓存，断句时随 `on_answer` 发给 Agent。
+        #
+        # ⚠️ 这里**不持有**描述文本 —— 缓存归 `InteractionDownstream`
+        #    （它才是读方，且 sink 的 getter 从它那儿取）。session 只负责
+        #    "什么时候请求一次描述"。
+        self._desc_enabled = bool(config.get("omni_describe", False))
+        #: 在途的描述任务（与 `_trigger_task` 分开：对话触发与描述触发是
+        #: **两种**触发，混在一个槽里会互相吞掉对方）
+        self._desc_task: Optional[asyncio.Task] = None
+        #: 滚动增量的间隔（秒）—— 见 config 的说明
+        self._desc_interval = float(config.get("omni_delta_interval_s", 2.0) or 2.0)
+        #: 滚动循环的任务（对话开始后常驻，会话结束时取消）
+        self._desc_loop_task: Optional[asyncio.Task] = None
+        #: 滚动是否已经启动（GREET 那次全量描述是起点 —— 见
+        #: `request_omni_description`）
+        self._desc_started = False
+        #: 是否有一轮描述**正在生成**（`response.done` 到之前为 True）。
+        #: 滚动循环靠它保证**不重叠**（不重叠 = 不自激，见 `_desc_loop`）
+        self._desc_inflight = False
+        #: 在途那一轮的发出时刻（算"在途超时"用）
+        self._desc_inflight_at = 0.0
+        #: 上一轮描述**结束**的时刻 —— 下一个增量的间隔从这里算
+        self._desc_last_done_at = 0.0
+        #: **本轮**（我们主动触发的这一轮）是不是描述轮。
+        #:
+        #: `main.py` 的 `on_omni_event` 靠它把 `response.done` 分流成
+        #: `OmniDescription` 而不是 `OmniResponseDone` —— 我们只能从
+        #: "是我们请求的"推出这一轮是描述（服务端不区分，见 plan）。
+        self._omni_stage = ""
+
         # 回声消除模式：browser | service | off（可被 session.start 覆盖）
         self.aec_mode = str(config.get("aec_mode") or "browser")
         # 声学延迟：优先用该设备的历史记录，没有则用配置默认值
@@ -1144,6 +1179,9 @@ class OrchestratorSession:
                 # 那恰恰是「用户在出声但没识别出来」的信号，state 里能看出来。
                 # 早先这里有 `if delta:` 守卫，把这类帧整条丢了。
                 self._asr_online_text += delta
+                # 描述链路的第二条点火路径（IC 直判 ANSWER、没有 GREET 时）。
+                # 挂**部分结果**是关键 —— 到 2pass-offline 才点火就来不及了。
+                self._start_desc_on_asr(self._asr_online_text)
                 self.post_downstream(AsrPartial(
                     t=self.clock.now(), text=self._asr_online_text,
                     confidence=parse_confidence(msg),
@@ -1177,6 +1215,10 @@ class OrchestratorSession:
                 is_final=fin["is_final"],
                 state=st,
             ))
+            # 兜底：万一这段**一个部分结果都没有**（低置信度被服务端整段
+            # 过滤），上面的部分结果路径就没点着火。此时至少把链路启起来，
+            # 让**后续**几句有描述可发 —— 本句的 VLM 已经来不及，认了。
+            self._start_desc_on_asr(fin["text"])
             # 最终结果到达：用它覆盖流式累积文本，并**清空缓冲**为下一段
             # 做准备（服务端也是这么做的：text_print_2pass_online = ""）
             self._asr_online_text = ""
@@ -1199,6 +1241,18 @@ class OrchestratorSession:
 
     def _trigger_omni(self, text: str) -> None:
         """按 ASR 文本触发一次 OmniLLM 回复（异步，不阻塞 ASR 回调）。"""
+        if self._desc_enabled:
+            # ⚠️ 描述模式下 **OmniLLM 不是对话方**：它的人设是"描述助手"
+            #    （见 `omni/describe.py`），拿 ASR 文本去触发它只会得到一段
+            #    "对用户说的话"。那段话在 IC 模式下**没有任何出口**
+            #    （`InteractionDownstream` 不消费 `OmniResponseDone`，回复由
+            #    Agent 产生）—— 纯白烧一次 GPU，还和滚动描述抢同一个共享
+            #    decode 队列，把描述本身的延迟推高。
+            #
+            #    所以这里直接不触发。要恢复对话式触发：关掉
+            #    `ORCH_OMNI_DESCRIBE`（那时 persona 也一起回到对话型）。
+            logger.debug("描述模式：跳过对话式 OmniLLM 触发（%r）", text[:20])
+            return
         if self._trigger_task is not None and not self._trigger_task.done():
             # 上一次触发还没送出去 —— 排队即可（同一话轮内多次 final
             # 通常意味着 VAD 切段，合并成一次触发更自然）
@@ -1222,6 +1276,186 @@ class OrchestratorSession:
                 logger.warning("触发 OmniLLM 回复失败: %s", exc)
 
         self._trigger_task = asyncio.create_task(_do())
+
+    # ------------------------------------------------------------------ #
+    #  VLM 描述（两阶段）
+    # ------------------------------------------------------------------ #
+
+    #: 滚动循环的轮询步长（秒）。**不追求精确**：循环只需判「上一轮完了没、
+    #: 距上一轮完成够久没」，250ms 的粒度对 2s 量级的间隔足够了。用轮询而
+    #: 不是"done 之后再排一个 sleep"，是为了**自愈** —— 万一看不到
+    #: `response.done`，链子也不会断（见 `_desc_loop` 的超时分支）。
+    _DESC_POLL_S = 0.25
+
+    async def request_omni_description(self, stage: str = "delta") -> None:
+        """让 OmniLLM 产一次描述（下游派的 `Describe` 动作）。
+
+        目前只有一个调用方：IC 判**切入 GREET** 时派 `Describe("full")`
+        —— 见 `interaction/downstream.py` 的 `_dispatch`。增量的 `delta`
+        由 `_desc_loop` 自己调度，不走这里。
+
+        首次调用同时**接管**滚动循环：GREET 之前不该有任何描述轮
+        （画面里还没人，纯浪费 GPU），GREET 之后才开始滚动刷新。
+
+        另一条点火路径是 `_start_desc_on_asr`（IC 直判 ANSWER、跳过 GREET）。
+        """
+        if not self._desc_enabled:
+            logger.debug("收到 Describe(%s) 但描述模式已关 —— 忽略", stage)
+            return
+        if stage == "full":
+            self._arm_desc_loop(reason="切入 GREET")
+        await self._do_describe(stage)
+
+    def _arm_desc_loop(self, *, reason: str) -> bool:
+        """首次点火：置 `_desc_started` 并起滚动循环。**幂等**。
+
+        返回本次是否真正点火（已启动过 ⇒ False）。同步完成置位，调用方
+        可以直接用它防重。
+        """
+        if self._desc_started:
+            return False
+        self._desc_started = True
+        # 起始时刻先记上：万一这次全量的 done 没回来，超时分支也要能
+        # 把滚动增量接上（否则"首份描述丢了 ⇒ 永远不再描述"）。
+        self._desc_last_done_at = time.monotonic()
+        self._ensure_desc_loop()
+        logger.info("[%s] 开始滚动描述（间隔 %.1fs，首次为全量）—— 点火：%s",
+                    self.session_id, self._desc_interval, reason)
+        return True
+
+    #: 描述链路的**第二条点火路径**：IC 直判 ANSWER、跳过 GREET 时用。
+    #:
+    #: 为什么必须补这一条：全量的唯一触发点是「切入 GREET」（见
+    #: `interaction/downstream.py::_dispatch`）。但**人一开口就进画**时，
+    #: IC 会直接判 ANSWER，`GREET` 这一拍根本不出现 ⇒ `_desc_started` 永远
+    #: 是 False ⇒ 整个描述链路（含滚动循环）此后再也不启动，`on_answer`
+    #: 的 VLM 恒为空。而现象只是"VLM 是空的"，看不出因果。
+    #:
+    #: 为什么挂在 **ASR 文本**上、而不是人脸：IC 判 ANSWER 本身就意味着
+    #: 「真有人在说话」，语义与 GREET 等价，且画面里站着人但没人开口时
+    #: 不必烧 omni 算力。
+    #:
+    #: 为什么来得及（实测 `orch-dumps/105/replay-121d10.log`）：首个**有文本**
+    #: 的部分结果 t=12.1s，`2pass-offline` 最终结果 t=28.9s 才到 —— 中间
+    #: **17s**，而全量描述实测 ~1.25s。所以挂部分结果（而非最终结果）是
+    #: 关键：挂最终结果等于在 `on_answer` 那一刻才开始生成，必然空。
+    def _start_desc_on_asr(self, text: str) -> None:
+        """首个带文本的 ASR 结果 ⇒ 若无 GREET 也已发生，补一次全量描述。"""
+        if not self._desc_enabled or not text or not text.strip():
+            return
+        if not self._arm_desc_loop(reason="首个 ASR 文本（IC 未判 GREET）"):
+            return
+        logger.info("[%s] 首个 ASR 文本（%d 字）⇒ 无 GREET 也点火的全量 VLM 描述",
+                    self.session_id, len(text))
+        self._desc_task = asyncio.create_task(self._do_describe("full"))
+
+    def take_omni_stage(self) -> str:
+        """读走「当前这一轮是不是我们请求的描述轮」，并清零。
+
+        `main.py` 的 `on_omni_event` 在 `response.done` 时调它：
+        非空 ⇒ 这一轮是描述 ⇒ 发出 `OmniDescription`；空 ⇒ 是对话回复 ⇒
+        照旧发 `OmniResponseDone`。**读走即清零**，两条路互斥。
+
+        ⚠️ 这里**必须**顺手清 `_desc_inflight` —— 它是滚动循环"上一轮完了"
+        的唯一信号。漏了它，循环会一直以为有生成在途，描述再也不会刷新
+        （而日志里只有超时告警，看不出因果）。
+        """
+        stage = self._omni_stage
+        self._omni_stage = ""
+        self._desc_inflight = False
+        self._desc_last_done_at = time.monotonic()
+        return stage
+
+    async def _do_describe(self, stage: str) -> None:
+        """真的发一次描述触发（异步任务，不阻塞调用方）。"""
+        if self.omni is None:
+            logger.warning("[%s] 描述请求被跳过：OmniLLM 未装配", self.session_id)
+            return
+        from .omni.describe import DELTA_INSTRUCTION, FULL_INSTRUCTION
+        instruction = FULL_INSTRUCTION if stage == "full" else DELTA_INSTRUCTION
+        self.stats["omni_desc_triggers"] = self.stats.get("omni_desc_triggers", 0) + 1
+        # 标记在途**必须在 create_task 之前** —— 循环下一次轮询要看它
+        self._desc_inflight = True
+        self._desc_inflight_at = time.monotonic()
+        self._omni_stage = str(stage)
+
+        async def _do():
+            try:
+                ok = await self.omni.trigger_reply(instruction)
+                if not ok:
+                    self.stats["omni_desc_failed"] = \
+                        self.stats.get("omni_desc_failed", 0) + 1
+                    logger.warning("[%s] 描述触发未能送出（OmniLLM 连接可能已断）"
+                                   "—— stage=%s", self.session_id, stage)
+                    # 送不出去 ⇒ 不会有 done ⇒ 立刻放掉在途标记，让循环重试
+                    self._desc_inflight = False
+                    self._omni_stage = ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] 触发描述失败（stage=%s）: %s",
+                               self.session_id, stage, exc)
+                self._desc_inflight = False
+                self._omni_stage = ""
+
+        logger.info("[%s] 触发%s描述", self.session_id,
+                    "全量" if stage == "full" else "增量")
+        self._desc_task = asyncio.create_task(_do())
+
+    def _ensure_desc_loop(self) -> None:
+        """起滚动循环（幂等）。"""
+        if self._desc_loop_task is not None and not self._desc_loop_task.done():
+            return
+        self._desc_loop_task = asyncio.create_task(self._desc_loop())
+
+    async def _desc_loop(self) -> None:
+        """滚动刷新增量描述 —— 目标是 `AsrFinal` 一到就有非空缓存可发。
+
+        ## 为什么用"轮询 + 在途标记"而不是"done 之后 sleep 一次"
+
+        done 之后再排一次 sleep 看着更优雅，但**链断在哪没人知道**：少一个
+        `response.done`（连接抖动、服务端异常），后续描述就永远不再产生，
+        缓存停在旧描述上，而现象是"Agent 收到的 VLM 越来越旧"，没人会往
+        循环上想。轮询版里"在途超时"是一个**显式分支**，恢复动作就写在
+        那里（打日志 + 放掉标记），链子自己接回来。
+
+        ## 绝不能自激
+
+        只在「上一轮**已结束**」且「距上一轮结束已过 `interval`」时才发下
+        一次。若不等结束就按固定周期发，生成慢于间隔时请求会在服务端排队，
+        延迟单调增长，同时把共享 decode 队列占满、**反而让每次描述更慢**
+        —— 恰好摧毁本循环要保的那个指标。
+        """
+        import time as _time
+        stale_s = max(10.0, self._desc_interval * 5)
+        while not self.closed:
+            await asyncio.sleep(self._DESC_POLL_S)
+            if not self._desc_started or self.omni is None:
+                continue
+            now = _time.monotonic()
+            if self._desc_inflight:
+                if now - self._desc_inflight_at <= stale_s:
+                    continue
+                # 生成迟迟不结束 = `response.done` 丢了（或连接断了）。
+                # **必须显式放掉并告警** —— 否则循环会一直在这里 continue，
+                # 描述永不刷新，而唯一的症状是"VLM 很旧"。
+                logger.warning("[%s] 描述在途超过 %.0fs 未见 done —— "
+                               "放掉在途标记，恢复滚动"
+                               "（若反复出现，查 OmniLLM 连接）",
+                               self.session_id, stale_s)
+                self._desc_inflight = False
+                self._omni_stage = ""
+                self._desc_last_done_at = now
+            if now - self._desc_last_done_at < self._desc_interval:
+                continue
+            await self._do_describe("delta")
+
+    def _stop_desc_loop(self) -> None:
+        """停掉滚动循环与在途描述任务（会话收尾用）。"""
+        for task in (self._desc_loop_task, self._desc_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._desc_loop_task = None
+        self._desc_task = None
+        self._desc_inflight = False
 
     def _send_display(self, msg, *, critical: bool = False) -> bool:
         """投递 UI 消息。返回**是否入队成功**。
@@ -1484,6 +1718,11 @@ class OrchestratorSession:
             self.metrics.inc("omni_deltas")
         elif k == "omni.done":
             self.metrics.inc("omni_dones")
+        elif k == "omni.description":
+            # 与 omni.done **分开计数** —— 混在一起就分不清"这一轮到底是
+            # 描述还是对话回复"，而两者的期望产出完全不同（前者进 VLM 载荷，
+            # 后者在 IC 模式下无出口）。
+            self.metrics.inc("omni_descriptions")
         elif k == "omni.turnsense":
             self.metrics.inc("omni_turnsense")
         elif k == "face.wake":
@@ -1755,6 +1994,11 @@ class OrchestratorSession:
             return
         self.closed = True
         logger.info("会话 %s 关闭（%s）", self.session_id, reason)
+        # 停滚动描述：否则循环会继续每 interval 向 OmniLLM 要一次描述，
+        # 而 omni 连接马上就要关掉 —— 白烧 GPU，还会在日志里刷一堆
+        # 「描述触发未能送出」。`closed` 已置位，这里只是**立刻**停，
+        # 不等下一个轮询周期。
+        self._stop_desc_loop()
         # 音视频转储落盘（默认关闭，无副作用）
         #
         # ⚠️ **顺序有讲究**：`flush_audio_dump()` 必须在 `_finish_raw_record()`

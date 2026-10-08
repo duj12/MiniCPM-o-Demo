@@ -43,12 +43,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
+from ..omni.describe import is_no_change, looks_conversational
+
 from ..downstream.interface import (
-    AsrFinal, AsrPartial, AsrStateUpdate, DownstreamAction,
+    AsrFinal, AsrPartial, AsrStateUpdate, Describe, DownstreamAction,
     DownstreamEvent, FaceIdentity, FaceLipState, FaceState, FaceWake,
-    PlaybackReceipt, Tick,
+    OmniDescription, PlaybackReceipt, Tick,
     # ⚠️ `Speak` / `Cancel` **当前没有代码使用** —— 编排侧不再主动播报/打断
     #    （见上面的类文档）。它们被注释掉的兜底分支引用着，取消注释时要用，
     #    所以**留着 import**；`flake8` 若报 F401 属预期，别顺手删。
@@ -111,7 +114,33 @@ class InteractionDownstream:
                  ic_expression_url: str = "",
                  ic_expression_ca: Optional[str] = None,
                  ic_callback_ic: Optional[str] = None,
-                 agent_set_target: bool = True) -> None:
+                 agent_set_target: bool = True,
+                 omni_describe: bool = False,
+                 agent_transcript_mode: str = "legacy") -> None:
+        #: 描述模式总开关（`ORCH_OMNI_DESCRIBE`）。**只管两件事**：
+        #:   ① 决定在 IC 判 GREET 时要不要发 `Describe("full")`
+        #:   ② 决定要不要给 IC 的 sink 装 VLM 包装（`agent_transcript_mode`
+        #:      也必须是非 legacy 才有意义）
+        #: 它**不**改 omni 的人设 —— 那是 `main.py` 按它挑 system prompt。
+        self._desc_enabled = bool(omni_describe)
+        #: Agent 载荷形态：legacy（逐字节旧版）/ dual / dict。
+        #: ⚠️ 默认值是**安全侧**，与 `config.agent_transcript_mode` 一致 ——
+        #:    编排代码 105/106 共用，默认开等于替 106 决定了对 Agent 的协议。
+        self._agent_transcript_mode = (agent_transcript_mode or "legacy").strip().lower()
+        #: 最近一份**生成完**的 VLM 描述（见 `_on_vlm_description`）。
+        #: 由 `agent_sink` 的 getter 在 `on_answer` 的**断句那一刻**读取 ——
+        #: 所以这里必须是一份"随时可用"的缓存，取值路径上**不做任何生成**。
+        self._vlm = ""
+        #: 该描述**生成完成**的单调时刻（算年龄用）
+        self._vlm_at = 0.0
+        #: 该描述属于哪个阶段（full / delta）
+        self._vlm_stage = ""
+        #: `AsrFinal` 到达时描述**还没就绪**的次数 —— 这是主指标的失败计数
+        #: （见 plan 的硬指标：主指标是"offline 文本到时已有非空描述"）
+        self._vlm_miss = 0
+        #: 上一次 dispatch 的 IC Action 类型。用于识别**切入** GREET
+        #: （不能用 `fresh`：见 `_dispatch` 里的说明）
+        self._prev_atype = ""
         self.ic_mode = (ic_mode or "grpc").strip().lower()
         if self.ic_mode == "inprocess":
             #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
@@ -122,6 +151,13 @@ class InteractionDownstream:
                 agent_url=agent_url,
                 expression_ca=ic_expression_ca,
                 callback_ic=ic_callback_ic,
+                # VLM 只在"描述模式生效 **且** 真要改 payload"时才装包装 ——
+                # 任一条不满足都传 None，sink 走原始路径（payload 与旧版
+                # 逐字节一致）。
+                vlm_getter=(lambda: self._vlm)
+                if (self._desc_enabled
+                    and self._agent_transcript_mode != "legacy") else None,
+                agent_transcript_mode=self._agent_transcript_mode,
             )
             logger.info("[%s] IC 模式=进程内 Engine（本会话独占，无单例限制）",
                         session_id or "?")
@@ -183,7 +219,15 @@ class InteractionDownstream:
                 "asr.final", "asr.partial", "asr.turnsense",
                 "face.state", "face.identity", "face.lip", "face.wake",
                 "playback", "tick",
+                # 只有真开了才声明 —— 这行是"本路会话会不会产 Describe"
+                # 的唯一可观测点（105 靠它判影子实例起对了没）
+                *(["omni.describe"] if self._desc_enabled else []),
             ],
+            #: 描述模式 / Agent 载荷形态的生效值。**同一份代码 105/106 共用**，
+            #: 日志里没有这一行就没法判"我这台到底开没开"（106 的默认值即
+            #: 关 —— 见 config 的说明）。
+            "omni_describe": self._desc_enabled,
+            "transcript_mode": self._agent_transcript_mode,
         }
 
     async def on_session_start(self, ctx) -> List[DownstreamAction]:
@@ -207,6 +251,19 @@ class InteractionDownstream:
         #    ⚠️ 用 `reset_session`（**不通知** agent/TTS），不是 `end_session`
         #       —— 后者是"用户主动结束"用的。
         self.ic.reset_session()
+        # ⚠️ VLM 缓存与 `_prev_atype` 都必须**随新会话清掉**：
+        #   · 描述属于**上一个人/上一个场景**，新会话的首个 GREET 全量描述
+        #     还没到之前，留着旧的比空着更糟（Agent 会照着一个不属于眼前
+        #     这个人的描述说话）。空 VLM 至少是"没有信息"，不是"错误信息"。
+        #   · `_prev_atype` 留着 `"GREET"` 会让新会话的首次 GREET 被判成
+        #     "不是切入" ⇒ **一次全量描述都不发**（静默，只在日志里看得出）。
+        if self._vlm:
+            logger.info("[%s] 新会话开始 —— 清掉上一会话的 VLM 描述（%d 字）",
+                        self.session_id, len(self._vlm))
+        self._vlm = ""
+        self._vlm_at = 0.0
+        self._vlm_stage = ""
+        self._prev_atype = ""
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []
@@ -350,6 +407,14 @@ class InteractionDownstream:
 
     def _feed(self, ev: DownstreamEvent) -> None:
         """把事件映射成 IC 的 ``apply_*``（**只投队列，立即返回**）。"""
+        # ⚠️ OmniDescription **放在可用性判据之前** —— 它只写本对象的缓存，
+        #    不调 `ic.apply`，与 IC 在不在无关。放在后面会被那条 `return`
+        #    连带跳过，于是"IC 掉线 ⇒ VLM 缓存永远是空"，而症状（Agent 收到
+        #    空 VLM）看起来像 prompt 的问题，很难往这儿想。
+        if isinstance(ev, OmniDescription):
+            self._on_vlm_description(ev)
+            return
+
         if not self.ic.available:
             return
 
@@ -423,6 +488,13 @@ class InteractionDownstream:
                 user_speaking_confidence=_conf(st.get("user_speaking_confidence")),
                 barge_in_confidence=_conf(st.get("barge_in_confidence")),
             )
+            # ---- 主指标的观测点 ---------------------------------------- #
+            # 这里就是「offline 文本到达」那一刻（`2pass-offline` = AsrFinal）。
+            # 从这行往下到 Agent 收到 `on_answer`，**不许有任何等待** ——
+            # VLM 只是 sink 里读一次缓存。所以这里只需要**度量**，
+            # 不做任何"没就绪就等一会儿"的事（等就破坏了硬指标）。
+            if text and self._desc_enabled:
+                self._note_vlm_readiness()
 
         elif isinstance(ev, FaceState):
             st = ev.state or {}
@@ -484,6 +556,57 @@ class InteractionDownstream:
             #
             # 表达层事实**只有一个权威写入点**（见 ``_notify_playback_active``）。
             pass
+
+    # ------------------------------------------------------------------ #
+    #  VLM 描述缓存（`Describe` 触发 → `OmniDescription` 落这里）
+    # ------------------------------------------------------------------ #
+
+    def _on_vlm_description(self, ev: OmniDescription) -> None:
+        """收下一份**生成完**的描述，覆盖缓存。
+
+        只覆盖**非空且非「无变化」**的 —— 空描述（模型什么都没说）与
+        「无变化」（模型说没变化）都意味着"上一份描述仍然成立"，用它去覆盖
+        只会把缓存清空，于是断句时发出去的是空串。缓存里**始终留着一份
+        非空描述**正是主指标的立足点。
+        """
+        text = (ev.text or "").strip()
+        if not text:
+            logger.info("[%s] VLM 描述为空（stage=%s）—— 保持上一轮",
+                        self.session_id, ev.stage)
+            return
+        if is_no_change(text):
+            logger.info("[%s] VLM 无变化，保持上一轮（stage=%s，已缓存 %d 字）",
+                        self.session_id, ev.stage, len(self._vlm))
+            return
+        if looks_conversational(text):
+            # 启发式告警（不丢数据）：system prompt 没镇住时模型会开始聊天，
+            # 而"聊天内容"混进 VLM 会让 Agent 以为有人在跟它说话。
+            logger.warning("[%s] ⚠️ VLM 描述像是**对话**而非描述（prompt 没镇住？）"
+                           "：%r", self.session_id, text[:60])
+        self._vlm = text
+        self._vlm_at = time.monotonic()
+        self._vlm_stage = ev.stage
+        logger.info("[%s] VLM 描述已更新（stage=%s）%d 字：%r",
+                    self.session_id, ev.stage, len(text), text[:60])
+
+    def _note_vlm_readiness(self) -> None:
+        """`AsrFinal` 到了 —— 记下缓存**此刻**的状态（主指标的度量）。
+
+        ⚠️ **纯度量，不做任何等待/补触发**。这里若是"没就绪就再等 100ms"，
+        就等于把 VLM 的生成耗时加到了 ASR→Agent 这条链路上，直接违反硬指标
+        （"发送的那一刻不生成"）。
+        """
+        if self._vlm:
+            age_ms = int((time.monotonic() - self._vlm_at) * 1000)
+            logger.info("[VLM 就绪] 断句点已有描述（stage=%s，年龄=%dms，%d 字）"
+                        "—— 本句随 ASR 一起发给 Agent",
+                        self._vlm_stage or "-", age_ms, len(self._vlm))
+        else:
+            self._vlm_miss += 1
+            logger.warning("[VLM 未就绪] 断句点还没有描述（第 %d 次）—— "
+                           "本条 on_answer 的 VLM 为空，**不等待**。"
+                           "频率高就调小 ORCH_OMNI_DELTA_INTERVAL_S",
+                           self._vlm_miss)
 
     def _should_report(self, atype: str, sop: Optional[str]) -> bool:
         """这次决策要不要下发给客户端 —— **变化时立刻发，不变时定时刷**。
@@ -561,6 +684,15 @@ class InteractionDownstream:
 
         key = (atype, sop, getattr(action, "transcript", None))
         fresh = key != self._last_action_key
+        # ⚠️ 「切入 GREET」的判据 —— **不能用上面的 `fresh`**。
+        #
+        # `_last_action_key` 只在**非 QUIET** 动作时更新（见下面 `:722`，QUIET
+        # 在 `:719-720` 提前 return），而 IC 迎宾后会长久停在
+        # LISTEN/WAIT/HOLD。于是**换人后的第二次 GREET**，其
+        # `(atype, sop, transcript)` 与上次 GREET 可能**完全相同** ⇒ `fresh`
+        # 为 False ⇒ 漏掉重迎宾，表现为「换了个人却不重新描述画面」。
+        # `_prev_atype` 只看**上一拍**，与中间夹了多少 QUIET 无关。
+        prev_atype, self._prev_atype = self._prev_atype, atype
 
         # ---- 下发给客户端：**变化时立刻发，不变时定时刷** ----
         #
@@ -687,4 +819,19 @@ class InteractionDownstream:
             logger.info("[%s] IC → %s（sop=%s）: %s（由 IC 自行播报）",
                         self.session_id, atype, sop, (text or "")[:40])
             # return [Speak(text=text)]        # ← 兜底，默认关
+            # ---- 切入 GREET ⇒ 让 OmniLLM 出**一份全量描述** ----
+            #
+            # 为什么挂在 GREET 上：GREET 是 IC 认定的「新的人/换人了」——
+            # 正是需要把画面重新讲一遍的时刻（用户明确要求就接在这里）。
+            # 之后画面持续输入，靠 `session` 的滚动增量刷新跟上变化。
+            #
+            # ⚠️ 只用 `prev_atype != "GREET"` 判「切入」。同一段 GREET 会连着
+            #    好几拍，逐拍触发就是每 50ms 一次全量推理 —— 会把 GPU 打满，
+            #    而且是本次改动最容易造成的自伤。代价：IC 若真的
+            #    GREET→LISTEN→GREET 抖动，会多发一次全量（可接受，且日志里
+            #    看得见）。
+            if atype == "GREET" and self._desc_enabled and prev_atype != "GREET":
+                logger.info("[%s] 切入 GREET（sop=%s）⇒ 触发全量 VLM 描述",
+                            self.session_id, sop)
+                return [Describe(stage="full")]
         return []

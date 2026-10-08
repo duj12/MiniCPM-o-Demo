@@ -44,7 +44,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from .agent_sink import make_vlm_agent_sink, normalize_mode
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +112,9 @@ class InProcessICClient:
                  expression_ca: Optional[str] = None,
                  expression_verify: bool = True,
                  callback_ic: Optional[str] = None,
-                 thresholds: Any = None) -> None:
+                 thresholds: Any = None,
+                 vlm_getter: Optional[Callable[[], str]] = None,
+                 agent_transcript_mode: str = "legacy") -> None:
         self.owner_key = session_id or ""
         self.target = "inprocess"
         self.expression_url = expression_url
@@ -120,6 +124,13 @@ class InProcessICClient:
         self._expression_verify = bool(expression_verify)
         self._callback_ic = callback_ic
         self._thresholds = thresholds
+        #: VLM 描述取值回调（见 `agent_sink.make_vlm_agent_sink`）。
+        #: **None = 不包装 sink** ⇒ payload 与今天逐字节一致。
+        self._vlm_getter = vlm_getter
+        #: ⚠️ 默认必须是 `legacy`（安全侧）—— 这个参数与
+        #:    `ORCH_AGENT_TRANSCRIPT_MODE` 的默认值必须一致，否则"只在
+        #:    config 层把关"会被这里悄悄改成 dual（编排代码是 105/106 共用的）。
+        self._agent_transcript_mode = normalize_mode(agent_transcript_mode)
 
         self._engine: Any = None
         self.available = False
@@ -178,8 +189,7 @@ class InProcessICClient:
 
         agent_sink = None
         if self.agent_url:
-            agent_sink = AgentSink(
-                self.agent_url,
+            sink_kwargs = dict(
                 timeout=self._agent_timeout,
                 session_id=self.owner_key or None,
                 callback_ic=self._callback_ic,
@@ -188,6 +198,30 @@ class InProcessICClient:
                 #    补上 session_id / callback_ic 正是我们要的。
                 session_envelope=True,
             )
+            # VLM 描述随 on_answer 发给 Agent。
+            #
+            # ⚠️ `legacy` 模式**不包装**（走下面那个分支）—— 不是"包装里
+            #    再判一次"。回退路径必须连这段代码都不过，才能保证 payload
+            #    与今天逐字节一致（106 的重启横幅判据就靠这个）。
+            if self._vlm_getter is not None \
+                    and self._agent_transcript_mode != "legacy":
+                agent_sink = make_vlm_agent_sink(
+                    target=self.agent_url,
+                    vlm_getter=self._vlm_getter,
+                    mode=self._agent_transcript_mode,
+                    **sink_kwargs,
+                )
+                logger.info(
+                    "[%s] IC 的 on_answer 将携带 VLM 描述"
+                    "（transcript 模式=%s）—— 仅本会话，IC 代码未改动",
+                    self.owner_key or "?", self._agent_transcript_mode)
+            else:
+                agent_sink = AgentSink(self.agent_url, **sink_kwargs)
+                if self._agent_transcript_mode == "legacy":
+                    logger.info(
+                        "[%s] IC 的 on_answer 不带 VLM 描述"
+                        "（transcript 模式=legacy，payload 与旧版一致）",
+                        self.owner_key or "?")
         else:
             logger.warning("[%s] 未配 agent_url —— IC 的 ANSWER/INSERT "
                            "派不出去", self.owner_key or "?")

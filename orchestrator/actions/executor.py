@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 
 from ..protocol import TtsAudio, TtsCancel, TtsDelta, TtsEnd, TtsStart
-from ..downstream.interface import Cancel, Emit, SendToOmni, Speak
+from ..downstream.interface import Cancel, Describe, Emit, SendToOmni, Speak
 
 if TYPE_CHECKING:
     from ..session import OrchestratorSession
@@ -81,6 +81,11 @@ class ActionExecutor:
             await self._cancel(act, session)
         elif isinstance(act, SendToOmni):
             await self._send_to_omni(act, session)
+        elif isinstance(act, Describe):
+            # ⚠️ 与 `SendToOmni` 一样**不阻塞**：`request_omni_description`
+            #    只是投一个异步任务（描述生成要几秒，等在这里会把
+            #    downstream 事件循环堵死，连 tick 都停了）。
+            await session.request_omni_description(act.stage)
         elif isinstance(act, Emit):
             logger.info("[emit:%s] %s", act.channel, act.payload)
         else:

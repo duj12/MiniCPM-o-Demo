@@ -222,6 +222,48 @@ class Settings:
     omni_turn_trigger: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_TRIGGER", "asr"))
 
+    # ---- VLM 描述（两阶段）------------------------------------------------
+    #
+    # ⚠️⚠️ **这两个开关的默认值就是 `legacy` / 关，且不许改。**
+    #
+    # `orchestrator/` 是 **105/106 共用**的一份代码（`run_orch_106.sh` 跑的
+    # 也是这个 main.py，连的是 102 的 Agent）。默认打开 = 替 106 决定了
+    # 「重启后给 102 的 Agent 多发一个 `content` 字段」—— 而那个 Agent 还没
+    # 改好。症状出现在 Agent 侧（可能直接把 `dict` 当字符串、回复变空），
+    # **编排这边看不出来**。这正是 `run_orch_*.sh` 里警告的那类**半切换**。
+    #
+    # 与 IC 自己的取舍完全同款（`interactioncore/interaction/runtime.py`
+    # `session_envelope` 那段）：确认目标 Agent 能接受之后，**在那一台的
+    # 启动脚本里显式打开**，而不是改默认值。
+    #
+    # 106 重启横幅上应显示 `描述模式=关 / transcript 模式=legacy` ——
+    # 这是「没碰 106」的唯一硬证据。
+    omni_describe: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DESCRIBE", "0") not in ("0", "false", "False", ""))
+    #: Agent 载荷形态（见 `interaction/agent_sink.py` 的 `MODES`）：
+    #:   `legacy` 与今天**逐字节一致**（也是默认，回退用）
+    #:   `dual`   额外带 `content:{ASR,VLM}`，`transcript` 原样保留（过渡）
+    #:   `dict`   `transcript` 本身换成 `{ASR,VLM}`（目标态，Agent 改好后）
+    agent_transcript_mode: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_AGENT_TRANSCRIPT_MODE", "legacy").strip().lower())
+    #: 增量描述的**滚动间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
+    #: （见 `session._schedule_next_delta`）。
+    #:
+    #: 缓存里描述的"年龄"上界 ≈ 本值 + 生成耗时。要满足主指标（`AsrFinal`
+    #: 一到就有非空描述），这个上界应**小于一句话的典型时长**。
+    #: 2.0 是起点 —— 105 实测按 `[VLM 就绪] 年龄=` 的分布调：想更新鲜就调小，
+    #: 代价是 omni 更吃算力（不重叠 ⇒ 调小不会自激，只会更频繁）。
+    omni_delta_interval_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "2.0")))
+    #: 三段模板都可整体覆盖（改措辞不用动代码，与 `ORCH_OMNI_SYSTEM_PROMPT`
+    #: 同款）。空 = 用 `omni/describe.py` 里的默认。
+    omni_describe_system_prompt: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DESCRIBE_SYSTEM_PROMPT", ""))
+    omni_describe_full_instruction: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DESCRIBE_FULL_INSTRUCTION", ""))
+    omni_describe_delta_instruction: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DESCRIBE_DELTA_INSTRUCTION", ""))
+
     # 人脸（阶段 4）—— 实现走 board-face-and-cloud-infer/G1 的官方 g1face 包
     #
     # ⚠️ `face_g1_root` 与 `face_model_dir` 是**两个不同的根**，不能合并：

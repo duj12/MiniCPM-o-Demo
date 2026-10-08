@@ -130,6 +130,13 @@ fi
 echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）" >&2
 echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
 echo "  python          = $ORCH_PY" >&2
+# VLM 描述（两阶段）生效值 —— **这行是「有没有碰过本机 Agent 协议」的唯一
+# 硬证据**（见 config.py 里 `omni_describe` / `agent_transcript_mode` 的说明：
+# 默认值就是 106 下次重启后的行为，所以默认必须显示「关 / legacy」）。
+# 取的默认值与 config.py 保持一致；真要改默认，**两处一起改**。
+echo "  VLM 描述        = ${ORCH_OMNI_DESCRIBE:-0}（0=关，omni 当对话方）" >&2
+echo "  Agent 载荷      = ${ORCH_AGENT_TRANSCRIPT_MODE:-legacy}" \
+     "（legacy=与旧版逐字节一致）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

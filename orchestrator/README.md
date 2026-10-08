@@ -76,6 +76,7 @@ ORCH_PORT=8101 bash orchestrator/run_orch_106.sh
 |---|---|
 | IC：进程内 Engine（默认，支持并发） ↔ 独立 gRPC IC 服务 | `ORCH_IC_MODE=inprocess` / `grpc` |
 | 人脸：远端服务（105:8767） ↔ 本地 `.so` | `ORCH_FACE_SERVICE_URL` 非空 / **显式置空** |
+| VLM 描述随 ASR 给 Agent（两阶段 omni） | `ORCH_OMNI_DESCRIBE` / `ORCH_AGENT_TRANSCRIPT_MODE`（**默认关**，见「决策链路」一节末尾） |
 
 ⚠️ 为什么不能只翻 `ORCH_IC_MODE`（`ORCH_IC_ADVERTISE` 必须一起变）、
 人脸为什么必须服务化、`ORCH_FACE_SERVICE_URL=` 为什么要写成**显式空值**
@@ -289,6 +290,57 @@ cd interactioncore && pip install -e .
 **Agent 需要调我们的 `POST /v1/speak` 把回复文本送进来** ——
 完整接口说明 + curl / Python 示例见
 [`docs/agent-integration.md`](docs/agent-integration.md)。
+
+### VLM 描述随 ASR 一起给 Agent（两阶段 OmniLLM，**默认关**）
+
+IC 派给 Agent 的 `on_answer` 原本只有 ASR 转写。开起来之后会多带一份
+**OmniLLM 的画面/语音描述**，让 Agent 知道"用户说这句话时，眼前是什么样"：
+
+```jsonc
+POST {callback_ic}/interaction/on_answer
+{
+  "identity_id": "…", "display_name": "…", "session_id": "…",
+  "transcript": "你好，请介绍一下这个展厅",          // dual：原样保留
+  "content": {                                     // ← 新增
+    "ASR": "你好，请介绍一下这个展厅",
+    "VLM": "画面里有一位青年男性，穿深蓝色外套，站在白色展示桌左侧。"
+  }
+}
+```
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `ORCH_OMNI_DESCRIBE` | `0` | `1` = omni 换成"描述助手"人设，按两阶段刷描述 |
+| `ORCH_AGENT_TRANSCRIPT_MODE` | `legacy` | `dual` = 追加 `content` 键；`dict` = `transcript` 本身换成 `{ASR,VLM}`；`legacy` = **逐字节等于旧版** |
+| `ORCH_OMNI_DELTA_INTERVAL_S` | `2.0` | 增量描述的最小间隔（不重叠、不自激） |
+
+**两个阶段**（靠注入指令区分，不重连、不重 init）：
+
+- **全量** —— IC 判 **GREET** 时触发一次（含人物/环境/情绪/视线/指向物体等九类）。
+  判据是「**切入** GREET」而不是"动作和上次不同"：迎宾后 IC 会长时间停在
+  LISTEN/HOLD，换人后的第二次 GREET 动作元组与上次**完全一样**，用去重会漏掉。
+- **增量** —— 进入对话态后每 `ORCH_OMNI_DELTA_INTERVAL_S` 自驱动刷一次，
+  只报**相对上一轮的变化**；回「无变化」或空则**不覆盖**缓存。
+
+**主指标是"发送的那一刻不生成"**：描述是**滚动预生成**的，`AsrFinal`
+（`2pass-offline`，即断句点）到达时直接取缓存 → 断句 → Agent 这条链路上
+**没有任何等待**。所以：
+
+- 进 payload 的永远是**生成完的整段**（`response.done`），**不是 token delta**
+  （delta 任一时刻都是半句话）
+- **不做本地截断** —— 生成长度直接决定生成耗时，短只是手段、快才是目的
+- 缓存为空时**照样立刻发**（`VLM` 为空串），只记 `vlm_miss` + 打日志，
+  **不等待**。这个窗口物理上消不掉（GREET 才触发首次推理），靠观测
+  `[VLM 就绪] 年龄=…ms` 的分布来调间隔
+
+⚠️ **为什么默认关**：编排代码也是 105/106 **共用一份**的，默认值就是 106
+下次重启后的行为 —— 默认开等于替 106 决定"给 102 的 Agent 多发一个键"。
+要开就在**那一台**的启动脚本里开（做法与 IC 的 `session_envelope` 同款）。
+
+⚠️ **`ORCH_IC_MODE=grpc` 结构性拿不到 VLM**：描述是搭在
+`AgentSink._send` 上的（见 [`interaction/agent_sink.py`](interaction/agent_sink.py)
+的模块 docstring），而 gRPC 模式下 sink 在**另一个进程**里，包不到。
+回退面本来就不该有它 —— 这条是已知限制，不是待修项。
 
 ---
 
@@ -795,6 +847,7 @@ python -m orchestrator.tests.test_face \
 
 # 单元测试（无外部依赖）
 python -m orchestrator.tests.test_clock         # 含 ctx↔会话采样 锚点映射
+python -m orchestrator.tests.test_omni_describe_stage  # VLM 描述随 ASR 发给 Agent
 python -m orchestrator.tests.test_ref_track     # 含 D 恢复 + 量纲回归护栏
 python -m orchestrator.tests.test_bargein_ref   # 打断 + armed 承诺落位
 python -m orchestrator.tests.check_html         # 前端结构 + 锚点协议发送端

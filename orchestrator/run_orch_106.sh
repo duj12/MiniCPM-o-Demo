@@ -189,6 +189,14 @@ fi
 echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）" >&2
 echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
 echo "  python          = $PY" >&2
+# VLM 描述（两阶段）生效值 —— **106 上这行必须显示「关 / legacy」**。
+# 编排代码与 105 共用一份（这个脚本跑的也是同一个 main.py），所以
+# `ORCH_OMNI_DESCRIBE` / `ORCH_AGENT_TRANSCRIPT_MODE` 的**默认值**就是
+# 106 重启后的行为 —— 默认开 = 替 106 决定「给 102 的 Agent 多发一个
+# content 字段」，而那个 Agent 还没改好（见 config.py 同名开关的说明）。
+echo "  VLM 描述        = ${ORCH_OMNI_DESCRIBE:-0}（0=关；106 保持 0）" >&2
+echo "  Agent 载荷      = ${ORCH_AGENT_TRANSCRIPT_MODE:-legacy}" \
+     "（legacy=与旧版逐字节一致；106 保持 legacy）" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \
