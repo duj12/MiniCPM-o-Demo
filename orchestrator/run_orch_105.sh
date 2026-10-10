@@ -25,7 +25,7 @@
 #
 #     ⚠️ :50051 上那个独立 IC 服务（pid 101057）**别停** —— 回退的依赖。
 #        它由 `run_ic_105.sh` 起。
-#     ⚠️ grpc 模式下 Agent 会跟着切成 **103:8081**（见下）—— 不是 8082。
+#     （Agent 两种模式都是 **103:8081**，翻模式不用跟着改 —— 见下面那节。）
 #
 # ## 影子实例
 #
@@ -72,21 +72,27 @@ fi
 export ORCH_IC_EXPRESSION_URL="${ORCH_IC_EXPRESSION_URL:-https://127.0.0.1:$PORT}"
 export ORCH_IC_EXPRESSION_CA="${ORCH_IC_EXPRESSION_CA:-$REPO/certs/cert.pem}"
 
-# ---- Agent：105 专用（103），**端口随 IC 模式变** ----
+# ---- Agent：105 专用（103）----
 #
-#   inprocess → **8082**：独立副本（`~/agent-test`），有多会话所需的
-#               「每会话一个桥接」与「IC 回写 HTTP 分流」。
-#   grpc      → **8081**：跑着的 IC 服务（pid 101057）是
+# **两种 IC 模式都走 8081**（2026-10-10 起）。
+#
+#   grpc      → 必须 8081：跑着的 IC 服务（pid 101057）是
 #               `--agent-url http://192.168.89.103:8081` 起的，IC 的四个
-#               `on_*` payload 送到 8081。编排若走 8082，就等于「IC 判了
+#               `on_*` payload 送到 8081。编排若走别处，就等于「IC 判了
 #               ANSWER、回复却送到另一个 Agent」—— 症状是**没有回复也不报错**
 #               （`run_ic_105.sh` 记的正是这个坑的另一半）。
-#   8081 跑的是 NFS 共享那份代码（属主 lijiahui），只有「方案 A」、没有多会话。
-if [ "$ORCH_IC_MODE" = "grpc" ]; then
-  export ORCH_AGENT_URL="${ORCH_AGENT_URL:-http://192.168.89.103:8081}"
-else
-  export ORCH_AGENT_URL="${ORCH_AGENT_URL:-http://192.168.89.103:8082}"
-fi
+#   inprocess → 也是 8081：8081 上的 `openai-agent-demo-try` 已经是多会话版
+#               （`BridgePool` 每会话一桥接 + LRU 回收），编排的每会话
+#               `callback_ic` 会让它把播报出口切到本会话 —— 与 8082 等价。
+#
+# ⚠️ **8082（dujing 的 `~/agent-test` 手工副本）已退役**。它存在的唯一理由
+#    是「播报出口是进程级全局」（`OrchestratorClient.target` 只在
+#    `VoiceSession.__init__` 读一次）⇒ 一份实例只能服务一台编排。该限制已按
+#    「会话级覆盖 + 全局兜底」改掉并合进 pite 的 try ⇒ 8081 一份就够，
+#    无需再维护一条同步链（见 memory `agent-103-8082-vlm`）。
+#    别把这里改回 8082：那个端口上已经没有服务了，症状同样是「没有回复也不
+#    报错」——与上面 grpc 那半句一模一样。
+export ORCH_AGENT_URL="${ORCH_AGENT_URL:-http://192.168.89.103:8081}"
 
 # ---- Omni（105 本地没有，指 106）----
 export ORCH_OMNI_URL="${ORCH_OMNI_URL:-wss://192.168.89.106:8006/v1/realtime?mode=video}"
@@ -167,6 +173,12 @@ echo "  python          = $ORCH_PY" >&2
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
 echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
      "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
+# 「视觉背景轮」没有独立开关：它与 `content` **同开同关**（判据 = sink 是否被
+# 包装，而那恰好等于「描述开 且 载荷非 legacy」）。加第三个开关会造出
+# 「背景轮开、content 关」这种半开状态 —— sink 根本没包装，静默不发、无日志。
+# 开了之后日志里应能看到 `视觉背景已交给 Agent（stage=full，N 字）`。
+echo "  视觉背景轮      = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
+     "（全量描述额外投一发 ASR 空的 on_answer，只存不答）" >&2
 # ⚠️ 与上两行同理：这行是「本机跑的是哪一版描述链路」的硬证据。
 # 开了之后日志里应能看到 `已换成「只报变化」短人设（关掉重连一次）`。
 echo "  增量人设        = $ORCH_OMNI_DELTA_PERSONA" \
