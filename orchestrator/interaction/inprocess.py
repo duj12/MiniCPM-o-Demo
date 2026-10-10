@@ -21,6 +21,7 @@
     connect() -> bool
     apply(method, **kwargs)
     apply_agent(status, session_end_pending)
+    send_visual_background() -> bool             （编排侧主动投背景轮；gRPC 恒假）
     async tick(dt_ms) -> Action | None
     async snapshot() -> dict | None
     reset_session() / end_session() / close()
@@ -133,6 +134,9 @@ class InProcessICClient:
         self._agent_transcript_mode = normalize_mode(agent_transcript_mode)
 
         self._engine: Any = None
+        #: 本会话的 Agent sink（`connect()` 里构造）。留引用是为了让编排侧能
+        #: **主动**投一发视觉背景轮 —— 见 `send_visual_background`。
+        self._agent_sink: Any = None
         self.available = False
         self.error: Optional[str] = None
 
@@ -226,6 +230,11 @@ class InProcessICClient:
             logger.warning("[%s] 未配 agent_url —— IC 的 ANSWER/INSERT "
                            "派不出去", self.owner_key or "?")
 
+        # 留一份引用供编排侧**主动**投递视觉背景轮（见 `send_visual_background`）。
+        # ⚠️ 只在真造出 sink 的这条路径上赋值 —— `:167-169` 的早返回（已有
+        #    engine）不经过这里，也不该覆盖既有引用。
+        self._agent_sink = agent_sink
+
         try:
             self._engine = Engine(
                 expression_sink=expression_sink,
@@ -317,6 +326,30 @@ class InProcessICClient:
         if not kwargs:
             return
         self.apply("apply_agent", **kwargs)
+
+    def send_visual_background(self) -> bool:
+        """把本会话当前缓存的 VLM 描述当「视觉背景轮」投给 Agent（ASR 为空）。
+
+        调用方是**编排侧**（`InteractionDownstream._on_vlm_description`，在全量
+        描述刚写进缓存之后同步调用）。它转给 sink 的
+        `emit_visual_background()`，语义与前提条件见那里。
+
+        ⚠️ **只用鸭子判定**，不能用 `isinstance` —— `VlmAgentSink` 是定义在
+        `agent_sink.make_vlm_agent_sink` **函数体内**的类，没有模块级名字可引。
+        没有这个方法的 sink（`legacy` 模式装的是裸 `AgentSink`、未配 agent_url
+        时是 None）⇒ 返回假，调用方据此不打"已投递"的日志、也不置闩。
+        """
+        emit = getattr(self._agent_sink, "emit_visual_background", None)
+        if not callable(emit):
+            return False
+        try:
+            return bool(emit())
+        except Exception as exc:  # noqa: BLE001
+            # 投递面失败不该把编排侧的事件循环带下去（与 _mark_dead 的取向一致：
+            # 记下来、别抛）。返回假 ⇒ 调用方下次全量还能再试。
+            logger.warning("进程内 IC 投递视觉背景失败（会话 %s）：%s: %s",
+                           self.owner_key or "?", type(exc).__name__, exc)
+            return False
 
     # ------------------------------------------------------------------ #
     #  生命周期

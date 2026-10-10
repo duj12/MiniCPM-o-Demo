@@ -141,6 +141,10 @@ class InteractionDownstream:
         #: 上一次 dispatch 的 IC Action 类型。用于识别**切入** GREET
         #: （不能用 `fresh`：见 `_dispatch` 里的说明）
         self._prev_atype = ""
+        #: 本会话是否已把「会话起点的视觉背景」投给 Agent（见
+        #: `_emit_visual_background`）。**只发本会话的第一份全量描述** ——
+        #: 理由见那里的说明。`on_session_start` 必须复位它。
+        self._bg_sent = False
         self.ic_mode = (ic_mode or "grpc").strip().lower()
         if self.ic_mode == "inprocess":
             #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
@@ -264,6 +268,11 @@ class InteractionDownstream:
         self._vlm_at = 0.0
         self._vlm_stage = ""
         self._prev_atype = ""
+        # ⚠️ 与上面两项**同理、且必须一起清**：`_bg_sent` 若不随新会话复位，
+        #    新会话的首份全量描述会被上一会话的闩挡在门外 ⇒ Agent 的
+        #    `scene.visual_background` 又是空的 —— **症状与本次要修的那个 bug
+        #    一模一样**（"Agent 拿着一个从没收到的背景"），更难往这里想。
+        self._bg_sent = False
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []
@@ -588,6 +597,52 @@ class InteractionDownstream:
         self._vlm_stage = ev.stage
         logger.info("[%s] VLM 描述已更新（stage=%s）%d 字：%r",
                     self.session_id, ev.stage, len(text), text[:60])
+        # 全量描述 ⇒ 补一发「会话起点的视觉背景」给 Agent。**必须在
+        # `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
+        if ev.stage == "full":
+            self._emit_visual_background(len(text))
+
+    def _emit_visual_background(self, n_chars: int) -> None:
+        """把刚写进缓存的全量描述当「视觉背景轮」投给 Agent（ASR 为空）。
+
+        Agent 收到 `content` 且 `ASR`/`transcript` 都空 ⇒ 走
+        `handle_visual_background`（**只存不答**，写 `scene.visual_background`）。
+        没有这一发，Agent 收到的 `scene.visual_change` 就在引用一个它**从没
+        收到过**的背景（全量只活在本地缓存里、随即被增量覆盖）。
+
+        ⚠️ 这**不是** `agent.py` 里删掉的那种「转发 IC 自己也会发的事件」
+        （那次让 Agent 收到两份 `on_answer`）：IC 的 `on_answer` 只在 ANSWER
+        时发、`transcript` 必非空，**结构上产生不了**这一轮。而且它走同一个
+        sink 队列 ⇒ 与 IC 的真实 `on_answer` 端到端串行，顺序确定。
+        别把它当重复投递"修掉"。
+
+        **只发第一份**（`_bg_sent` 闩）：第一份全量做完后
+        `session._maybe_switch_delta_persona` 会把 omni 换成「只报变化」的短
+        人设（**幂等**，只重连一次）。换人后的第二次 GREET 仍会派
+        `Describe("full")`，但它是在短人设下答的 ⇒ 回的是**几十字的变化描述**；
+        拿它覆盖背景就是用 46 字冲掉 476 字的有效背景 —— 正是本要在修的 bug
+        换了个入口。Agent 那个字段的名字就是「**会话起点**的视觉背景」，
+        换人后的差异由每轮的 `scene.visual_change` 承载。
+        """
+        if not self._desc_enabled:
+            return
+        if self._bg_sent:
+            logger.info("[%s] 已有视觉背景（stage=full %d 字）—— 不重复投递"
+                        "（换人后的差异走每轮的 change）", self.session_id, n_chars)
+            return
+        # ⚠️ 闩**只在成功交出后**才置：`_feed` 处理 OmniDescription 是在
+        #    `if not self.ic.available: return` **之前**（那是故意的，见 `_feed`），
+        #    所以 IC 掉线时也会走到这儿。若先闩后发，一次瞬时失败就**永久**
+        #    丢掉这份背景。
+        if self.ic.send_visual_background():
+            self._bg_sent = True
+            logger.info("[%s] 视觉背景已交给 Agent（stage=full，%d 字）"
+                        "—— 后续轮次会注入 scene.visual_background",
+                        self.session_id, n_chars)
+        else:
+            logger.warning("[%s] 视觉背景**未能交出**（无 Agent sink / gRPC 模式 / "
+                           "dict 模式 / worker 已关）—— 不置闩，下份全量再试",
+                           self.session_id)
 
     def _note_vlm_readiness(self) -> None:
         """`AsrFinal` 到了 —— 记下缓存**此刻**的状态（主指标的度量）。

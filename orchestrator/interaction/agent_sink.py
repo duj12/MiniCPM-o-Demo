@@ -30,6 +30,20 @@ IC 的调用链是 ``on_answer`` → ``_send``（同步入队）→ worker 线�
 线程上，Agent 慢时队列积压会让描述漂到几秒之后 —— 与"这条描述要对应这句话
 的时刻"的前提直接矛盾。
 
+## 另一件只有"自己造 sink"才做得到的事：视觉背景轮
+
+除了给每轮 `on_answer` 追加 `content`，本子类还提供
+``emit_visual_background()``：把**当前缓存**里的全量描述当成一轮「ASR 为空」的
+`on_answer` 投出去 —— Agent 收到后走 `handle_visual_background`（只存不答），
+把 `scene.visual_background` 真正填上。IC **结构上产生不了**这一轮（它的
+`on_answer` 只在 ANSWER 时发、`transcript` 必非空），所以必须由编排侧合成。
+
+⚠️ 这与 `interaction/agent.py` 里删掉的 `ORCH_AGENT_RELAY` **不是一回事**：
+那条转发的是 IC **自己也会发**的事件（于是 Agent 收到两份）；这一轮 IC
+**从不产生**，不存在重复。而且它走的是**同一个** sink 队列 ⇒ 与 IC 的真实
+`on_answer` 端到端串行（`_post` 阻塞到 HTTP 返回才取下一件），顺序确定。
+别把它当重复投递"修掉"。
+
 ## ⚠️ 代价：耦合一个私有方法
 
 ``_send(name, payload)`` 是 IC 的**私有**方法。它若被改名/改签名，这个覆写在
@@ -114,5 +128,44 @@ def make_vlm_agent_sink(*, target: str, vlm_getter: Callable[[], str],
                     "[VLM 注入] mode=%s ASR=%d字 VLM=%d字 VLM=%r",
                     mode, len(asr), len(vlm), vlm[:60])
             super()._send(name, payload)
+
+        def emit_visual_background(self) -> bool:
+            """把**当前缓存里**的描述当「会话起点的视觉背景」投给 Agent。
+
+            投出去的是一轮 ``ASR 为空`` 的 ``on_answer``：Agent 收到
+            ``content`` 且 ``ASR``/``transcript`` 都空 ⇒ 走
+            ``handle_visual_background``（**只存不答**，写会话状态
+            ``scene.visual_background``）。
+
+            为什么需要这一发：增量的语义是「相对**上一份**的变化」，而上一份
+            全量描述只会活在编排侧的缓存里、随后被增量覆盖 ⇒ 不补这一发，
+            Agent 收到的 ``scene.visual_change`` 就在**引用一个它从没收到的
+            背景**，``scene.visual_background`` 恒空。IC 自己产生不了这一轮
+            （它的 ``on_answer`` 只在 ANSWER 时发，``transcript`` 必非空），
+            所以由编排侧合成 —— **不是** IC 事件的转发。
+
+            ⚠️ 前置条件：调用方必须在**刚把全量描述写进缓存之后同步调用**
+            （见 ``downstream._on_vlm_description``）。本方法**不收文本参数**
+            —— 它借基类的 ``on_answer(transcript="")`` 让上面的 ``_send``
+            覆写按 ``asr == ""`` 自动补出 ``content={"ASR": "", "VLM": …}``，
+            于是取到的正是那一份刚写入的描述。不收参数 ⇒ 没有"override 槽位"
+            这类可变状态，也就不存在跨会话/跨线程泄漏的可能。
+
+            ⚠️ 返回值只表示「**已交给 sink 的发送队列**」，**不是**「已送达」：
+            基类 ``_send`` 吞掉了 ``_QueuedWorker.submit`` 的返回值
+            （``runtime.py`` 的 ``AgentSink._send``），拿不到送达回执。
+            所以调用方**不要**拿它当"Agent 已收到"的证据。
+            """
+            if mode == "dict":
+                # dict 模式把 `transcript` 整个换成 `{ASR,VLM}`，而 Agent 的
+                # `OnAnswerRequest.transcript` 是 `str` ⇒ 背景轮必被 **422** 挡掉。
+                # 明确拒绝并说出来，别让它静默消失（dict 是目标态、当前未启用）。
+                logger.warning("transcript 模式=dict：不发视觉背景轮"
+                               "（Agent 的 transcript 字段是 str，背景轮会被拒）")
+                return False
+            logger.info("[视觉背景] 已交出 %d 字 → on_answer(ASR 空，只存不答)",
+                        len(str(vlm_getter() or "")))
+            self.on_answer(identity_id=None, display_name=None, transcript="")
+            return True
 
     return VlmAgentSink(target, **kwargs)

@@ -139,6 +139,10 @@ class InteractionClient:
         #: 否则 IC 状态静静停在默认值、决策永远不变（踩过）
         self.failures: dict = {}
         self._fail_streak = 0
+        #: 「gRPC 模式不支持视觉背景轮」那条告警只打一次（见
+        #: `send_visual_background`）—— 它是**每会话每全量描述**都会被问一次的
+        #: 路径，不节流会把日志淹掉。
+        self._bg_unsupported_logged = False
 
     def activate(self) -> None:
         """声明本实例为 IC 的**唯一驱动者**，把上一个挂起。
@@ -331,6 +335,28 @@ class InteractionClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("apply_agent 失败（%s）：%s —— 已忽略",
                            self.target, exc)
+
+    def send_visual_background(self) -> bool:
+        """**恒假** —— gRPC 模式结构性做不到，只为与进程内模式保持鸭子接口。
+
+        「视觉背景轮」要由**持有 Agent sink 的那一方**主动投出去
+        （见 `agent_sink.VlmAgentSink.emit_visual_background`）。gRPC 模式下
+        sink 在**远端 IC 服务进程**里，本进程只有一根 gRPC 签子，够不到它 ——
+        与「VLM 注入在 gRPC 模式拿不到」是**同一个**结构性限制
+        （见 `agent_sink.py` 模块文档的第 2 条后果）。
+
+        为什么不干脆在编排侧对 `{agent_url}/interaction/on_answer` 直投一发：
+        那会开出**第二条**通往 Agent 的队列/线程，背景轮与 IC 真实
+        `on_answer` 的先后就不再由同一个 FIFO 决定 —— 正是 `agent.py` 里
+        删掉 `ORCH_AGENT_RELAY` 的那个病（同一件事两遍、顺序不可控）。
+        **宁可不支持，也不这么干。**
+        """
+        if not self._bg_unsupported_logged:
+            self._bg_unsupported_logged = True
+            logger.warning(
+                "gRPC 模式（%s）不支持视觉背景轮 —— sink 在远端 IC 进程里，"
+                "编排侧够不到。需要它请用 ORCH_IC_MODE=inprocess", self.target)
+        return False
 
     def apply(self, method: str, **kwargs: Any) -> None:
         """把一次 ``apply_*`` 投进队列（**立即返回**）。
