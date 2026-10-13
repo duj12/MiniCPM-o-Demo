@@ -61,7 +61,15 @@ class SessionRegistry:
     def add(self, sid: str, s: OrchestratorSession) -> None:
         self.sessions[sid] = s
 
-    def remove(self, sid: str) -> None:
+    def remove(self, sid: str, sess=None) -> None:
+        """摘掉登记。
+
+        ⚠️ 给了 `sess` 就**只在该 sid 还是它**时才摘。摘除现在发生在收尾
+        **跑完之后**（见 `_shutdown_session`），而收尾要几秒；这几秒里
+        同一个 sid 理论上可能已被新连接顶掉，不校验就会把新会话误摘。
+        """
+        if sess is not None and self.sessions.get(sid) is not sess:
+            return
         self.sessions.pop(sid, None)
 
     def stats(self) -> dict:
@@ -177,6 +185,20 @@ async def _shutdown_session(sess: OrchestratorSession, sid: str,
     except Exception:  # noqa: BLE001
         pass
     logger.info("[%s] 会话结束\n%s", sid, sess.summary())
+    # ⚠️⚠️ **摘会话必须在这里，不能早**。
+    #
+    # `sess.close()` 里的 `on_session_end` → `IC.end_session()` →
+    # `ExpressionSink.stop()` 要 `POST /v1/stop`，而那个端点靠
+    # `_find_session` 查 `REGISTRY`。早先摘在 `handle_client` 的 finally
+    # 里（socket 一断就摘），于是收尾还在后台跑、会话已经查不到 ——
+    # 实测 2026-10-13（106）：**55 次 `/v1/stop` 全部 404**，
+    # `外部请求停止播报` 成功 0 次。
+    #
+    # 晚摘这几秒不影响「唯一活跃会话兜底」：Agent 回调带 `X-Session-Id`，
+    # 走的是精确匹配那条路（`_find_session` 只在**没带** sid 时才用兜底）。
+    #
+    # 传 `sess` 是防「收尾期间同 sid 被新连接顶掉」—— 见 `remove`。
+    REGISTRY.remove(sid, sess)
 
 
 # ====================================================================== #
@@ -837,9 +859,14 @@ async def handle_client(ws, cfg: Settings) -> None:
                 pass
             logger.info("[%s] 客户端断开（存活 %.1fs），收尾转入后台",
                         sid, time.monotonic() - t_connect)
+            # ⚠️ **这里不摘会话** —— 摘除挪到 `_shutdown_session` 末尾了，
+            #    否则收尾里的 `/v1/stop` 会 404（原因见那里）。
+        else:
+            # 装配中途失败，压根没建起会话 ⇒ 没有收尾任务会来摘，自己摘
+            # （没 add 过也无害，`remove` 用的是 `pop(sid, None)`）。
+            REGISTRY.remove(sid)
         # ⚠️ 后台任务的取消放在 _shutdown_session 里（drain 之后）——
         # drain 靠它们收尾部输出。这里不动它们。
-        REGISTRY.remove(sid)
 
 
 async def dispatch(sess: OrchestratorSession, msg: dict) -> None:

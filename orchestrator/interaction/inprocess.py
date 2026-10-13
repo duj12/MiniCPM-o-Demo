@@ -30,20 +30,47 @@
 > 接管」的计数，进程内模式不存在这个状态。保留它们是因为 `session.summary()`
 > 会读 —— 等 `client.py` 那套闸门删掉后可以一起删。
 
-## ⚠️ 两个必须 off-loop 的调用
+## ⚠️ 三个必须 off-loop 的调用
 
-`end_session()` 与 `close()` 里有**同步 HTTP**：
+`tick()` / `end_session()` / `close()` 里有**同步 HTTP**：
 
-  · `end_session` → `Engine.end_session()` → `ExpressionSink.stop()`
-    打 `POST /v1/stop`，超时 `STOP_TIMEOUT_S = 1.0`
+  · `tick` → `Engine.tick()` → 判 `YIELD`/`END` 时经 `_notify_sinks` 调
+    `ExpressionSink.stop()`，打 `POST /v1/stop`，超时 `STOP_TIMEOUT_S = 1.0`
+  · `end_session` → `Engine.end_session()` → 同上（`/v1/stop`）
   · `close` → `flush_sinks()` / `close_sinks()`，每个各 join worker 线程
     （各 2s 超时）
 
 走 gRPC 时它们跑在**服务端线程**里，编排侧感觉不到；进程内会**阻塞事件循环**。
-所以调用方（`Downstream.on_session_end`）必须用 `asyncio.to_thread` 包起来。
+所以 `tick()` 自己走 `asyncio.to_thread`（见那里），而
+`Downstream.on_session_end` 必须把 `end_session()` / `close()` 用
+`asyncio.to_thread` 包起来。
+
+### 为什么 tick 这条最要命：**自锁**
+
+`/v1/stop` 打的是 `https://127.0.0.1:<本进程端口>` —— **编排自己**的 HTTPS
+端口，而唯一的服务者就是事件循环。在循环上直呼 ⇒ 循环被这一行攥住 ⇒
+没人去握手 ⇒ 只能等满 1s 超时。
+
+实测（2026-10-13，106，`orch106-8100.log`）：
+
+  · 84 次 `_ssl.c:1000 handshake operation timed out` ≈ `END(sop=24)` 51 次
+    + `YIELD` 30 次 —— 正好是 tick 路径的全部停播调用
+  · 每次冻结 0.6~1s，**且是进程级的**：同一毫秒三个会话同时报卡顿
+    （`15:28:24,958/959/961` → 848/530/531ms）
+  · `POST /v1/stop` 成功次数 **0** —— IC 的「掐断正在出声的音频」
+    从未生效过，全靠紧随其后的新播报 `superseded` 顶掉才听不出来
+    （D24「持续说话不停播」的根因就是这个）
+
+挪进线程后：循环空出来服务 `/v1/stop`，请求**几毫秒**返回 —— 冻结消失，
+IC 的停播才真正落地。
+
+⚠️ `Engine._lock` 在 `tick()` 里覆盖到 `_notify_sinks`（`runtime.py:432-447`），
+所以挪到线程后，循环上的 `apply_*` 会等这把锁。但锁的持有时间正是从
+「1s 超时」降到「几毫秒」—— 这不是代价，就是本改动要的效果。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable, Optional
 
@@ -392,18 +419,32 @@ class InProcessICClient:
     async def tick(self, dt_ms: int = 0):
         """调一次 `Engine.tick()`，返回 `Action`；失败返回 `None`。
 
-        **不需要 `to_thread`** —— policy 是纯 Python 运算（微秒级），没有 I/O。
-        保持 `async` 只是为了与 `InteractionClient` 同接口。
+        ⚠️⚠️ **必须 off-loop —— `tick()` 不是纯计算**。
 
-        ⚠️ `tick()` **不是只读的**：它会推进状态机（`advance_*` → `decide()`
-        → `apply_action()`）。进程内模式下这没有并发问题 —— 每路会话的
-        Engine 是自己的。
+        policy 判 `YIELD`/`END` 时，`Engine.tick()` 会经 `_notify_sinks` 调
+        `ExpressionSink.stop()` —— 那是**同步 HTTP**（`POST /v1/stop`，
+        超时 1s）。在事件循环上直呼会**自锁**：`/v1/stop` 打的是本进程
+        自己的 HTTPS 端口，唯一能服务它的就是被这一行攥住的同一个循环。
+        完整证据见模块文档「为什么 tick 这条最要命：自锁」。
+
+        放进线程后循环空出来服务那个请求，`stop()` 几毫秒返回 ——
+        既消掉 0.6~1s 的进程级冻结，IC 的停播也才**真正生效**。
+
+        ⚠️ **顺序仍然严格**：调用方 `await` 完一次才发下一次，所以同一个
+        会话不会并发 tick。不同会话各在自己的线程上跑，Engine 各自独占。
+
+        ⚠️ `tick()` 会推进状态机（`advance_*` → `decide()` →
+        `apply_action()`），**不是只读的**。挪到线程后与循环上的 `apply_*`
+        之间靠 `Engine._lock` 串行 —— tick 整段持锁，所以 `apply_*` 要么
+        整段在 tick 前、要么整段在 tick 后，与「两者都在循环上」时**语义
+        相同**（那时也不可能交错，同样是这把锁）。
         """
         if not self.available or self._engine is None:
             self.bad_ticks += 1
             return None
         try:
-            action = self._engine.tick(dt_ms)
+            # ⚠️ 不要为了省一次线程跳转改回直呼 —— 那会把 1s 自锁带回来。
+            action = await asyncio.to_thread(self._engine.tick, dt_ms)
         except Exception as exc:  # noqa: BLE001
             self.bad_ticks += 1
             self._mark_dead(f"tick 失败: {type(exc).__name__}: {exc}")
