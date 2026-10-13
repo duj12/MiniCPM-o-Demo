@@ -189,14 +189,62 @@ fi
 echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）" >&2
 echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
 echo "  python          = $PY" >&2
-# VLM 描述（两阶段）生效值 —— **106 上这行必须显示「关 / legacy」**。
-# 编排代码与 105 共用一份（这个脚本跑的也是同一个 main.py），所以
-# `ORCH_OMNI_DESCRIBE` / `ORCH_AGENT_TRANSCRIPT_MODE` 的**默认值**就是
-# 106 重启后的行为 —— 默认开 = 替 106 决定「给 102 的 Agent 多发一个
-# content 字段」，而那个 Agent 还没改好（见 config.py 同名开关的说明）。
-echo "  VLM 描述        = ${ORCH_OMNI_DESCRIBE:-0}（0=关；106 保持 0）" >&2
-echo "  Agent 载荷      = ${ORCH_AGENT_TRANSCRIPT_MODE:-legacy}" \
-     "（legacy=与旧版逐字节一致；106 保持 legacy）" >&2
+# ---- VLM 描述（两阶段）+ 增量人设 ----
+#
+# 2026-10-13 起**开着**（此前一段是关的，原因见下「为什么原先关着」）。
+#
+# ⚠️⚠️ 打开它的**前置顺序不能反**：必须**先**更新 102 的 Agent，**再**重启
+#     本服务。兼容性是**不对称**的：
+#
+#       新 Agent ← 旧编排   ✅ 安全（`content` 可缺省 = 旧版行为）
+#       旧 Agent ← 新编排   ❌ **会凭空多出一句话**
+#
+#     原因不只在载荷。`dual` 除了给每轮多带一个 `content` 键（旧 Agent 的
+#     pydantic 会当多余字段丢掉，**这一半无害**），还会**多发一轮**「会话
+#     起点的视觉背景轮」—— 一轮 `transcript=""` 的 `on_answer`，语义是
+#     「只存不答」，全靠 Agent 侧的 `handle_visual_background` 认。旧 Agent
+#     里 `handle_answer` 对空 transcript **没有任何护栏**（`openai-agent-demo`
+#     的 2c01305 及之前），会当正常话轮：写 BUSY → 拿空用户文本跑 LLM →
+#     回一句 → IC 收到 ANSWER → **会话开头凭空插一句话**。症状全在 Agent
+#     侧，编排这边看不出来 —— 正是 `config.py` 里警告的那类半切换。
+#
+#     判据（102 侧 `GET /openapi.json`）：`components.schemas` 里要有
+#     `Content`，且 `OnAnswerRequest.properties` 里要有 `content`。
+#     2026-10-13 实测已满足（103 更早就有）。
+#
+# 为什么原先关着：102 的 Agent 那时还没改好 —— 也就是上面那条判据不成立。
+#
+# 为什么落在这个**本机专属**脚本里、而不是 `config.py` 的默认值：编排代码
+# 105/106 共用一份，`config.py` 的默认值就是「**106 下次重启后的行为**」，
+# 动它会连「哪台开了什么」的横幅证据一起抹掉。写在这里，下面几行 echo
+# 才是启动横幅上那条硬证据。
+#
+# 回退（102 的 Agent 若被退回旧版 —— **先退编排、再退 Agent**，顺序与开时
+# 相反，因为危险的永远是「新编排 + 旧 Agent」这个组合）：
+#     ORCH_OMNI_DESCRIBE=0 ORCH_AGENT_TRANSCRIPT_MODE=legacy \
+#     ORCH_OMNI_DELTA_PERSONA=0 \
+#     nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
+#
+#   `dual`   = 纯增量：`transcript` 仍是字符串，只多一个 `content={ASR,VLM}` 键
+#   `dict`   = `transcript` 整个换成 dict（目标态，**当前未启用**：Agent 的
+#              `transcript` 字段是 `str`，背景轮会被 422 挡掉）
+#   `legacy` = 连子类都不装，payload 逐字节等于旧版（回退用）
+export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
+export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
+# 增量人设：全量描述在「八类清单」的连接上做完 ⇒ **关掉重连** ⇒ 用「只报
+# 变化」的短人设接着跑增量。不换的话每轮增量都长成八类分条（3~4s），且
+# 压不短 —— 推演见 `orchestrator/omni/describe.py`「为什么增量轮压不短」。
+# 与 `ORCH_OMNI_DESCRIBE` 同开同关（这一组值与 105 对齐，两边行为一致）。
+export ORCH_OMNI_DELTA_PERSONA="${ORCH_OMNI_DELTA_PERSONA:-1}"
+
+# 生效值落日志 —— 切换/回退后**第一眼看这里**，别靠猜。
+echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（1=omni 只当描述器，0=当对话方）" >&2
+echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
+     "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
+echo "  视觉背景轮      = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
+     "（全量描述额外投一发 ASR 空的 on_answer，只存不答）" >&2
+echo "  增量人设        = $ORCH_OMNI_DELTA_PERSONA" \
+     "（1=全量做完后关掉重连、换短人设跑增量）" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \
