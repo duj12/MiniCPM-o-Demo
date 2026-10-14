@@ -1738,11 +1738,23 @@ class OrchestratorSession:
                 ))
                 # 记住识别结果，后续每帧的 face.state 都带上（否则前端
                 # 只在识别那一瞬间能看到名字，之后又变回"未知"）
+                #
+                # ⚠️ 必须记下这是**哪条轨迹**的识别结果。上游对「认不出来
+                #    了」是静默的（`remote_provider` 在 uid 为空时直接不发
+                #    identity 事件），这份缓存**没有任何外部失效信号** ——
+                #    不绑轨迹，换人后上一个人的姓名/uid 会一直挂在新的人脸
+                #    框上（badcase s-282cef8565b1）。
+                #    `IdentityEvent.track_id` 是恒 0 的占位（provider 手里
+                #    只有那一帧的缓存身份），只能就近取当前观测的 track ——
+                #    worker 是「先投观测、后 poll_identity」，所以此刻
+                #    `_last_face` 就是产出这条身份的那一帧。
                 self._last_identity = {
                     "name": ev.name, "uid": ev.uid, "person_id": ev.person_id,
                     "similarity": round(ev.similarity, 3),
                     "enrolled": bool(ev.is_enrolled),
                     "identity_state": ev.identity_state,
+                    "track_id": (getattr(self, "_last_face", None)
+                                 or {}).get("track_id"),
                 }
                 self._push_face_display()
 
@@ -1761,6 +1773,30 @@ class OrchestratorSession:
         except Exception as exc:  # noqa: BLE001
             logger.debug("回写 playback_active 失败: %s", exc)
 
+    def _live_identity(self) -> dict | None:
+        """只把身份挂给**它被识别时的那条轨迹**；人换了/出画了就撤下。
+
+        ⚠️ 上游对「这个人认不出来」是**静默**的：`remote_provider` 在 uid
+        为空时根本不发 identity 事件，所以 `_last_identity` 不会被人换了这件
+        事覆盖，也没有任何一条消息来清它 —— 前端于是把上一个人的姓名/uid
+        顶在新的人脸框旁边（badcase s-282cef8565b1）。
+
+        判据两级，够用即止：先比 track（最强的「同一张脸」证据）；没有
+        track 可比的实现再退回比 uid；两级都比不了就**不显示** —— 宁可让
+        前端回到「未知」，也不能显示另一个人的名字。
+        """
+        ident = getattr(self, "_last_identity", None)
+        face = getattr(self, "_last_face", None) or {}
+        if not ident:
+            return None
+        if not face.get("valid"):
+            return None                      # 人不在画里 —— 身份一并撤下
+        tid = ident.get("track_id")
+        if tid not in (None, 0, "0"):
+            return ident if face.get("track_id") == tid else None
+        uid = ident.get("uid")
+        return ident if (uid and face.get("uid") == uid) else None
+
     def _push_face_display(self) -> None:
         """把最新的观测/唤醒/身份合成一条 face.state 发给 UI。
 
@@ -1776,7 +1812,8 @@ class OrchestratorSession:
             # 与会话采样轴对齐（0 = 首块音频）—— 与 AsrDisplay.t_ms 同一口径
             t_ms=int(self.clock.seconds() * 1000),
             tracks=[self._last_face] if getattr(self, "_last_face", None) else [],
-            identity=getattr(self, "_last_identity", None),
+            # 身份**不当全局缓存发** —— 见 `_live_identity`
+            identity=self._live_identity(),
             wake=getattr(self, "_last_wake", None),
             state=getattr(self, "_last_face_state", None),
         ))
