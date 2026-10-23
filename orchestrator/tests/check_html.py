@@ -20,7 +20,11 @@ CAPTURE_JS = (Path(__file__).resolve().parents[2]
 
 _JS = re.compile(r"<script>(.*?)</script>", re.S)
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
-_LINE = re.compile(r"//[^\n]*")
+# ⚠️ `(?<!:)` 是必须的：行注释先于字符串剥离，而 JS 里出现 `ws://host`
+#    这类字面量时，裸的 `//` 规则会从 URL 中间切掉后半行 —— 剩下一个孤立
+#    引号，把后面成片的代码吞进"字符串"里，表现为一堆函数"未定义"（踩过：
+#    AlsaServer 的默认地址）。URL 里的 `//` 前面永远是 `:`，注释前面不是。
+_LINE = re.compile(r"(?<!:)//[^\n]*")
 _TMPL = re.compile(r"`(?:\\.|[^`\\])*`", re.S)
 _SQ = re.compile(r"'(?:\\.|[^'\\])*'")
 _DQ = re.compile(r'"(?:\\.|[^"\\])*"')
@@ -93,7 +97,7 @@ def main() -> int:
     print()
     syms = ("PcmPlayer", "diagUpdate",
             "audiostat", "src_w", "src_h", "createConstantSource",
-            "statechange", "grab(320, 240",
+            "statechange", "VIDEO_BOX_W", "camRotate", "alsaUrl",
             # AEC 模式 / 延迟与锚点显示
             "aecMode", "renderDelay", "selectedAecMode",
             "deviceKey", "session.stats", "delayinfo",
@@ -167,6 +171,58 @@ def main() -> int:
          "audioEpoch" in html and "epoch: audioEpoch" in html),
         ("AudioContext 挂起时有恢复路径（手势监听兜底）",
          "pointerdown" in html and "audioCtx.resume()" in html),
+        # ---- Android 兼容（旋转 + AlsaServer）----
+        # ⚠️ 旋转必须发生在**抓帧画布**上（ctx.rotate + drawImage）。
+        #    只转预览、不转发出去的 JPEG 时，人脸框必然错位 —— 旧版就栽在这。
+        ("画面旋转在抓帧画布上做（不是 CSS 转预览）",
+         "ctx2d.rotate(" in html and "camRotate" in html
+         and "transform:rotate" not in html.replace(" ", "")),
+        # 输出尺寸会话内锁死：服务端只认首帧的 src_w/src_h
+        ("抓帧尺寸会话内锁死（源尺寸变化也不改输出）",
+         "_lockedFrame" in html and "outW" in html),
+        # ⚠️ 旧实现是 `const w = video.clientWidth` —— 旋转后那是"预览元素"的
+        #    尺寸，和发出去的 JPEG 不是同一个坐标系。现在按 src_w/src_h 1:1 画。
+        ("人脸框按服务端 src_w 1:1 画（不再用 video.clientWidth）",
+         "t.src_w" in html and "const w = video.clientWidth" not in html),
+        # AlsaServer：协议解析 + 1600 采样块的硬契约
+        ("接入 AlsaServer（38888 / 24 字节帧头）",
+         "38888" in html and "parseAlsaFrame" in html
+         and "cmd: 'start'" in html),
+        ("按 ALSA 帧头时间戳做 ctxTime（不是发消息时的墙钟）",
+         "alsaCtxTimeOf" in html and "tsHi" in html),
+        ("音频块恰好 1600 采样（服务端 MIC_CHUNK）",
+         "ALSA_CHUNK = 1600" in html),
+        ("外接麦不报 browser AEC（没有 MediaStream）",
+         "effectiveAecMode" in html),
+        ("设备标识区分两条采集路径",
+         "'-alsa'" in html),
+        # ---- 音频不再被视频编码饿死 + 回采当 AEC farend ----
+        # ⚠️ 1280×720 q0.9 在 Android 大屏上单帧 60~110ms，25fps 把主线程
+        #    打满，AlsaServer 收包被饿死（实测音频只跑到 36% 实时）。长边
+        #    压到 640 后单帧 15~25ms —— 这条断言防止有人把尺寸改回去。
+        # Android 才降分辨率；Windows 浏览器麦路径保持 1280×720 q0.9
+        ("Android 只降自己的分辨率；浏览器路径仍 1280×720 q0.9",
+         "VIDEO_BOX_W = ON_ANDROID ? 640 : 1280" in html
+         and "VIDEO_BOX_H = ON_ANDROID ? 640 : 720" in html
+         and "VIDEO_Q = ON_ANDROID ? 0.6 : 0.9" in html),
+        # ⚠️ 人脸服务要 24fps —— 不许用降帧率来省 CPU
+        ("保持 25fps（人脸服务要 24fps 输入）",
+         "VIDEO_TICK_MS = 40" in html),
+        # ⚠️ 同步 toDataURL 会把主线程打满（真机音频只跑到 36% 实时）。
+        #    编码必须走 toBlob（后台线程）+ 异步 base64。
+        ("JPEG 编码在浏览器后台线程（toBlob，不是同步 toDataURL）",
+         "encodeJpeg" in html and "toBlob" in html
+         and "cv.toDataURL" not in html),
+        ("上行积压超限时跳过视频帧（音频优先）",
+         "VIDEO_BUFFER_LIMIT" in html
+         and "bufferedAmount > VIDEO_BUFFER_LIMIT" in html),
+        ("mic=ch2-5 / 回采=ch6-7 分开下混",
+         "ALSA_MIC_CHS" in html and "ALSA_REF_CHS" in html
+         and "alsaRefUse" in html),
+        ("回采作为 farend 与 mic 成对上行（D=0）",
+         "chunk.ref" in html),
+        ("序号跳变/块率/滞后有仪表（能判定是否真丢帧）",
+         "alsaSeqGaps" in html and "alsaLogStats" in html),
     ]
     for desc, ok in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {desc}")
@@ -245,6 +301,10 @@ def main() -> int:
          "_firstAt()" in js and "stop_ctx" in js and "epoch: this.epoch" in js),
         ("session 客户端：采集块带上 ctx_time + epoch",
          "ctx_time: chunk.ctxTime" in js),
+        # 可选 farend：有 ref 才加字段，没有时消息形状与旧版逐字节一致
+        ("session 客户端：可选 ref_base64（客户端回采 = AEC 的 D=0 参考）",
+         "chunk.ref" in js and "ref_base64" in js
+         and "chunk.ref.length === audio.length" in js),
         ("session 客户端：存下服务端下发的 lead_ms",
          "msg.lead_ms" in js),
         ("采集 worklet：每个块带上首采样的 ctx 时刻",

@@ -265,13 +265,24 @@
       const audio = chunk.audio;
       const buf = new ArrayBuffer(audio.length * 4);
       new Float32Array(buf).set(audio);
-      this._send({
+      const msg = {
         type: 'audio',
         audio_base64: arrayBufferToBase64(buf),
         t_ms: 0,
         ctx_time: chunk.ctxTime || 0,
         epoch: this.epoch || 0,
-      });
+      };
+      // ⚠️ **可选 farend**：多通道设备（Android 大屏）把"本机播报的回采"
+      //    与 mic **成对**送上来。两者是同一帧里切出来的，逐采样对齐 ——
+      //    服务端直接拿它当 AEC 参考，D=0，不需要任何延迟估计。
+      //    不带这个字段时，消息形状与改动前**逐字节一致**（Windows 浏览器麦）。
+      if (chunk.ref && chunk.ref.length === audio.length) {
+        const rbuf = new ArrayBuffer(chunk.ref.length * 4);
+        new Float32Array(rbuf).set(chunk.ref);
+        msg.ref_base64 = arrayBufferToBase64(rbuf);
+        this.stats.refChunksSent = (this.stats.refChunksSent || 0) + 1;
+      }
+      this._send(msg);
       this.stats.audioSent += 1;
 
       if (chunk.frameBase64) {

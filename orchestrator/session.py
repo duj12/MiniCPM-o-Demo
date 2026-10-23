@@ -251,7 +251,8 @@ class OrchestratorSession:
     # ------------------------------------------------------------------ #
 
     async def on_audio(self, x: np.ndarray, t_ms: int = 0,
-                       ctx_time: float = 0.0, epoch: int = 0) -> None:
+                       ctx_time: float = 0.0, epoch: int = 0,
+                       ref: Optional[np.ndarray] = None) -> None:
         """收到一段麦克风音频（float32 (1,T)，16kHz）。
 
         mic ingest 是**唯一**推进时钟的地方。时钟因此跟踪真实音频流，
@@ -260,6 +261,11 @@ class OrchestratorSession:
         ``ctx_time`` 是本块首采样在浏览器 ``AudioContext`` 上的时刻 ——
         登记成锚点后，服务端就能把浏览器承诺的起播时刻精确换算到会话
         采样轴上（见 ``SampleClock.record_anchor``）。
+
+        ``ref`` 是**可选的客户端 farend**（多通道设备把自己的播报回采
+        通道和 mic 一起送上来）。它与 ``x`` 是同一帧切出来的，**逐采样
+        对齐** —— 直接当 AEC 参考即可，D=0，既不依赖服务端 TTS 参考轨，
+        也不需要测声学延迟。``ref=None`` 时行为与改动前完全一致。
         """
         if self.closed:
             return
@@ -295,12 +301,41 @@ class OrchestratorSession:
         #    `if self.aec is not None` 里调 —— 于是用**浏览器原生 AEC**
         #    （前端不连云端 AEC，`self.aec is None`）时根本不转储，
         #    跑完整场一个文件都没有。转储是排查手段，不该依赖 AEC 模式。
-        ref = self._ref_for(frame) if self.aec is not None else None
-        self._dump_audio(frame.data, ref, frame)
+        # ---- farend：客户端回采优先，其次才是服务端 TTS 参考轨 ----
+        #
+        # 客户端送来的 ref 是**同一帧里切出来的回采通道**（设备自己的
+        # 播报），与 mic 逐采样对齐。用它就不存在 D 的估计误差 —— 而 D
+        # 一旦错，回声就永远消不掉（这正是之前"播报被识别成用户说话"的
+        # 根因）。只有没送 ref 的老路径才走 RefTrack + D 补偿。
+        client_ref = None
+        if ref is not None and self.aec is not None:
+            r = np.asarray(ref, dtype=np.float32).reshape(1, -1)
+            if r.shape[1] != frame.n_samples:
+                # 契约上必须等长。不等长时对齐并只告警一次（不崩）。
+                if not getattr(self, "_client_ref_warned", False):
+                    self._client_ref_warned = True
+                    logger.warning(
+                        "[%s] 客户端 farend 长度 %d ≠ mic %d —— 已截断/补零对齐",
+                        self.session_id, r.shape[1], frame.n_samples)
+                r = r[:, :frame.n_samples]
+                if r.shape[1] < frame.n_samples:
+                    r = np.pad(r, ((0, 0),
+                                   (0, frame.n_samples - r.shape[1])))
+            client_ref = np.ascontiguousarray(r, dtype=np.float32)
+            self._using_client_ref = True
+            if not getattr(self, "_client_ref_logged", False):
+                self._client_ref_logged = True
+                logger.info("[%s] AEC farend = 客户端回采通道（D=0，"
+                            "逐采样对齐；不再使用 TTS 参考轨）",
+                            self.session_id)
+
+        ref_arr = (client_ref if client_ref is not None
+                   else (self._ref_for(frame) if self.aec is not None else None))
+        self._dump_audio(frame.data, ref_arr, frame)
 
         if self.aec is not None:
-            self._trace_ref(ref, frame)
-            await self.aec.push(frame.data, ref)
+            self._trace_ref(ref_arr, frame)
+            await self.aec.push(frame.data, ref_arr)
         else:
             await self._fanout_direct(frame.data)
 
@@ -450,12 +485,17 @@ class OrchestratorSession:
                 self.stats["ref_rms_max"] = round(rms, 5)
             if prev == 0:
                 # 首次出现非零参考 —— 最关键的转折点，必须打日志
+                if getattr(self, "_using_client_ref", False):
+                    src = "客户端回采 ch6/7（D=0）"
+                else:
+                    src = ("服务端参考轨(写入区间=%s D=%d)" % (
+                        self.ref_track.buf.written_span()
+                        if self.ref_track else None,
+                        self.ref_track.delay_samples
+                        if self.ref_track else -1))
                 logger.info(
-                    "[%s] 参考轨首次送出非零 farend：t0=%d rms=%.4f "
-                    "（写入区间=%s D=%d）",
-                    self.session_id, frame.t0, rms,
-                    self.ref_track.buf.written_span() if self.ref_track else None,
-                    self.ref_track.delay_samples if self.ref_track else -1,
+                    "[%s] 首次送出非零 farend（%s）：t0=%d rms=%.4f",
+                    self.session_id, src, frame.t0, rms,
                 )
             elif self.stats["ref_push_nonzero"] % 100 == 0:
                 logger.info(

@@ -874,11 +874,17 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
     t = msg.get("type")
     if t == "audio":
         x = decode_audio_b64(msg.get("audio_base64", ""))
+        # 可选 farend：多通道设备把本机播报的**回采**与 mic 成对送来
+        # （同一帧切出，逐采样对齐）。有它就直接当 AEC 参考，D=0，
+        # 不用服务端 TTS 参考轨，也不用测声学延迟。
+        ref_b64 = msg.get("ref_base64") or ""
+        ref = decode_audio_b64(ref_b64) if ref_b64 else None
         # ctx_time/epoch 是浏览器 AudioContext 的锚点 —— 参考轨靠它做
         # 跨时钟域换算，缺了就只能退回预测落位（误差逐句变化）。
         await sess.on_audio(x, msg.get("t_ms", 0),
                             float(msg.get("ctx_time") or 0.0),
-                            int(msg.get("epoch") or 0))
+                            int(msg.get("epoch") or 0),
+                            ref=ref)
     elif t == "video_face":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))

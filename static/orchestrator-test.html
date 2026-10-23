@@ -11,8 +11,18 @@
   .wrap { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
   .col { flex: 1 1 380px; min-width: 320px; }
   video { width: 100%; border-radius: 8px; background: #000; }
-  /* 视频 + 人脸叠加层 */
+  /* 视频 + 人脸叠加层
+   *
+   * ⚠️ **三层结构，旋转靠"抓帧"而不是 CSS**：
+   *   #cam     原始预览（0° 时用；非 0° 时保留在 DOM 里但不可见 ——
+   *            部分 Android WebView 对 display:none 的 video 抓不到帧）
+   *   #camview **原样显示发出去的那张 JPEG**（非 0° 时用）—— 这样用户
+   *            看到的画面与人脸框所在的那张图逐像素一致
+   *   #overlay 人脸框，backing store = 服务端下发的 src_w × src_h（1:1 画）
+   */
   .stage { position: relative; line-height: 0; }
+  .stage #camview { display: none; width: 100%; height: auto;
+                    border-radius: 8px; background: #000; }
   .stage canvas#overlay { position: absolute; inset: 0; width: 100%; height: 100%;
                           border-radius: 8px; pointer-events: none; }
   button { padding: 10px 18px; font-size: 15px; border-radius: 8px;
@@ -42,8 +52,10 @@
 <div class="wrap">
   <div class="col">
     <h3>摄像头（人脸框叠加）</h3>
-    <div class="stage">
+    <div class="stage" id="stage">
       <video id="cam" autoplay playsinline muted></video>
+      <!-- 非 0° 时的预览：**就是**发出去的那张 JPEG（不再另外渲染一路） -->
+      <img id="camview" alt="">
       <canvas id="overlay"></canvas>
     </div>
     <canvas id="cv" style="display:none"></canvas>
@@ -52,6 +64,59 @@
     <div class="stats" id="camstate"></div>
     <div class="stats" id="faceinfo">人脸：等待中…</div>
     <div style="margin-top:12px">
+      <!-- 音频来源：Android 大屏上浏览器**看不到**系统外接的阵列麦，
+           只能从同机 AlsaServer 的 WebSocket 拿（默认 127.0.0.1:38888）。
+           Windows 保持"浏览器麦克风"，行为与改动前完全一致。 -->
+      <label style="display:block;margin-bottom:8px">
+        音频来源：
+        <select id="audioSrc">
+          <option value="browser">浏览器麦克风（默认）</option>
+          <option value="alsa">AlsaServer 转发（Android 外接麦）</option>
+        </select>
+      </label>
+      <div id="alsaOpts" style="display:none;margin:-2px 0 10px;
+                                padding:8px 10px;border:1px solid #333;
+                                border-radius:8px;background:#161616">
+        <label style="display:block;margin-bottom:6px">
+          <span style="color:#bbb">转发地址</span>
+          <input id="alsaUrl" type="text" value="ws://127.0.0.1:38888"
+                 style="width:100%;margin-top:4px;background:#1a1a1a;
+                        color:#e6e6e6;border:1px solid #333;
+                        border-radius:6px;padding:6px;
+                        font-family:ui-monospace,monospace;font-size:12px">
+        </label>
+        <label style="display:block;margin-bottom:6px">
+          <span style="color:#bbb">声道</span>
+          <select id="alsaCh">
+            <!-- 设备固定布局：0/1 静音、2-5 阵列麦、6/7 回采（播报回声）。
+                 选它就把 mic=ch2-5、AEC 的 farend=ch6-7 **成对**送上去 ——
+                 两路是同一块采集数据切出来的，时间天然对齐，D=0。 -->
+            <option value="mic">阵列麦 ch2-5 + 回采 ch6-7（算法 AEC）</option>
+            <option value="auto">自动（按电平挑有效通道）</option>
+            <option value="avg">全部麦克风平均（不含回采）</option>
+            <option value="0">通道 0</option>
+            <option value="1">通道 1</option>
+            <option value="2">通道 2</option>
+            <option value="3">通道 3</option>
+            <option value="4">通道 4</option>
+            <option value="5">通道 5</option>
+            <option value="6">通道 6</option>
+            <option value="7">通道 7</option>
+          </select>
+        </label>
+        <div id="alsaStat" class="stats" style="margin:0"></div>
+      </div>
+      <label style="display:block;margin-bottom:8px">
+        画面旋转：
+        <!-- ⚠️ 旋转是在**抓帧画布**上做的：发给人脸/Omni/录制的 JPEG 就是转过的
+             那一张，所以人脸框天然贴合。会话中途改无效（尺寸被锁死）。 -->
+        <select id="camRotate">
+          <option value="0">0°（默认）</option>
+          <option value="90">90°（顺时针）</option>
+          <option value="180">180°</option>
+          <option value="270">270°（顺时针）</option>
+        </select>
+      </label>
       <label style="display:block;margin-bottom:8px">
         回声消除：
         <!-- 默认 **browser**（浏览器原生 AEC）：开箱即用、不依赖任何
@@ -88,6 +153,16 @@
         <div style="color:#888;font-size:12px;margin-bottom:8px">
           改完点「开始会话」生效。<b>会话中途改无效</b>（参数在首帧发给服务端）。
         </div>
+
+        <!-- 仅用于"从本地 http.server 打开本页联调"：此时 location.host 是
+             本机，必须显式指向编排服务。留空 = 沿用 location.host（默认）。 -->
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span style="width:200px;color:#bbb">编排服务地址</span>
+          <input id="orchUrl" type="text" placeholder="留空 = 当前页面所在主机"
+                 style="flex:1;min-width:180px;background:#1a1a1a;color:#e6e6e6;
+                        border:1px solid #333;border-radius:6px;padding:6px;
+                        font-family:ui-monospace,monospace;font-size:12px">
+        </label>
 
         <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
           <span style="width:200px;color:#bbb">VAD 尾部静音 vad_tail_sil</span>
@@ -174,6 +249,14 @@ let session = null, micStream = null, audioCtx = null, workletNode = null;
 let videoStream = null, running = false;
 /** 采集侧 AudioContext 的代号 —— 服务端据此丢弃换 context 前的锚点 */
 let audioEpoch = 0;
+
+/* 抓帧尺寸/角度：**会话开始时锁死**，会话内不再变 —— 服务端只认首帧的
+ * src_w/src_h（`session.py` 的 `_frame_size` 只在第一帧赋值），中途换尺寸会让
+ * 人脸框的坐标系整体失效。 */
+let _lockedFrame = null;   // { srcW, srcH, rot, outW, outH }
+let _rotAutoDone = false;  // 自动纠偏只做一次
+let _noFaceStreak = 0;
+let _sessionStartedAt = 0;
 
 /**
  * 把 ASR 消息里的 `state` 渲染成一行小标签。
@@ -694,6 +777,138 @@ function deviceKey() {
   return k;
 }
 
+/* ---------- 音视频来源选择（Windows 默认不变） ----------
+ *
+ * Android 大屏上浏览器**看不到**系统外接的阵列麦 —— 只能用同机 AlsaServer
+ * 的 WebSocket（默认 127.0.0.1:38888）。所以：
+ *   · 非 Android：默认「浏览器麦克风」，与改动前完全一致；
+ *   · Android： 默认「AlsaServer 转发」（用户仍可切回）。
+ * 选择都记住（localStorage），刷新后保持。
+ */
+const AUDIO_SRC_KEY = 'orch_audio_src';
+const CAM_ROT_KEY = 'orch_cam_rot';
+
+function isAndroid() {
+  return /Android/i.test(navigator.userAgent || '');
+}
+
+function selectedAudioSource() {
+  const el = $('audioSrc');
+  return el ? el.value : 'browser';
+}
+
+/** 外接麦没有 MediaStream ⇒ 浏览器原生 AEC 无从生效。
+ *  用户选了 browser 时可执行模式强制为 service（算法服务 AEC），
+ *  页面上会打一行日志说明 —— 不静默改。 */
+function effectiveAecMode() {
+  const m = selectedAecMode();
+  if (selectedAudioSource() === 'alsa' && m === 'browser') return 'service';
+  return m;
+}
+
+function syncAlsaOpts() {
+  const on = selectedAudioSource() === 'alsa';
+  const box = $('alsaOpts');
+  if (box) box.style.display = on ? '' : 'none';
+}
+
+function initAudioSource() {
+  const el = $('audioSrc');
+  if (!el) return;
+  try {
+    const saved = localStorage.getItem(AUDIO_SRC_KEY);
+    el.value = saved || (isAndroid() ? 'alsa' : 'browser');
+  } catch (e) { /* ignore */ }
+  el.addEventListener('change', () => {
+    try { localStorage.setItem(AUDIO_SRC_KEY, el.value); } catch (e) {}
+    syncAlsaOpts();
+    log('v', '音频来源 → ' + (el.value === 'alsa' ? 'AlsaServer 转发' : '浏览器麦克风'));
+  });
+
+  const u = $('alsaUrl');
+  if (u) {
+    try {
+      const savedUrl = localStorage.getItem('orch_alsa_url');
+      if (savedUrl) u.value = savedUrl;
+    } catch (e) { /* ignore */ }
+    u.addEventListener('change', () => {
+      try { localStorage.setItem('orch_alsa_url', u.value.trim()); } catch (e) {}
+    });
+  }
+  const ch = $('alsaCh');
+  if (ch) {
+    try {
+      const savedCh = localStorage.getItem('orch_alsa_ch');
+      if (savedCh) ch.value = savedCh;
+    } catch (e) { /* ignore */ }
+    ch.addEventListener('change', () => {
+      try { localStorage.setItem('orch_alsa_ch', ch.value); } catch (e) {}
+      log('v', 'AlsaServer 声道 → ' + ch.value);
+    });
+  }
+  syncAlsaOpts();
+}
+
+function selectedAlsaChannel() {
+  const el = $('alsaCh');
+  return el ? el.value : 'auto';
+}
+
+/* ---------- 画面旋转（抓帧侧，不是 CSS） ---------- */
+
+function selectedCamRotate() {
+  const el = $('camRotate');
+  const v = el ? parseInt(el.value, 10) : 0;
+  return (v === 90 || v === 180 || v === 270) ? v : 0;
+}
+
+function initCamRotate() {
+  const el = $('camRotate');
+  if (!el) return;
+  try {
+    const saved = parseInt(localStorage.getItem(CAM_ROT_KEY) || '0', 10);
+    if (saved === 90 || saved === 180 || saved === 270) el.value = String(saved);
+  } catch (e) { /* ignore */ }
+  el.addEventListener('change', () => {
+    try { localStorage.setItem(CAM_ROT_KEY, el.value); } catch (e) {}
+    if (running) log('e', '画面旋转已改 —— **下次开始会话才生效**（尺寸会话内锁死）');
+  });
+  // 0° 时沿用原来的 <video> 预览
+  syncPreviewMode(selectedCamRotate());
+}
+
+/** 0° → 用 <video>；非 0° → 用 <img> 显示"发出去的那张"。
+ *  ⚠️ 非 0° 时 video **不能 display:none**（部分 Android WebView 抓不到帧），
+ *     只能透明叠在下面。 */
+function syncPreviewMode(rot) {
+  const v = $('cam'), img = $('camview');
+  if (!v || !img) return;
+  const rotated = (rot % 360) !== 0;
+  img.style.display = rotated ? 'block' : 'none';
+  v.style.position = rotated ? 'absolute' : '';
+  v.style.inset = rotated ? '0' : '';
+  v.style.opacity = rotated ? '0' : '';
+  v.style.pointerEvents = rotated ? 'none' : '';
+  v.style.width = rotated ? '100%' : '';
+  v.style.height = rotated ? '100%' : '';
+  v.style.objectFit = rotated ? 'fill' : '';
+}
+
+/** 竖屏大屏上别让画面顶出可视区：按锁定后的宽高比把宽度压到 62vh 以内。 */
+function applyStageAspect() {
+  const stage = $('stage');
+  if (!stage) return;
+  const L = _lockedFrame;
+  if (!L || (L.rot % 360) === 0) {
+    stage.style.maxWidth = '';
+    stage.style.margin = '';
+    return;
+  }
+  const maxH = Math.max(240, window.innerHeight * 0.62);
+  stage.style.maxWidth = Math.round(maxH * L.outW / L.outH) + 'px';
+  stage.style.margin = '0 auto';
+}
+
 /** 显示服务端推来的链路状态（重点是声学延迟与落位锚点）。 */
 let lastStats = null;
 // 实测容忍窗：D 偏 5ms 就开始掉，偏 166ms 完全失效
@@ -804,6 +1019,13 @@ function setCamState(state, msg) {
   diag.camState = state;
 }
 
+// ⚠️ 这两个定时器必须声明在**顶层**：`startCapture()` 里创建，但
+//    `#btnStop` 的处理器在顶层要 clear 它们。早先声明在 startCapture 内部
+//    （函数作用域），Stop 时 `clearInterval(_videoTimer)` 直接抛
+//    ReferenceError —— 后面的 `session.stop()` 根本没执行，停在页面上
+//    看就是"点了停止没反应"。
+let _videoTimer = null, _linkTimer = null;
+
 async function startCapture() {
   // 回声消除模式由用户在页面上选（见 #aecMode）——**二选一，不能同时开**：
   //   browser —— 浏览器原生 AEC（设备侧工作，不受网络延迟影响）
@@ -818,32 +1040,52 @@ async function startCapture() {
   //    起伏 —— 而算法 AEC 的线性自适应滤波器假定该路径是**线性时不变**
   //    的。AGC 一动，滤波器就追不上，抑制上限被显著拉低。
   //    browser 模式保持原样（原生 AEC 自己能处理 AGC）。
-  const mode = selectedAecMode();
-  const useBrowserAEC = (mode === 'browser');
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: useBrowserAEC,
-             noiseSuppression: useBrowserAEC,
-             autoGainControl: useBrowserAEC },
-    video: false,
-  });
-  // ⚠️ 必须读**实际生效**的值 —— 浏览器可能忽略/改写请求的约束，
-  // 尤其移动端。申请了不等于生效，写日志时要用 getSettings()。
-  let actual = {};
-  try {
-    const tr = micStream.getAudioTracks()[0];
-    actual = (tr && tr.getSettings) ? tr.getSettings() : {};
-  } catch (e) { /* ignore */ }
-  // 供「导出诊断」用 —— 真机排查时"申请了什么"与"实际生效什么"经常不同
-  window._lastMicSettings = actual;
-  log('k', `麦克风约束：请求 echoCancellation=${useBrowserAEC} `
-         + `noiseSuppression=${useBrowserAEC}（模式=${mode}）`);
-  log('k', `实际生效：echoCancellation=${actual.echoCancellation} `
-         + `noiseSuppression=${actual.noiseSuppression} `
-         + `autoGainControl=${actual.autoGainControl} `
-         + `sampleRate=${actual.sampleRate} deviceId=${(actual.deviceId||'').slice(0,8)}`);
-  if (useBrowserAEC && actual.echoCancellation === false) {
-    log('e', '⚠️ 浏览器**拒绝**了 echoCancellation —— 此设备/浏览器上'
-           + '原生 AEC 不可用，回声不会被消除');
+  const audioSrc = selectedAudioSource();
+  // 外接麦（alsa）没有 MediaStream ⇒ 浏览器 AEC 不可能生效，
+  // 实际下发给服务端的模式见 effectiveAecMode()
+  const mode = effectiveAecMode();
+  const useBrowserAEC = (mode === 'browser') && (audioSrc === 'browser');
+  // 每次开始会话都重新锁尺寸/角度（上一轮的可能已经过期）
+  _lockedFrame = null;
+  _rotAutoDone = false;
+  _noFaceStreak = 0;
+  _sessionStartedAt = Date.now();
+
+  if (audioSrc === 'browser') {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: useBrowserAEC,
+               noiseSuppression: useBrowserAEC,
+               autoGainControl: useBrowserAEC },
+      video: false,
+    });
+    // ⚠️ 必须读**实际生效**的值 —— 浏览器可能忽略/改写请求的约束，
+    // 尤其移动端。申请了不等于生效，写日志时要用 getSettings()。
+    let actual = {};
+    try {
+      const tr = micStream.getAudioTracks()[0];
+      actual = (tr && tr.getSettings) ? tr.getSettings() : {};
+    } catch (e) { /* ignore */ }
+    // 供「导出诊断」用 —— 真机排查时"申请了什么"与"实际生效什么"经常不同
+    window._lastMicSettings = actual;
+    log('k', `麦克风约束：请求 echoCancellation=${useBrowserAEC} `
+           + `noiseSuppression=${useBrowserAEC}（模式=${mode}）`);
+    log('k', `实际生效：echoCancellation=${actual.echoCancellation} `
+           + `noiseSuppression=${actual.noiseSuppression} `
+           + `autoGainControl=${actual.autoGainControl} `
+           + `sampleRate=${actual.sampleRate} deviceId=${(actual.deviceId||'').slice(0,8)}`);
+    if (useBrowserAEC && actual.echoCancellation === false) {
+      log('e', '⚠️ 浏览器**拒绝**了 echoCancellation —— 此设备/浏览器上'
+             + '原生 AEC 不可用，回声不会被消除');
+    }
+  } else {
+    // ⚠️ 这里**不申请 mic**：Android 上那次 getUserMedia 必然拿不到外接麦，
+    //    失败还会把整个 startCapture 拖垮。音频由 AlsaServer 提供。
+    micStream = null;
+    log('k', '音频来源：AlsaServer 转发 —— 不申请浏览器麦克风');
+    if (selectedAecMode() === 'browser') {
+      log('m', '外接麦没有 MediaStream，浏览器原生 AEC 无从生效 → '
+             + '本次实际使用**算法服务 AEC**（可在页面上改成「不做回声消除」）');
+    }
   }
   // ---- 摄像头：**拿不到也要能跑** ----
   // ⚠️ 早先这里是无保护的 await：没有摄像头时直接抛
@@ -924,22 +1166,28 @@ async function startCapture() {
   diag.ctxState = audioCtx.state;
   diag.ctxRate = audioCtx.sampleRate;
   diagUpdate();
-  // ⚠️ **必须带版本查询串**。iOS Safari 没有"强制刷新"，而且对
-  //    AudioWorklet 模块的缓存极其顽固 —— 改了 worklet 代码后，页面
-  //    拿到新 HTML 但 worklet 还是旧的，表现为"能力位对、锚点却是 0 个"，
-  //    排查起来毫无线索（真机踩过）。改 worklet 内容时**同步改这个号**。
-  await audioCtx.audioWorklet.addModule(
-    '/static/duplex/lib/capture-processor.js?v=5');
+  let chunkSize = 0;
+  if (audioSrc === 'browser') {
+    // ⚠️ **必须带版本查询串**。iOS Safari 没有"强制刷新"，而且对
+    //    AudioWorklet 模块的缓存极其顽固 —— 改了 worklet 代码后，页面
+    //    拿到新 HTML 但 worklet 还是旧的，表现为"能力位对、锚点却是 0 个"，
+    //    排查起来毫无线索（真机踩过）。改 worklet 内容时**同步改这个号**。
+    await audioCtx.audioWorklet.addModule(
+      '/static/duplex/lib/capture-processor.js?v=5');
 
-  const src = audioCtx.createMediaStreamSource(micStream);
-  const chunkSize = Math.max(160, Math.floor(audioCtx.sampleRate / 10)); // 100ms
-  workletNode = new AudioWorkletNode(audioCtx, 'capture-processor',
-                                     { processorOptions: { chunkSize,
-                                                           epoch: audioEpoch } });
-  const sink = audioCtx.createGain(); sink.gain.value = 0;
-  src.connect(workletNode); workletNode.connect(sink); sink.connect(audioCtx.destination);
-  log('k', '采集启动：chunkSize=' + chunkSize + ' (' +
-      (chunkSize / audioCtx.sampleRate * 1000).toFixed(0) + 'ms)');
+    const src = audioCtx.createMediaStreamSource(micStream);
+    chunkSize = Math.max(160, Math.floor(audioCtx.sampleRate / 10)); // 100ms
+    workletNode = new AudioWorkletNode(audioCtx, 'capture-processor',
+                                       { processorOptions: { chunkSize,
+                                                             epoch: audioEpoch } });
+    const sink = audioCtx.createGain(); sink.gain.value = 0;
+    src.connect(workletNode); workletNode.connect(sink); sink.connect(audioCtx.destination);
+    log('k', '采集启动：chunkSize=' + chunkSize + ' (' +
+        (chunkSize / audioCtx.sampleRate * 1000).toFixed(0) + 'ms)');
+  } else {
+    // 音频来自 AlsaServer：没有 MediaStream，也就不需要 worklet
+    log('k', '跳过浏览器采集 worklet（音频来自 AlsaServer 转发）');
+  }
 
   const cv = $('cv'), ctx2d = cv.getContext('2d'), video = $('cam');
 
@@ -950,17 +1198,88 @@ async function startCapture() {
    *  这样录下来的视频**逐字节等于**服务端喂给算法的视频，离线复现时
    *  算法看到的就是当时看到的 —— 不存在"录制一个格式、算法另一个格式"。
    *
-   *  ⚠️ 尺寸 640×480 → **1280×720 是本次的实质变化**：G1 的检测分对像素
-   *  尺寸敏感（早先 320×240 只有 0.70~0.77、IC 迎宾门禁过不了；640×480 是
-   *  0.82~0.85）。换到 1280×720 后**必须重新实测迎宾是否还正常**。
+   *  ⚠️ 尺寸演进：320×240 → 640×480 → **1280×720** →（现在）**长边 640**。
+   *  G1 的检测分对像素敏感（320×240 只有 0.70~0.77、过不了 IC 迎宾门禁；
+   *  640×480 是 0.82~0.85）。回到长边 640 是**性能换的**：1280×720 q0.9
+   *  在 Android 大屏上单帧 60~110ms，把主线程打满后音频只跑到 36% 实时。
+   *  代价是人脸分可能落在 640×480 与 320×240 之间 —— **必须复测迎宾**。
    */
-  function grab(maxW, maxH, q) {
+  function grab(maxW, maxH) {
     if (!video.videoWidth) return null;
     const vw = video.videoWidth, vh = video.videoHeight;
-    const s = Math.min(1, maxW / vw, maxH / vh);
-    cv.width = Math.round(vw * s); cv.height = Math.round(vh * s);
-    ctx2d.drawImage(video, 0, 0, cv.width, cv.height);
-    return cv.toDataURL('image/jpeg', q).split(',')[1] || null;
+
+    // ---- 首次成功抓帧：锁定角度与输出尺寸（整个会话不再变）----
+    if (!_lockedFrame) {
+      const rot = selectedCamRotate();
+      const swap = (rot % 180) !== 0;
+      const rw = swap ? vh : vw, rh = swap ? vw : vh;
+      const s = Math.min(1, maxW / rw, maxH / rh);
+      _lockedFrame = {
+        srcW: vw, srcH: vh, rot: rot,
+        outW: Math.max(2, Math.round(rw * s)),
+        outH: Math.max(2, Math.round(rh * s)),
+      };
+      syncPreviewMode(rot);
+      applyStageAspect();
+      log('k', `抓帧锁定：源 ${vw}×${vh}，旋转 ${rot}°，`
+             + `输出 ${_lockedFrame.outW}×${_lockedFrame.outH}`);
+      if (rot !== 0) {
+        log('m', '旋转在**抓帧画布**上完成 —— 发给人脸/Omni/录制的就是'
+               + '画面上看到的这张，所以人脸框不会错位');
+      }
+    }
+    const L = _lockedFrame;
+    // 源尺寸中途变了也**不改输出尺寸**（服务端只认首帧的 src_w/src_h）；
+    // 按锁定时那组尺寸拉伸，画面可能轻微变形，但框的坐标系始终有效。
+    if (vw !== L.srcW || vh !== L.srcH) {
+      if (!grab._sizeWarned) {
+        grab._sizeWarned = true;
+        log('e', `⚠️ 摄像头源尺寸变了（${L.srcW}×${L.srcH} → ${vw}×${vh}）—— `
+               + `输出仍锁在 ${L.outW}×${L.outH}，画面会被拉伸`);
+      }
+    }
+    const swap = (L.rot % 180) !== 0;
+    const dw = swap ? L.outH : L.outW;     // 旋转**前**的绘制宽
+    const dh = swap ? L.outW : L.outH;     // 旋转**前**的绘制高
+    if (cv.width !== L.outW || cv.height !== L.outH) {
+      cv.width = L.outW; cv.height = L.outH;
+    }
+    ctx2d.save();
+    ctx2d.translate(L.outW / 2, L.outH / 2);
+    ctx2d.rotate(L.rot * Math.PI / 180);
+    ctx2d.drawImage(video, -dw / 2, -dh / 2, dw, dh);
+    ctx2d.restore();
+    return { w: L.outW, h: L.outH };
+  }
+
+  /** 抓帧画布 → JPEG base64（**在回调里给结果**）。
+   *
+   *  ⚠️ **不要用 `toDataURL`**：它是同步的，JPEG 编码 + base64 全在主线程。
+   *  真机实测 1280×720 单帧 60~110ms → 25fps 把主线程打满，AlsaServer 的
+   *  WebSocket 收包被饿死，音频只跑到 36% 实时（墙钟 285.9s / 时钟 102.8s）。
+   *
+   *  `toBlob` 把**编码**交给浏览器自己的图像编码线程，`readAsDataURL` 的
+   *  base64 也在后台线程 —— 主线程只剩一次 drawImage（长边 640 约 1~2ms）。
+   *  这是"人脸 24fps"和"音频 10 块/s"能同时满足的关键。
+   *
+   *  `toBlob` 不可用时退回 `toDataURL`（老 WebView），行为与旧版一致。
+   */
+  function encodeJpeg(canvas, q, cb) {
+    if (typeof canvas.toBlob !== 'function') {
+      const du = canvas.toDataURL('image/jpeg', q);
+      cb(du.split(',')[1] || null, du);
+      return;
+    }
+    canvas.toBlob((blob) => {
+      if (!blob) { cb(null, ''); return; }
+      const fr = new FileReader();
+      fr.onload = () => {
+        const du = String(fr.result || '');
+        cb(du.split(',')[1] || null, du);
+      };
+      fr.onerror = () => cb(null, '');
+      fr.readAsDataURL(blob);
+    }, 'image/jpeg', q);
   }
 
   // 采集自检：worklet 装好、`{command:'start'}` 已发出之后，**第一个 chunk
@@ -968,41 +1287,43 @@ async function startCapture() {
   // 「AudioContext 没跑 → worklet 不渲染 → 没有音频也没有视频」
   // —— 这是「web 端音视频全无反馈」最可能的形态，而它在服务端看起来
   // 完全正常（收不到任何东西，日志干净）。
-  let _chunkSeen = false;
-  const _capTimer = setTimeout(() => {
-    if (!_chunkSeen && running) {
-      log('e', `采集自检失败：3s 内没有收到任何音频块 —— `
-             + `AudioContext=${audioCtx ? audioCtx.state : 'null'}`
-             + ` 采样率=${audioCtx ? audioCtx.sampleRate : '?'}`
-             + `。若为 suspended，点一下页面任意处恢复。`);
-      diag.lastErr = '采集未产出音频块（AudioContext=' +
-                     (audioCtx ? audioCtx.state : 'null') + '）';
-      diagUpdate();
-    }
-  }, 3000);
+  if (audioSrc === 'browser') {
+    let _chunkSeen = false;
+    const _capTimer = setTimeout(() => {
+      if (!_chunkSeen && running) {
+        log('e', `采集自检失败：3s 内没有收到任何音频块 —— `
+               + `AudioContext=${audioCtx ? audioCtx.state : 'null'}`
+               + ` 采样率=${audioCtx ? audioCtx.sampleRate : '?'}`
+               + `。若为 suspended，点一下页面任意处恢复。`);
+        diag.lastErr = '采集未产出音频块（AudioContext=' +
+                       (audioCtx ? audioCtx.state : 'null') + '）';
+        diagUpdate();
+      }
+    }, 3000);
 
-  workletNode.port.onmessage = (ev) => {
-    if (!running || ev.data.type !== 'chunk') return;
-    if (!_chunkSeen) {
-      _chunkSeen = true;
-      clearTimeout(_capTimer);
-      log('k', `采集自检通过：收到首个音频块`
-             + `（${ev.data.audio.length} 采样，AudioContext=${audioCtx.state}）`);
-    }
-    // ⚠️ **必须重采样到 16kHz 再回传**。设备不认 16kHz 的 AudioContext 时会
-    //    退到 44.1k/48k，此时每块是 4410/4800 个采样，而服务端
-    //    ``_normalize_chunk`` 会把超过 1600 的部分**截断** —— 时间轴整体
-    //    错 3 倍，参考轨的锚点换算也就全废了。
-    //    用跨块保持的分数相位累加器（见 resampleChunk16k），避免长期漂移。
-    const a16 = resampleChunk16k(ev.data.audio, audioCtx.sampleRate);
-    // ⚠️ 视频**不在这里抓**了 —— 抓帧改由独立的 40ms 定时器驱动
-    //    （见下方的 `startVideoCapture`）。原因：帧率不该被音频块率锁死。
-    //    早先抓帧挂在本回调上，于是帧率 = 块率 = 10fps。
-    session && session.sendChunk({
-      audio: a16,
-      ctxTime: ev.data.t0,                                 // 本块首采样的 ctx 时刻
-    });
-  };
+    workletNode.port.onmessage = (ev) => {
+      if (!running || ev.data.type !== 'chunk') return;
+      if (!_chunkSeen) {
+        _chunkSeen = true;
+        clearTimeout(_capTimer);
+        log('k', `采集自检通过：收到首个音频块`
+               + `（${ev.data.audio.length} 采样，AudioContext=${audioCtx.state}）`);
+      }
+      // ⚠️ **必须重采样到 16kHz 再回传**。设备不认 16kHz 的 AudioContext 时会
+      //    退到 44.1k/48k，此时每块是 4410/4800 个采样，而服务端
+      //    ``_normalize_chunk`` 会把超过 1600 的部分**截断** —— 时间轴整体
+      //    错 3 倍，参考轨的锚点换算也就全废了。
+      //    用跨块保持的分数相位累加器（见 resampleChunk16k），避免长期漂移。
+      const a16 = resampleChunk16k(ev.data.audio, audioCtx.sampleRate);
+      // ⚠️ 视频**不在这里抓**了 —— 抓帧改由独立的 40ms 定时器驱动
+      //    （见下方的 `startVideoCapture`）。原因：帧率不该被音频块率锁死。
+      //    早先抓帧挂在本回调上，于是帧率 = 块率 = 10fps。
+      session && session.sendChunk({
+        audio: a16,
+        ctxTime: ev.data.t0,                                 // 本块首采样的 ctx 时刻
+      });
+    };
+  }
 
   /* ---------- 视频抓帧（独立定时器，25fps）----------
    *
@@ -1025,28 +1346,597 @@ async function startCapture() {
    * ⚠️ 尺寸 **1280×720**（原 640×480）。G1 的检测分对像素敏感、IC 迎宾
    *  门禁要求 HIGH，这个变化**必须实测迎宾是否仍正常**。
    */
+  // ⚠️ **音频不再丢靠两件事，不是靠降帧率**（人脸服务要 24fps）：
+  //    ① 长边压到 640（像素降到 1/4.4）；
+  //    ② JPEG 编码移到浏览器后台线程（见 `encodeJpeg` 的说明）。
+  //    1280×720 q0.9 同步编码在真机单帧 60~110ms，25fps 把主线程打满 ——
+  //    AlsaServer 的 WebSocket 收包被饿死，音频只跑 36% 实时（墙钟 285.9s
+  //    / 时钟 102.8s），表现为"识别又慢又丢、播报内容还被当成用户说话"。
+  //
+  //    人脸侧的取舍：320×240 的检测分只有 0.70~0.77，过不了 IC 迎宾门禁；
+  //    640×480 是 0.82~0.85。640×360 落在这两者之间 —— **上线前必须复测
+  //    迎宾是否仍能到 HIGH**。若掉档，先抬 `VIDEO_MAX_DIM`，别去动音频侧。
+  // ⚠️ **只对 Android 大屏降分辨率**。Windows/笔记本走浏览器麦克风时保持
+  //    原来的 1280×720 q0.9 —— 那条路径从来没有主线程压力（实测 20.9fps），
+  //    不能因为修 Android 的问题把它的画质/人脸分拖下来。
+  const ON_ANDROID = isAndroid();
+  // Android 用正方形上限（旋转后长边才是 640）；其它平台沿用原来的
+  // 1280×720 包围盒 —— 输出尺寸与改动前**完全一致**。
+  const VIDEO_BOX_W = ON_ANDROID ? 640 : 1280;
+  const VIDEO_BOX_H = ON_ANDROID ? 640 : 720;
+  const VIDEO_Q = ON_ANDROID ? 0.6 : 0.9;
+  // ⚠️ **25fps 不能降**：人脸服务要 24fps 输入。主线程的负担改由
+  //    「长边 640 + 编码移到浏览器后台线程」来消，而不是降帧率。
   const VIDEO_TICK_MS = 40;          // 25fps
-  let _videoTimer = null;
+  const VIDEO_BUFFER_LIMIT = 1e6;    // 上行积压超过 1MB 就跳过视频帧
+  // 上次会话残留的定时器先清掉（重复 Start 否则会叠加抓帧）
+  if (_videoTimer) { clearInterval(_videoTimer); _videoTimer = null; }
+  if (_linkTimer) { clearInterval(_linkTimer); _linkTimer = null; }
+  let _videoSkipped = 0, _videoFrames = 0;
   function startVideoCapture() {
     if (_videoTimer) return;
-    _videoTimer = setInterval(() => {
+    // ⚠️ **自排程的链**，不是 setInterval：下一帧的起点按"上一帧真正
+    //    花掉的时间"补足到 40ms。用 setInterval 时，一旦某帧编码超过
+    //    40ms 就会整拍丢掉（25fps 直接掉成 12.5fps）；自排程只会把那一
+    //    帧延后，帧率是平滑的 ~24fps。
+    function videoTick() {
+      _videoTimer = null;
       if (!running || !session) return;
-      const frame = grab(1280, 720, 0.9);
-      if (!frame) return;
-      // ⚠️ **只发这一路**。Omni 的 1s 帧与它是同一份字节，服务端到点
-      //    自己转发（`session._maybe_feed_omni`）—— 前端不再多发一条，
-      //    省掉每秒那一帧的重复上行。
-      session.sendFrame({
-        frameBase64: frame,
-        // 抓帧**此刻**的 AudioContext 时刻 —— 服务端据此精确落位
-        ctxTime: audioCtx ? audioCtx.currentTime : 0,
+      // ⚠️ **音频优先**：socket 积压说明上行跟不上，这时只跳视频帧。
+      //    不跳的话 buffer 会越堆越多，音频块排在几百 KB 后面 ——
+      //    服务端看到的仍是"音频时快时慢"，锚点拟合照样崩。
+      if (session.ws && session.ws.bufferedAmount > VIDEO_BUFFER_LIMIT) {
+        _videoSkipped++;
+        _videoTimer = setTimeout(videoTick, VIDEO_TICK_MS);
+        return;
+      }
+      const t0 = Date.now();
+      // ⚠️ ctx_time 必须在**抓帧这一刻**取：编码回调可能晚 10~30ms，
+      //    用回调时刻会让每帧的落位都系统性偏晚。
+      const ctxAt = audioCtx ? audioCtx.currentTime : 0;
+      const shot = grab(VIDEO_BOX_W, VIDEO_BOX_H);
+      if (!shot) {
+        _videoTimer = setTimeout(videoTick, VIDEO_TICK_MS);
+        return;
+      }
+      encodeJpeg(cv, VIDEO_Q, (b64, dataUrl) => {
+        if (running && session && b64) {
+          _videoFrames++;
+          // ⚠️ **只发这一路**。Omni 的 1s 帧与它是同一份字节，服务端
+          //    到点自己转发（`session._maybe_feed_omni`）—— 前端不再
+          //    多发一条，省掉每秒那一帧的重复上行。
+          session.sendFrame({ frameBase64: b64, ctxTime: ctxAt });
+          // 非 0° 时预览**原样显示这一张**（与框所在的图逐像素一致）。
+          // ⚠️ 预览限速 5fps：给 <img> 换 src 会触发 JPEG 解码 + 纹理
+          //    上传，都占主线程；算法要的是"送出去的那张"，预览够看即可。
+          if (_lockedFrame && (_lockedFrame.rot % 360) !== 0) {
+            const nowMs = Date.now();
+            if (nowMs - (startVideoCapture._previewAt || 0) >= 200) {
+              startVideoCapture._previewAt = nowMs;
+              const img = $('camview');
+              if (img) img.src = dataUrl;
+            }
+          }
+        }
+        if (!running || !session) return;
+        // 自排程：把"上一帧总耗时"从 40ms 里扣掉，帧率钉在 25fps
+        _videoTimer = setTimeout(
+          videoTick, Math.max(0, VIDEO_TICK_MS - (Date.now() - t0)));
       });
-    }, VIDEO_TICK_MS);
-    log('k', `视频抓帧已启动：${VIDEO_TICK_MS}ms/帧（${1000 / VIDEO_TICK_MS}fps）`
-           + ` 1280×720 q0.9 —— 人脸/Omni/录制**同一份字节**`);
+    }
+    _videoTimer = setTimeout(videoTick, 0);
+    log('k', `视频抓帧已启动：目标 ${VIDEO_TICK_MS}ms/帧（25fps，人脸服务要 24fps）`
+           + ` 上限 ${VIDEO_BOX_W}×${VIDEO_BOX_H} q${VIDEO_Q}，`
+           + `JPEG 编码在浏览器后台线程 —— 人脸/Omni/录制**同一份字节**`);
   }
   startVideoCapture();
-  workletNode.port.postMessage({ command: 'start' });
+  // 链路自检：10s 一行。三个数就能判定"有没有丢" ——
+  //   视频 fps 应 ≈ 1000/VIDEO_TICK_MS；积压应长期为 0；音频块率 10/s。
+  // 若音频块率 < 9/s 或 `丢帧` 在涨，说明主线程/设备侧仍在丢，别只看
+  // ASR 的延迟下结论。
+  if (_linkTimer) clearInterval(_linkTimer);
+  _linkTimer = setInterval(() => {
+    if (!running) return;
+    const bu = (session && session.ws) ? session.ws.bufferedAmount : 0;
+    log('k', `链路 10s：视频 ${(_videoFrames / 10).toFixed(1)}fps`
+           + `（积压跳过 ${_videoSkipped} 帧）`
+           + ` 上行积压 ${(bu / 1024).toFixed(0)}KB`);
+    _videoFrames = 0; _videoSkipped = 0;
+    if (selectedAudioSource() === 'alsa') alsaLogStats();
+  }, 10000);
+  if (audioSrc === 'browser') {
+    workletNode.port.postMessage({ command: 'start' });
+  } else {
+    startAlsaSource();
+  }
+}
+
+/* ---------- AlsaServer 音频转发（Android 外接麦） ----------
+ *
+ * 协议见 `orchestrator/audio/android接入文档.md`；帧头解析与下混直接沿用
+ * 同目录 `index.html` 里已跑通的写法。
+ *
+ * ⚠️ **契约：每条音频消息必须恰好 1600 个 float32 采样**
+ *   （服务端 `MIC_CHUNK=1600`）。`session._normalize_chunk` 对超长**截断**、
+ *   对不足**补零**，且两种情况都把时间轴推进 100ms —— 块长差一点，整条
+ *   时间轴就错，AEC 参考轨与 ASR 一起废。
+ */
+const ALSA_HEADER = 24;
+const ALSA_CHUNK = 1600;
+
+// 设备固定布局（用户确认）：ch0/1 静音、ch2-5 阵列麦、ch6/7 回采。
+// ⚠️ 回采用来当 **AEC 的 farend（回声参考）**：它和 mic 是在同一块
+//    采集数据里切出来的，时间/时钟天然对齐 —— **不需要延迟估计**。
+//    这比服务端拿"自己播出去的 TTS"做参考轨准得多（那条路要测声学
+//    延迟 D，D 一错回声就消不掉）。
+const ALSA_MIC_CHS = [2, 3, 4, 5];
+const ALSA_REF_CHS = [6, 7];
+
+let alsaWs = null;
+let alsaChans = 8, alsaRate = 16000;
+let alsaSamplesSeen = 0;          // 已下混并进入待切块缓冲的采样总数
+let alsaPending = new Float32Array(0);
+let alsaPendingRef = new Float32Array(0);  // 与 alsaPending **逐采样对齐**
+let alsaTsMap = [];               // [{s, ts}] 最近若干帧的首采样时刻（epoch ms）
+let alsaChunksSent = 0;
+let alsaChunksWindow = 0;         // 本统计窗口发出的块数
+let alsaFramesIn = 0;             // 本统计窗口收到的帧数
+let alsaWindowT = 0;              // 统计窗口起点（epoch ms）
+let alsaSeqGaps = 0;              // 累计序号跳变（= 真丢数据）
+let alsaLastSeq = -1;
+let alsaLastRxLag = 0;            // 最新一帧的接收滞后（ms）
+let alsaSel = null;               // 自动选路结果 Set<int>，每个会话定一次
+let alsaCalib = null, alsaCalibN = 0, alsaCalibDone = false;
+let alsaCtxAnchor = null;         // {ctx, wall}：AudioContext ↔ 墙钟 的锚点对
+let alsaSkewMs = 0;               // 设备与浏览器是**两台机器**时的时钟偏差
+let alsaDropLogged = false;
+
+function setAlsaStat(msg, color) {
+  const el = $('alsaStat');
+  if (el) {
+    el.innerHTML = `<span style="color:${color || '#86efac'}">${msg}</span>`;
+  }
+}
+
+/** 24 字节小端帧头 → { channels, sampleRate, seq, tsHi, tsLo, payload }。 */
+function parseAlsaFrame(buf) {
+  if (!buf || buf.byteLength < ALSA_HEADER) return null;
+  const dv = new DataView(buf);
+  if (dv.getUint8(0) !== 0x41 || dv.getUint8(1) !== 0x53) return null;
+  const headerLen = dv.getUint8(3);
+  if (!headerLen || headerLen > buf.byteLength) return null;
+  return {
+    headerLen: headerLen,
+    channels: dv.getUint16(4, true),
+    sampleRate: dv.getUint32(8, true),
+    seq: dv.getUint32(12, true),
+    // ⚠️ 偏移 16 是**小端 uint64**：低 32 位在前、高 32 位在后。
+    //    写反了会得到一个 7e18 量级的假值（实测踩过：注释里那句"hi 在前"），
+    //    于是 ctxTime 全部落到兜底分支、服务端的仿射拟合永远不成形。
+    tsLo: dv.getUint32(16, true),      // 低 32 位
+    tsHi: dv.getUint32(20, true),      // 高 32 位
+    payload: new Uint8Array(buf, headerLen),
+  };
+}
+
+/** 前 1.5s 统计逐通道 RMS：auto 模式据此挑有效通道，其它模式只打日志。 */
+function alsaMaybeCalibrate(payload, ch) {
+  if (alsaCalibDone) return;
+  const n = Math.floor(payload.length / 2 / ch);
+  if (n <= 0) return;
+  if (!alsaCalib || alsaCalib.length !== ch) {
+    alsaCalib = new Float64Array(ch);
+    alsaCalibN = 0;
+  }
+  const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < ch; c++) {
+      const v = dv.getInt16((i * ch + c) * 2, true);
+      alsaCalib[c] += v * v;
+    }
+  }
+  alsaCalibN += n;
+  if (alsaCalibN < (alsaRate || 16000) * 1.5) return;
+  alsaCalibDone = true;
+  const rms = Array.from(alsaCalib, (s) => Math.sqrt(s / alsaCalibN));
+  const db = rms.map((r) => (20 * Math.log10(Math.max(r, 1e-9) / 32768)).toFixed(1));
+  log('k', 'AlsaServer 逐通道 RMS：'
+         + rms.map((r, i) => `ch${i}=${r.toFixed(0)}(${db[i]}dBFS)`).join(' '));
+  // ⚠️ 末两路是回采（本机播报的回声），**绝不能**进 mic 的自动选路 ——
+  //    早先 auto 会把它算进去，于是送进 AEC 的 nearend 自己就带着回声，
+  //    再怎么消都消不干净。
+  const micN = Math.max(1, ch - 2);
+  let mx = 0;
+  for (let i = 0; i < micN; i++) mx = Math.max(mx, rms[i]);
+  if (mx < 1) {
+    alsaSel = new Set([0]);
+    log('e', '⚠️ AlsaServer 麦克风通道几乎全静音（RMS<1）—— '
+           + '麦克风没在采，或选的声卡不对');
+    return;
+  }
+  if (selectedAlsaChannel() !== 'auto') {
+    log('k', `回采（AEC farend）ch${ch - 2}/${ch - 1}：`
+           + `RMS=${rms.slice(micN).map((r) => r.toFixed(0)).join('/')}`
+           + `（播报时应有明显电平；全 0 说明回采没接上）`);
+    return;
+  }
+  alsaSel = new Set();
+  for (let i = 0; i < micN; i++) {
+    if (rms[i] >= mx * 0.25) alsaSel.add(i);
+  }
+  if (!alsaSel.size) alsaSel.add(rms.indexOf(mx));
+  log('k', `自动选路：[${Array.from(alsaSel).join(',')}]`
+         + `（阈值 ${(mx * 0.25).toFixed(0)}；末两路回采不参与）`);
+}
+
+/** mic 用哪些通道（返回 null = 全部平均）。 */
+function alsaMicUse(ch) {
+  const mode = selectedAlsaChannel();
+  if (mode === 'mic') {
+    if (ch >= 8) return ALSA_MIC_CHS.slice();
+    // 非 8 通道设备：退化成"除末两路之外的全部"
+    const out = [];
+    for (let i = 0; i < Math.max(1, ch - 2); i++) out.push(i);
+    return out;
+  }
+  if (mode === 'auto') return alsaSel ? Array.from(alsaSel) : null;
+  if (mode === 'avg') {
+    // "全部平均"也**不含末两路回采** —— 把回声混进 nearend 等于自废 AEC
+    if (ch >= 4) {
+      const out = [];
+      for (let i = 0; i < ch - 2; i++) out.push(i);
+      return out;
+    }
+    return null;
+  }
+  const ci = Math.max(0, Math.min(ch - 1, parseInt(mode, 10) || 0));
+  return [ci];
+}
+
+/** AEC 的 farend 用哪些通道。
+ *
+ *  ⚠️ 8 通道设备**不管 mic 选哪种模式都送末两路** —— 回采是设备物理
+ *  布局，和 mic 怎么取无关。这样即使 localStorage 里还存着旧的 "auto"，
+ *  算法 AEC 也照样拿得到参考信号（否则回声会静默地消不掉）。
+ *  更少通道的设备只在显式 `mic` 模式下才猜"末两路"（可能是别的东西）。 */
+function alsaRefUse(ch) {
+  if (ch >= 8) return ALSA_REF_CHS.slice();
+  if (ch >= 4 && selectedAlsaChannel() === 'mic') return [ch - 2, ch - 1];
+  return null;
+}
+
+/** 交错 s16le → 单声道 float32（-1..1）。``use`` 为 null 时全部平均。 */
+function alsaDownmix(payload, ch, use) {
+  const n = Math.floor(payload.length / 2 / ch);
+  const out = new Float32Array(Math.max(0, n));
+  if (n <= 0) return out;
+  const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  for (let i = 0; i < n; i++) {
+    const base = i * ch;
+    let s = 0, cnt = 0;
+    if (use) {
+      for (let k = 0; k < use.length; k++) {
+        s += dv.getInt16((base + use[k]) * 2, true);
+        cnt++;
+      }
+    } else {
+      for (let c = 0; c < ch; c++) {
+        s += dv.getInt16((base + c) * 2, true);
+        cnt++;
+      }
+    }
+    out[i] = (cnt ? s / cnt : 0) / 32768;
+  }
+  return out;
+}
+
+/** 第 sampleIdx 个采样（在已收到的采样轴上）的采集时刻，epoch ms。
+ *
+ *  ⚠️ **不要直接用逐帧时间戳**：USB 采集是批量调度的，`pcm_read` 返回后才
+ *  打时间戳，实测相邻块的时间差在 48~136ms 之间抖（标称 100ms），最小二乘
+ *  残差 ~19ms —— 正好卡在服务端 `ANCHOR_RESIDUAL_MS=20` 的门槛上，AEC 的
+ *  参考轨也会跟着抖 ±20ms（容忍窗只有 ±5ms）。
+ *  改用「固定斜率 16000 + 最近 32 帧偏移中位数」的平滑时钟：抖动是对称的，
+ *  中位数把它消掉；设备时钟的长期漂移靠滑动窗口跟上（实测斜率
+ *  −174ppm，3.2s 窗口内只差 0.5ms）。
+ */
+function alsaTsOfSample(sampleIdx) {
+  if (alsaTsMap.length >= 4) {
+    const offs = alsaTsMap
+      .map((r) => r.ts - r.s * 1000 / alsaRate)
+      .sort((a, b) => a - b);
+    const med = offs[Math.floor(offs.length / 2)];
+    return med + sampleIdx * 1000 / alsaRate;
+  }
+  // 预热阶段（前几帧）只能用原始戳
+  for (let i = alsaTsMap.length - 1; i >= 0; i--) {
+    const r = alsaTsMap[i];
+    if (sampleIdx >= r.s) return r.ts + (sampleIdx - r.s) * 1000 / alsaRate;
+  }
+  return null;
+}
+
+/** 采集时刻 → 浏览器的 AudioContext 时钟（服务端靠它拟合 sample↔ctx）。
+ *
+ *  ⚠️ 不能用"发消息那一刻的 currentTime"：WebSocket 会突发/积压，那样
+ *  标记会把积压伪装成匀速，AEC 参考轨就落错位置。用帧头时间戳才是真的
+ *  "这块是什么时候采到的"。
+ */
+function alsaCtxTimeOf(sampleIdx) {
+  if (!audioCtx) return 0;
+  const nowMs = Date.now();
+  if (!alsaCtxAnchor || nowMs - alsaCtxAnchor.wall > 1000) {
+    // 同一 tick 内取一对锚点；两钟都按真实时间走，1s 刷新足够
+    alsaCtxAnchor = { ctx: audioCtx.currentTime, wall: nowMs };
+  }
+  let ts = alsaTsOfSample(sampleIdx);
+  if (ts != null && alsaSkewMs) ts += alsaSkewMs;
+  if (ts != null) {
+    let ago = (alsaCtxAnchor.wall - ts) / 1000;
+    if (ago < 0) ago = 0;                 // 抖动导致的"未来"时刻，夹到 0
+    if (ago <= 15) {                      // 再旧就说明时间戳对不上，走兜底
+      const v = alsaCtxAnchor.ctx - ago;
+      if (v > 0) return v;
+    }
+  }
+  return Math.max(0.001, audioCtx.currentTime - 0.05);
+}
+
+/** 追加单声道样本，按 1600 精确切块后发送。
+ *
+ *  ``ref`` 是与 ``mono`` **在同一帧里切出来的回采通道**（AEC 的 farend）。
+ *  两者长度相同、逐采样对齐 —— 服务端拿到就直接当参考，**D=0**，
+ *  不需要任何声学延迟估计。这是消掉"播报被识别成用户说话"的关键。
+ */
+function alsaPush(mono, ref, tsMs) {
+  if (!mono.length) return;
+  // 防御：ref 必须与 mic 同长，且两路待切缓冲必须从头就同步。
+  // 不满足就整段不发 ref —— 绝不把错位的 farend 送进 AEC。
+  let useRef = !!(ref && ref.length === mono.length
+                  && alsaPendingRef.length === alsaPending.length);
+  if (!useRef && alsaPendingRef.length) alsaPendingRef = new Float32Array(0);
+  const startSample = alsaSamplesSeen;
+  // 设备 NTP 校时会让时间戳跳变 —— 跳变时按外推值继续，别把锚点带歪
+  if (alsaTsMap.length) {
+    const prev = alsaTsMap[alsaTsMap.length - 1];
+    const expect = prev.ts + (startSample - prev.s) * 1000 / alsaRate;
+    if (Math.abs(tsMs - expect) > 2000) {
+      if (!alsaPush._tsWarned) {
+        alsaPush._tsWarned = true;
+        log('e', `⚠️ AlsaServer 时间戳跳变 `
+               + `${(tsMs - expect).toFixed(0)}ms —— 按外推值继续`);
+      }
+      tsMs = expect;
+    }
+  }
+  alsaTsMap.push({ s: startSample, ts: tsMs });
+  if (alsaTsMap.length > 64) alsaTsMap.shift();
+  alsaSamplesSeen += mono.length;
+
+  const merged = new Float32Array(alsaPending.length + mono.length);
+  merged.set(alsaPending, 0);
+  merged.set(mono, alsaPending.length);
+  alsaPending = merged;
+  if (useRef) {
+    const mergedRef = new Float32Array(alsaPendingRef.length + ref.length);
+    mergedRef.set(alsaPendingRef, 0);
+    mergedRef.set(ref, alsaPendingRef.length);
+    alsaPendingRef = mergedRef;
+  }
+
+  const base = alsaSamplesSeen - alsaPending.length;   // pending[0] 的绝对下标
+  let off = 0;
+  while (alsaPending.length - off >= ALSA_CHUNK) {
+    if (session && session.ready && running) {
+      const chunk = {
+        // ⚠️ 必须拷一份：subarray 与原缓冲共享内存
+        audio: alsaPending.slice(off, off + ALSA_CHUNK),
+        ctxTime: alsaCtxTimeOf(base + off),
+      };
+      // farend 与 mic 用**同一次切块边界** —— 服务端直接当参考，D=0
+      if (alsaPendingRef.length >= off + ALSA_CHUNK) {
+        chunk.ref = alsaPendingRef.slice(off, off + ALSA_CHUNK);
+      }
+      session.sendChunk(chunk);
+      alsaChunksSent++;
+      alsaChunksWindow++;
+    } else if (!alsaDropLogged) {
+      alsaDropLogged = true;
+      log('m', '会话尚未 ready —— 先丢弃 AlsaServer 的音频块');
+    }
+    off += ALSA_CHUNK;
+  }
+  if (off > 0) {
+    alsaPending = alsaPending.slice(off);
+    if (alsaPendingRef.length >= off) {
+      alsaPendingRef = alsaPendingRef.slice(off);
+    } else {
+      alsaPendingRef = new Float32Array(0);
+    }
+  }
+}
+
+/** 每 10s 一行：把"音频到底有没有丢"变成可读的数字。
+ *
+ *  ``块率`` 必须 ≈10/s（服务端契约 100ms/块）；``丢帧`` 是 AlsaServer
+ *  序号跳变累计（TCP 不会丢，涨说明设备侧/服务端缓冲溢出 —— 就是主线程
+ *  被视频编码卡住的那种形态）。 */
+function alsaLogStats() {
+  const now = Date.now();
+  const dt = (now - (alsaWindowT || now)) / 1000;
+  alsaWindowT = now;
+  const rate = dt > 0 ? alsaChunksWindow / dt : 0;
+  const warn = rate < 9;
+  log(warn ? 'e' : 'k',
+      `AlsaServer ${dt.toFixed(1)}s：收帧 ${alsaFramesIn}`
+      + ` 发送 ${alsaChunksWindow} 块（${rate.toFixed(1)}/s，正常 10/s）`
+      + ` 丢帧 ${alsaSeqGaps} 滞后 ${alsaLastRxLag.toFixed(0)}ms`
+      + (warn ? ' ⚠️ 音频没跑满实时 —— 先查视频编码是否还在抢主线程' : ''));
+  alsaFramesIn = 0;
+  alsaChunksWindow = 0;
+}
+
+function alsaOnBinary(buf) {
+  const f = parseAlsaFrame(buf);
+  if (!f || !f.channels) {
+    log('e', 'AlsaServer 帧头解析失败 —— 丢弃该帧');
+    return;
+  }
+  if (f.channels) alsaChans = f.channels;
+  if (f.sampleRate) alsaRate = f.sampleRate;
+
+  // ---- 序号跳变 = 真的丢数据了 ----
+  // TCP 本身不丢包，所以这里涨就意味着 **AlsaServer 的发送缓冲/本端
+  // 接收缓冲溢出**（典型诱因：主线程被 JPEG 编码占满，收包来不及）。
+  // 这是"音频丢失"最直接的证据，比事后看 ASR 延迟靠谱。
+  const seq = f.seq >>> 0;
+  if (alsaLastSeq >= 0) {
+    const gap = (seq - alsaLastSeq) >>> 0;
+    if (gap > 1 && gap < 0x7fffffff) alsaSeqGaps += gap - 1;
+  }
+  alsaLastSeq = seq;
+  alsaFramesIn++;
+
+  let tsMs = f.tsHi * 4294967296 + f.tsLo;
+  if (!alsaOnBinary._skewChecked) {
+    alsaOnBinary._skewChecked = true;
+    const skew = Date.now() - tsMs;
+    if (Math.abs(skew) > 500) {
+      // 浏览器不在设备上（例如从笔记本联调）：两台机器的时钟不同源
+      alsaSkewMs = skew;
+      log('m', `AlsaServer 时间戳来自另一台机器的时钟，偏差 `
+             + `${(skew / 1000).toFixed(1)}s —— 已校正`);
+    }
+  }
+  // 采集→收到 的滞后。设备本机应在几十 ms 内；持续涨 = 主线程在卡。
+  alsaLastRxLag = Date.now() - (tsMs + alsaSkewMs);
+
+  alsaMaybeCalibrate(f.payload, f.channels);
+  // mic 与 farend **从同一帧里各切一路** —— 对齐是天然的（D=0）
+  const mic = alsaDownmix(f.payload, f.channels, alsaMicUse(f.channels));
+  const refUse = alsaRefUse(f.channels);
+  const ref = refUse ? alsaDownmix(f.payload, f.channels, refUse) : null;
+  alsaPush(mic, ref, tsMs);
+}
+
+function alsaOnText(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch (e) { return; }
+  if (msg.type === 'response') {
+    if (msg.cmd === 'start') {
+      // 1005 = 已在录音中（全局只有一路，直接监听即可）
+      if (msg.code === 0 || msg.code === 1005) {
+        const cfg = (msg.data && msg.data.config) || {};
+        if (cfg.channels) alsaChans = cfg.channels;
+        if (cfg.sampleRate) alsaRate = cfg.sampleRate;
+        setAlsaStat(`录音中 —— ${alsaChans}ch @ ${alsaRate}Hz`
+                    + (msg.code === 1005 ? '（已在录音中，直接监听）' : ''));
+        log('k', `AlsaServer start ok：${alsaChans}ch/${alsaRate}Hz `
+               + `card=${cfg.card} mono=${cfg.mono}`);
+      } else {
+        setAlsaStat(`start 失败 code=${msg.code}：${msg.message || ''}`, '#fca5a5');
+        log('e', `AlsaServer start 失败 code=${msg.code} ${msg.message || ''}`);
+      }
+    }
+  } else if (msg.type === 'event') {
+    if (msg.event === 'recording_started') {
+      setAlsaStat(`录音中 —— ${alsaChans}ch @ ${alsaRate}Hz`);
+    } else if (msg.event === 'recording_stopped') {
+      setAlsaStat('录音已停止', '#fbbf24');
+    } else if (msg.event === 'error') {
+      const d = msg.data || {};
+      setAlsaStat(`错误 ${d.code}：${d.message || ''}`, '#fca5a5');
+      log('e', `AlsaServer 错误 ${d.code}：${d.message || ''}`);
+    }
+  }
+}
+
+function startAlsaSource() {
+  const urlEl = $('alsaUrl');
+  const url = (urlEl && urlEl.value.trim()) || 'ws://127.0.0.1:38888';
+  alsaSamplesSeen = 0;
+  alsaPending = new Float32Array(0);
+  alsaPendingRef = new Float32Array(0);
+  alsaTsMap = [];
+  alsaChunksSent = 0;
+  alsaChunksWindow = 0;
+  alsaFramesIn = 0;
+  alsaWindowT = Date.now();
+  alsaSeqGaps = 0;
+  alsaLastSeq = -1;
+  alsaLastRxLag = 0;
+  alsaSel = null;
+  alsaCalib = null; alsaCalibN = 0; alsaCalibDone = false;
+  alsaCtxAnchor = null;
+  alsaSkewMs = 0;
+  alsaDropLogged = false;
+  alsaOnBinary._skewChecked = false;
+  alsaPush._tsWarned = false;
+
+  setAlsaStat('连接中…', '#fbbf24');
+  log('k', 'AlsaServer 连接 ' + url);
+  if (selectedAlsaChannel() === 'mic') {
+    log('k', `声道映射：mic=ch${ALSA_MIC_CHS.join('/')}，`
+           + `AEC farend=ch${ALSA_REF_CHS.join('/')}（回采，D=0）`);
+  } else {
+    log('m', `mic 用「${selectedAlsaChannel()}」模式；8 通道设备的 `
+           + `AEC farend 仍固定取末两路 ch${ALSA_REF_CHS.join('/')}（回采）`);
+  }
+  try {
+    alsaWs = new WebSocket(url);
+  } catch (e) {
+    setAlsaStat('WebSocket 创建失败：' + e.message, '#fca5a5');
+    return;
+  }
+  alsaWs.binaryType = 'arraybuffer';
+  alsaWs.onopen = () => {
+    setAlsaStat('已连接，请求开始录音…', '#fbbf24');
+    alsaWs.send(JSON.stringify({
+      id: Date.now(), cmd: 'start',
+      params: {
+        channels: 8, sampleRate: 16000, periodSize: 1024, periodCount: 8,
+        format: 0,
+        // 所有客户端断开就停 —— 免得页关了设备还在录
+        autoStopWhenAllClientsLeave: true,
+      },
+    }));
+  };
+  alsaWs.onmessage = (ev) => {
+    if (typeof ev.data === 'string') alsaOnText(ev.data);
+    else alsaOnBinary(ev.data);
+  };
+  alsaWs.onerror = () => {
+    setAlsaStat('连接错误 —— 检查 AlsaServer 是否在跑、地址与端口', '#fca5a5');
+  };
+  alsaWs.onclose = () => {
+    setAlsaStat('已断开', '#fbbf24');
+  };
+
+  // 自检：3s 内一个 1600 采样块都没发出去 = 音频链路没通
+  setTimeout(() => {
+    if (running && !alsaChunksSent) {
+      log('e', '采集自检失败（AlsaServer）：3s 内没有任何音频数据 —— '
+             + '看「音频来源」里的状态行与错误码');
+      diag.lastErr = 'AlsaServer 未产出音频';
+      diagUpdate();
+      setAlsaStat('3s 无音频数据', '#fca5a5');
+    }
+  }, 3000);
+}
+
+function stopAlsaSource() {
+  const ws = alsaWs;
+  alsaWs = null;
+  if (ws) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ id: Date.now(), cmd: 'stop' }));
+      }
+    } catch (e) { /* ignore */ }
+    try { ws.close(); } catch (e) { /* ignore */ }
+  }
+  alsaPending = new Float32Array(0);
+  setAlsaStat('已停止', '#888');
 }
 
 /* ---------- 人脸叠加绘制 ----------
@@ -1056,13 +1946,7 @@ async function startCapture() {
  * 服务端在每条 face.state 里带 src_w/src_h。
  */
 function drawFace(m) {
-  const video = $('cam'), ov = $('overlay');
-  const w = video.clientWidth || 320;
-  const h = video.clientHeight || 240;
-  if (ov.width !== w || ov.height !== h) { ov.width = w; ov.height = h; }
-  const ctx = ov.getContext('2d');
-  ctx.clearRect(0, 0, w, h);
-
+  const ov = $('overlay');
   const t = (m.tracks && m.tracks[0]) || null;
   const id = m.identity || null;
   const wake = m.wake || null;
@@ -1070,19 +1954,29 @@ function drawFace(m) {
   const fs = m.state || null;
   if (fs) evtCounts['face.state_seq'] = fs.state_seq;
 
-  // 源分辨率优先用服务端下发的；缺失时退回采集分辨率
-  const srcW = (t && t.src_w) || 320;
-  const srcH = (t && t.src_h) || 240;
-  const sx = w / srcW, sy = h / srcH;
+  // ⚠️ 坐标系 = **服务端收到的 JPEG 的像素空间**，也就是我们锁死的输出尺寸。
+  //    overlay 的 backing store 直接用它（1:1 画），CSS 再整体缩放到显示区 ——
+  //    不再依赖 video.clientWidth（旋转后那个值与 JPEG 完全不是同一个坐标系，
+  //    这正是"转了画面框还是错"的根因）。
+  const srcW = (t && t.src_w) || (_lockedFrame && _lockedFrame.outW) || 320;
+  const srcH = (t && t.src_h) || (_lockedFrame && _lockedFrame.outH) || 240;
+  if (ov.width !== srcW || ov.height !== srcH) {
+    ov.width = srcW; ov.height = srcH;
+  }
+  const ctx = ov.getContext('2d');
+  ctx.clearRect(0, 0, srcW, srcH);
+  // 线宽/字号按"显示尺寸"反向放大：backing store 是 1280×720 而 CSS 只显示
+  // 几百像素，不放大的话框线细得看不见。
+  const k = Math.max(1, srcW / (ov.clientWidth || srcW));
 
   if (t && t.valid && t.box) {
-    const [l, tp, r, b] = t.box;
-    const x = l * sx, y = tp * sy;
-    const bw = (r - l) * sx, bh = (b - tp) * sy;
+    const [l, tp, r, b] = t.box;      // 原始像素坐标，1:1
+    const x = l, y = tp;
+    const bw = r - l, bh = b - tp;
 
     // 唤醒中：绿框；否则黄框
     ctx.strokeStyle = t.interacting ? '#22c55e' : '#eab308';
-    ctx.lineWidth = t.interacting ? 3 : 2;
+    ctx.lineWidth = (t.interacting ? 3 : 2) * k;
     ctx.strokeRect(x, y, bw, bh);
 
     // 标签：置信度 + 唇动 + 身份
@@ -1094,12 +1988,12 @@ function drawFace(m) {
     if (t.interacting) parts.push('✓唤醒');
     const label = parts.join(' · ');
 
-    ctx.font = '600 13px ui-monospace, monospace';
+    ctx.font = `600 ${Math.round(13 * k)}px ui-monospace, monospace`;
     const tw = ctx.measureText(label).width;
     ctx.fillStyle = 'rgba(0,0,0,0.65)';
-    ctx.fillRect(x, Math.max(0, y - 20), tw + 10, 19);
+    ctx.fillRect(x, Math.max(0, y - 20 * k), tw + 10 * k, 19 * k);
     ctx.fillStyle = t.interacting ? '#86efac' : '#fde68a';
-    ctx.fillText(label, x + 5, Math.max(14, y - 6));
+    ctx.fillText(label, x + 5 * k, Math.max(14 * k, y - 6 * k));
   }
 
   // 文本面板
@@ -1131,6 +2025,41 @@ function drawFace(m) {
         : '');
   }
   if (t) evtCounts['face.state'] = (evtCounts['face.state'] || 0) + 1;
+}
+
+/** 自动纠偏（**只做一次**，仅会话开始后 6s 内）：
+ *  连续 8 条 face.state 都检不到脸 → 认为角度猜反了，翻 180°。
+ *
+ *  ⚠️ 只翻 180°：90↔270 / 0↔180 的**输出尺寸完全相同**，所以服务端那套
+ *     "首帧定 src_w/src_h" 的坐标系不会失效（尺寸一变就再也没脸了）。
+ *  误判的代价只是画面上下颠倒一次，用户手动改回即可，框依然对。
+ */
+function maybeAutoRotate(m) {
+  if (_rotAutoDone || !_lockedFrame) return;
+  if (!_sessionStartedAt || Date.now() - _sessionStartedAt > 6000) {
+    _rotAutoDone = true;
+    return;
+  }
+  const t = (m.tracks && m.tracks[0]) || null;
+  if (t && t.valid) {
+    _rotAutoDone = true;
+    _noFaceStreak = 0;
+    return;
+  }
+  _noFaceStreak += 1;
+  if (_noFaceStreak < 8) return;
+  _rotAutoDone = true;
+  const L = _lockedFrame;
+  const alt = (L.rot + 180) % 360;
+  log('m', `角度自动纠偏：${L.rot}° → ${alt}°（图像尺寸不变 `
+         + `${L.outW}×${L.outH}，服务端坐标系不受影响）`);
+  L.rot = alt;
+  const sel = $('camRotate');
+  if (sel) {
+    sel.value = String(alt);
+    try { localStorage.setItem(CAM_ROT_KEY, sel.value); } catch (e) { /* ignore */ }
+  }
+  syncPreviewMode(alt);
 }
 
 /* ---------- 统计 ---------- */
@@ -1217,6 +2146,9 @@ $('btnStart').onclick = async () => {
     player = new PcmPlayer(audioCtx);
     session = new OrchestratorSession({
       player,
+      // 可选覆盖（高级参数）：从本地 http.server 打开本页联调时，
+      // location.host 是本机，必须显式指向编排服务。留空 = 默认。
+      url: ($('orchUrl') && $('orchUrl').value.trim()) || undefined,
       onEvent: (m) => {
         evtCounts[m.type] = (evtCounts[m.type] || 0) + 1;
         if (m.type === 'asr') {
@@ -1251,6 +2183,7 @@ $('btnStart').onclick = async () => {
           diagUpdate();
           finishTtsLine(m.response_id, m.text);
         } else if (m.type === 'face.state') {
+          maybeAutoRotate(m);
           drawFace(m);
         } else if (m.type === 'session.stats') {
           renderDelay(m);
@@ -1275,11 +2208,21 @@ $('btnStart').onclick = async () => {
       onClose: () => { log('e', '连接关闭'); running = false; },
       onError: (e) => log('e', 'WS 错误'),
     });
-    const aecMode = selectedAecMode();
+    const aecMode = effectiveAecMode();
+    if (selectedAecMode() !== aecMode) {
+      log('m', `回声消除：页面选的是「${selectedAecMode()}」，但外接麦没有 `
+             + `MediaStream ⇒ 实际按「${aecMode}」下发`);
+    }
     // 高级参数：只在**有值**时才放进 payload（空 = 服务端用默认）
     const { asr: advAsr, systemPrompt: advPrompt } = collectAdvParams();
     const startPayload = {
-      identity: { page: 'orchestrator-test', device_id: deviceKey() },
+      identity: {
+        page: 'orchestrator-test',
+        // ⚠️ 两条采集路径的声学延迟 D 不共用（外接麦 vs 浏览器麦），
+        //    设备标识加后缀让服务端分别记忆。
+        device_id: deviceKey()
+          + (selectedAudioSource() === 'alsa' ? '-alsa' : ''),
+      },
       aec_mode: aecMode,
       // 能力位：本前端会在 tts.start 后立刻**承诺**起播时刻，服务端据此
       // 精确落位参考轨。没有这一位的客户端会让服务端退回预测落位。
@@ -1347,8 +2290,11 @@ function resampleChunk16k(x, srcRate) {
 
 /* 切换 AEC 模式：会话中可直接切，服务端会启用/停用云端 AEC */
 $('aecMode').onchange = () => {
-  const m = selectedAecMode();
+  const m = effectiveAecMode();
   log('v', `回声消除模式 → ${m}`);
+  if (selectedAecMode() !== m) {
+    log('m', '外接麦没有 MediaStream，浏览器原生 AEC 不可用 ⇒ 实际用算法服务 AEC');
+  }
   if (session && session.ready) {
     session.send({ type: 'set_aec_mode', mode: m });
     if (m === 'service') {
@@ -1361,6 +2307,8 @@ $('aecMode').onchange = () => {
 $('btnStop').onclick = async () => {
   running = false;
   if (_videoTimer) { clearInterval(_videoTimer); _videoTimer = null; }
+  if (_linkTimer) { clearInterval(_linkTimer); _linkTimer = null; }
+  stopAlsaSource();
   if (workletNode) { try { workletNode.port.postMessage({ command: 'stop' }); } catch (e) {} }
   if (session) await session.stop('user_stop');
   if (micStream) micStream.getTracks().forEach(t => t.stop());
@@ -1373,6 +2321,9 @@ $('btnStop').onclick = async () => {
 
 initAecMode();
 initAdvParams();
+initAudioSource();
+initCamRotate();
+window.addEventListener('resize', () => { applyStageAspect(); });
 log('k', `就绪。当前回声消除模式：${selectedAecMode()}`
        + `（选算法服务请外放，别戴耳机）`);
 
