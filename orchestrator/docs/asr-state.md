@@ -1,190 +1,96 @@
-# ASR 五个状态量 —— 取值约定（**权威**）
+# ASR 五个状态量 —— 编排层的消费约定
 
-本文是 `AsrState` 五个字段的**唯一权威定义**。其它位置（`README.md`、
-`asr/client.py` 的 docstring、`tests/README.md`）只做摘要 + 链接到本文，
-避免多处各写一份、然后各自漂移。
+**2026-10 起，这五个量全部由 ASR 服务端计算**，放在每条消息的 `state` 里
+下发（取值规则的权威定义见 `asr-2pass/docs/websocket-api.md` §4 与
+`Fun-ASR-deploy/docs/websocket-api.md` §4）。编排层**不再自己归纳** ——
+`orchestrator/asr/client.py` 的 `AsrStateTracker` 现在只是：
 
-代码：`orchestrator/asr/client.py` 的 `AsrStateTracker`。
+1. 把服务端的 `state` 原样缓存成 `AsrState`（档位归一成大写四值）；
+2. 一轮结束后分两拍把快照清零（见第三节）。
+
 下发：`AsrDisplay.state`（UI）/ `apply_vad` `apply_asr`（InteractionCore）。
 
 ---
 
-## 一、核心区分：**本轮内** vs **本轮结论**
+## 一、字段（服务端语义摘要）
 
-这五个字段分成两类，**清空时机完全不同** —— 这是本设计最要紧的一条：
-
-| 类别 | 字段 | 回答的问题 | 一轮结束后 |
-|---|---|---|---|
-| **本轮内** | `说` `抢` | 「**此刻**在不在出声 / 抢话」 | **立即** `NONE` |
-| **本轮结论** | `完` `信` `text` | 「**这一轮**说完了吗 / 置信度 / 说了什么」 | **保留 1s**（可调），供 UI 读刚才那句 |
-
-**为什么这么分**：「此刻在不在」是**瞬时**事实 —— 这一轮结束了，答案就作废，
-继续报 `HIGH` 是错的。「本轮是什么」是**已经发生**的事实 —— 轮结束后还要让人
-看到（UI 上得能读刚才说了什么）。
-
-> 早先两者共用同一个保持窗口（`SPEAKING_HOLD_MS = 1200`），表现为
-> 「一轮结束了还在报用户在说话」。已废弃。
-
-### 「一轮结束」的定义
-
-**段关闭**，两处触发：
-
-- 收到 `2pass-offline`（服务端对这段的最终识别）
-- 收到 `turnsense`（VAD 判出语音段边界）
-
-### ⚠️ 一拍缓冲：保证「拿到最终结果 = 抢 HIGH」能被观测到
-
-`offline` **同时**是「本轮结束」和「确认说出了内容」—— 两者在同一条消息上。
-若在 `offline` 里直接关段，那个 `HIGH` 就**永远观测不到**（快照与关段同拍完成）。
-
-所以 `offline` 那一拍：
-
-```
-offline 到达 → 说=HIGH 抢=HIGH（IC 必然收到）    ← 一拍缓冲
-下一拍       → 说=NONE 抢=NONE（立即清）
-```
-
-实现见 `_pending_close` / `_turn_active()`。**这一拍不是"保持窗口"**，
-而是「让同一拍产生的两个事实都被观测到」—— 只有一个 tick（50ms）。
-
----
-
-## 二、四个档位量
-
-取值域统一 `HIGH` / `MEDIUM` / `LOW` / `NONE`。
-
-### 说 `user_speaking_confidence` —— 用户是否正在出声
-
-| 值 | 条件 |
-|---|---|
-| `HIGH` | 段开着（含拍板那一拍）**且**本段已有转写文本 |
-| `MEDIUM` | 段开着**但还没有文本**（盲窗：出声了、ASR 还没吐字） |
-| `NONE` | 段已关且过了缓冲那一拍 = 真静音 |
-
-**用途**：IC 的 `user_is_speaking`（→ `LISTEN`）与 SOP 06。
-注意 IC 要求的是 `== HIGH`，`MEDIUM` 不满足。
-
-### 抢 `barge_in_confidence` —— 抢话把握
-
-| 值 | 条件 |
-|---|---|
-| `HIGH` | **拿到带转写的最终结果**，或本段已吐 **≥3 个**带文本流式帧 |
-| `MEDIUM` | 本段 **2 个**带文本流式帧 |
-| `LOW` | 本段 **1 个**带文本流式帧 |
-| `NONE` | 本段还没有，或段已关 |
-
-**用途**：IC 的 SOP 07 抢话停播 —— `barge_yield_signal` 判据是
-`barge≥MEDIUM ∧ face HIGH ∧ lip≥MEDIUM`，且需**连续满足 300ms**（`barge_yield_ms`）
-才 `YIELD`。
-
-**两条达到 `HIGH` 的路径**，为什么：
-
-- 「拿到带转写的最终结果」= 用户**确实说出了内容**，最硬的证据
-- 「≥3 个带文本流式帧」= ASR 反复确认有内容（应对最终结果来得晚的情况）
-
-⚠️ **空文本的最终结果不置 `HIGH`** —— 那只是 VAD 收尾帧，不代表说出了内容
-（与「空帧不擦转写」同一口径，见 `downstream.py` 里那段注释）。
-
-⚠️ **帧数每段重置**（在 `_on_online` 的新段分支里）。早先只在 `offline` 归零，
-而 `offline` 不再归零之后，靠的是段开始重置 —— 这样**不跨句累积**
-（早先的 bug：句1+1、句2+1、句3 刚开始就 `HIGH`）。
-
-### 信 `asr_confidence` —— 本轮转写置信度
-
-| 值 | 条件 |
-|---|---|
-| `HIGH` | 平均置信度 `>= confidence_threshold`（默认 **0.8**） |
-| `MEDIUM` | `>= online_confidence_threshold`（默认 **0.6**）且 `< 0.8` |
-| `LOW` | `< 0.6` |
-| `NONE` | 本轮还没有任何置信度信号 |
-
-**用途**：IC 判 SOP 01/02「没听清，请您再说一遍」（`asr_fail_streak` 累加）。
-
-**流式与离线走同一套三档** —— 都用各自的 `confidence.avg`，
-用户不用记「流式看这个线、离线看那个线」。
-
-#### ⚠️ 关键：空文本帧**保留**上一次的分数，不擦成 NONE
-
-实测（31366 / C++ 服务端）：
-
-| 帧 | `text` | `online_confidence` |
+| 字段 | 取值 | 含义 |
 |---|---|---|
-| 1 | `'好了现在'` | **0.854** |
-| 2 | `''` | **（无此字段）** |
-| 3 | `'呃我今'` | **0.795** |
-| 4 | `''` | **（无此字段）** |
+| `user_speaking_confidence`（说） | `HIGH` / `MEDIUM` / `NONE` | 此刻是否在出声 |
+| `barge_in_confidence`（抢） | `HIGH` / `MEDIUM` / `LOW` / `NONE` | 此刻是否在抢话 |
+| `transcript` | string | 本轮累计转写（服务端维护：流式拼接、离线覆盖、新轮清空） |
+| `asr_confidence`（信） | `HIGH` / `MEDIUM` / `LOW` / `NONE` | 本轮转写置信度 |
+| `turn_complete_confidence`（完） | `HIGH` / `MEDIUM` / `LOW` / `NONE` | 本轮是否说完 |
 
-**有文本的帧一定带分数，空文本帧一定不带。**
+服务端的具体档位规则（阈值、拍板条件、抢话档位）见上面两份
+`websocket-api.md` §4 —— **以那里为准**，本文不复述，避免两处漂移。
 
-所以规则是：
+`state` 里还会有 9 个感知字段（`language` / `emotion` / `snr_db` /
+`noise` / `overlap` …）。编排层**默认打开**（`AsrConfig.enable_perception =
+True`，首帧连同 6 个逐项开关一起下发），所以线上 `state` 是 14 个 key。
 
-- 帧**带分数** → 按三档正常更新
-- 帧**不带分数** → **保持上一次的值**
+- 部署侧想关：`ORCH_ASR_PERCEPTION=0`（`orchestrator/config.py` 的
+  `Settings.asr_perception`）→ 首帧 `enable_perception=false`，`state` 回到
+  5 个 key，服务端也不再跑感知推理。
+- **不让前端单会话改**：服务端模型是全局加载的，逐会话开关只会让排查时
+  说不清"到底开没开"。
+- 编排层目前对这 9 个字段**只透传、不消费**：`AsrState` 只取那 5 个基础
+  字段 + `transcript`，其余 key 原样丢弃（不会报错，也不进 IC/UI）。
 
-早先的实现是「拿不到分就置 `NONE`」，于是**每个空帧都把上一帧刚给的分擦掉** ——
-`信` 在 `HIGH`/`NONE` 之间**逐帧抖动**。空帧只表示「这一帧没有新分数」，
-不代表这一轮没置信度。
-
-> 排查提示：看原始帧的置信度**必须用 `parse_online_confidence()`**（先标量、
-> 后对象），不能只看 `msg["confidence"]` —— asr-2pass(C++) 流式走标量
-> `online_confidence`，Fun-ASR(Python) 走 `confidence` 对象。
-> 只看对象会把 C++ 的帧全看成"没带分数"（这个盲区把人带偏过）。
-
-### 完 `turn_complete_confidence` —— 本轮说完的把握
-
-| 值 | 条件 |
-|---|---|
-| `HIGH` | **已拍板**：收到 `2pass-offline`，或 `turnsense` 判 `complete` |
-| `MEDIUM` | 本段发生过 VAD 切分（知道有边界），但还没拍板 |
-| `LOW` | 有转写、正在说，还没结束 |
-| `NONE` | 无转写 |
-
-**用途**：IC 判 `ANSWER`（`turn_complete == HIGH` 才回答）。
+**档位归一**：服务端下发什么就是什么，只有大小写与未知值做归一
+（`high` → `HIGH`，缺失/`null`/未知 → `NONE`）。客户端不推导档位。
 
 ---
 
-## 三、`transcript` —— 本轮说了什么
+## 二、为什么还要在客户端清一次
 
-- 流式阶段：`2pass-online` 是**增量片段**（`"今天的"` / `"说出去看"`），
-  **自己拼接**（服务端不发累积文本）
-- 收到 `2pass-offline`：用最终结果**覆盖**
-- 新一轮开始：清空
+服务端**只在"有消息"时带 `state`**。一句话说完（`2pass-offline`）之后
+它不会再主动下发任何消息，而 IC 需要知道"状态已经清了" —— 不清的话
+它会永远停在最后一条快照上（实测：一轮结束后 `说`/`抢` 一直 `HIGH`）。
 
----
-
-## 四、清空机制
-
-| 字段 | 由什么驱动 |
-|---|---|
-| `说` `抢` | **段关闭即返回 `NONE`**（读时现算，不需要外部调用） |
-| `完` `信` `text` | `expire_if_idle()` —— **必须由 `session.run_tick` 周期性调用**（50ms） |
-
-⚠️ **`完`/`信`/`text` 为什么必须挂 tick**：清空逻辑若只放在「读快照」时，
-而生产里唯一读快照的时机是**收到新 ASR 消息** —— 那么「说完一句就静音」的
-场景下两者**永不相遇**，三个字段会**永远挂着**（实测：静音后 `完` 恒为 `HIGH`）。
-
-这与 `_check_audio_watchdog` 是**同一类坑**：那个也不能挂在 `_periodic_diag`
-（由 `on_audio` 调用，收不到音频时自己就不跑）。
-
-### 保留时长
-
-```
-TURN_HOLD_MS = 1000   # 可用 ORCH_ASR_TURN_HOLD_MS 覆盖
-```
-
-从**段关闭**那一刻起算。
+所以 `session.run_tick` 每 50ms 调一次 `AsrClient.expire_if_idle()`，
+由它把**已结束的那一轮**推过清零的两个拍子。
 
 ---
 
-## 五、实测参考
+## 三、清零：两拍，没有时间窗口
 
-两个服务端的字段差异（见 `asr/client.py` 的 `parse_confidence` /
+原来的 `TURN_HOLD_MS`（默认 1s，可用 `ORCH_ASR_TURN_HOLD_MS` 覆盖）
+**已删除**。现在的时序完全由 tick 驱动：
+
+| 拍 | 触发 | 快照 |
+|---|---|---|
+| 0 | 收到 `2pass-offline` | 服务端原值：`说`/`抢`=HIGH，`完`=HIGH，带本轮转写 |
+| 1 | 下一次 tick（~50ms） | `说`/`抢` → `NONE`；`完`/`信`/`transcript` **保留** |
+| 2 | 再下一次 tick（~50ms） | 全部清空 |
+
+**拍 1 不能省**：IC 的 `fresh_turn → ANSWER` 依赖"已经安静下来、但本轮
+已拍板"这份快照；只有 `offline` 那一拍的话，`完=HIGH` 会被 IC 同拍的
+`advance_*` 吃掉（实测 `turn=NONE`、只回 HOLD）。
+见 `tests/test_omni_describe_stage.py` 的 `_ASR_SETTLED` 说明。
+
+**例外**：
+
+- `turnsense=incomplete` → 段关了但话没说完，两拍都**不发生**，
+  等后半句（否则 IC 会以为一轮结束，提前回答）。
+- 收尾帧（`is_final=true` 且空文本）→ **立即**全部清空。
+  服务端那一拍里的值（可能 `说=MEDIUM`）只是兼容残留，不透传。
+- 新的一段开始（收到 `2pass-online`）→ 取消待清零，快照换成新消息的 `state`。
+
+---
+
+## 四、两个解析细节（仍与编排层有关）
+
+**置信度字段形态不同**（`asr/client.py` 的 `parse_confidence` /
 `parse_online_confidence`）：
 
 - `Fun-ASR-deploy`（Python）：online **和** offline 都发 `confidence` 对象
 - `asr-2pass`（C++）：只有 offline 发该对象；online 走标量 `online_confidence`
 
 **同一个 offline 帧里两个字段可以同时存在**，所以解析是「先标量、后对象」
-的有序回退，不是二选一。
+的有序回退，不是二选一。这只影响日志/展示，`信` 档位本身由服务端算好。
+
+`turnsense` 消息的 `probabilities` 也有两种形态（C++ 是数组 + `prediction_id`，
+Python 是 dict），由 `extract_turnsense()` 统一。
 
 部分结果延迟实测 **950–1450ms**（见 `tests/README.md`）。

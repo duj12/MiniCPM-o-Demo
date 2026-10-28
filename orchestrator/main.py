@@ -242,6 +242,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         # 白名单见 AsrConfig.CLIENT_OVERRIDABLE —— 像 mode / chunk_size
         # 这种改了会让识别跑不起来的字段不开放。
         asr_cfg = AsrConfig()
+        # 感知总开关由部署侧定（ORCH_ASR_PERCEPTION），**不让前端单会话改**：
+        # 服务端模型是全局加载的，逐会话开关只会让排查时更难说清"到底开没开"。
+        asr_cfg.enable_perception = bool(cfg.asr_perception)
         if hello:
             applied = asr_cfg.apply_overrides(hello.get("asr"))
             if applied:

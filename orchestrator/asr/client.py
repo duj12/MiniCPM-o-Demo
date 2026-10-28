@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -56,6 +55,22 @@ class AsrConfig:
     enable_timestamp: bool = True
     confidence_threshold: float = 0.8
     online_confidence_threshold: float = 0.6
+
+    # ---- 感知（SOP 03/12/13/14/15）：语种 / 情绪 / 音频事件 / SNR /
+    #      突发噪声 / 交叠语音。字段并入服务端下发的 ``state``，本层只透传。
+    #      打开后 ``state`` 从 5 个基础字段变成 14 个；关掉则字节级回到原样。
+    #      代价在**服务端**：每段多一次 SenseVoice 标签 + 交叠 ONNX 推理
+    #      （与识别并行、独立线程池，不拖慢 ASR）。默认开，可用环境变量
+    #      ``ORCH_ASR_PERCEPTION=0`` 全局关掉（见 ``config.Settings``）。
+    #      ⚠️ ``svs_lang`` 固定成 ``zh`` 时模型 lid 输入被钉死，语种恒为
+    #      ``zh``、``language_switch`` 永远 false —— 要真语种检测必须保持 ``auto``。
+    enable_perception: bool = True
+    perception_language: bool = True
+    perception_emotion: bool = True
+    perception_event: bool = True
+    perception_noise: bool = True
+    perception_overlap: bool = True
+    perception_snr: bool = True
 
     #: 允许客户端在 ``session.start`` 里覆盖的字段 → 类型转换。
     #:
@@ -113,6 +128,13 @@ class AsrConfig:
             "enable_timestamp": self.enable_timestamp,
             "confidence_threshold": self.confidence_threshold,
             "online_confidence_threshold": self.online_confidence_threshold,
+            "enable_perception": self.enable_perception,
+            "perception_language": self.perception_language,
+            "perception_emotion": self.perception_emotion,
+            "perception_event": self.perception_event,
+            "perception_noise": self.perception_noise,
+            "perception_overlap": self.perception_overlap,
+            "perception_snr": self.perception_snr,
         }, ensure_ascii=False)
 
 
@@ -138,7 +160,7 @@ class AsrClient:
         self.closed = False
         self.error: Optional[str] = None
 
-        # 状态归纳（user_speaking / barge_in / asr_conf / turn_complete）
+        # 服务端 state 的透传缓存（说/抢/信/完 + transcript）
         self._tracker = AsrStateTracker(self.config)
 
         # 统计
@@ -155,25 +177,25 @@ class AsrClient:
 
     @property
     def state(self) -> AsrState:
-        """最近一条 ASR 消息归纳出的状态快照。
+        """最近一条 ASR 消息带来的**服务端**状态快照。
 
-        ``recv_loop`` 在每条消息上都会推进它，所以 ``on_message`` 回调里读到的
-        就是**与该消息同步**的状态。
+        ``recv_loop`` 在每条消息上都会刷新它，所以 ``on_message`` 回调里读到的
+        就是**与该消息同步**的状态（值完全来自服务端，客户端不做推导）。
         """
         return self._tracker.state
 
     def expire_if_idle(self) -> None:
-        """把「本轮结论」的过期检查推进一步（**需周期性调用**）。
+        """把「一轮已结束」的清零推进一步（**需周期性调用**）。
 
-        由 ``session.run_tick`` 每 50ms 调一次 —— 静音时没有新 ASR 消息，
-        只靠「读快照时顺手清」是清不掉的（见 ``AsrStateTracker.expire_if_idle``）。
+        由 ``session.run_tick`` 每 50ms 调一次 —— 服务端在一句话说完之后
+        不再发消息，不在 tick 里清，IC 会永远停在最后一条 HIGH 上。
         """
         self._tracker.expire_if_idle()
 
     def reset_turn_state(self) -> None:
-        """话轮结束：重置本轮累计。
+        """话轮结束：清空快照。
 
-        ⚠️ **生产不调用** —— 改用 ``expire_if_idle()``（段一关 + 超时）。
+        ⚠️ **生产不调用** —— 改用 ``expire_if_idle()``。
         保留给测试构造干净起点用。
         """
         self._tracker.reset_turn()
@@ -315,7 +337,7 @@ class AsrClient:
 
 
 # ====================================================================== #
-#  状态归纳（把逐帧的 ASR 消息归纳成 5 个离散状态量）
+#  状态快照（**由 ASR 服务端计算**，编排层只负责透传）
 # ====================================================================== #
 
 HIGH = "HIGH"
@@ -323,63 +345,24 @@ MEDIUM = "MEDIUM"
 LOW = "LOW"
 NONE = "NONE"
 
-#: 一轮结束后（段关闭），**本轮结论**（``完`` / ``信`` / ``transcript``）
-#: 再保留多久才清（毫秒）。默认 1000，可用 ``ORCH_ASR_TURN_HOLD_MS`` 覆盖。
-#:
-#: ⚠️ 这个常量**以前**叫 ``SPEAKING_HOLD_MS``、语义是「段关闭后让
-#:    ``user_speaking_confidence`` 维持 ``LOW`` 防闪烁」。那个语义**已废弃**：
-#:    ``说`` / ``抢`` 描述的是「**本轮内**用户有没有出声 / 抢话」，一轮结束
-#:    这个答案就作废了 —— 继续报 HIGH/LOW 是错的。现在它们**段一关立即 NONE**。
-#:
-#:    保留窗口只留给「**本轮结论**」那三个字段：``完``（本轮说完没有）、
-#:    ``信``（本轮置信度）、``transcript``（本轮说了什么）—— 这些是**已经
-#:    发生的事实**，轮结束后还要让人看到（UI 上得能读刚说的那句）。
-TURN_HOLD_MS = int(os.environ.get("ORCH_ASR_TURN_HOLD_MS", "1000"))
+_TIERS = (HIGH, MEDIUM, LOW, NONE)
 
-#: ``barge_in_confidence`` 的**段内**档位映射：第 N 个「带文本的流式帧」对应哪档。
-#: 注意 ``HIGH`` 还有另一条达到路径 —— 拿到**带转写的最终结果**（见 ``_barge_in``），
-#: 那比「吐了 3 个 chunk」更确定（确实说出了内容）。
-_BARGE_TIERS = (LOW, MEDIUM, HIGH)
 
-#: ``barge_in_confidence`` 的档位阈值：第 N 个「带文本的流式帧」对应哪一档
-_BARGE_TIERS = (LOW, MEDIUM, HIGH)
+def _tier(v) -> str:
+    """把服务端下发的档位归一成四值之一；未知/缺失 → ``NONE``。"""
+    s = str(v or "").upper()
+    return s if s in _TIERS else NONE
 
 
 @dataclass(frozen=True)
 class AsrState:
-    """一次 ASR 消息归纳出的状态快照。
+    """一次 ASR 消息带来的状态快照（**值由服务端计算**）。
 
-    **完整取值表见 `orchestrator/docs/asr-state.md`**（权威）。下面是精简版：
+    字段与取值约定见两份 ``docs/websocket-api.md`` §4（服务端权威），
+    以及 `orchestrator/docs/asr-state.md`（编排层的消费约定）。这里只是
+    服务端 ``state`` 的结构化拷贝：编排层**不再**自己推导档位。
 
-    ── 本轮**内**的量（段一关立即 ``NONE``，无保持窗口）──
-
-    ``user_speaking_confidence`` —— 此刻在不在出声
-        ``HIGH``   段开着且有转写文本
-        ``MEDIUM`` 段开着但还没文本（盲窗：出声了、ASR 还没吐字）
-        ``NONE``   段已关 = 本轮结束
-
-    ``barge_in_confidence`` —— 此刻在不在抢话
-        ``HIGH``   拿到**带转写的最终结果**，或本段已吐 ≥3 个带文本流式帧
-        ``MEDIUM`` 本段 2 个带文本流式帧
-        ``LOW``    本段 1 个
-        ``NONE``   本段还没有，或段已关
-
-    ── 本轮**结论**（轮结束后保留 ``TURN_HOLD_MS``，供 UI 读刚才那句）──
-
-    ``transcript`` —— 本轮说了什么（online 增量拼接 / offline 覆盖）
-    ``asr_confidence`` —— 本轮转写置信度
-        ``HIGH`` ≥0.8 · ``MEDIUM`` ≥0.6 · ``LOW`` <0.6 · ``NONE`` 本轮还没有信号
-        ⚠️ 空文本帧若**不带**分数，**保持**上一次的值（不擦成 NONE）
-    ``turn_complete_confidence`` —— 本轮说完的把握
-        ``HIGH``   已拍板（offline 或 turnsense=complete）
-        ``MEDIUM`` 发生过 VAD 切分但未拍板
-        ``LOW``    有转写、正在说
-        ``NONE``   无转写
-
-    ⚠️ 这个「两类」的划分是**语义要求**，不是实现细节：
-    「此刻在不在」是瞬时事实，轮结束即作废；「本轮是什么」是已发生的事实，
-    轮结束后还要让人看到。早先两者用同一个保持窗口，导致「一轮结束了还在报
-    用户在说话」。
+    一轮结束后（下一拍 tick）五个字段一起清空，没有保持窗口。
     """
 
     user_speaking_confidence: str = NONE
@@ -399,435 +382,118 @@ class AsrState:
 
 
 class AsrStateTracker:
-    """把逐帧 ASR 消息归纳成 :class:`AsrState`。
+    """服务端 ``state`` 的**透传缓存**（不在本地归纳）。
 
-    **只跟服务端消息走** —— 不做 100ms 合成 tick。实测流式帧约 **600ms 一帧**，
-    所以状态的更新粒度就是 600ms。
+    五个状态量（说 / 抢 / 信 / 完 + ``transcript``）全部由 ASR 服务端算好，
+    放在**每条消息**的 ``state`` 里下发（取值约定见两份
+    ``docs/websocket-api.md`` §4）。客户端只做两件事：
 
-    核心是让 ``user_speaking_confidence`` 变成**带保持的状态机**而不是逐帧判断。
-    逐帧判断有三个真实缺陷：首个流式结果要 ~1450ms 才到（盲窗）、每次 VAD 切分
-    都会把状态打回原形（用户还在说下半句）、帧与帧之间完全没有信息。这里改用
-    **ASR 服务自己那套 VAD 的段状态** —— 服务端本来就在跑 VAD，它的判断已经
-    免费写在消息里了，不需要客户端再跑一个：
+    1. 记住最后一条消息的 ``state``，原样转给 IC / UI；
+    2. 一轮结束后的**下一拍**把快照清成全 ``NONE``。
 
-      - 流式帧带 ``start_time`` ⇒ 服务端 VAD 有**开着的**语音段
-      - ``2pass-offline`` 到达  ⇒ 服务端 VAD **刚关闭**一个段
-      - ``turnsense=incomplete`` ⇒ 段关了但语义没说完，用户很可能接着说
+    第 2 步为什么留在客户端：服务端只在"有消息"时带 ``state``，一句说完
+    （``2pass-offline``）之后它**不会再主动发任何消息**。不清的话 IC 会
+    永远停在最后一条快照上（实测：一轮结束后 ``说``/``抢`` 一直 HIGH）。
+
+    **没有时间保持窗口**（原 ``ORCH_ASR_TURN_HOLD_MS`` 的 1s 保留已删除），
+    但清零要分**两拍**，因为 IC 的 ANSWER 判定需要中间那一拍：
+
+      - offline 那一条：服务端原值（``说``/``抢``=HIGH，``完``=HIGH，带转写）
+      - 下一拍（tick）：``说``/``抢`` → ``NONE``，``完``/``信``/``transcript``
+        **保留** —— 这就是 IC 的 ``fresh_turn → ANSWER`` 依赖的"安静下来但
+        本轮已拍板"快照（见 `tests/test_omni_describe_stage.py` 的说明）
+      - 再下一拍：全部清空
+
+    两拍都是 tick 驱动（各 50ms），不是计时器。
+
+    唯一例外是 ``turnsense=incomplete``：段关了但话没说完，后半句马上就来，
+    这两拍都不发生 —— 否则 IC 会以为一轮已经结束。
     """
 
     def __init__(self, config: Optional[AsrConfig] = None) -> None:
         self.config = config or AsrConfig()
-        # 服务端 VAD 的段状态
-        self._seg_open = False
-        # 当前段的累积转写（online 增量拼接 / offline 整段替换）
-        self._transcript = ""
-        # 本轮抢话档位：累计「带新文本的流式帧」数（段内爬档用）。
-        # ⚠️ **不再于 offline 时归零** —— 见 `_barge_final` 与 `_on_offline`。
-        self._barge_frames = 0
-        #: **本段已拿到带转写的最终结果** —— 抢话的最硬证据（「用户确实
-        #: 说出了内容」）。达到即 ``抢`` = ``HIGH``，比"吐了几个 chunk"确定得多。
-        #: 段一开始就复位；空文本的最终结果**不置位**（那只是 VAD 收尾帧，
-        #: 不代表说出了内容 —— 与「空帧不擦转写」同一口径）。
-        self._barge_final = False
-        #: **刚拍板、等着被消费的那一拍**（见 ``_turn_active``）。
-        #: ``_on_offline`` 置位 → 该拍的 ``说``/``抢`` 仍报 HIGH
-        #: → 由 ``expire_if_idle()``（tick）或新消息到达时清掉。
-        #:
-        #: ⚠️ **读快照（``.state``）不会消费它** —— recv_loop 对每条消息读
-        #: 两次快照，只有后一次（``on_message`` 里那次）是发给 IC/UI 的；
-        #: 若读快照就消费，第一次读用掉缓冲、发给 IC 的已是 NONE。
-        self._pending_close = False
-        #: **本段**是否出过声（有过带文本的流式帧）。
-        #: ⚠️ 早先它还兼管 `_user_speaking()` 在段关闭后 hold 窗口里的 LOW
-        #:    判定；那个 hold 语义已废弃（一轮结束立即 NONE），现在它只剩
-        #:    诊断用途。
-        self._spoke_this_segment = False
-        # 段是否已关闭？（下一段第一条流式帧到达时清空转写）
-        self._segment_closed = False
-        # **本段已拍板** —— 收到 offline 结果，或 turnsense 判 complete。
-        # 这是「本轮已说完」最硬的证据，下一段开始时清掉。
-        self._segment_done = False
-        # 本轮内是否出现过 VAD 段切分（收到过 offline）。按整轮累计，
-        # 用来把切分之后的流式帧标成 MEDIUM。
-        self._vad_split_seen = False
-        # 段关闭后维持 LOW 的截止时刻（取不到时钟时为 None）
-        self._hold_until_ms: Optional[float] = None
-        # 最近一次的 asr_confidence 档位
-        self._asr_conf = NONE
+        self._state = AsrState()
+        #: 收到段末 ⇒ 等 tick 走"安静下来"那一拍
+        self._turn_ended = False
+        #: 已经走过"安静下来"那一拍 ⇒ 下一次 tick 全部清空
+        self._settled = False
 
     # ------------------------------------------------------------------ #
 
     @property
     def state(self) -> AsrState:
-        """当前状态快照。
-
-        ⚠️ **读的时候会顺手清**：一句说完（收到 offline）并过了 hold 窗口
-        之后，四个状态量全部归 ``NONE``、``transcript`` 清空。
-
-        为什么需要这一步：状态机是**纯事件驱动**的 —— 所有字段都只在
-        "收到下一条消息"时被覆盖。可一句话说完就**不再有消息**了，于是
-        最后那组值会**永远挂着**（实测：静音 3.5s 后 `抢`/`信`/`完` 还是
-        旧值，只有 `说` 会掉到 NONE）。表现就是"早就不说话了，状态栏还写
-        着置信度 HIGH"。
-
-        为什么放在**读快照**时而不是加定时器：清空的本质是"这轮结束了"，
-        而没人读的时候清不清都无所谓 —— 省掉一个后台定时任务。
-
-        ⚠️ **不会影响"offline 后立刻来新一句"**：新消息一进来就自己在
-        `_on_online` / `_on_offline` 里把该覆盖的覆盖掉（新 transcript、
-        barge 重新计数），这条清理路径只在**没有新消息**时才起作用。
-
-        ⚠️⚠️ **这里只清「本轮结论」的超时，绝不消费 ``_pending_close``**。
-        原因：``recv_loop`` 对**每条消息读两次快照** ——
-        ``self._tracker.update(msg)``（内部 ``return self.state``）一次，
-        紧接的 ``on_message(msg)`` 里再读一次，而**后者的 ``st`` 才是发给
-        IC / UI 的那份**。若在这里消费缓冲，第一次读就把它用掉了，
-        真正的下发读到的已经是 ``NONE`` —— 「拿到最终结果 = 抢 HIGH」
-        永远到不了 IC（实测踩过，用户一眼看出来）。
-        ``_pending_close`` 只由 ``expire_if_idle()``（tick）或新消息到达消费。
-        """
-        self._expire_turn_results()
-        return AsrState(
-            user_speaking_confidence=self._user_speaking(),
-            barge_in_confidence=self._barge_in(),
-            transcript=self._transcript,
-            asr_confidence=self._asr_conf,
-            turn_complete_confidence=self._turn_complete_conf(),
-        )
-
-    def expire_if_idle(self) -> None:
-        """周期性推进：消费一拍缓冲 + 过期「本轮结论」。**由 tick 调用**。
-
-        ⚠️ **必须由外部周期性调用**（``session.run_tick`` 每 50ms 一次）。
-        不能只靠读快照时顺手清 —— 那条路只在**收到新 ASR 消息**时才发生，
-        而「说完一句就静音」的场景下恰恰没有新消息（这正是问题 A）。
-        """
-        # 消费「刚拍板那一拍」的缓冲 —— 让 `说`/`抢` 从 HIGH 转 NONE。
-        # offline 那一拍已让 IC 收到过 HIGH，这里是"下一拍清"。
-        if self._pending_close and not self._seg_open:
-            self._pending_close = False
-        self._expire_turn_results()
-
-    def _expire_turn_results(self) -> None:
-        """过了 ``TURN_HOLD_MS`` ⇒ 清掉**本轮结论**（`完`/`信`/`transcript`）。
-
-        条件收紧到「**不在说话**」：``_seg_open`` 为真说明新一轮已经开始了，
-        此时绝不能清 —— 那会打断刚爬起来的本轮状态。
-
-        ⚠️ 只管「本轮结论」那三个字段。``说``/``抢`` 是「本轮内」的量，
-        段一关就已返回 ``NONE``，不依赖这个方法。
-        """
-        if self._seg_open:
-            return
-        if self._hold_until_ms is None:
-            return
-        now = self._now_ms()
-        if now is None or now < self._hold_until_ms:
-            return
-        self._clear_all()
-
-    def _clear_all(self) -> None:
-        """清掉**本轮结论**（转写 / 置信度 / 是否说完）+ 全部段内状态。
-
-        ``说`` / ``抢`` 不需要在这里"清" ——
-        它们是读时现算的，段一关（``_seg_open=False``）就返回 ``NONE`` 了。
-        """
-        self._transcript = ""
-        self._asr_conf = NONE
-        self._segment_done = False
-        self._vad_split_seen = False
-        self._barge_frames = 0
-        self._barge_final = False
-        self._pending_close = False
-        self._spoke_this_segment = False
-        self._segment_closed = False
-        self._hold_until_ms = None
+        """当前快照 —— 服务端原值（清零那两步除外）。"""
+        return self._state
 
     def reset_turn(self) -> None:
-        """话轮结束：清空本轮累计（等价于立即过期）。
-
-        ⚠️ **生产代码不调用它** —— 「一轮结束」现在由
-        ``_seg_open`` 转 False + ``expire_if_idle()`` 的超时路径覆盖。
-        保留它是给测试用的（``test_asr_state.py`` 用它构造干净起点）。
-        """
-        self._clear_all()
+        """清空本轮（**仅供测试/显式重置**；生产走 ``expire_if_idle``）。"""
+        self._state = AsrState()
+        self._turn_ended = False
+        self._settled = False
 
     # ------------------------------------------------------------------ #
 
     def update(self, msg: dict) -> AsrState:
-        """吃一条原始 ASR JSON，推进状态机并返回新快照。"""
-        mode = str(msg.get("mode") or "")
+        """吃一条原始 ASR JSON，采纳其中的 ``state``。
 
-        # turnsense 可能有**独立消息**和**嵌在 offline 里**两种形态，
-        # 这里统一按「本段收到过判决」处理。注意它可能先于 offline 到达
-        # （runtime 里 incomplete 会 defer，offline 要等超时）——那时段其实
-        # 已经关闭了，所以这里就把段标记为关闭。
+        收尾帧（``is_final`` 且空文本）是"流结束"的信号，直接归零 ——
+        服务端那一拍里的值（``说=MEDIUM`` 之类）只是老客户端的兼容残留，
+        不代表当前状态，不能透传给 IC。
+        """
+        mode = str(msg.get("mode") or "")
+        text = str(msg.get("text") or "")
+
+        if msg.get("is_final") and not text.strip():
+            self._state = AsrState()
+            self._turn_ended = False
+            self._settled = False
+            return self._state
+
+        st = msg.get("state")
+        if isinstance(st, dict) and st:
+            self._state = AsrState(
+                user_speaking_confidence=_tier(st.get("user_speaking_confidence")),
+                barge_in_confidence=_tier(st.get("barge_in_confidence")),
+                transcript=str(st.get("transcript") or ""),
+                asr_confidence=_tier(st.get("asr_confidence")),
+                turn_complete_confidence=_tier(
+                    st.get("turn_complete_confidence")),
+            )
+
+        # 段末判定：只有「服务端关掉了一个 VAD 段」才需要走清零两步。
         ts = extract_turnsense(msg)
         if ts is not None:
-            self._seg_open = False
-            self._mark_closed()
-            # ⚠️ 语义判完整 **且本段确实有转写** 才拍板。
-            #    没有转写 = 这段语音没被识别出内容（噪声/被过滤），
-            #    谈不上"说完了" —— 拍板会让 IC 判出一个**空转写的轮**。
-            #    与 `_on_offline` 里「空文本不拍板」同一口径。
-            if is_turnsense_complete(ts) and self._transcript:
-                self._segment_done = True
+            self._turn_ended = is_turnsense_complete(ts)
+        elif mode == "2pass-offline":
+            self._turn_ended = True
+        elif mode == "2pass-online":
+            # 新的一拍流式帧 ⇒ 上一轮已经过去，取消待清理
+            self._turn_ended = False
+        self._settled = False
+        return self._state
 
-        if mode == "turnsense":
-            # 独立消息：状态已由上面更新，没有转写要处理
-            return self.state
+    def expire_if_idle(self) -> None:
+        """周期性推进（tick 每 50ms 调一次）：一轮结束后分两拍清零。
 
-        if mode == "2pass-online":
-            self._on_online(msg)
+        第一拍只把 ``说``/``抢`` 归零、保留本轮结论（IC 的 ANSWER 靠它），
+        第二拍全部清空。**没有时间保持窗口** —— 两拍都是 tick 驱动。
+        """
+        if not self._turn_ended:
+            return
+        if not self._settled:
+            self._state = AsrState(
+                user_speaking_confidence=NONE,
+                barge_in_confidence=NONE,
+                transcript=self._state.transcript,
+                asr_confidence=self._state.asr_confidence,
+                turn_complete_confidence=self._state.turn_complete_confidence,
+            )
+            self._settled = True
         else:
-            # 2pass-offline（含匿名收尾帧）
-            self._on_offline(msg)
-        return self.state
+            self._state = AsrState()
+            self._turn_ended = False
+            self._settled = False
 
-    # ------------------------------------------------------------------ #
-
-    def _on_online(self, msg: dict) -> None:
-        delta = msg.get("text") or ""
-        # 上一段已关闭 ⇒ 这是新段的第一帧
-        if self._segment_closed:
-            self._transcript = ""
-            self._segment_closed = False
-            self._spoke_this_segment = False   # 新的一段，重新计
-            # 抢话的两个量**每段重置** —— 这样既不跨句累积（帧数从 0 爬），
-            # 又不会因为 offline 不再归零而丢掉"本段已确认说出内容"。
-            self._barge_frames = 0
-            self._barge_final = False
-            # 新段开始：上一轮的"一拍缓冲"就此作废（它只在 offline 那一拍有效）
-            self._pending_close = False
-            # 新的一段还没拍板。注意 `_vad_split_seen` **不清** —— 它按整轮
-            # 累计，正是它把「切分之后的流式帧」标成 MEDIUM。
-            self._segment_done = False
-
-        self._seg_open = True
-        if delta:
-            # ⚠️ 实测流式 ``text`` 是**增量片段**（"今天的"/"说出去看"），
-            # 不是累积文本，必须自己拼。
-            self._transcript += delta
-            self._barge_frames += 1
-            self._spoke_this_segment = True
-            self._asr_conf = self._grade(parse_online_confidence(msg))
-        else:
-            # 空文本帧：要么是低置信度被服务端过滤掉，要么是纯噪声段。
-            #
-            # ⚠️ **没有置信度时保留上一次的值，不回退 NONE。**
-            #    实测（31366 / C++）：**有文本的帧一定带 `online_confidence`，
-            #    空文本帧一定不带**。早先这里"拿不到分就置 NONE"，于是每个
-            #    空帧都把上一帧刚给的分擦掉 —— `信` 在 HIGH/NONE 之间逐帧
-            #    抖动（实测日志：0.854 → None → 0.795 → None …）。
-            #    空帧只是"这一帧没有新分数"，不代表这一轮没置信度。
-            conf = parse_online_confidence(msg)
-            if conf is None:
-                pass                      # 保留上一次的 `_asr_conf`
-            elif conf < self.config.online_confidence_threshold:
-                self._asr_conf = LOW      # 有分且偏低 ⇒ 确实没识别出来
-            else:
-                # 有分但不低：文本却被过滤了 —— 说明服务端因其它原因丢弃
-                # （噪声段/无效段），按分数正常分档，不要凭空降级。
-                self._asr_conf = self._grade(conf)
-
-    def _on_offline(self, msg: dict) -> None:
-        text = (msg.get("text") or "").strip()
-        if text:
-            # 最终结果**覆盖**本段累积的流式文本
-            self._transcript = text
-        # 无论成功失败，离线结果到达就意味着服务端那个段已经关闭
-        self._seg_open = False
-        self._segment_closed = True
-        # ⚠️ 但**这一拍** `说`/`抢` 还要报 HIGH（`_pending_close`）——
-        #    offline 同时是「本轮结束」和「确认说出内容」，两者在同一条消息上。
-        #    直接关段会让「抢=HIGH」永远观测不到（快照与关段同拍完成）。
-        #    留一拍缓冲，让 IC 必然收到一次；下一拍由 expire_if_idle 清掉。
-        self._pending_close = True
-        # ---- 是否"拍板"（turn_complete → HIGH）----
-        #
-        # ⚠️⚠️ **只有带转写的 offline 才算拍板**。
-        #
-        # 文本被服务端过滤掉（`text` 为空）时，这一轮**根本不存在** ——
-        # 那是噪声段/无效段（实测带的 `turnsense: invalid`）。若照样置
-        # `_segment_done=True`，状态会变成：
-        #
-        #     空转写 + asr_confidence=LOW + turn_complete=HIGH
-        #
-        # 而 IC 的 Policy 正是拿这个组合判「没听清」：
-        #
-        #     if fresh_turn and speech.asr_confidence == LOW:
-        #         return UTTER(sop="01", text="抱歉，我没听清，请您再说一遍。")
-        #
-        # → 用户什么也没说（或只是噪声），却被回一句「请再说一遍」。
-        # 实测 D16 就是这么复现的。
-        #
-        # 所以空文本时**不拍板**，`turn_complete` 落到 LOW（有转写才 HIGH）。
-        if text:
-            self._segment_done = True
-        # 本轮出现过 VAD 切分（收到过 offline）。**按整轮累计、不清零** ——
-        # 它服务于 `turn_complete`：有它才把"切分之后那段"的流式帧标成
-        # MEDIUM（而不是 LOW）。
-        # ⚠️ 与 barge 的"每句重新爬"是**两套语义**，别混：barge 在下面归零，
-        #    这个不归零。早先改 barge 时误删过这一行，导致切分后的段掉成 LOW。
-        self._vad_split_seen = True
-        self._mark_closed()
-        # 离线也走同一套三档（用离线自带的 confidence.avg）—— 与流式口径
-        # 一致，用户不用记"流式看这个线、离线看那个线"。
-        #
-        # ⚠️ **没带分数时保留上一次的值，不擦成 NONE** —— 与流式空帧同一口径
-        #    （见 `_on_online` 里的长注释）。收尾帧（`is_final=true`、
-        #    `text` 为空）就是典型：它只是"这段结束了"，不代表这一轮没置信度。
-        #    早先无条件 `_grade(...)`，`_grade(None)` 返回 NONE，于是收尾帧
-        #    把刚拿到的分擦掉。
-        _off_conf = parse_confidence(msg)
-        if _off_conf is not None:
-            self._asr_conf = self._grade(_off_conf)
-
-        # ---- 抢话：**有转写 = 确实说出了内容 → 置位（不再归零）** ----
-        #
-        # ⚠️ 这里以前是 `self._barge_frames = 0`（归零）—— 那是错的：
-        #    短句往往 1~2 个 chunk 就出 offline，归零让「刚确认说出内容」
-        #    这一刻 `抢` 反而**砸到 NONE**，正好反了。
-        #
-        # 但**跨句累积**那个问题是真的（早先不清零 → 句3 刚开始就是 HIGH，
-        # 实测复现）。两者兼顾的办法是分开两个量：
-        #   · `_barge_frames` 段**内**爬档，段一开就重置（见 `_on_online`）
-        #   · `_barge_final`   本段拿到带转写的最终结果 → `抢` 直接 HIGH
-        # 这样既不跨句累积（帧数每段重置），也不会在拿到结果时反而降档。
-        #
-        # ⚠️ 空文本的 offline **不置位** —— 那只是 VAD 收尾帧，不代表
-        #    说出了内容（与「空帧不擦转写」同一口径）。
-        if text:
-            self._barge_final = True
-        # `_spoke_this_segment` **不清** —— 段内用，下段第一帧才重置。
-        # （它现在只作诊断用：`说` 的 hold 语义已废弃，一轮结束即 NONE）
-
-    # ------------------------------------------------------------------ #
-
-    def _mark_closed(self) -> None:
-        self._hold_until_ms = self._now_ms() + TURN_HOLD_MS
-
-    def _now_ms(self) -> Optional[float]:
-        try:
-            return time.monotonic() * 1000.0
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _grade(self, conf: Optional[float]) -> str:
-        """浮点置信度 → **三档**（``HIGH`` / ``MEDIUM`` / ``LOW``），无信号 ``NONE``。
-
-        阈值用配置里现有的两个，不新增参数：
-
-            conf >= confidence_threshold(0.8)          → HIGH
-            >= online_confidence_threshold(0.6)        → MEDIUM
-            <  online_confidence_threshold             → LOW
-
-        ⚠️ 早先只有两档（HIGH/LOW，且流式拿 0.6 当 HIGH 线）—— 于是
-        **0.6~0.8 的临时结果也被显示成 HIGH**，说话时满屏"高置信"的低质量
-        结果，看不出哪些能信。加一档 MEDIUM 正好落在这个区间。
-        """
-        if conf is None:
-            return NONE
-        if conf >= self.config.confidence_threshold:
-            return HIGH
-        if conf >= self.config.online_confidence_threshold:
-            return MEDIUM
-        return LOW
-
-    def _user_speaking(self) -> str:
-        """用户是否在出声 —— **本轮内**的量。
-
-        ``HIGH``   段开着（含"刚拍板那一拍"）且有转写文本
-        ``MEDIUM`` 段开着但还没有文本（盲窗：出声了、ASR 还没吐字）
-        ``NONE``   段已关且过了缓冲那一拍
-
-        ⚠️ **没有"保持窗口"**（早先的 ``SPEAKING_HOLD_MS`` 语义已废弃 ——
-        那等于「一轮结束了还在报用户在说话」）。但有**一拍缓冲**，
-        见 ``_turn_active``：offline 拍板那一拍仍报 HIGH，让 IC 一定收到
-        "用户刚才在说话 + 确实说出了内容"这个组合；下一拍起才 NONE。
-        """
-        if self._turn_active():
-            return HIGH if self._transcript else MEDIUM
-        return NONE
-
-    def _barge_in(self) -> str:
-        """抢话把握 —— **本轮内**的量。
-
-        本轮进行中时，两种达到 ``HIGH`` 的路径：
-
-          · **拿到带转写的最终结果**（``_barge_final``）—— 最确定，
-            「用户确实说出了内容」
-          · 本段已吐 **≥3 个**带文本的流式帧
-
-        其余按帧数爬档：1 帧 ``LOW`` → 2 帧 ``MEDIUM`` → 0 帧 ``NONE``。
-
-        ⚠️ 早先这里**只**看帧数，且 ``offline`` 一到就把计数归零 —— 于是
-        短句（1~2 帧就出最终结果）刚确认说出内容，``抢`` 反而**砸到 NONE**，
-        正好反了。现在保留最终结果那条路径，且**用一拍缓冲**保证 IC 收得到。
-        """
-        if not self._turn_active():
-            return NONE          # 一轮结束（且过了缓冲那一拍）
-        if self._barge_final:
-            return HIGH          # 已确认说出内容
-        if self._barge_frames <= 0:
-            return NONE
-        idx = min(self._barge_frames, len(_BARGE_TIERS)) - 1
-        return _BARGE_TIERS[idx]
-
-    def _turn_active(self) -> bool:
-        """本轮是否"算还在进行"—— 供 ``说``/``抢`` 判定。
-
-        两种情况都算：
-
-          · **段开着** —— 正常进行中
-          · **刚拍板但还没被读过**（``_pending_close``）—— offline 到达的
-            **那一拍**。``session.on_message`` 收到消息后会立刻读一次
-            ``state`` 投给 IC，所以这一拍读到的 ``说``/``抢`` 就是
-            「拍板时刻」的值（``HIGH``）；下一次读（下一拍 tick）才转 NONE。
-
-        ⚠️ **为什么需要这一拍缓冲**：用户要求「拿到最终结果 = 抢话 HIGH」，
-        但 offline **同时**是「本轮结束」—— 两者在同一条消息上。
-        若在 offline 里直接关段，那个 HIGH 就**永远观测不到**
-        （快照和关段在同一拍完成）。留一拍，IC 必然收到一次。
-        """
-        return self._seg_open or self._pending_close
-
-    def _turn_complete_conf(self) -> str:
-        """本轮是否已经说完。
-
-        ``HIGH``   本段**已拍板**（带转写的 ``2pass-offline``，或带转写的
-                   turnsense=complete）
-        ``MEDIUM`` 本轮发生过 VAD 切分，且**当前有转写**（续接段）
-        ``LOW``    **没有任何转写** —— 这段语音没被识别出内容（噪声段、
-                   或文本被置信度过滤掉了）
-        ``NONE``   （同上，``LOW`` 与 ``NONE`` 目前同义；保留 NONE 供
-                   "完全没收到过任何消息"的初始态）
-
-        ⚠️ **「没有转写」优先于「切过段」**：早先判据是
-        ``if _vad_split_seen: return MEDIUM`` 在前，没有先看转写 —— 于是
-        「本轮切过段，但这一段是空的」会报 ``MEDIUM``。
-        而 IC 的 Policy 对空转写有明确分支（``asr_confidence==LOW`` 时
-        走「没听清，请您再说一遍」），拿一个 MEDIUM/HIGH 的 ``turn`` 配上
-        空转写，语义上是在说"用户说完了一句空话"—— 那不存在。
-
-        **拍板（HIGH）必须是"带转写"的**：文本被过滤掉（``text`` 为空）
-        时这一段根本没被识别出内容，谈不上"说完了"。这一条是 D16 那个
-        「用户没说有效内容、却被回『请再说一遍』」的根因。
-        """
-        if not self._transcript:
-            # 没有转写 ⇒ 没有一轮可言。哪怕切过段、哪怕收到过 offline。
-            return LOW if self._segment_done or self._vad_split_seen else NONE
-        if self._segment_done:
-            return HIGH
-        if self._vad_split_seen:
-            # 本轮已经切过段，当前这段是续接的 —— 比首段更有把握一些
-            return MEDIUM
-        return LOW
-
-
-# ====================================================================== #
-#  消息解析辅助（把 ASR 的原始 JSON 转成 downstream 事件）
-# ====================================================================== #
 
 def parse_confidence(msg: dict) -> Optional[float]:
     """从 ASR 消息里取平均置信度（``confidence`` **对象**形态）。

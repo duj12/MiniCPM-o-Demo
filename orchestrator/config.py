@@ -49,6 +49,13 @@ class Settings:
     enable_face: bool = False        # 阶段 4 后开启
     verify_ssl: bool = False         # gateway 用自签证书
 
+    # ASR 感知（语种/情绪/事件/SNR/突发噪声/交叠）总开关，默认开。
+    # 关掉后服务端 ``state`` 回到原来的 5 个字段，也不再跑感知推理。
+    # ``ORCH_ASR_PERCEPTION=0`` 关。
+    asr_perception: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_ASR_PERCEPTION", "1").strip().lower() not in
+        ("0", "false", "off", "no"))
+
     # ---- 回声消除模式（可被前端 session.start 覆盖）----
     #   "browser" —— 浏览器原生 AEC（getUserMedia 的 echoCancellation）。
     #                在设备侧工作，**不受网络延迟影响**；不连云端 AEC，
