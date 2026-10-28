@@ -130,11 +130,13 @@ class InteractionDownstream:
         #:    编排代码 105/106 共用，默认开等于替 106 决定了对 Agent 的协议。
         self._agent_transcript_mode = (agent_transcript_mode or "legacy").strip().lower()
         #: 最近一份**生成完**的 VLM 描述（见 `_on_vlm_description`）。
-        #: 由 `agent_sink` 的 getter 在 `on_answer` 的**断句那一刻**读取 ——
-        #: 所以这里必须是一份"随时可用"的缓存，取值路径上**不做任何生成**。
+        #: 由 `agent_sink` 的 getter 在**推视觉轮的那一刻**同步读取（正常话轮
+        #: 不再取它，见 `agent_sink._send`）—— 所以这里必须是一份"随时可用"
+        #: 的缓存，取值路径上**不做任何生成**。
         self._vlm = ""
         #: 解析出来的**结构化快照**（`KEY -> 值`，见 `omni/describe.py`）。
-        #: 增量只带变化的键，合并到这里；渲染成 `self._vlm` 送给 Agent。
+        #: 每份都是 8 键全量；合并到这里再渲染成 `self._vlm`（合并是为了兜住
+        #: 某一行被截断的情况）。
         #: ⚠️ 解析失败（模型没按格式答）时保持为空，`self._vlm` 退回原文 ——
         #:    绝不能因为"格式不对"就把一份有效描述丢掉。
         self._vlm_state: Dict[str, str] = {}
@@ -148,10 +150,10 @@ class InteractionDownstream:
         #: 上一次 dispatch 的 IC Action 类型。用于识别**切入** GREET
         #: （不能用 `fresh`：见 `_dispatch` 里的说明）
         self._prev_atype = ""
-        #: 本会话是否已把「会话起点的视觉背景」投给 Agent（见
-        #: `_emit_visual_background`）。**只发本会话的第一份全量描述** ——
-        #: 理由见那里的说明。`on_session_start` 必须复位它。
-        self._bg_sent = False
+        #: 「视觉轮交不出去」的告警是否已经打过（**只为去重日志**，不是闩）。
+        #: 每份描述都会尝试投递（见 `_emit_visual_background`），gRPC / legacy
+        #: 这类交不出去的配置下别每轮刷一条 warning。
+        self._bg_fail_logged = False
         self.ic_mode = (ic_mode or "grpc").strip().lower()
         if self.ic_mode == "inprocess":
             #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
@@ -276,11 +278,8 @@ class InteractionDownstream:
         self._vlm_at = 0.0
         self._vlm_stage = ""
         self._prev_atype = ""
-        # ⚠️ 与上面两项**同理、且必须一起清**：`_bg_sent` 若不随新会话复位，
-        #    新会话的首份全量描述会被上一会话的闩挡在门外 ⇒ Agent 的
-        #    `scene.visual_background` 又是空的 —— **症状与本次要修的那个 bug
-        #    一模一样**（"Agent 拿着一个从没收到的背景"），更难往这里想。
-        self._bg_sent = False
+        # 告警去重标记随会话复位（不是闩，投递本身每份都做）
+        self._bg_fail_logged = False
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []
@@ -624,20 +623,29 @@ class InteractionDownstream:
         logger.info("[%s] VLM 描述已更新（stage=%s）%d 字，快照 %d 键：%r",
                     self.session_id, ev.stage, len(self._vlm),
                     len(self._vlm_state), self._vlm[:400])
-        # 全量描述 ⇒ 补一发「会话起点的视觉背景」给 Agent。**必须在
-        # `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
-        if ev.stage == "full":
-            # 传**缓存里那份**（已渲染成快照），不是模型原文 —— 日志里的字数
-            # 要能对上 Agent 实际收到的东西。
-            self._emit_visual_background(len(self._vlm))
+        # ---- 有了就推：VLM **不与 ASR 强行同步**（2026-10-28 用户口径）----
+        #
+        # 每份描述（full 与 turn 一样）一生成完就**立刻**作为「ASR 空的视觉轮」
+        # 推给 Agent（只存不答），而不是塞进缓存等下一次 `on_answer` 捎带。
+        # 两条理由：
+        #  · 断句触发的描述本来就晚于本句的 `on_answer`（窗口几十毫秒 vs
+        #    decode 秒级）⇒ 缓存只会让 Agent 永远看到「上一句那时候」的画面；
+        #  · 用户不说话、画面却变了的时候，也该及时更新 —— 缓存模式下没有
+        #    `on_answer` 就永远发不出去。
+        # 每份都是 8 键全量快照 ⇒ 直接覆盖，不存在"旧值残留"。
+        # **必须在 `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
+        # 传**缓存里那份**（已渲染成快照），不是模型原文 —— 日志里的字数要能
+        # 对上 Agent 实际收到的东西。
+        self._emit_visual_background(len(self._vlm))
 
     def _emit_visual_background(self, n_chars: int) -> None:
-        """把刚写进缓存的全量描述当「视觉背景轮」投给 Agent（ASR 为空）。
+        """把**刚生成完的**一份描述当「视觉轮」立刻投给 Agent（ASR 为空）。
 
         Agent 收到 `content` 且 `ASR`/`transcript` 都空 ⇒ 走
-        `handle_visual_background`（**只存不答**，写 `scene.visual_background`）。
-        没有这一发，Agent 收到的 `scene.visual_change` 就在引用一个它**从没
-        收到过**的背景（全量只活在本地缓存里、随即被增量覆盖）。
+        `handle_visual_background`（**只存不答**，覆盖写
+        `scene.visual_background`，该键随 system prompt 的「会话状态」段进入
+        每一轮 LLM 调用）。所以**每份描述都推**是对的：它天然就是"当前视觉
+        状态"，覆盖即更新。
 
         ⚠️ 这**不是** `agent.py` 里删掉的那种「转发 IC 自己也会发的事件」
         （那次让 Agent 收到两份 `on_answer`）：IC 的 `on_answer` 只在 ANSWER
@@ -645,51 +653,48 @@ class InteractionDownstream:
         sink 队列 ⇒ 与 IC 的真实 `on_answer` 端到端串行，顺序确定。
         别把它当重复投递"修掉"。
 
-        **只发第一份**（`_bg_sent` 闩）：第一份全量做完后
-        `session._maybe_switch_delta_persona` 会把 omni 换成「只报变化」的短
-        人设（**幂等**，只重连一次）。换人后的第二次 GREET 仍会派
-        `Describe("full")`，但它是在短人设下答的 ⇒ 回的是**几十字的变化描述**；
-        拿它覆盖背景就是用 46 字冲掉 476 字的有效背景 —— 正是本要在修的 bug
-        换了个入口。Agent 那个字段的名字就是「**会话起点**的视觉背景」，
-        换人后的差异由每轮的 `scene.visual_change` 承载。
+        ⚠️ **2026-10-28 起去掉了「只发第一份」的闩**。那个闩是为旧方案（每轮
+        只报变化、且靠换短人设重连）设的：换人后第二份 full 只有几十字，拿它
+        覆盖 476 字的起点背景是净损失。现在每份都是 **8 键全量快照**、语义
+        就是"此刻的完整状态" ⇒ 越新越准，覆盖是对的；再留闩反而会让 Agent
+        停在会话起点那一份、越用越旧。
         """
         if not self._desc_enabled:
             return
-        if self._bg_sent:
-            logger.info("[%s] 已有视觉背景（stage=full %d 字）—— 不重复投递"
-                        "（换人后的差异走每轮的 change）", self.session_id, n_chars)
-            return
-        # ⚠️ 闩**只在成功交出后**才置：`_feed` 处理 OmniDescription 是在
-        #    `if not self.ic.available: return` **之前**（那是故意的，见 `_feed`），
-        #    所以 IC 掉线时也会走到这儿。若先闩后发，一次瞬时失败就**永久**
-        #    丢掉这份背景。
+        # ⚠️ `_feed` 处理 OmniDescription 是在 `if not self.ic.available: return`
+        #    **之前**（故意的，见 `_feed`），所以 IC 掉线时也会走到这儿 ——
+        #    失败只告警**一次**，别每份描述刷一条。
         if self.ic.send_visual_background():
-            self._bg_sent = True
-            logger.info("[%s] 视觉背景已交给 Agent（stage=full，%d 字）"
-                        "—— 后续轮次会注入 scene.visual_background",
+            self._bg_fail_logged = False
+            logger.info("[%s] 视觉轮已推给 Agent（%d 字）"
+                        "—— 覆盖 scene.visual_background，与 ASR 不同步",
                         self.session_id, n_chars)
-        else:
-            logger.warning("[%s] 视觉背景**未能交出**（无 Agent sink / gRPC 模式 / "
-                           "dict 模式 / worker 已关）—— 不置闩，下份全量再试",
-                           self.session_id)
+        elif not self._bg_fail_logged:
+            self._bg_fail_logged = True
+            logger.warning("[%s] 视觉轮**未能交出**（无 Agent sink / gRPC 模式 / "
+                           "dict 模式 / worker 已关）—— 后续每份还会重试，"
+                           "本条只告警一次", self.session_id)
 
     def _note_vlm_readiness(self) -> None:
-        """`AsrFinal` 到了 —— 记下缓存**此刻**的状态（主指标的度量）。
+        """`AsrFinal` 到了 —— 记下**Agent 手上那份视觉状态**有多旧（纯度量）。
 
-        ⚠️ **纯度量，不做任何等待/补触发**。这里若是"没就绪就再等 100ms"，
-        就等于把 VLM 的生成耗时加到了 ASR→Agent 这条链路上，直接违反硬指标
-        （"发送的那一刻不生成"）。
+        2026-10-28 起 VLM 与 ASR **不再同步发送**（描述一生成完就单独推给
+        Agent，见 `_emit_visual_background`），所以这里不再是"本句有没有带上
+        VLM"的判据，只剩一个可观测性指标：**断句那一刻，Agent 看到的画面有多
+        旧**。数字大就说明描述触发得太稀（断句/心跳都没跟上）。
+
+        ⚠️ **纯度量，不做任何等待/补触发** —— 等就等于把 VLM 的生成耗时加到
+        ASR→Agent 这条链路上。
         """
         if self._vlm:
             age_ms = int((time.monotonic() - self._vlm_at) * 1000)
-            logger.info("[VLM 就绪] 断句点已有描述（stage=%s，年龄=%dms，%d 字）"
-                        "—— 本句随 ASR 一起发给 Agent",
+            logger.info("[VLM 状态] 断句点最近一份描述（stage=%s，年龄=%dms，%d 字）"
+                        "—— 已单独推给 Agent，与本句 ASR 无关",
                         self._vlm_stage or "-", age_ms, len(self._vlm))
         else:
             self._vlm_miss += 1
-            logger.warning("[VLM 未就绪] 断句点还没有描述（第 %d 次）—— "
-                           "本条 on_answer 的 VLM 为空，**不等待**。"
-                           "频率高就调小 ORCH_OMNI_DELTA_INTERVAL_S",
+            logger.warning("[VLM 状态] 断句点还没有任何描述（第 %d 次）—— "
+                           "Agent 手上没有视觉状态，但**不等待**",
                            self._vlm_miss)
 
     def _should_report(self, atype: str, sop: Optional[str]) -> bool:

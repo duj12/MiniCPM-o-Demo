@@ -170,16 +170,16 @@ echo "  python          = $ORCH_PY" >&2
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
 echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
      "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
-# 「视觉背景轮」没有独立开关：它与 `content` **同开同关**（判据 = sink 是否被
+# 「视觉轮」没有独立开关：它与 `content` **同开同关**（判据 = sink 是否被
 # 包装，而那恰好等于「描述开 且 载荷非 legacy」）。加第三个开关会造出
-# 「背景轮开、content 关」这种半开状态 —— sink 根本没包装，静默不发、无日志。
-# 开了之后日志里应能看到 `视觉背景已交给 Agent（stage=full，N 字）`。
-echo "  视觉背景轮      = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
-     "（全量描述额外投一发 ASR 空的 on_answer，只存不答）" >&2
+# 「视觉轮开、content 关」这种半开状态 —— sink 根本没包装，静默不发、无日志。
+# 开了之后日志里每份描述都应出现一条 `视觉轮已推给 Agent（N 字）`。
+echo "  视觉轮          = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
+     "（每份描述一生成完就投一发 ASR 空的 on_answer，只存不答）" >&2
 # ⚠️ 与上两行同理：这行是「本机跑的是哪一版描述链路」的硬证据。
 # 两阶段定稿后日志里应能看到 `描述完成 stage=full`（起点一次）与
 # `描述完成 stage=turn`（之后每轮 8 键全量、值压短）。
-echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量、值压短）" >&2
+echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

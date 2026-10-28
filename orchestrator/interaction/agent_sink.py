@@ -26,17 +26,22 @@
 
 IC 的调用链是 ``on_answer`` → ``_send``（同步入队）→ worker 线程 → ``_post``。
 选 ``_send`` 是为了**取值时机**：它在 ``on_answer`` 里被**同步**调用，取到的
-正是**断句那一刻**缓存的描述。若改在 ``_post`` 里取，取值发生在 worker
-线程上，Agent 慢时队列积压会让描述漂到几秒之后 —— 与"这条描述要对应这句话
-的时刻"的前提直接矛盾。
+正是**推这一轮那一刻**缓存里的描述。若改在 ``_post`` 里取，取值发生在 worker
+线程上，Agent 慢时队列积压会让描述漂到几秒之后 —— 与"推出去的就是当时那份
+状态"的前提直接矛盾。
 
 ## 另一件只有"自己造 sink"才做得到的事：视觉背景轮
 
-除了给每轮 `on_answer` 追加 `content`，本子类还提供
-``emit_visual_background()``：把**当前缓存**里的全量描述当成一轮「ASR 为空」的
-`on_answer` 投出去 —— Agent 收到后走 `handle_visual_background`（只存不答），
-把 `scene.visual_background` 真正填上。IC **结构上产生不了**这一轮（它的
-`on_answer` 只在 ANSWER 时发、`transcript` 必非空），所以必须由编排侧合成。
+除正常话轮外，本子类还提供 ``emit_visual_background()``：把**当前缓存**里的
+那份描述当成一轮「ASR 为空」的 `on_answer` 投出去 —— Agent 收到后走
+`handle_visual_background`（只存不答），覆盖写 `scene.visual_background`。
+IC **结构上产生不了**这一轮（它的 `on_answer` 只在 ANSWER 时发、
+`transcript` 必非空），所以必须由编排侧合成。
+
+**VLM 与 ASR 不同步（2026-10-28）**：每份描述一生成完就立刻这样推一次；
+正常话轮（ASR 非空）的 ``content.VLM`` 因此留空 —— 视觉信息全部走
+``scene.visual_background``，每轮随「会话状态」段注入 prompt。这样两边互不
+等待：ASR 该发就发，VLM 算完就发。
 
 ⚠️ 这与 `interaction/agent.py` 里删掉的 `ORCH_AGENT_RELAY` **不是一回事**：
 那条转发的是 IC **自己也会发**的事件（于是 Agent 收到两份）；这一轮 IC
@@ -117,7 +122,12 @@ def make_vlm_agent_sink(*, target: str, vlm_getter: Callable[[], str],
         def _send(self, name: str, payload: dict) -> None:
             if name == "on_answer":
                 asr = str(payload.get("transcript", "") or "")
-                vlm = str(vlm_getter() or "")
+                # VLM 与 ASR **不同步**（2026-10-28）：视觉状态一生成完就由
+                # `emit_visual_background` 单独推（那种轮次 ASR 为空、VLM 取
+                # 缓存）；正常话轮（ASR 非空）**只发 ASR**、VLM 留空。
+                # 否则 Agent 手上会同时拿到「刚推的那份」和「本句缓存那份」，
+                # 两份时刻不同，反而说不清哪份才是当前画面。
+                vlm = str(vlm_getter() or "") if not asr.strip() else ""
                 content = {"ASR": asr, "VLM": vlm}
                 payload = {**payload, "content": content}
                 if mode == "dict":
@@ -130,19 +140,18 @@ def make_vlm_agent_sink(*, target: str, vlm_getter: Callable[[], str],
             super()._send(name, payload)
 
         def emit_visual_background(self) -> bool:
-            """把**当前缓存里**的描述当「会话起点的视觉背景」投给 Agent。
+            """把**当前缓存里**的那份描述当「视觉轮」立刻推给 Agent。
 
             投出去的是一轮 ``ASR 为空`` 的 ``on_answer``：Agent 收到
             ``content`` 且 ``ASR``/``transcript`` 都空 ⇒ 走
-            ``handle_visual_background``（**只存不答**，写会话状态
-            ``scene.visual_background``）。
+            ``handle_visual_background``（**只存不答**，覆盖写会话状态
+            ``scene.visual_background``，该键随 system prompt 的「会话状态」段
+            进入每一轮 LLM 调用）。
 
-            为什么需要这一发：增量的语义是「相对**上一份**的变化」，而上一份
-            全量描述只会活在编排侧的缓存里、随后被增量覆盖 ⇒ 不补这一发，
-            Agent 收到的 ``scene.visual_change`` 就在**引用一个它从没收到的
-            背景**，``scene.visual_background`` 恒空。IC 自己产生不了这一轮
-            （它的 ``on_answer`` 只在 ANSWER 时发，``transcript`` 必非空），
-            所以由编排侧合成 —— **不是** IC 事件的转发。
+            为什么需要这一发：描述**不与 ASR 同步**（2026-10-28 用户口径）——
+            一生成完就推，而不是等下一次 ``on_answer`` 捎带。IC 自己产生不了
+            这一轮（它的 ``on_answer`` 只在 ANSWER 时发，``transcript`` 必
+            非空），所以由编排侧合成 —— **不是** IC 事件的转发。
 
             ⚠️ 前置条件：调用方必须在**刚把全量描述写进缓存之后同步调用**
             （见 ``downstream._on_vlm_description``）。本方法**不收文本参数**
@@ -163,7 +172,7 @@ def make_vlm_agent_sink(*, target: str, vlm_getter: Callable[[], str],
                 logger.warning("transcript 模式=dict：不发视觉背景轮"
                                "（Agent 的 transcript 字段是 str，背景轮会被拒）")
                 return False
-            logger.info("[视觉背景] 已交出 %d 字 → on_answer(ASR 空，只存不答)",
+            logger.info("[视觉轮] 已交出 %d 字 → on_answer(ASR 空，只存不答)",
                         len(str(vlm_getter() or "")))
             self.on_answer(identity_id=None, display_name=None, transcript="")
             return True

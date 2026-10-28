@@ -89,9 +89,12 @@
 
 描述文本经 `OmniDescription` 事件落进
 `orchestrator/interaction/downstream.py`：先 `parse_state()` 解析，
-增量**合并**进缓存快照，再用 `render_state()` 渲染成完整的 8 行文本，
-最后由 `agent_sink.py` 塞进 `on_answer` 的 ``content.VLM``。
-**只在 `response.done`（生成完的整段）取值**，绝不用
+按键**合并**进缓存快照，再用 `render_state()` 渲染成完整的 8 行文本，
+然后由 `agent_sink.py` **立刻**以「视觉轮」（ASR 空的 `on_answer`）推给 Agent
+—— Agent 只存不答，覆盖写 `scene.visual_background`，随 system prompt 的
+「会话状态」段进入每一轮 LLM 调用。
+**VLM 与 ASR 不同步**（2026-10-28）：正常话轮只带 ASR、``content.VLM`` 留空，
+两边各自就绪各自发。**只在 `response.done`（生成完的整段）取值**，绝不用
 `response.output.delta` 的 token 流 —— 那是半句话（见 `omni/client.py:_emit`）。
 """
 from __future__ import annotations

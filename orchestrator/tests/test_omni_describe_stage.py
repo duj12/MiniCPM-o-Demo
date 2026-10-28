@@ -359,9 +359,10 @@ def test_payload_dual(srv_url: str) -> None:
           f"transcript 内容不变：{body.get('transcript')!r}")
     check(body.get("content", {}).get("ASR") == _TALK,
           "content.ASR == transcript（两个字段说的是同一件事）")
-    check(body.get("content", {}).get("VLM") == DESC_FULL,
-          "content.VLM == 缓存的那份描述"
-          f"（实际 {body.get('content', {}).get('VLM')!r}）")
+    check(body.get("content", {}).get("VLM") == "",
+          "正常话轮**只带 ASR**，content.VLM 为空（VLM 与 ASR 不同步，"
+          "视觉状态走单独的视觉轮；实际 "
+          f"{body.get('content', {}).get('VLM')!r}）")
     check(body.get("session_id") == "t-desc" and body.get("callback_ic"),
           "会话信封（session_id / callback_ic）仍在 —— 没被覆写挤掉")
     check(body.get("identity_id") == "uid-a"
@@ -387,16 +388,15 @@ def test_no_truncation(srv_url: str) -> None:
     if not check_ic(d):
         return
     d._feed(OmniDescription(t=0, stage="turn", text=long_desc))
-    _answer_path(d)
     _flush(d)
-    ans = _answers()
-    if not ans:
-        check(False, "没抓到 on_answer")
+    bgs = _bg_rounds()
+    if not bgs:
+        check(False, "没抓到视觉轮")
         d.ic.close()
         return
-    got = ans[0][1].get("content", {}).get("VLM", "")
+    got = bgs[0][1].get("content", {}).get("VLM", "")
     check(got == long_desc and len(got) == len(long_desc),
-          f"{len(long_desc)} 字原样送达（实际 {len(got)} 字）")
+          f"{len(long_desc)} 字原样推送（实际 {len(got)} 字）")
     d.ic.close()
 
 
@@ -422,11 +422,10 @@ def test_no_change_keeps_previous(srv_url: str) -> None:
     d._feed(OmniDescription(t=3, stage="turn", text=mixed))
     check(d._vlm == mixed,
           "「人物无变化，但…」这种**有信息**的描述要收下（判据是整句相等，不是 in）")
-    _answer_path(d)
     _flush(d)
-    ans = _talk_rounds()
-    check(ans and ans[0][1].get("content", {}).get("VLM") == mixed,
-          "送到 Agent 的是最新那份")
+    bgs = _bg_rounds()
+    check(bgs and bgs[-1][1].get("content", {}).get("VLM") == mixed,
+          "推给 Agent 的是最新那份（视觉轮，ASR 空）")
     d.ic.close()
 
 
@@ -450,12 +449,10 @@ def test_visual_background_round(srv_url: str) -> None:
                        agent_transcript_mode="dual")
     if not check_ic(d):
         return
-    check(d._bg_sent is False, "起手没投过背景")
     d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
     _flush(d)
     bgs = _bg_rounds()
-    check(len(bgs) == 1, f"恰好 1 个背景轮（实际 {len(bgs)}）")
-    check(d._bg_sent is True, "闩已置位（本会话不再重复投）")
+    check(len(bgs) == 1, f"恰好 1 个视觉轮（实际 {len(bgs)}）")
     if bgs:
         body = bgs[0][1]
         check(body.get("content", {}).get("VLM") == DESC_FULL,
@@ -473,48 +470,54 @@ def test_visual_background_round(srv_url: str) -> None:
     d.ic.close()
 
 
-def test_turn_makes_no_background(srv_url: str) -> None:
-    """每轮描述**不**产生背景轮 —— 背景轮的语义是「会话起点」，只发一次。"""
+def test_turn_pushes_visual_round(srv_url: str) -> None:
+    """每轮描述**也**单独推一发视觉轮（ASR 空），正常话轮只带 ASR。
+
+    VLM 与 ASR 不同步（2026-10-28）：描述一生成完就推，不等下一次
+    `on_answer` 捎带 —— 断句触发的描述本来就晚于本句，缓存只会让 Agent
+    永远看到"上一句那时候"的画面。
+    """
     from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[背景轮] 每轮描述不产生背景轮（只走每轮的 content.VLM）")
+    print("\n[背景轮] 每轮描述也单独推一发（ASR 空），正常话轮 VLM 为空")
     HITS.clear()
     d = _mk_downstream(srv_url, omni_describe=True,
                        agent_transcript_mode="dual")
     if not check_ic(d):
         return
-    turn = "人物没有明显变化，只是眨了一下眼。"
+    turn = "EMOTION: 不耐烦\nBEHAVIOR: 站立 6 秒"
     d._feed(OmniDescription(t=0, stage="turn", text=turn))
     _flush(d)
-    check(_bg_rounds() == [], "只有每轮描述 ⇒ 一个背景轮都不该有")
+    bgs = _bg_rounds()
+    check(len(bgs) == 1, f"每轮描述 ⇒ 1 个视觉轮（实际 {len(bgs)}）")
+    if bgs:
+        check("EMOTION: 不耐烦" in (bgs[0][1].get("content", {}).get("VLM") or ""),
+              "推出去的就是这份描述")
+        check(bgs[0][1].get("content", {}).get("ASR") == ""
+              and bgs[0][1].get("transcript") == "",
+              "ASR 与 transcript 都空（Agent 据此走「只存不答」）")
     _answer_path(d)
     _flush(d)
     ans = _talk_rounds()
     check(len(ans) == 1, f"真实话轮 1 个（实际 {len(ans)}）")
     if ans:
-        check(ans[0][1].get("content", {}).get("VLM") == turn,
-              "每轮描述走的是 content.VLM（不是背景轮）")
+        check(ans[0][1].get("content", {}).get("VLM") == "",
+              "正常话轮不带 VLM（视觉状态已经单独推过了）")
         check(ans[0][1].get("content", {}).get("ASR") == _TALK,
               "ASR 照常送达")
-    check(_bg_rounds() == [], "整条链路跑完仍然没有背景轮")
     d.ic.close()
 
 
-def test_background_latch_per_session(srv_url: str) -> None:
-    """只发**第一份** full；`on_session_start` 必须复位闩。
+def test_visual_push_every_description(srv_url: str) -> None:
+    """**每份**描述都推（没有"只发第一份"的闩）；换会话照推。
 
-    两件事各对应一个坑（都**静默**）：
-
-      · 第二份 full 是「换人」触发的：它描述的是**新的会话起点**，而 Agent
-        那个字段的语义是「本会话起点的视觉背景」⇒ 拿它覆盖背景 = 用一份
-        刚刚开始观察的短描述冲掉已经稳定的有效背景，
-        **正是本次要修的那个 bug 换了个入口**。
-      · 闩不复位 ⇒ 新会话的首份 full 被上一会话的闩挡在门外 ⇒ Agent 的
-        `scene.visual_background` 又是空的，**症状与要修的 bug 一模一样**。
+    旧方案的闩是为「每轮只报变化 + 换短人设重连」设的（第二份 full 只有
+    几十字，覆盖 476 字的起点背景是净损失）。现在每份都是 8 键全量快照、
+    语义就是"此刻的完整状态" ⇒ 越新越准，留闩反而让 Agent 停在起点那份。
     """
     from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[背景轮] 只认第一份 full；换会话复位")
+    print("\n[背景轮] 每份描述都推（无闩）；换会话照推")
     HITS.clear()
     d = _mk_downstream(srv_url, omni_describe=True,
                        agent_transcript_mode="dual")
@@ -522,24 +525,22 @@ def test_background_latch_per_session(srv_url: str) -> None:
         return
     d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
     _flush(d)
-    check(len(_bg_rounds()) == 1, "第一份 full ⇒ 1 个背景轮")
+    check(len(_bg_rounds()) == 1, "第一份 ⇒ 1 个视觉轮")
 
-    # 换人：第二份 full（真实链路上它已在短人设下答，只有几十字）
     d._feed(OmniDescription(t=1, stage="full", text="画面里换了一位访客。"))
     _flush(d)
     bgs = _bg_rounds()
-    check(len(bgs) == 1, f"第二份 full **不**再投（实际共 {len(bgs)} 个）")
-    check(bgs and bgs[0][1].get("content", {}).get("VLM") == DESC_FULL,
-          "Agent 手上仍是那份完整的会话起点背景（没被短文本冲掉）")
+    check(len(bgs) == 2, f"第二份 **也**推（实际共 {len(bgs)} 个）")
+    check(bgs and (bgs[-1][1].get("content", {}).get("VLM") or "").find("换了一位访客") >= 0,
+          "Agent 手上换成了**最新**那份（背景 = 当前视觉状态）")
 
-    # 新会话 —— 闩必须复位
+    # 新会话：清场标记复位，之后照推
     asyncio.run(d.on_session_start(None))
-    check(d._bg_sent is False, "on_session_start 复位了闩")
+    check(d._bg_fail_logged is False, "on_session_start 复位告警去重标记")
     HITS.clear()
     d._feed(OmniDescription(t=2, stage="full", text=DESC_FULL))
     _flush(d)
-    check(len(_bg_rounds()) == 1,
-          "新会话的第一份 full 投得出去（闩没复位的话这里是 0）")
+    check(len(_bg_rounds()) == 1, "新会话的第一份照样推出去")
     d.ic.close()
 
 
@@ -563,8 +564,9 @@ def test_background_not_sent_in_legacy(srv_url: str) -> None:
           "裸 sink ⇒ send_visual_background 返回假（鸭子判定，不抛）")
     d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
     _flush(d)
-    check(_answers() == [], "一条都没发 —— 背景轮不该在 legacy 下冒出来")
-    check(d._bg_sent is False, "没交出 ⇒ 闩不置位（下次还有机会）")
+    check(_answers() == [], "一条都没发 —— 视觉轮不该在 legacy 下冒出来")
+    check(d._bg_fail_logged is True,
+          "交不出去 ⇒ 只告警一次（每题描述都重试，但日志不刷屏）")
     d.ic.close()
 
 
@@ -573,16 +575,22 @@ def test_background_not_sent_in_legacy(srv_url: str) -> None:
 # ====================================================================== #
 
 def test_ready_before_asr_final(srv_url: str) -> None:
-    """(a) 描述**早于** `AsrFinal` 就绪 ⇒ payload 非空，且记下年龄。"""
+    """(a) 描述**早于** `AsrFinal` ⇒ 它已经单独推过了，ASR 轮不再等。"""
     from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[时序] 描述早于断句 ⇒ 断句点不生成、直接取用")
+    print("\n[时序] 描述早于断句 ⇒ 已单独推送；ASR 轮不生成、不等待")
     HITS.clear()
     d = _mk_downstream(srv_url, omni_describe=True,
                        agent_transcript_mode="dual")
     if not check_ic(d):
         return
     d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
+    _flush(d)
+    bgs = _bg_rounds()
+    check(len(bgs) == 1
+          and bgs[0][1].get("content", {}).get("VLM") == DESC_FULL,
+          "描述一到就推给了 Agent（不等 ASR）")
+    HITS.clear()
     t_feed = time.monotonic()
     _answer_path(d)
     _flush(d)
@@ -593,8 +601,8 @@ def test_ready_before_asr_final(srv_url: str) -> None:
         d.ic.close()
         return
     hit, body = ans[0]
-    check(body.get("content", {}).get("VLM") == DESC_FULL,
-          "断句点取到的是已就绪的描述")
+    check(body.get("content", {}).get("VLM") == "",
+          "ASR 轮只带 ASR（视觉状态已经单独推过）")
     check(hit["mono"] - t_feed < 0.5,
           "断句 → Agent 收到 POST 用时 "
           f"{(hit['mono'] - t_feed) * 1000:.0f}ms（< 500ms）")
@@ -751,9 +759,11 @@ def test_contract_drift(srv_url: str) -> None:
           f"包装后仍恰好 1 次 POST（实际 {len(wrapped)}）—— 没多发也没漏发")
     if wrapped:
         body = wrapped[0][1]
-        check(body.get("content") == {"ASR": "转写", "VLM": "描述文本"},
-              f"content 注进去了（实际 {body.get('content')!r}）—— "
-              "为 0 说明 `_send` 已不在投递路径上（IC 改版了？）")
+        check(body.get("content") == {"ASR": "转写", "VLM": ""},
+              f"content 注进去了，且**正常话轮 VLM 为空**"
+              f"（实际 {body.get('content')!r}）—— 缺 content 说明 `_send` "
+              "已不在投递路径上（IC 改版了？）；VLM 非空说明同步发送的老行为"
+              "又回来了")
         check(body.get("transcript") == "转写",
               "transcript 未被改动（dual 是**追加**一个键）")
 
@@ -777,8 +787,8 @@ def test_contract_drift(srv_url: str) -> None:
               and both[0][1].get("transcript") == "",
               f"#1 是背景轮（ASR / transcript 都空，VLM = 投递那一刻的缓存）"
               f"，实际 {both[0][1]!r} —— 少 content 说明 `_send` 不在投递路径上")
-        check(both[1][1].get("content") == {"ASR": "转写", "VLM": "后来的描述"},
-              f"#2 是真实轮、且取的是**更新后**的缓存"
+        check(both[1][1].get("content") == {"ASR": "转写", "VLM": ""},
+              f"#2 是真实轮：**只带 ASR**，VLM 留空（视觉状态走单独那一路）"
               f"（实际 {both[1][1].get('content')!r}）")
 
     # ---- dict 模式：背景轮必被 Agent 的 `transcript: str` 挡掉 ⇒ 明确拒绝 ----
@@ -1193,15 +1203,15 @@ def test_state_merge_snapshot(srv_url: str) -> None:
     check(d._vlm_state == {} and d._vlm == "",
           "on_session_start 清空快照与缓存")
 
-    # 送出去的是快照
+    # 送出去的是快照 —— 走**视觉轮**（ASR 空），不是正常话轮
     d._feed(OmniDescription(t=5, stage="full", text=_STATE_FULL))
     d._feed(OmniDescription(t=6, stage="turn", text="BEHAVIOR: 持续远离 6 秒"))
-    _answer_path(d)
     _flush(d)
-    ans = _talk_rounds()
-    vlm = ans[0][1].get("content", {}).get("VLM") if ans else ""
+    bgs = _bg_rounds()
+    vlm = bgs[-1][1].get("content", {}).get("VLM") if bgs else ""
     check(bool(vlm) and "BEHAVIOR: 持续远离 6 秒" in vlm and vlm.count("\n") == 7,
-          f"送到 Agent 的是 8 行完整快照（实际 {len(vlm)} 字）")
+          f"推给 Agent 的是 8 行完整快照（实际 {len(vlm)} 字）")
+    check(len(bgs) >= 2, f"两份描述 ⇒ 两个视觉轮（实际 {len(bgs)}）")
     d.ic.close()
 
 
@@ -1375,8 +1385,8 @@ def main() -> int:
         test_no_truncation(url)
         test_no_change_keeps_previous(url)
         test_visual_background_round(url)
-        test_turn_makes_no_background(url)
-        test_background_latch_per_session(url)
+        test_turn_pushes_visual_round(url)
+        test_visual_push_every_description(url)
         test_background_not_sent_in_legacy(url)
         test_ready_before_asr_final(url)
         test_missing_description_never_waits(url)
