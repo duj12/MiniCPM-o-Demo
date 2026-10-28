@@ -163,7 +163,8 @@ class OrchestratorSession:
         #: **两种**触发，混在一个槽里会互相吞掉对方）
         self._desc_task: Optional[asyncio.Task] = None
         #: 每轮描述的**兜底心跳**间隔（秒）—— 主路径是断句触发，见
-        #: `_on_vad_segment_end` 与 config 的说明
+        #: `_on_vad_segment_end` 与 config 的说明。心跳**只在静默时**发：
+        #: 距最近一次语音活动（partial / offline）不足这个间隔就跳过。
         self._desc_interval = float(config.get("omni_delta_interval_s", 10.0) or 10.0)
         #: 断句点是否触发一次每轮描述（默认开）。关掉即回到纯定时轮询。
         self._desc_on_turn_boundary = bool(
@@ -194,6 +195,10 @@ class OrchestratorSession:
         self._desc_inflight_at = 0.0
         #: 上一轮描述**结束**的时刻 —— 下一轮的间隔从这里算
         self._desc_last_done_at = 0.0
+        #: 最近一次**检测到用户在说话**的时刻（monotonic，0 = 还没说过）。
+        #: 心跳只在**静默**时才发：有语音输入时主路径（VAD 断句点）已经在
+        #: 触发描述，再叠一条定时心跳纯属重复 decode —— 见 `_desc_loop`。
+        self._last_speech_at = 0.0
         #: **本轮**（我们主动触发的这一轮）是不是描述轮。
         #:
         #: `main.py` 的 `on_omni_event` 靠它把 `response.done` 分流成
@@ -1243,6 +1248,9 @@ class OrchestratorSession:
                 # 那恰恰是「用户在出声但没识别出来」的信号，state 里能看出来。
                 # 早先这里有 `if delta:` 守卫，把这类帧整条丢了。
                 self._asr_online_text += delta
+                # 用户在说话 ⇒ 心跳让位给断句点触发（见 `_desc_loop`）。
+                # 空文本帧也算：那是"在出声但没识别出来"，同样不是静默。
+                self._last_speech_at = time.monotonic()
                 # 描述链路的第二条点火路径（IC 直判 ANSWER、没有 GREET 时）。
                 # 挂**部分结果**是关键 —— 到 2pass-offline 才点火就来不及了。
                 self._start_desc_on_asr(self._asr_online_text)
@@ -1266,6 +1274,9 @@ class OrchestratorSession:
             if embedded_ts is not None:
                 _post_turnsense(embedded_ts)
 
+            # 断句点也是一次语音活动 —— 心跳从这一刻起重新计时（下面那次
+            # 断句触发的描述结束时会再推一次 `_desc_last_done_at`）。
+            self._last_speech_at = time.monotonic()
             fin = parse_final(msg)
             t0 = self.asr.ms_to_sample(fin["start_ms"])
             t1 = self.asr.ms_to_sample(fin["end_ms"])
@@ -1616,6 +1627,17 @@ class OrchestratorSession:
                 self._desc_last_done_at = now
             if now - self._desc_last_done_at < self._desc_interval:
                 continue
+            # ⚠️ 心跳只服务**静默**（2026-10-28 用户口径）：ASR 出了结果之后
+            #    一直没有新的语音输入，画面仍可能在变（人走开、拿东西），
+            #    这时候才需要定时补一条。**用户正在说话时不要发** —— 主路径
+            #    （VAD 断句点）本来就会在每个语音段结束时触发一次，再叠心跳
+            #    等于对同一段话 decode 两遍。
+            #    判据用"最近一次检测到语音活动"（partial / offline 都算），
+            #    而不是"最近一次 ASR 文本"：说不出字的噪音段同样不是静默。
+            if now - self._last_speech_at < self._desc_interval:
+                continue
+            logger.info("[%s] 静默 %.0fs 无新的语音输入 ⇒ 心跳描述",
+                        self.session_id, now - self._last_speech_at)
             await self._do_describe("turn")
 
     def _stop_desc_loop(self) -> None:
