@@ -46,7 +46,9 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from ..omni.describe import is_no_change, looks_conversational
+from ..omni.describe import (
+    is_no_change, looks_conversational, parse_state, render_state,
+)
 
 from ..downstream.interface import (
     AsrFinal, AsrPartial, AsrStateUpdate, Describe, DownstreamAction,
@@ -131,6 +133,11 @@ class InteractionDownstream:
         #: 由 `agent_sink` 的 getter 在 `on_answer` 的**断句那一刻**读取 ——
         #: 所以这里必须是一份"随时可用"的缓存，取值路径上**不做任何生成**。
         self._vlm = ""
+        #: 解析出来的**结构化快照**（`KEY -> 值`，见 `omni/describe.py`）。
+        #: 增量只带变化的键，合并到这里；渲染成 `self._vlm` 送给 Agent。
+        #: ⚠️ 解析失败（模型没按格式答）时保持为空，`self._vlm` 退回原文 ——
+        #:    绝不能因为"格式不对"就把一份有效描述丢掉。
+        self._vlm_state: Dict[str, str] = {}
         #: 该描述**生成完成**的单调时刻（算年龄用）
         self._vlm_at = 0.0
         #: 该描述属于哪个阶段（full / delta）
@@ -265,6 +272,7 @@ class InteractionDownstream:
             logger.info("[%s] 新会话开始 —— 清掉上一会话的 VLM 描述（%d 字）",
                         self.session_id, len(self._vlm))
         self._vlm = ""
+        self._vlm_state = {}
         self._vlm_at = 0.0
         self._vlm_stage = ""
         self._prev_atype = ""
@@ -593,14 +601,35 @@ class InteractionDownstream:
             logger.warning("[%s] ⚠️ VLM 描述像是**对话**而非描述（prompt 没镇住？）"
                            "：%r", self.session_id, text[:60])
         self._vlm = text
+        # ---- 结构化合并 ----
+        #
+        # 解析不到任何键 ⇒ **保持原文**（模型没按格式答时不丢数据，只是回到
+        # 老行为：`content.VLM` 是自由文本）。这是本改动唯一的安全阀。
+        parsed = parse_state(text)
+        if parsed:
+            if ev.stage == "full":
+                # 起点全量是**完整替换**：旧的键不该残留（换人后 FEATURE 必须换）
+                self._vlm_state = dict(parsed)
+            else:
+                # 每轮（`turn`）也是全量 8 键，合并 == 替换；用 `update` 是为了
+                # 兜住"某一行被截断/没答"的情形 —— 缺的键保旧值，而不是丢掉。
+                self._vlm_state.update(parsed)
+            self._vlm = render_state(self._vlm_state)
+        else:
+            # 解析失败 ⇒ 快照与原文脱节，**清掉快照**，免得下一份增量合并到
+            # 一个过时的底座上（旧键会以"没变化"的名义永远留着）。
+            self._vlm_state = {}
         self._vlm_at = time.monotonic()
         self._vlm_stage = ev.stage
-        logger.info("[%s] VLM 描述已更新（stage=%s）%d 字：%r",
-                    self.session_id, ev.stage, len(text), text[:60])
+        logger.info("[%s] VLM 描述已更新（stage=%s）%d 字，快照 %d 键：%r",
+                    self.session_id, ev.stage, len(self._vlm),
+                    len(self._vlm_state), self._vlm[:400])
         # 全量描述 ⇒ 补一发「会话起点的视觉背景」给 Agent。**必须在
         # `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
         if ev.stage == "full":
-            self._emit_visual_background(len(text))
+            # 传**缓存里那份**（已渲染成快照），不是模型原文 —— 日志里的字数
+            # 要能对上 Agent 实际收到的东西。
+            self._emit_visual_background(len(self._vlm))
 
     def _emit_visual_background(self, n_chars: int) -> None:
         """把刚写进缓存的全量描述当「视觉背景轮」投给 Agent（ASR 为空）。

@@ -262,6 +262,21 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 sess.post_downstream(OmniTurnSense(
                     t=now, label=str(ev.get("label") or "")))
             elif t == "response.output.delta":
+                # ---- 后端度量（计划 §4.2D 的埋点）----
+                # `listen` 回执带着 `metrics`：`kv_cache_length` 是**持续推帧**
+                # 的直接成本证据（帧到达即 prefill 进 KV），`vision_tokens`
+                # 是每次看图的实际 token 数。早先这里整块丢弃 ⇒ 只能靠体感
+                # 判断"少描述有没有抑制 KV 增长"。**只记数，不改任何行为。**
+                met = ev.get("metrics")
+                if isinstance(met, dict):
+                    for key in ("kv_cache_length", "vision_tokens", "vision_slices"):
+                        val = met.get(key)
+                        if isinstance(val, (int, float)):
+                            sess.stats[f"omni_{key}"] = val
+                    kv = met.get("kv_cache_length")
+                    if isinstance(kv, (int, float)):
+                        sess.stats["omni_kv_max"] = max(
+                            sess.stats.get("omni_kv_max", 0), int(kv))
                 sess.post_downstream(OmniDelta(
                     t=now,
                     delta_kind=ev.get("kind", "text"),
@@ -283,10 +298,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 #    都断掉）。
                 take = getattr(sess, "take_omni_stage", None)
                 try:
-                    # 传 text：session 用**描述轮的完整文本**记「上一轮描述」
-                    # —— 换人设重连后第一条增量要靠它当参照物（见
-                    # `session._desc_needs_context`）。老版本 session 的方法
-                    # 不收参数 ⇒ 退回无参调用（与上面 getattr 同款兜底）。
+                    # 传 text：session 用它算**这一轮描述的成本**（耗时/字数）。
+                    # 老版本 session 的方法不收参数 ⇒ 退回无参调用（与上面
+                    # getattr 同款兜底）。
                     stage = take(text) if take is not None else ""
                 except TypeError:
                     stage = take() if take is not None else ""
@@ -484,11 +498,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 if cfg.omni_describe:
                     logger.info(
                         "[%s] VLM 描述已开：transcript 模式=%s；"
-                        "全量描述挂 IC 的 GREET，增量每 %.1fs 滚动%s",
-                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s,
-                        "；增量用短人设（全量做完后**关掉重连一次**）"
-                        if cfg.omni_delta_persona else
-                        "（增量与全量共用一条连接/一个 system prompt）")
+                        "起点全量挂 IC 的 GREET（只发一次作背景），"
+                        "之后每轮全量、断句点触发 / %.1fs 心跳兜底",
+                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s)
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，

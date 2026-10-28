@@ -142,12 +142,18 @@ class OrchestratorSession:
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
-        # ---- VLM 描述（两阶段）--------------------------------------------
+        # ---- VLM 描述（起点全量 + 每轮全量）--------------------------------
         #
         # `ORCH_OMNI_DESCRIBE=1` 时 OmniLLM 不再当"对话方"，而是当**描述
-        # 助手**：全量描述挂 IC 的 GREET（见 `interaction/downstream.py`），
-        # 增量描述由 `_desc_loop` 滚动刷。产出的文本经 `OmniDescription`
-        # 事件落进下游的 `_vlm` 缓存，断句时随 `on_answer` 发给 Agent。
+        # 助手**：起点那份带细节的全量挂 IC 的 GREET（见
+        # `interaction/downstream.py`，只发一次作为 Agent 的视觉背景）；
+        # 之后**每一轮**（VAD 断句点 / 10s 心跳）也发**全量 8 键**，只是
+        # 值压到最短。产出的文本经 `OmniDescription` 事件落进下游的
+        # `_vlm` 缓存，断句时随 `on_answer` 发给 Agent。
+        #
+        # 为什么每轮都发全量而不是"只报变化"：增量不报的字段会一直沿用旧值
+        # （`ATTENTION` 卡在「面向屏幕」就是这么来的），且模型跟不上"只报
+        # 变化"这条抽象元指令。详见 `omni/describe.py` 模块文档。
         #
         # ⚠️ 这里**不持有**描述文本 —— 缓存归 `InteractionDownstream`
         #    （它才是读方，且 sink 的 getter 从它那儿取）。session 只负责
@@ -156,11 +162,29 @@ class OrchestratorSession:
         #: 在途的描述任务（与 `_trigger_task` 分开：对话触发与描述触发是
         #: **两种**触发，混在一个槽里会互相吞掉对方）
         self._desc_task: Optional[asyncio.Task] = None
-        #: 滚动增量的间隔（秒）—— 见 config 的说明
-        self._desc_interval = float(config.get("omni_delta_interval_s", 2.0) or 2.0)
+        #: 每轮描述的**兜底心跳**间隔（秒）—— 主路径是断句触发，见
+        #: `_on_vad_segment_end` 与 config 的说明
+        self._desc_interval = float(config.get("omni_delta_interval_s", 10.0) or 10.0)
+        #: 断句点是否触发一次每轮描述（默认开）。关掉即回到纯定时轮询。
+        self._desc_on_turn_boundary = bool(
+            config.get("omni_desc_on_turn_boundary", True))
+        #: 每轮描述的 token 上限（0 = 不限）。全量 8 键约 90~120 字，给 192
+        #: 留出余量；键值契约下截断只影响最后一行。
+        self._desc_delta_max_new_tokens = int(
+            config.get("omni_delta_max_new_tokens", 0) or 0)
+        #: 两段模板的 config 覆盖（空 = 用 `omni/describe.py` 的默认）。
+        #: 这让 prompt 调优不用改代码 —— 见 config 的说明。
+        self._desc_full_instruction = str(
+            config.get("omni_describe_full_instruction", "") or "")
+        self._desc_delta_instruction = str(
+            config.get("omni_describe_delta_instruction", "") or "")
+        #: 已经为哪个 VAD 段发过断句触发的描述。段关闭的证据今天只有
+        #: `2pass-offline` 到达，但同一次关闭可能来多条 offline（`is_final`
+        #: 之外还有收尾帧），所以要去重 —— 否则一次断句发两次 decode。
+        self._desc_last_segment_id = -1
         #: 滚动循环的任务（对话开始后常驻，会话结束时取消）
         self._desc_loop_task: Optional[asyncio.Task] = None
-        #: 滚动是否已经启动（GREET 那次全量描述是起点 —— 见
+        #: 滚动是否已经启动（GREET 那次起点描述是起点 —— 见
         #: `request_omni_description`）
         self._desc_started = False
         #: 是否有一轮描述**正在生成**（`response.done` 到之前为 True）。
@@ -168,7 +192,7 @@ class OrchestratorSession:
         self._desc_inflight = False
         #: 在途那一轮的发出时刻（算"在途超时"用）
         self._desc_inflight_at = 0.0
-        #: 上一轮描述**结束**的时刻 —— 下一个增量的间隔从这里算
+        #: 上一轮描述**结束**的时刻 —— 下一轮的间隔从这里算
         self._desc_last_done_at = 0.0
         #: **本轮**（我们主动触发的这一轮）是不是描述轮。
         #:
@@ -176,26 +200,6 @@ class OrchestratorSession:
         #: `OmniDescription` 而不是 `OmniResponseDone` —— 我们只能从
         #: "是我们请求的"推出这一轮是描述（服务端不区分，见 plan）。
         self._omni_stage = ""
-
-        #: 换人设重连（`ORCH_OMNI_DELTA_PERSONA=1`，默认关）。开了之后：
-        #: 全量在 `DESCRIBE_SYSTEM_PROMPT` 的连接上做完 ⇒ 关掉重连 ⇒ 换成
-        #: `DELTA_SYSTEM_PROMPT` 接着跑增量。见 `omni/describe.py` 模块文档
-        #: 「为什么增量轮压不短」——那是**为什么非开不可**的原因。
-        self._delta_persona_enabled = bool(config.get("omni_delta_persona", False))
-        #: 本会话**已经换过**人设（整个会话只换一次）。失败也算换过 ——
-        #: 否则每次全量描述都会重试一次重连，把 omni 反复打断。
-        self._persona_switched = False
-        #: 换连接后的**第一条**增量要带上「上一轮描述」（新连接 KV 是空的，
-        #: 模型不知道"相对什么"在变）。用掉即清。
-        self._desc_needs_context = False
-        #: 最近一份完整描述 —— 只给 `_desc_needs_context` 那条用。
-        #: 由 `take_omni_stage(text=…)` 记（`main.py` 手上才有 text）。
-        self._desc_last_text = ""
-        #: 换人设重连**期间**暂停滚动循环：空档里发触发必然失败，只会白刷
-        #: `omni_desc_failed`。配一个上限（见 `_desc_loop`）防"重连卡死
-        #: ⇒ 描述链路一起卡死"。
-        self._desc_paused = False
-        self._desc_paused_at = 0.0
 
         # 回声消除模式：browser | service | off（可被 session.start 覆盖）
         self.aec_mode = str(config.get("aec_mode") or "browser")
@@ -1279,6 +1283,15 @@ class OrchestratorSession:
             # 过滤），上面的部分结果路径就没点着火。此时至少把链路启起来，
             # 让**后续**几句有描述可发 —— 本句的 VLM 已经来不及，认了。
             self._start_desc_on_asr(fin["text"])
+            # ---- 断句点触发（主路径）----
+            # `2pass-offline` 到达 = VAD 关掉了一个语音段。这里立刻发一次
+            # 增量描述，**不等待**（它服务的是下一轮，见 `_on_vad_segment_end`）。
+            # ⚠️ 放在 `_start_desc_on_asr` **之后**：首句那一次是"点火"，
+            #    不该在同一拍再补一条增量。
+            # ⚠️ 只有**说出字**的段才算一次话轮：纯噪音段关掉也要 decode，
+            #    在嘈杂环境里会白白烧算力，而它没有任何 `on_answer` 可服务。
+            if fin["text"] and fin["text"].strip():
+                self._on_vad_segment_end()
             # 最终结果到达：用它覆盖流式累积文本，并**清空缓冲**为下一段
             # 做准备（服务端也是这么做的：text_print_2pass_online = ""）
             self._asr_online_text = ""
@@ -1338,7 +1351,7 @@ class OrchestratorSession:
         self._trigger_task = asyncio.create_task(_do())
 
     # ------------------------------------------------------------------ #
-    #  VLM 描述（两阶段）
+    #  VLM 描述（起点全量 + 每轮全量）
     # ------------------------------------------------------------------ #
 
     #: 滚动循环的轮询步长（秒）。**不追求精确**：循环只需判「上一轮完了没、
@@ -1347,12 +1360,12 @@ class OrchestratorSession:
     #: `response.done`，链子也不会断（见 `_desc_loop` 的超时分支）。
     _DESC_POLL_S = 0.25
 
-    async def request_omni_description(self, stage: str = "delta") -> None:
+    async def request_omni_description(self, stage: str = "turn") -> None:
         """让 OmniLLM 产一次描述（下游派的 `Describe` 动作）。
 
         目前只有一个调用方：IC 判**切入 GREET** 时派 `Describe("full")`
-        —— 见 `interaction/downstream.py` 的 `_dispatch`。增量的 `delta`
-        由 `_desc_loop` 自己调度，不走这里。
+        —— 见 `interaction/downstream.py` 的 `_dispatch`。每轮的 `turn`
+        由 `_desc_loop` / 断句点自己调度，不走这里。
 
         首次调用同时**接管**滚动循环：GREET 之前不该有任何描述轮
         （画面里还没人，纯浪费 GPU），GREET 之后才开始滚动刷新。
@@ -1409,6 +1422,57 @@ class OrchestratorSession:
                     self.session_id, len(text))
         self._desc_task = asyncio.create_task(self._do_describe("full"))
 
+    def _on_vad_segment_end(self) -> None:
+        """**VAD 关掉一个语音段** ⇒ 立刻发一次每轮描述，**不等待**。
+
+        ## 为什么挂在"段关闭"而不是 TurnSense
+
+        TurnSense 是**条件触发**的 —— 真实语音里可能一次都不发
+        （`asr/client.py:16`）。段关闭是更基础的信号；今天唯一的证据是
+        `2pass-offline` 到达（`asr/client.py:_on_offline` → `_mark_closed()`），
+        将来外部下发 VAD 断句事件时**从同一个钩子进**，调度链路不动。
+
+        ## 为什么"不等待"
+
+        触发点与 IC 判 ANSWER 是**同一拍**（`_mark_closed()` 与
+        `post_downstream(AsrFinal)` 在同一条消息的处理里），而 VLM decode
+        是秒级、这个窗口只有几十毫秒 ⇒ 这次 decode **必然晚于本句的
+        `on_answer`**。所以它服务的是**下一轮**：本句用缓存里已有的描述，
+        结果落在缓存里随下一次 `on_answer` 走。两边谁都不等谁。
+
+        ## 在途时**不排队、不补发**
+
+        一次只允许一条 decode 在飞（与 `_desc_loop` 同一个不变量）。断句点
+        正好撞上在途那一轮时直接放弃 —— 那一轮抓的帧比断句还新，沿用即可。
+        """
+        if not (self._desc_enabled and self._desc_on_turn_boundary):
+            return
+        if not self._desc_started or self.omni is None:
+            return
+        seg = int(getattr(self.asr, "finals", 0))
+        if seg == self._desc_last_segment_id:
+            # 同一段关闭可能来多条 offline（收尾帧）—— 只算一次
+            return
+        self._desc_last_segment_id = seg
+        # ⚠️ 还要看**已排进队列但还没跑起来**的任务：`_start_desc_on_asr`
+        #    在首句时刚 `create_task` 了一个全量，而它在真正执行前不会置
+        #    `_desc_inflight` —— 只看那个标记会在这里再补发一条增量。
+        if self._desc_inflight or (self._desc_task is not None
+                                   and not self._desc_task.done()):
+            self.stats["omni_desc_skipped_busy"] = \
+                self.stats.get("omni_desc_skipped_busy", 0) + 1
+            logger.debug("[%s] 断句（段 %d）撞上在途描述 —— 跳过，不排队",
+                         self.session_id, seg)
+            return
+        self.stats["omni_desc_on_boundary"] = \
+            self.stats.get("omni_desc_on_boundary", 0) + 1
+        logger.info("[%s] VAD 断句（段 %d）⇒ 触发每轮描述（不等待）",
+                    self.session_id, seg)
+        # 同步占位：`create_task` 只是排队，同一拍再来一次断句会双发
+        self._desc_inflight = True
+        self._desc_inflight_at = time.monotonic()
+        self._desc_task = asyncio.create_task(self._do_describe("turn"))
+
     def take_omni_stage(self, text: str = "") -> str:
         """读走「当前这一轮是不是我们请求的描述轮」，并清零。
 
@@ -1416,10 +1480,8 @@ class OrchestratorSession:
         非空 ⇒ 这一轮是描述 ⇒ 发出 `OmniDescription`；空 ⇒ 是对话回复 ⇒
         照旧发 `OmniResponseDone`。**读走即清零**，两条路互斥。
 
-        ``text`` 是这一轮的完整文本（`response.done.text`）。只有**描述轮**
-        才用它，且只干两件事：记成「最近一份描述」（换人设重连后的第一条
-        增量要拿它当参照物），以及在全量做完时**点火换人设**。空 / 「无
-        变化」不算 —— 它们意味着上一份描述仍然成立。
+        ``text`` 是这一轮的完整文本（`response.done.text`），只用来算成本
+        （耗时 / 字数）与打日志。空 / 「无变化」的描述由下游过滤，不在这里管。
 
         ⚠️ 这里**必须**顺手清 `_desc_inflight` —— 它是滚动循环"上一轮完了"
         的唯一信号。漏了它，循环会一直以为有生成在途，描述再也不会刷新
@@ -1429,87 +1491,40 @@ class OrchestratorSession:
         self._omni_stage = ""
         self._desc_inflight = False
         self._desc_last_done_at = time.monotonic()
-        if stage and text and text.strip():
-            from .omni.describe import is_no_change
-            if not is_no_change(text):
-                self._desc_last_text = text
-        if stage == "full":
-            # 全量做完 = 唯一一次换人设的时机（换早了全量就没八类清单了）。
-            self._maybe_switch_delta_persona()
+        if stage:
+            # ---- 单次描述成本（计划 §4.2D 的埋点）----
+            # 触发 → done 的耗时 + 输出字数。没有它，"降开销"只是体感。
+            # 累计值用来算均值；`_last_*` 是给日志/验收直接看的那一条。
+            _ms = int((self._desc_last_done_at - self._desc_inflight_at) * 1000)
+            _chars = len(text or "")
+            self.stats["omni_desc_last_ms"] = _ms
+            self.stats["omni_desc_last_chars"] = _chars
+            self.stats["omni_desc_total_ms"] = self.stats.get("omni_desc_total_ms", 0) + _ms
+            self.stats["omni_desc_total_chars"] = \
+                self.stats.get("omni_desc_total_chars", 0) + _chars
+            logger.info("[%s] 描述完成 stage=%s 耗时 %dms、%d 字",
+                        self.session_id, stage, _ms, _chars)
         return stage
-
-    def _maybe_switch_delta_persona(self) -> None:
-        """全量描述**刚拿到** ⇒ 换成"只报变化"的短人设（重连一次）。
-
-        幂等：`_persona_switched` 一旦置位就不再进（含**失败**——否则每次
-        全量都会重连一次，把 omni 反复打断）。
-
-        换人设要花 ~1~3s，所以挂在**任务**上，不阻塞 `on_omni_event`
-        （那是 omni 的接收回调，堵住它会连带卡住所有 omni 事件）。
-        """
-        if not (self._delta_persona_enabled and self._desc_enabled):
-            return
-        if self._persona_switched or self.omni is None:
-            return
-        self._persona_switched = True
-        # ⚠️ 暂停**必须在这里同步置位**，不能等 `_switch_delta_persona`
-        #    跑起来再置 —— `create_task` 只是排进队列，而全量 done 刚把
-        #    `_desc_inflight` 清掉、`_desc_last_done_at` 刷成"现在"，滚动
-        #    循环下一次轮询（250ms）就会发出一条增量。那条增量落在**旧**
-        #    连接上，随即被重连掐断，它的 done 永远不来 ⇒ 在途标记挂到
-        #    超时（10s）才自愈，缓存里这 10s 描述不更新。
-        self._desc_paused = True
-        self._desc_paused_at = time.monotonic()
-        self._desc_task = asyncio.create_task(self._switch_delta_persona())
-
-    async def _switch_delta_persona(self) -> None:
-        """关掉重连、换短人设；给下一条增量挂上「上一轮描述」。
-
-        失败**不抛**（`switch_system_prompt` 自己兜了）：退化成"原人设常驻"
-        —— 增量照旧长，但链路不塌。
-        """
-        from .omni.describe import DELTA_SYSTEM_PROMPT
-        try:
-            ok = await self.omni.switch_system_prompt(DELTA_SYSTEM_PROMPT)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] 换短人设异常: %s", self.session_id, exc)
-            ok = False
-        finally:
-            self._desc_paused = False
-            # 换连接前可能有哪条增量已经发出去了（暂停与发出之间没有 await
-            # 能保证互斥，见 `_maybe_switch_delta_persona` 的注释）——旧连接
-            # 已经不在了，它的 done 永远不会来。**主动放掉在途标记**，否则
-            # 滚动循环要空等满超时（10s）才自愈。
-            self._desc_inflight = False
-            self._omni_stage = ""
-        # 新连接的 KV 是空的 ⇒ 第一条增量必须自带参照物
-        self._desc_needs_context = ok
-        # 重连本身也花时间，别紧接着又触发一条（间隔从**现在**起算）
-        self._desc_last_done_at = time.monotonic()
-        self.stats["omni_persona_switch"] = self.stats.get("omni_persona_switch", 0) + 1
-        if ok:
-            logger.info("[%s] 已换成「只报变化」短人设（关掉重连一次）—— "
-                        "后续增量在这条连接上滚动，首条会带上上一轮描述",
-                        self.session_id)
-        else:
-            logger.warning("[%s] 换短人设**失败** —— 保持原人设继续跑："
-                           "增量仍按八类分条（能跑，只是长）", self.session_id)
 
     async def _do_describe(self, stage: str) -> None:
         """真的发一次描述触发（异步任务，不阻塞调用方）。"""
         if self.omni is None:
             logger.warning("[%s] 描述请求被跳过：OmniLLM 未装配", self.session_id)
             return
-        from .omni.describe import DELTA_INSTRUCTION, FULL_INSTRUCTION
-        instruction = FULL_INSTRUCTION if stage == "full" else DELTA_INSTRUCTION
-        if stage != "full" and self._desc_needs_context:
-            # 换人设后的**第一条**增量：新连接的 KV 是空的，模型不知道
-            # "相对什么"在变 —— 不带上参照物，它要么把画面从头描述一遍，
-            # 要么直接编。用掉即清（之后同一连接上它自己有上下文）。
-            self._desc_needs_context = False
-            if self._desc_last_text:
-                instruction = ("上一轮描述（供你判断什么变了）：\n"
-                               f"{self._desc_last_text}\n\n" + instruction)
+        from .omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
+        # config 覆盖（`ORCH_OMNI_DESCRIBE_*_INSTRUCTION`）—— 调 prompt 不用
+        # 改代码；空则用 `omni/describe.py` 的默认。
+        #
+        # 两段都是**全量 8 键**，差别只在详细程度：起点那份要当 Agent 的
+        # 视觉背景，允许展开；每轮那份只求快，值压到最短。
+        if stage == "full":
+            instruction = self._desc_full_instruction or FULL_INSTRUCTION
+        else:
+            instruction = self._desc_delta_instruction or TURN_INSTRUCTION
+        # 起点全量不设上限；每轮给上限（0 = 不限）。键值契约下截断只影响
+        # 最后一行，不会污染合并后的快照。
+        max_new_tokens = (None if stage == "full" or self._desc_delta_max_new_tokens <= 0
+                          else self._desc_delta_max_new_tokens)
         self.stats["omni_desc_triggers"] = self.stats.get("omni_desc_triggers", 0) + 1
         # 标记在途**必须在 create_task 之前** —— 循环下一次轮询要看它
         self._desc_inflight = True
@@ -1518,7 +1533,8 @@ class OrchestratorSession:
 
         async def _do():
             try:
-                ok = await self.omni.trigger_reply(instruction)
+                ok = await self.omni.trigger_reply(
+                    instruction, max_new_tokens=max_new_tokens)
                 if not ok:
                     self.stats["omni_desc_failed"] = \
                         self.stats.get("omni_desc_failed", 0) + 1
@@ -1531,7 +1547,7 @@ class OrchestratorSession:
                 self._release_desc_attempt()
 
         logger.info("[%s] 触发%s描述", self.session_id,
-                    "全量" if stage == "full" else "增量")
+                    "起点全量" if stage == "full" else "每轮")
         self._desc_task = asyncio.create_task(_do())
 
     def _release_desc_attempt(self) -> None:
@@ -1544,7 +1560,7 @@ class OrchestratorSession:
         * **推进 `_desc_last_done_at`** —— 否则间隔判据（`now -
           _desc_last_done_at < interval`）永远成立，循环会以轮询步长
           （250ms）疯狂重试。真机实测（2026-10-08，omni 连接断掉时）：
-          日志被 `触发增量描述` + `触发未能送出` 刷成每 250ms 一对，
+          日志被 `触发每轮描述` + `触发未能送出` 刷成每 250ms 一对，
           四秒上百行，把真正有用的信息冲掉了。
 
         推进之后重试频率就等于配置的 `ORCH_OMNI_DELTA_INTERVAL_S` ——
@@ -1561,7 +1577,7 @@ class OrchestratorSession:
         self._desc_loop_task = asyncio.create_task(self._desc_loop())
 
     async def _desc_loop(self) -> None:
-        """滚动刷新增量描述 —— 目标是 `AsrFinal` 一到就有非空缓存可发。
+        """滚动刷新每轮描述 —— 目标是 `AsrFinal` 一到就有非空缓存可发。
 
         ## 为什么用"轮询 + 在途标记"而不是"done 之后 sleep 一次"
 
@@ -1585,16 +1601,6 @@ class OrchestratorSession:
             if not self._desc_started or self.omni is None:
                 continue
             now = _time.monotonic()
-            if self._desc_paused:
-                # 换人设重连的空档 —— 发了也送不出去，只会白刷
-                # `omni_desc_failed`。给个上限防呆：重连卡死时**不能**把
-                # 整条描述链路一起卡住（与下面"在途超时"同一个道理）。
-                if now - self._desc_paused_at <= stale_s:
-                    continue
-                logger.warning("[%s] 换人设重连超过 %.0fs 未结束 —— "
-                               "解除暂停、恢复滚动（查 OmniLLM 连接）",
-                               self.session_id, stale_s)
-                self._desc_paused = False
             if self._desc_inflight:
                 if now - self._desc_inflight_at <= stale_s:
                     continue
@@ -1610,7 +1616,7 @@ class OrchestratorSession:
                 self._desc_last_done_at = now
             if now - self._desc_last_done_at < self._desc_interval:
                 continue
-            await self._do_describe("delta")
+            await self._do_describe("turn")
 
     def _stop_desc_loop(self) -> None:
         """停掉滚动循环与在途描述任务（会话收尾用）。"""

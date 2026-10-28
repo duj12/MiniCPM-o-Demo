@@ -292,7 +292,8 @@ class OmniClient:
                 logger.warning("Omni 连续 %d 次发送失败 —— 标记连接已断",
                                self._send_errors)
 
-    async def trigger_reply(self, text: str = "") -> bool:
+    async def trigger_reply(self, text: str = "",
+                            max_new_tokens: Optional[int] = None) -> bool:
         """主动触发一次回复（``turn_trigger="asr"`` 时用）。
 
         机制：不带 ``force_listen`` 的 push 会让后端 **decode**（生成），
@@ -300,6 +301,8 @@ class OmniClient:
         「force_listen intentionally omitted → decode」。
 
         ``text`` 非空时同时注入文本（给模型一个明确的话轮边界提示）。
+        ``max_new_tokens`` 非 None 时限制本轮生成长度（增量描述用 96）；
+        描述是键值契约，截断只会丢掉最后一行（见 `omni/describe.py`）。
         返回是否成功送出。
         """
         if self.closed or self.dead or self.client is None:
@@ -310,7 +313,8 @@ class OmniClient:
                 logger.warning("OmniLLM 连接已断，触发被跳过（不回复）")
             return False
         try:
-            await self.client.send_input(text=text, force_listen=False)
+            await self.client.send_input(
+                text=text, force_listen=False, max_new_tokens=max_new_tokens)
             self.triggers += 1
             # ⚠️ 文案别写死"ASR 触发回复"：描述模式下这条路径是**描述**
             #    触发的（`session._do_describe`），照样会走到这里。触发源

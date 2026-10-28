@@ -24,7 +24,6 @@ OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`），而 interactionc
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import sys
@@ -204,11 +203,10 @@ def _greet_path(d) -> list:
 #: offline 之后**下一拍**的 ASR 快照 —— `说/抢` 转 NONE，`完` 与 `transcript`
 #: 保留。为什么需要它（这是本测试最容易写错的一处）：
 #:
-#:   · `2pass-offline` 到达的那一拍，`说/抢` 靠 `_pending_close` **故意**仍报
-#:     HIGH（`asr/client.py:641-645`：留一拍缓冲，让 IC 必然观测到"抢"），
+#:   · `2pass-offline` 到达的那一拍带**服务端原值**：`说/抢`=HIGH，
 #:     `完=HIGH`、`transcript=离线文本`
-#:   · **下一拍** tick 调 `expire_if_idle()` 消费那个缓冲 ⇒ `说/抢`→NONE，
-#:     而"本轮结论"（`完`/`信`/`transcript`）要等 `TURN_HOLD_MS` 才清
+#:   · **下一拍** tick 调 `expire_if_idle()` ⇒ `说/抢`→NONE，而
+#:     `完/信/transcript` 保留（再下一拍才全部清空，见 `docs/asr-state.md`）
 #:   · 编排侧 tick 里 `_push_asr_state_if_changed()` 会把这个变化推给 IC
 #:
 #: ⚠️ **少了这一条，IC 到不了 ANSWER**。`AsrFinal` 自己那条 `完=HIGH` 会被
@@ -321,6 +319,17 @@ def test_greet_reentry_not_deduped() -> None:
 
 DESC_FULL = "画面里有一位青年男性，穿深蓝色外套、戴黑框眼镜，站在白色展示桌左侧，正看向镜头。"
 
+#: 8 键契约下的**标准全量描述**（顺序与 `STATE_KEYS` 一致 —— `render_state`
+#: 必须逐字还原它，这是"合并成快照"最容易错的地方）。
+_STATE_FULL = """ATTENTION: 面向屏幕，注视镜头
+ACTION: 无
+EMOTION: 平静
+FEATURE: 青年女性，灰色短袖上衣
+BEHAVIOR: 站立，保持不动
+RELATION: 单人
+ENV: 室内展厅，光线明亮
+POSITION: 站在展台右侧"""
+
 
 def test_payload_dual(srv_url: str) -> None:
     from orchestrator.downstream.interface import OmniDescription
@@ -377,7 +386,7 @@ def test_no_truncation(srv_url: str) -> None:
                        agent_transcript_mode="dual")
     if not check_ic(d):
         return
-    d._feed(OmniDescription(t=0, stage="delta", text=long_desc))
+    d._feed(OmniDescription(t=0, stage="turn", text=long_desc))
     _answer_path(d)
     _flush(d)
     ans = _answers()
@@ -405,12 +414,12 @@ def test_no_change_keeps_previous(srv_url: str) -> None:
     if not check_ic(d):
         return
     d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    d._feed(OmniDescription(t=1, stage="delta", text="无变化"))
-    d._feed(OmniDescription(t=2, stage="delta", text="   "))
+    d._feed(OmniDescription(t=1, stage="turn", text="无变化"))
+    d._feed(OmniDescription(t=2, stage="turn", text="   "))
     check(d._vlm == DESC_FULL, "「无变化」/空 之后缓存仍是那份有效描述")
     # 但**真变化**的描述（含"无变化"字样）不能被误丢
     mixed = "人物无变化，但桌上多了一个红色的杯子。"
-    d._feed(OmniDescription(t=3, stage="delta", text=mixed))
+    d._feed(OmniDescription(t=3, stage="turn", text=mixed))
     check(d._vlm == mixed,
           "「人物无变化，但…」这种**有信息**的描述要收下（判据是整句相等，不是 in）")
     _answer_path(d)
@@ -464,27 +473,27 @@ def test_visual_background_round(srv_url: str) -> None:
     d.ic.close()
 
 
-def test_delta_makes_no_background(srv_url: str) -> None:
-    """增量**不**产生背景轮 —— 它是「相对上一份的变化」，不是会话起点。"""
+def test_turn_makes_no_background(srv_url: str) -> None:
+    """每轮描述**不**产生背景轮 —— 背景轮的语义是「会话起点」，只发一次。"""
     from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[背景轮] 增量不产生背景轮（只走每轮的 content.VLM）")
+    print("\n[背景轮] 每轮描述不产生背景轮（只走每轮的 content.VLM）")
     HITS.clear()
     d = _mk_downstream(srv_url, omni_describe=True,
                        agent_transcript_mode="dual")
     if not check_ic(d):
         return
-    delta = "人物没有明显变化，只是眨了一下眼。"
-    d._feed(OmniDescription(t=0, stage="delta", text=delta))
+    turn = "人物没有明显变化，只是眨了一下眼。"
+    d._feed(OmniDescription(t=0, stage="turn", text=turn))
     _flush(d)
-    check(_bg_rounds() == [], "只有增量 ⇒ 一个背景轮都不该有")
+    check(_bg_rounds() == [], "只有每轮描述 ⇒ 一个背景轮都不该有")
     _answer_path(d)
     _flush(d)
     ans = _talk_rounds()
     check(len(ans) == 1, f"真实话轮 1 个（实际 {len(ans)}）")
     if ans:
-        check(ans[0][1].get("content", {}).get("VLM") == delta,
-              "增量走的是每轮的 content.VLM（不是背景轮）")
+        check(ans[0][1].get("content", {}).get("VLM") == turn,
+              "每轮描述走的是 content.VLM（不是背景轮）")
         check(ans[0][1].get("content", {}).get("ASR") == _TALK,
               "ASR 照常送达")
     check(_bg_rounds() == [], "整条链路跑完仍然没有背景轮")
@@ -496,9 +505,9 @@ def test_background_latch_per_session(srv_url: str) -> None:
 
     两件事各对应一个坑（都**静默**）：
 
-      · 第二份 full 是「换人」触发的，但那时 omni 已被换成「只报变化」的短人设
-        （`session._maybe_switch_delta_persona`，幂等、只重连一次）⇒ 它回的是
-        **几十字的变化描述**。拿它覆盖背景 = 用 46 字冲掉 476 字的有效背景，
+      · 第二份 full 是「换人」触发的：它描述的是**新的会话起点**，而 Agent
+        那个字段的语义是「本会话起点的视觉背景」⇒ 拿它覆盖背景 = 用一份
+        刚刚开始观察的短描述冲掉已经稳定的有效背景，
         **正是本次要修的那个 bug 换了个入口**。
       · 闩不复位 ⇒ 新会话的首份 full 被上一会话的闩挡在门外 ⇒ Agent 的
         `scene.visual_background` 又是空的，**症状与要修的 bug 一模一样**。
@@ -794,6 +803,8 @@ class FakeOmni:
 
     def __init__(self) -> None:
         self.reqs: list = []
+        #: 每次触发的关键字参数（`max_new_tokens` 用它验）
+        self.kwargs: list = []
         self.alive = True
         #: 换人设调用记录（真实现是"关掉重连"，这里只记 system_prompt）
         self.switches: list = []
@@ -806,6 +817,7 @@ class FakeOmni:
         if not self.alive:
             return False
         self.reqs.append((time.monotonic(), text))
+        self.kwargs.append(dict(kw))
         return True
 
     async def switch_system_prompt(self, system_prompt: str) -> bool:
@@ -816,8 +828,8 @@ class FakeOmni:
 
 
 def test_two_stage_prompts_and_loop() -> None:
-    """`session` 侧：全量/增量指令分开注入；滚动刷新**不重叠、能自愈**。"""
-    from orchestrator.omni.describe import DELTA_INSTRUCTION, FULL_INSTRUCTION
+    """`session` 侧：起点/每轮指令分开注入；滚动刷新**不重叠、能自愈**。"""
+    from orchestrator.omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
     from orchestrator.session import OrchestratorSession
 
     print("\n[两阶段] 指令注入 + 滚动刷新")
@@ -857,9 +869,9 @@ def test_two_stage_prompts_and_loop() -> None:
     reqs = omni.reqs
     check(len(reqs) >= 2, f"发出了 ≥2 次描述请求（实际 {len(reqs)}）")
     check(reqs and reqs[0][1] == FULL_INSTRUCTION,
-          "第 1 次注入的是**全量**指令")
-    check(any(t == DELTA_INSTRUCTION for _, t in reqs[1:]),
-          "之后注入的是**增量**指令（两阶段靠注入指令区分，不重连不重 init）")
+          "第 1 次注入的是**起点全量**指令")
+    check(any(t == TURN_INSTRUCTION for _, t in reqs[1:]),
+          "之后注入的是**每轮**指令（两阶段靠注入指令区分，不重连不重 init）")
     check(n1 == 2 and n2 == 2,
           f"增量在途未完成时**不再发**（{n1} → {n2}）—— 不自激烧 GPU")
     check(len(reqs) > n2,
@@ -935,222 +947,262 @@ def test_answer_path_starts_desc_without_greet() -> None:
     sess2.closed = True
 
 
-def test_describe_prompt_matches_demo() -> None:
-    """提示词与 `streaming_chat_demo.py` 的分工**不许漂移**。
+def test_vad_boundary_trigger() -> None:
+    """**VAD 断句点 ⇒ 立刻发一次增量描述**（主路径），不排队、不重复。
 
-    约定（见 `omni/describe.py` 的模块文档）：
+    三件事必须同时成立，缺一条就会把开销优化变成"要么白烧要么漏"：
 
-    * `DEMO_DESCRIBE_PROMPT` == demo 的 `DESCRIBE_SYSTEM_PROMPT`，**逐字**；
-    * `FULL_INSTRUCTION` 以它结尾 ⇒ **全量阶段用的就是 demo 那份原文**；
-    * `DESCRIBE_SYSTEM_PROMPT` 的**前两行**逐字取自 demo（身份句 + 要求句），
-      但**不带**八类清单与"输出：分条" —— 那两句是格式要求，
-      system prompt 每轮重发，待在里头会把增量轮也顶成八类清单
-      （2026-10-08 实测：增量轮 311~679 字，注入指令压不回来）。
+    * 断句点**不等心跳**（10s 间隔下也要立刻发 —— 否则每个话轮都要等到
+      下一次心跳，描述永远落后一个话轮）；
+    * 一次断句**只发一次**（`2pass-offline` 可能来多条）；
+    * 在途时**不排队、不补发**（与 `_desc_loop` 同一个不变量：一次只有
+      一条 decode 在飞，否则服务端共享队列被占满、反而更慢）。
     """
-    print("\n[提示词] 与 demo 的分工不许漂移")
+    from orchestrator.omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
+    from orchestrator.session import OrchestratorSession
+
+    print("\n[断句] VAD 段关闭 ⇒ 立刻发每轮描述；去重；在途不排队")
+
+    def _mk(**cfg):
+        base = {"omni_describe": True, "omni_delta_interval_s": 10.0,
+                "omni_delta_max_new_tokens": 96}
+        base.update(cfg)
+        s = OrchestratorSession("t-vad-boundary", base)
+        o = FakeOmni()
+        s.omni = o
+        s.asr = SimpleNamespace(finals=1)
+        return s, o
+
+    async def _drive() -> None:
+        sess, omni = _mk()
+        # 点火（首个 ASR 文本 ⇒ 全量），再回灌 done 让链路进入"可发增量"
+        sess._start_desc_on_asr("你好")
+        await asyncio.sleep(0.05)
+        sess.take_omni_stage(_STATE_FULL)
+        check(omni.reqs[0][1] == FULL_INSTRUCTION, "第 1 次是全量")
+        check(omni.kwargs[0].get("max_new_tokens") is None,
+              "全量**不设** token 上限")
+
+        n0 = len(omni.reqs)
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == n0 + 1,
+              f"断句点**立刻**发了一次每轮描述（不等 10s 心跳，实际 +{len(omni.reqs) - n0}）")
+        check(omni.reqs[-1][1] == TURN_INSTRUCTION, "注入的是每轮指令")
+        check(omni.kwargs[-1].get("max_new_tokens") == 96,
+              f"每轮描述带 token 上限（实际 {omni.kwargs[-1]}）")
+
+        # 同一段（`finals` 没变）再来一条 offline ⇒ 不重复发
+        n1 = len(omni.reqs)
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == n1, "同一段关闭的多条 offline 只算一次")
+
+        # 在途时新段到达 ⇒ 跳过，不排队
+        sess.asr = SimpleNamespace(finals=2)
+        n2 = len(omni.reqs)
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == n2, "在途时**不补发**（一次只允许一条 decode 在飞）")
+        check(sess.stats.get("omni_desc_skipped_busy") == 1,
+              "跳过计数记上了（可观测）")
+
+        # 上一轮 done ⇒ 新段可以发了
+        sess.take_omni_stage("EMOTION: 平静")
+        sess.asr = SimpleNamespace(finals=3)
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == n2 + 1, "上一轮结束后，下一个断句点照常发")
+        check(sess.stats.get("omni_desc_on_boundary", 0) >= 2,
+              f"断句触发计数（实际 {sess.stats.get('omni_desc_on_boundary')}）")
+        check(sess.stats.get("omni_desc_last_ms") is not None
+              and sess.stats.get("omni_desc_last_chars") == len("EMOTION: 平静"),
+              "单次描述成本已埋点（耗时 + 字数）")
+        sess._stop_desc_loop()
+        sess.closed = True
+
+        # 链路没点火（没有 GREET / 没有 ASR）时，断句点不能凭空烧一次
+        sess, omni = _mk()
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == 0, "未点火时断句点不发（省下开场那次白烧）")
+        sess._stop_desc_loop()
+        sess.closed = True
+
+        # 一键回退到纯定时：`ORCH_OMNI_DESC_ON_TURN_BOUNDARY=0`
+        sess, omni = _mk(omni_desc_on_turn_boundary=False)
+        sess._start_desc_on_asr("你好")
+        await asyncio.sleep(0.05)
+        sess.take_omni_stage(_STATE_FULL)
+        n = len(omni.reqs)
+        sess.asr = SimpleNamespace(finals=9)
+        sess._on_vad_segment_end()
+        await asyncio.sleep(0.05)
+        check(len(omni.reqs) == n, "关掉开关 ⇒ 断句点完全不触发（回到旧行为）")
+        sess._stop_desc_loop()
+        sess.closed = True
+
+    asyncio.run(_drive())
+
+
+def test_state_contract_prompts() -> None:
+    """8 键契约：prompt 侧 + 解析/渲染侧的断言。
+
+    契约本身在 `omni/describe.py` 的模块文档里。这里只盯**容易悄悄漂移**
+    的地方 —— 每一处漂移都不会报错，只会让 Agent 收到的状态缺一项：
+
+    * system prompt 必须逐个点名 8 个键（摘掉键表 ⇒ 全量轮塌成一段话，
+      2026-10-08 实测 151 字）；
+    * `EMOTION` 必须写明"不参考说话内容" —— 08_2 用例（皱眉却说"满意"）
+      全靠这一句判，删了就永远跟着语音走；
+    * `ACTION` 必须保留"短暂动作已结束也要报" —— 07 的点头/摇头跨采样窗
+      即漏；
+    * 旧常量 `DEMO_DESCRIBE_PROMPT` / `FULL_FORMAT_LINE` 已删除，
+      不许以任何形式回来。
+    """
+    print("\n[契约] 8 键提示词与解析器")
     from orchestrator.omni.describe import (
-        DEMO_DESCRIBE_PROMPT, DESCRIBE_SYSTEM_PROMPT, FULL_FORMAT_LINE,
-        FULL_INSTRUCTION,
+        DESCRIBE_SYSTEM_PROMPT, FULL_INSTRUCTION, STATE_KEYS, TURN_INSTRUCTION,
+        parse_state, render_state,
     )
+    import orchestrator.omni.describe as desc
 
-    demo_file = Path(__file__).resolve().parents[2] / "streaming_chat_demo.py"
-    if not demo_file.exists():
-        check(False, f"找不到 {demo_file} —— 这条断言失去意义，别静默跳过")
-        return
-    tree = ast.parse(demo_file.read_text(encoding="utf-8"))
-    demo = None
-    for node in tree.body:
-        if (isinstance(node, ast.Assign)
-                and any(getattr(t, "id", None) == "DESCRIBE_SYSTEM_PROMPT"
-                        for t in node.targets)):
-            demo = ast.literal_eval(node.value)
-    check(demo is not None, "demo 里仍有 DESCRIBE_SYSTEM_PROMPT（改名了？）")
-    if demo is None:
-        return
+    check(STATE_KEYS == ("ATTENTION", "ACTION", "EMOTION", "FEATURE",
+                         "BEHAVIOR", "RELATION", "ENV", "POSITION"),
+          f"键表与顺序（{STATE_KEYS}）")
+    missing = [k for k in STATE_KEYS if k not in DESCRIBE_SYSTEM_PROMPT]
+    check(not missing, f"system prompt 逐个点名全部 8 键（缺 {missing}）")
+    emo = DESCRIBE_SYSTEM_PROMPT.split("EMOTION")[1].split("\n")[0]
+    check("绝不参考" in emo and "说了什么" in emo,
+          "EMOTION 那一行写明「只看表情姿态、绝不参考说了什么」（08_2 的判据）")
+    check("全部输出" in TURN_INSTRUCTION,
+          "每轮指令要求 **8 个字段全部输出**（全量方案的全部价值）")
+    check("绝不能写“无变化”" in TURN_INSTRUCTION,
+          "每轮指令禁止把「无变化」写进字段值（否则 ATTENTION: 无变化 会污染快照）")
+    check("即使已经结束也要报" in TURN_INSTRUCTION,
+          "每轮指令要求短暂动作结束了也要报（07 的瞬时动作）")
+    check("持续秒数" in TURN_INSTRUCTION,
+          "每轮指令要求行为写明持续时间（10 的连续行为）")
+    check("越短越好" in TURN_INSTRUCTION and "2~10 个字" in TURN_INSTRUCTION,
+          "每轮指令要求值压低（成本口径）")
+    # 抽象的一句「尽量短」实测**零效果**（turn 147 字 ≈ full 146 字，2026-10-28 105），
+    # 所以改成了逐字段预算 + 一份**可照抄长度的示例块** —— 示例块必须留着，
+    # 否则又退回"抽象元指令"，模型不会执行。
+    check(TURN_INSTRUCTION.count("\n") >= 8
+          and "FEATURE: 青年女性，深色长袖" in TURN_INSTRUCTION,
+          "每轮指令带一份「照这个长度写」的具体示例块（抽象指令实测无效）")
+    check("格式" in FULL_INSTRUCTION and "全部输出" in FULL_INSTRUCTION,
+          "起点指令同样交代「8 个字段全部输出」")
+    check("不要与用户对话" in DESCRIBE_SYSTEM_PROMPT
+          and "不要与用户对话" in TURN_INSTRUCTION,
+          "两套指令都保留『不要对话』护栏（口吻锚，删了模型会聊天）")
+    check(not hasattr(desc, "DEMO_DESCRIBE_PROMPT")
+          and not hasattr(desc, "FULL_FORMAT_LINE"),
+          "旧常量 DEMO_DESCRIBE_PROMPT / FULL_FORMAT_LINE 已删除")
+    check(not hasattr(desc, "DELTA_SYSTEM_PROMPT")
+          and not hasattr(desc, "DELTA_INSTRUCTION"),
+          "增量时代的常量已删除（每轮也是全量，不再换人设）")
 
-    check(DEMO_DESCRIBE_PROMPT == demo,
-          f"DEMO_DESCRIBE_PROMPT 与 demo 逐字一致（demo {len(demo)} 字 / "
-          f"本模块 {len(DEMO_DESCRIBE_PROMPT)} 字）—— 不一致就是只改了一边")
-    check(FULL_INSTRUCTION.endswith(DEMO_DESCRIBE_PROMPT),
-          "FULL_INSTRUCTION 以 demo 原文结尾 ⇒ **全量阶段用的就是那份**")
-    check(FULL_INSTRUCTION.startswith("直接输出"),
-          "全量指令开头是那句针对'模型回好的'的护栏")
-    sys_lines = DESCRIBE_SYSTEM_PROMPT.split("\n")
-    check(sys_lines[:2] == demo.split("\n")[:2],
-          "system prompt 前两行（身份句 + 要求句）逐字取自 demo")
-    check("【P0" in DESCRIBE_SYSTEM_PROMPT,
-          "system prompt **保留**八类清单 —— 摘掉它全量轮就不分条了（实测）")
-    check(FULL_FORMAT_LINE not in DESCRIBE_SYSTEM_PROMPT,
-          "system prompt **摘掉**'输出：按上述八类分条' —— 留着增量轮会被顶回长格式")
-    check("不要与用户对话" in DESCRIBE_SYSTEM_PROMPT,
-          "system prompt 里有'不要对话'护栏（第一版走样的教训）")
+    # ---- parse_state：宽容解析 ----
+    full_text = "\n".join([
+        "ATTENTION: 面向屏幕，注视镜头",
+        "ACTION: 无",
+        "EMOTION: 平静",
+        "FEATURE: 青年女性，灰色短袖上衣",
+        "BEHAVIOR: 站立，保持不动",
+        "RELATION: 单人",
+        "ENV: 室内展厅，光线明亮",
+        "POSITION: 站在展台右侧",
+    ])
+    got = parse_state(full_text)
+    check(got == {k: v for k, v in zip(STATE_KEYS, [
+        "面向屏幕，注视镜头", "无", "平静", "青年女性，灰色短袖上衣",
+        "站立，保持不动", "单人", "室内展厅，光线明亮", "站在展台右侧"])},
+          f"完整块逐键解析（{got}）")
+    check(parse_state("**EMOTION**：不耐烦") == {"EMOTION": "不耐烦"},
+          "粗体 + 中文冒号")
+    check(parse_state("- 【ACTION】摇头（3 次）") == {"ACTION": "摇头（3 次）"},
+          "列表前缀 + 方括号")
+    check(parse_state("好的，我看一下。") == {},
+          "纯自由文本 ⇒ 空 dict（调用方据此回退原文）")
+    check(parse_state("SCENE: 展厅\nSUMMARY: 两人") == {},
+          "未知键一律丢弃（模型自己造的字段不破坏契约）")
+    check(parse_state("ACTION:") == {}, "只有键没有值 ⇒ 不算（否则会清空该键）")
+    # 模型把「无变化」当字段值写（实测 4/138，全在增量轮）⇒ 跳过该键、保旧值
+    check(parse_state("ATTENTION: 无变化\nBEHAVIOR: 没有变化\nEMOTION: 不耐烦")
+          == {"EMOTION": "不耐烦"},
+          "值是「无变化」的键被丢掉（否则会把字段永久污染成「无变化」）")
+    check(parse_state("ACTION: 无") == {"ACTION": "无"},
+          "裸「无」是**合法值**（没有动作），不许一起过滤掉")
 
-    # `DELTA_SYSTEM_PROMPT`（换人设重连后的新人设）—— 它的价值全在
-    # **没有什么**上面，所以这几条是断言"缺席"的。
-    from orchestrator.omni.describe import (
-        DELTA_INSTRUCTION, DELTA_SYSTEM_PROMPT)
-    check("【P0" not in DELTA_SYSTEM_PROMPT
-          and "【P1" not in DELTA_SYSTEM_PROMPT
-          and "【P2" not in DELTA_SYSTEM_PROMPT,
-          "DELTA_SYSTEM_PROMPT **不含八类清单** —— 它正是增量轮压不短的"
-          "源头（2026-10-08 实测 3 版）；留着它换人设就白换了")
-    check("不要与用户对话" in DELTA_SYSTEM_PROMPT,
-          "DELTA_SYSTEM_PROMPT 保留'不要对话'护栏（口吻的锚，不是格式的锚）")
-    check("视频监控/行为分析助手" in DELTA_SYSTEM_PROMPT,
-          "DELTA_SYSTEM_PROMPT 保留身份句 —— 抽象人设会让模型回"
-          "'好的，现在开始录音。'（第一版走样的教训）")
-    check(len(DELTA_SYSTEM_PROMPT) < len(DESCRIBE_SYSTEM_PROMPT),
-          f"DELTA_SYSTEM_PROMPT 比全量那份短"
-          f"（{len(DELTA_SYSTEM_PROMPT)} < {len(DESCRIBE_SYSTEM_PROMPT)} 字）")
-    check(DELTA_SYSTEM_PROMPT != DESCRIBE_SYSTEM_PROMPT
-          and DELTA_INSTRUCTION != DELTA_SYSTEM_PROMPT,
-          "三份提示词互不相同（少抄/抄错都会在这里露出来）")
+    # ---- render_state：固定顺序 ----
+    shuffled = {"POSITION": "右下", "ATTENTION": "背对", "EMOTION": "不耐烦"}
+    check(render_state(shuffled) == "ATTENTION: 背对\nEMOTION: 不耐烦\nPOSITION: 右下",
+          "渲染按 STATE_KEYS 的固定顺序，缺的键跳过")
+    check(render_state({}) == "", "空快照渲染为空串")
 
 
-def test_delta_persona_switch() -> None:
-    """`ORCH_OMNI_DELTA_PERSONA=1`：全量做完**关掉重连**换短人设。
+def test_state_merge_snapshot(srv_url: str) -> None:
+    """每轮描述 ⇒ 编排侧合并成**完整快照**再送 Agent。
 
-    为什么非换不可（每轮 prompt 试过三版全压不住）见
-    `omni/describe.py` 的模块文档「为什么增量轮压不短」。这里只验编排侧
-    那几步**必须**做到位，否则现象会很难归因：
+    `content.VLM` 必须是 8 键的完整快照。每轮也是全量，所以正常情况下
+    `update` 与 `replace` 等价；这里用**只给 2 个键**的输入验的是兜底：
+    某一行被截断/没答时，缺的键保旧值而不是丢掉。同时验三条安全阀：
 
-    * 换人设**只在全量之后**（换早了全量就没有八类清单了）；
-    * 整个会话**只换一次**（换人设失败也算换过 —— 否则每次全量都会把
-      omni 重连打断一遍）；
-    * 重连窗口里**一次触发都不许发**（发了也送不出去，白刷
-      `omni_desc_failed`）；且窗口结束后在途标记要**主动**放掉 ——
-      否则滚动循环空等满超时（10s），这 10s 缓存里描述不更新；
-    * 换连接后的**第一条**增量带上「上一轮描述」（新连接 KV 是空的，
-      模型不知道"相对什么"在变），**第二条起不带**。
+    * 解析失败 ⇒ 退回原文（一个字节都不丢）；
+    * 「无变化」⇒ 快照一字不变；
+    * 换会话 ⇒ 快照复位（否则新人会继承上一个人的 FEATURE）。
     """
-    from orchestrator.omni.describe import (
-        DELTA_INSTRUCTION, DELTA_SYSTEM_PROMPT, FULL_INSTRUCTION)
-    from orchestrator.session import OrchestratorSession
+    from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[人设] 全量做完 ⇒ 关掉重连换短人设（首条增量带上一轮描述）")
-    sess = OrchestratorSession("t-persona",
-                               {"omni_describe": True,
-                                "omni_delta_interval_s": 0.2,
-                                "omni_delta_persona": True})
-    omni = FakeOmni()
-    omni.switch_delay = 0.6          # 比间隔长 ⇒ 能验"重连期间暂停滚动"
-    sess.omni = omni
+    print("\n[合并] 每轮 ⇒ 完整快照；解析失败回退原文；换会话复位")
+    d = _mk_downstream(srv_url, omni_describe=True,
+                       agent_transcript_mode="dual")
+    if not check_ic(d):
+        return
+    d._feed(OmniDescription(t=0, stage="full", text=_STATE_FULL))
+    check(d._vlm_state.get("ATTENTION") == "面向屏幕，注视镜头"
+          and len(d._vlm_state) == 8, "全量写满 8 键")
+    check(d._vlm == _STATE_FULL.strip(), "渲染结果与全量原文逐字一致（顺序未乱）")
 
-    async def _drive():
-        # ① IC 判 GREET ⇒ 全量（等价于 Describe("full") 走到 executor）
-        await sess.request_omni_description("full")
-        await asyncio.sleep(0.05)
-        # ② 全量的 `response.done` 到达 —— main.py 那一步（传 text！）
-        stage_full = sess.take_omni_stage(DESC_FULL)
-        # ③ 重连窗口（0.6s）内不许有触发；此刻只有那次全量
-        await asyncio.sleep(0.9)
-        n_during, n_switch = len(omni.reqs), len(omni.switches)
-        # ④ 等第一条增量
-        await asyncio.sleep(0.9)
-        first_delta = omni.reqs[1][1] if len(omni.reqs) > 1 else ""
-        # ⑤ 回灌它的 done（顺带用「无变化」验它不覆盖参照物）⇒ 第二条增量
-        sess.take_omni_stage("无变化")
-        await asyncio.sleep(0.8)
-        # ⑥ 再来一次"全量 done"（重迎宾）—— 不许再换一次人设
-        sess._omni_stage = "full"
-        sess.take_omni_stage(DESC_FULL)
-        await asyncio.sleep(0.3)
-        return stage_full, n_during, n_switch, first_delta
+    d._feed(OmniDescription(t=1, stage="turn",
+                            text="EMOTION: 不耐烦\nACTION: 摇头（3 次）"))
+    check(d._vlm_state.get("EMOTION") == "不耐烦"
+          and d._vlm_state.get("ACTION") == "摇头（3 次）",
+          "增量覆盖出现过的键")
+    check(d._vlm_state.get("FEATURE") == "青年女性，灰色短袖上衣"
+          and d._vlm_state.get("ENV") == "室内展厅，光线明亮",
+          "没出现的键保留旧值（这就是「合并成快照」的全部含义）")
+    check(d._vlm.count("\n") == 7, f"快照仍是 8 行（实际 {d._vlm.count(chr(10)) + 1} 行）")
+    check("ACTION: 摇头（3 次）" in d._vlm and "EMOTION: 不耐烦" in d._vlm,
+          "快照里是新值")
 
-    stage_full, n_during, n_switch, first_delta = asyncio.run(_drive())
-    sess._stop_desc_loop()
+    d._feed(OmniDescription(t=2, stage="turn", text="无变化"))
+    check(d._vlm_state.get("EMOTION") == "不耐烦"
+          and "ACTION: 摇头（3 次）" in d._vlm,
+          "「无变化」不动快照")
 
-    check(stage_full == "full", f"take 读走的是 full（实际 {stage_full!r}）")
-    check(n_switch == 1, f"恰好换 1 次人设（实际 {n_switch}）")
-    check(omni.switches == [DELTA_SYSTEM_PROMPT],
-          "换的是 DELTA_SYSTEM_PROMPT（不是全量那份）")
-    check(n_during == 1,
-          f"重连窗口里**没有**发出任何描述触发（{n_during} 次 —— 应当只有 "
-          f"最初那次全量）")
-    check(omni.reqs and omni.reqs[0][1] == FULL_INSTRUCTION,
-          "第 1 次注入的是**全量**指令")
-    check(first_delta.endswith(DELTA_INSTRUCTION)
-          and first_delta.startswith("上一轮描述"),
-          "换连接后的**第一条**增量带上了「上一轮描述」当参照物")
-    check(DESC_FULL in first_delta,
-          "……而且带的就是那份全量描述原文")
-    reqs = [t for _, t in omni.reqs]
-    check(len(reqs) >= 3 and reqs[2] == DELTA_INSTRUCTION,
-          f"**第二条**增量不再带参照物（第 3 次注入是否等于裸增量指令："
-          f"{len(reqs) >= 3 and reqs[2] == DELTA_INSTRUCTION}）")
-    check(sess._desc_last_text == DESC_FULL,
-          "「无变化」没把参照物覆盖掉（它意味着上一份仍然成立）")
-    sess.closed = True
+    d._feed(OmniDescription(t=3, stage="turn", text="画面上还是刚才那个人。"))
+    check(d._vlm == "画面上还是刚才那个人。",
+          "解析失败 ⇒ content.VLM 就是原文（不丢数据）")
+    check(d._vlm_state == {}, "同时清掉快照 —— 免得下一条增量合并到过时底座上")
 
+    # 跨会话复位：换人后 FEATURE 不能还是上一个人的
+    d._feed(OmniDescription(t=4, stage="full", text=_STATE_FULL))
+    asyncio.run(d.on_session_start(None))
+    check(d._vlm_state == {} and d._vlm == "",
+          "on_session_start 清空快照与缓存")
 
-def test_delta_persona_off_and_fail() -> None:
-    """换人设**默认关**；开了但换失败要降级、不能把会话带塌。
-
-    默认关的理由与 `ORCH_OMNI_DESCRIBE` 同款：编排代码 105/106 共用，
-    默认值就是 106 下次重启后的行为。
-    """
-    from orchestrator.config import Settings
-    from orchestrator.omni.describe import DELTA_INSTRUCTION
-    from orchestrator.session import OrchestratorSession
-
-    print("\n[人设] 默认关 / 换失败降级")
-    import os
-    for k in ("ORCH_OMNI_DELTA_PERSONA", "ORCH_OMNI_DESCRIBE"):
-        os.environ.pop(k, None)
-    check(Settings().omni_delta_persona is False,
-          "ORCH_OMNI_DELTA_PERSONA 不设时默认 **False**（安全侧）")
-
-    # ---- ① 默认关：不换人设，两阶段仍靠同一条连接上的注入指令区分 ----
-    sess = OrchestratorSession("t-persona-off",
-                               {"omni_describe": True,
-                                "omni_delta_interval_s": 0.2})
-    omni = FakeOmni()
-    sess.omni = omni
-
-    async def _off():
-        await sess.request_omni_description("full")
-        await asyncio.sleep(0.05)
-        sess.take_omni_stage(DESC_FULL)
-        await asyncio.sleep(0.9)
-        return omni.switches[:], [t for _, t in omni.reqs]
-
-    switches, reqs = asyncio.run(_off())
-    sess._stop_desc_loop()
-    sess.closed = True
-    check(switches == [], "默认关时**一次都不换**人设")
-    check(len(reqs) >= 2 and reqs[1] == DELTA_INSTRUCTION,
-          "……增量仍是那条连接的裸增量指令（不带参照物）")
-
-    # ---- ② 开了但换失败：降级成"原人设常驻"，不抛、不重试 ----
-    sess2 = OrchestratorSession("t-persona-fail",
-                                {"omni_describe": True,
-                                 "omni_delta_interval_s": 0.2,
-                                 "omni_delta_persona": True})
-    omni2 = FakeOmni()
-    omni2.switch_ok = False
-    sess2.omni = omni2
-
-    async def _fail():
-        await sess2.request_omni_description("full")
-        await asyncio.sleep(0.05)
-        sess2.take_omni_stage(DESC_FULL)
-        await asyncio.sleep(0.6)
-        sess2._omni_stage = "full"          # 重迎宾 ⇒ 不许重试换人设
-        sess2.take_omni_stage(DESC_FULL)
-        await asyncio.sleep(0.3)
-        return [t for _, t in omni2.reqs]
-
-    reqs2 = asyncio.run(_fail())
-    sess2._stop_desc_loop()
-    sess2.closed = True
-    check(len(omni2.switches) == 1,
-          f"换失败也只尝试**一次**（实际 {len(omni2.switches)}）")
-    check(sess2._desc_needs_context is False,
-          "换失败 ⇒ 不挂参照物（新连接压根没建起来）")
-    check(reqs2 and all(t != "" for t in reqs2),
-          "换失败后链路照跑（注入的是非空指令）")
-    check(len(reqs2) >= 2 and reqs2[1] == DELTA_INSTRUCTION,
-          "……增量退回裸增量指令（退化成'原人设常驻'，能跑只是长）")
+    # 送出去的是快照
+    d._feed(OmniDescription(t=5, stage="full", text=_STATE_FULL))
+    d._feed(OmniDescription(t=6, stage="turn", text="BEHAVIOR: 持续远离 6 秒"))
+    _answer_path(d)
+    _flush(d)
+    ans = _talk_rounds()
+    vlm = ans[0][1].get("content", {}).get("VLM") if ans else ""
+    check(bool(vlm) and "BEHAVIOR: 持续远离 6 秒" in vlm and vlm.count("\n") == 7,
+          f"送到 Agent 的是 8 行完整快照（实际 {len(vlm)} 字）")
+    d.ic.close()
 
 
 class _FakeSCC:
@@ -1323,7 +1375,7 @@ def main() -> int:
         test_no_truncation(url)
         test_no_change_keeps_previous(url)
         test_visual_background_round(url)
-        test_delta_makes_no_background(url)
+        test_turn_makes_no_background(url)
         test_background_latch_per_session(url)
         test_background_not_sent_in_legacy(url)
         test_ready_before_asr_final(url)
@@ -1332,11 +1384,11 @@ def main() -> int:
         test_legacy_mode_with_describe_on(url)
         test_illegal_mode_falls_back_to_legacy(url)
         test_contract_drift(url)
-        test_describe_prompt_matches_demo()
+        test_state_contract_prompts()
+        test_state_merge_snapshot(url)
         test_two_stage_prompts_and_loop()
         test_answer_path_starts_desc_without_greet()
-        test_delta_persona_switch()
-        test_delta_persona_off_and_fail()
+        test_vad_boundary_trigger()
         test_connect_publishes_client_last()
         test_desc_loop_rate_limits_failures()
     finally:

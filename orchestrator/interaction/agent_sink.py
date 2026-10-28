@@ -126,7 +126,7 @@ def make_vlm_agent_sink(*, target: str, vlm_getter: Callable[[], str],
                 #    （编排侧其余日志看不到 Agent 收到的 payload）。
                 logger.info(
                     "[VLM 注入] mode=%s ASR=%d字 VLM=%d字 VLM=%r",
-                    mode, len(asr), len(vlm), vlm[:60])
+                    mode, len(asr), len(vlm), vlm[:400])
             super()._send(name, payload)
 
         def emit_visual_background(self) -> bool:

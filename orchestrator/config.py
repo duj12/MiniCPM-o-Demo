@@ -246,36 +246,46 @@ class Settings:
     #:   `dict`   `transcript` 本身换成 `{ASR,VLM}`（目标态，Agent 改好后）
     agent_transcript_mode: str = field(default_factory=lambda: os.environ.get(
         "ORCH_AGENT_TRANSCRIPT_MODE", "legacy").strip().lower())
-    #: 增量描述的**滚动间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
-    #: （见 `session._schedule_next_delta`）。
+    #: 每轮描述的**心跳间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
+    #: （见 `session._desc_loop`）。
     #:
-    #: 缓存里描述的"年龄"上界 ≈ 本值 + 生成耗时。要满足主指标（`AsrFinal`
-    #: 一到就有非空描述），这个上界应**小于一句话的典型时长**。
-    #: 2.0 是起点 —— 105 实测按 `[VLM 就绪] 年龄=` 的分布调：想更新鲜就调小，
-    #: 代价是 omni 更吃算力（不重叠 ⇒ 调小不会自激，只会更频繁）。
+    #: ⚠️ 2026-10-28 起主路径不再是定时轮询，而是**VAD 断句点触发**
+    #: （`omni_desc_on_turn_boundary`）。这个值退化成**兜底心跳** —— 没人说话、
+    #: 也没有断句时多久刷一次。10s 是用户在"事件驱动"口径下拍的值。
+    #:
+    #: 回退到纯定时：`ORCH_OMNI_DESC_ON_TURN_BOUNDARY=0 ORCH_OMNI_DELTA_INTERVAL_S=2`。
     omni_delta_interval_s: float = field(default_factory=lambda: float(
-        os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "2.0")))
-    #: **增量换人设**（`ORCH_OMNI_DELTA_PERSONA=1`，默认关）。
+        os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "10.0")))
+    #: **VAD 断句点触发一次增量描述**（默认开）。
     #:
-    #: 开了之后：全量描述在 `DESCRIBE_SYSTEM_PROMPT` 的连接上做完 ⇒ **关掉
-    #: 重连** ⇒ 用 `DELTA_SYSTEM_PROMPT`（只报变化、无八类清单）接着跑增量。
-    #: 为什么非这样不可（每轮 prompt 试过、压不住）记在
-    #: `orchestrator/omni/describe.py` 的模块文档「为什么增量轮压不短」。
+    #: 断句点 = ASR 服务端 VAD 关掉一个语音段。今天唯一的证据是
+    #: `2pass-offline` 到达（`asr/client.py:_on_offline` → `_mark_closed()`）；
+    #: **不能挂 TurnSense** —— 它是条件触发的，真实语音可能一次都不发
+    #: （`asr/client.py:16`）。将来外部下发 VAD 断句事件时，从同一个钩子进。
     #:
-    #: 代价：①整个会话多一次重连（~1~3s），窗口内 omni 少听少看一小段；
-    #: ②新连接 KV 空，第一条增量要重新热（所以它会带上「上一轮描述」）；
-    #: ③106:8006 上仍是**一条**连接（先关后开），不多占并发。
+    #: ⚠️ 触发的这次 decode **赶不上本句的 `on_answer`**（窗口几十毫秒，
+    #: decode 秒级）—— 它的消费者是**下一轮**。这是刻意的：绝不等待。
+    omni_desc_on_turn_boundary: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DESC_ON_TURN_BOUNDARY", "1") not in ("0", "false", "False", ""))
+    #: **每轮**描述的 token 上限（0 = 不限）。
     #:
-    #: 默认关的理由与 `omni_describe` 同款：**编排代码 105/106 共用**，
-    #: 默认值就是 106 下次重启后的行为。要开请在**那一台的启动脚本**里开。
-    omni_delta_persona: bool = field(default_factory=lambda: os.environ.get(
-        "ORCH_OMNI_DELTA_PERSONA", "0") not in ("0", "false", "False", ""))
-    #: 三段模板都可整体覆盖（改措辞不用动代码，与 `ORCH_OMNI_SYSTEM_PROMPT`
+    #: 2026-10-28 起每轮也输出**全量 8 键**（只是值压短），所以要给足：
+    #: 精简后约 90~120 字，192 留出余量。键值契约下截断只影响最后一行
+    #: （`parse_state` 按行解析），不会污染合并后的快照。
+    #:
+    #: ⚠️ 键名沿用 `delta` 是为了不破坏已有的 env 配置
+    #: （`ORCH_OMNI_DELTA_MAX_NEW_TOKENS`）。
+    omni_delta_max_new_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_OMNI_DELTA_MAX_NEW_TOKENS", "192")))
+    #: 两段模板都可整体覆盖（改措辞不用动代码，与 `ORCH_OMNI_SYSTEM_PROMPT`
     #: 同款）。空 = 用 `omni/describe.py` 里的默认。
     omni_describe_system_prompt: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE_SYSTEM_PROMPT", ""))
+    #: 起点那份（带细节）—— 只发一次，进 Agent 的视觉背景。
     omni_describe_full_instruction: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE_FULL_INSTRUCTION", ""))
+    #: 每轮那份（同样 8 键，值压到最短）。键名沿用 `delta` 是为了不破坏
+    #: 已有的 env（`ORCH_OMNI_DESCRIBE_DELTA_INSTRUCTION`）。
     omni_describe_delta_instruction: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE_DELTA_INSTRUCTION", ""))
 

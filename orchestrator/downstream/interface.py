@@ -32,7 +32,8 @@ class AsrPartial:
     confidence: Optional[float] = None   # 实测 2pass-online 的 confidence 可能为 None
     segment_id: int = 0
     # 五个离散状态量（user_speaking / barge_in / transcript / asr_confidence /
-    # turn_complete_confidence），由 AsrStateTracker 归纳，见 asr/client.py。
+    # turn_complete_confidence）—— **由 ASR 服务端计算**，客户端只透传，
+    # 见 asr/client.py 与 docs/asr-state.md。
     state: Optional[Dict[str, str]] = None
     kind: Literal["asr.partial"] = "asr.partial"
 
@@ -62,8 +63,8 @@ class AsrStateUpdate:
     事件驱动，下游永远收不到"已经清了"，会一直停在第最后一条消息的快照上
     （实测：一轮结束后 IC 侧 `说`/`抢` 仍是 HIGH，SOP 06 判定跟着错）。
 
-    ``state`` 与 ``AsrStateTracker.state`` **完全一致**（含归零后的空
-    ``transcript``）—— 下游拿到的就是当前真相，不需要自己推断。
+    ``state`` 就是服务端最近一次下发的快照（含客户端两拍清零后的结果）——
+    下游拿到的就是当前真相，不需要自己推断。
     """
     t: int
     state: Dict[str, str] = field(default_factory=dict)
@@ -137,7 +138,7 @@ class OmniDescription:
     靠 `session.take_omni_stage()` 区分 —— 我们**主动触发的**那轮才是描述。
     """
     t: int
-    stage: Literal["full", "delta"]
+    stage: Literal["full", "turn"]
     text: str
     response_id: str = ""
     kind: Literal["omni.description"] = "omni.description"
@@ -298,9 +299,9 @@ class SendToOmni:
 
 @dataclass(frozen=True)
 class Describe:
-    """请求 OmniLLM **产一次描述**（`stage` = full | delta）。
+    """请求 OmniLLM **产一次描述**（`stage` = full | turn）。
 
-    「**何时**描述」是下游的纯决策（GREET ⇒ full；对话中滚动 ⇒ delta），
+    「**何时**描述」是下游的纯决策（会话起点 ⇒ full；对话中滚动 ⇒ turn），
     「**怎么**调 OmniLLM」由 session 执行（拼指令 + `trigger_reply`）——
     与 `SendToOmni` 同款划分（下游不碰传输层）。
 
@@ -309,7 +310,7 @@ class Describe:
     **已知用途**（描述）生成一轮"。描述轮的产出会被标成
     `OmniDescription` 而不是 `OmniResponseDone` —— 见 `session.take_omni_stage`。
     """
-    stage: Literal["full", "delta"] = "delta"
+    stage: Literal["full", "turn"] = "turn"
     kind: Literal["describe"] = "describe"
 
 

@@ -142,18 +142,15 @@ SSL_ARGS=()
 export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
 
-# ---- 增量换人设（全量做完后关掉重连、换「只报变化」短人设）----
+# ---- 两阶段方案（2026-10-28 定稿）----
 #
-# 为什么非这样不可：每轮 prompt（`input.append.text`）**压不住** system
-# prompt 里的八类清单 —— 实测三版全失败，唯一有效的是让它没有八类清单，
-# 而那要换 system prompt，服务端又不支持一条连接上第二次 init ⇒ 只能关掉
-# 重连一次。证据与推演在 `orchestrator/omni/describe.py` 的模块文档
-# 「为什么增量轮压不短」。代价：整个会话多一次重连（~1~3s）。
+# 每轮**不再**换短人设、也不再"只报变化"：起点一份全量（带细节）作会话背景，
+# 之后每轮同样是 8 键全量、只是值压短。理由见 `orchestrator/omni/describe.py`
+# 模块文档「为什么每轮也输出全量」—— 换人设那条路已删（`_switch_delta_persona`
+# 与 `ORCH_OMNI_DELTA_PERSONA` 均已移除）。
 #
-# 默认**开着**（只在这台脚本里）—— 与 `ORCH_OMNI_DESCRIBE` 同款：105 是
-# 唯一跑描述链路的一台，106 的 `run_orch_106.sh` 两个都不设。
-# 关了仍能跑，只是增量长（八类分条、每次 3~4s）。
-export ORCH_OMNI_DELTA_PERSONA="${ORCH_OMNI_DELTA_PERSONA:-1}"
+# 早先这里 export 的 `ORCH_OMNI_DELTA_PERSONA` 现在**没人读**，留着会误导启动
+# 横幅，故删掉。回退到"只报变化"那套请 checkout 旧版本代码，不是翻开关。
 
 # 生效配置落日志 —— 回退/切换后**第一眼看这里**，别靠猜
 echo "105 编排：IC 模式 = $ORCH_IC_MODE" >&2
@@ -180,9 +177,9 @@ echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
 echo "  视觉背景轮      = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
      "（全量描述额外投一发 ASR 空的 on_answer，只存不答）" >&2
 # ⚠️ 与上两行同理：这行是「本机跑的是哪一版描述链路」的硬证据。
-# 开了之后日志里应能看到 `已换成「只报变化」短人设（关掉重连一次）`。
-echo "  增量人设        = $ORCH_OMNI_DELTA_PERSONA" \
-     "（1=全量做完后关掉重连、换短人设跑增量）" >&2
+# 两阶段定稿后日志里应能看到 `描述完成 stage=full`（起点一次）与
+# `描述完成 stage=turn`（之后每轮 8 键全量、值压短）。
+echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量、值压短）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \
