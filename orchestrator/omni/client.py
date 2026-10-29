@@ -20,6 +20,7 @@ import asyncio
 import base64
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -90,6 +91,15 @@ class OmniClient:
 
         # 待发送的视频帧（1fps）。用最新的替换旧的 —— 旧画面没有价值。
         self._pending_frame: Optional[str] = None
+        #: 最近一次**真正随音频发出去**的视频帧时刻（monotonic）。
+        #:
+        #: ⚠️ 记的是"发出去"，不是 `offer_frame()` 那一刻：帧只是塞进
+        #: `_pending_frame`，要等下一块音频 `_send()` 才真正进 KV。会话侧
+        #: 用它做**帧新鲜度闸**（见 `session._do_describe`）。
+        #: `None` = 本连接还没发出过任何一帧 —— 与"很久没发"同样危险
+        #: （模型面对空画面会按 8 键格式**编造**，实测见
+        #: `session._seconds_since_last_frame` 的说明）。
+        self.last_frame_at: Optional[float] = None
         # 音频缓冲：凑够 1s 再发（StreamingChatClient 的节奏）
         self._audio_buf: List[np.ndarray] = []
         self._audio_len = 0
@@ -267,6 +277,9 @@ class OmniClient:
             frames = [self._pending_frame]
             self._pending_frame = None
             self.frames_sent += 1
+            # 帧**真正发出去**的时刻（不是 offer 的时刻）—— 会话侧的
+            # 帧新鲜度闸以此为准，见 `last_frame_at` 的说明。
+            self.last_frame_at = time.monotonic()
         # ⚠️ 所有音频推送一律 force_listen（只 prefill 进 KV，"边听边看"），
         # 由触发源决定何时生成：
         #   · turn_trigger="asr"      → 我方在 ASR final 时补触发

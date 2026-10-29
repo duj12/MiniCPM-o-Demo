@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _LOOP_LAG_INTERVAL = 0.5
 _LOOP_LAG_WARN = 0.5
 
+#: `omni.last_frame_at` **不存在**时的哨兵（与"存在但为 None"区分开：
+#: 前者 = 这个 client 不报帧时刻，不设闸；后者 = 一帧都没发过，按过期处理）。
+_NO_FRAME_CLOCK = object()
+
 
 class OrchestratorSession:
     """一路会话的编排器。
@@ -173,6 +177,17 @@ class OrchestratorSession:
         #: 留出余量；键值契约下截断只影响最后一行。
         self._desc_delta_max_new_tokens = int(
             config.get("omni_delta_max_new_tokens", 0) or 0)
+        #: **帧新鲜度闸**（秒，0 = 关）。没有新鲜画面就不触发描述 ——
+        #: 空画面下模型会按 8 键格式**编造**（见 config 里
+        #: `omni_desc_stale_s` 的实测证据），比"保留上一份真实快照"更糟。
+        _stale = config.get("omni_desc_stale_s", 5.0)
+        self._desc_stale_s = 5.0 if _stale is None else float(_stale)
+        #: 起点 full 因「还没帧」被压住了 —— 等第一次有新鲜帧时补发。
+        #: ⚠️ 不补的话，开场摄像头还没出图的那批会话**永远没有**视觉背景轮
+        #: （full 是"只发一次"的，被闸吃掉就没了）。
+        self._desc_pending_full = False
+        #: 闸的告警只打一次（每次"从有帧→无帧"的转变打一条，恢复后复位）
+        self._desc_stale_warned = False
         #: 两段模板的 config 覆盖（空 = 用 `omni/describe.py` 的默认）。
         #: 这让 prompt 调优不用改代码 —— 见 config 的说明。
         self._desc_full_instruction = str(
@@ -1517,11 +1532,70 @@ class OrchestratorSession:
                         self.session_id, stage, _ms, _chars)
         return stage
 
+    def _seconds_since_last_frame(self) -> Optional[float]:
+        """距最近一次**真正发出**的视频帧有多少秒。
+
+        三种返回值，别混：
+
+        * ``None`` —— 这个 client **不报**帧时刻（测试替身、老接口）⇒
+          **不设闸**（fail-open）。否则所有不关心画面的用例都会被闸掉；
+        * ``inf``  —— 连接建好了但**一帧都没发过** ⇒ 按"已过期"处理。
+          这正是开场摄像头没出图的情形，同样会编；
+        * 其它     —— 正常秒数。
+
+        ⚠️ 判据是"发出去"不是"offer 过"：帧要等下一块音频才真正进 KV
+        （`omni/client.py:_send`）。用 offer 时刻的话，恢复推帧后的第一拍
+        会出现"闸已放开、帧还没进 KV"的空窗。
+        """
+        if self.omni is None:
+            return None
+        t = getattr(self.omni, "last_frame_at", _NO_FRAME_CLOCK)
+        if t is _NO_FRAME_CLOCK:
+            return None
+        if t is None:
+            return float("inf")
+        return time.monotonic() - float(t)
+
     async def _do_describe(self, stage: str) -> None:
         """真的发一次描述触发（异步任务，不阻塞调用方）。"""
         if self.omni is None:
             logger.warning("[%s] 描述请求被跳过：OmniLLM 未装配", self.session_id)
             return
+        # ---- 帧新鲜度闸：没有画面就别让模型编 ----
+        #
+        # 触发源有三条（GREET 的 full / VAD 断句 / 10s 心跳），全部收口
+        # 在这里，所以闸放一处就够。
+        #
+        # ⚠️ 跳过时**必须**推进 `_desc_last_done_at`：滚动循环的判据是
+        #    「距上一轮结束 ≥ interval」，不推进的话它每 250ms 重试一次，
+        #    日志被"跳过描述"刷成每拍一条 —— 与 `_release_desc_attempt`
+        #    防的是同一类自激。
+        if self._desc_stale_s > 0:
+            age = self._seconds_since_last_frame()
+            if age is not None and age > self._desc_stale_s:
+                if stage == "full":
+                    # full 只发一次：压住它，等有帧时补发（见 `_do_describe`
+                    # 开头的补发分支），不能把额度吃在这儿
+                    self._desc_pending_full = True
+                if not self._desc_stale_warned:
+                    self._desc_stale_warned = True
+                    logger.info(
+                        "[%s] 无新视频帧已 %s ⇒ 跳过描述（stage=%s）—— "
+                        "空画面下模型会按 8 键格式编造，保留上一份真实快照",
+                        self.session_id,
+                        "从未收到" if age == float("inf") else "%.1fs" % age,
+                        stage)
+                self._desc_last_done_at = time.monotonic()
+                return
+            self._desc_stale_warned = False
+        else:
+            self._desc_stale_warned = False
+        # 起点 full 被压住过 ⇒ 第一次有新鲜帧时补发（值更详细，正好当背景）
+        if self._desc_pending_full and stage != "full":
+            stage = "full"
+            logger.info("[%s] 有新鲜帧了 ⇒ 补发起点全量描述", self.session_id)
+        if stage == "full":
+            self._desc_pending_full = False
         from .omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
         # config 覆盖（`ORCH_OMNI_DESCRIBE_*_INSTRUCTION`）—— 调 prompt 不用
         # 改代码；空则用 `omni/describe.py` 的默认。

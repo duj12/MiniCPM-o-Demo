@@ -284,6 +284,19 @@ class Settings:
     #: （`ORCH_OMNI_DELTA_MAX_NEW_TOKENS`）。
     omni_delta_max_new_tokens: int = field(default_factory=lambda: int(
         os.environ.get("ORCH_OMNI_DELTA_MAX_NEW_TOKENS", "192")))
+    #: **帧新鲜度闸**（秒）：距最近一次**真正发出去**的视频帧超过这么久，
+    #: **不触发**描述（`0` = 关闸，回到 2026-10-29 之前的行为）。
+    #:
+    #: 为什么必须闸：没有画面时模型不会说"看不到"，而是按 8 键契约
+    #: **编造**一份格式完好的快照（实测：停帧 25s 后触发，编出"中年男性、
+    #: 白色墙壁"；SOP 11_1026 / 08_2_1026 的尾巴上各复现一次），然后被当
+    #: 视觉轮推给 Agent 覆盖 `scene.visual_background`。
+    #:
+    #: 5s 的依据：实测停帧 7s 时描述还正确、18s 后开始编 —— KV 里的画面
+    #: 被挤出去了；闸取 5s 留足余量。恢复推帧后第一份描述是**正确**的
+    #: （直连后端做过 A → 停 25s → B 的对照实验）。
+    omni_desc_stale_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_OMNI_DESC_STALE_S", "5.0")))
     #: 两段模板都可整体覆盖（改措辞不用动代码，与 `ORCH_OMNI_SYSTEM_PROMPT`
     #: 同款）。空 = 用 `omni/describe.py` 里的默认。
     omni_describe_system_prompt: str = field(default_factory=lambda: os.environ.get(
