@@ -348,6 +348,37 @@ NONE = "NONE"
 _TIERS = (HIGH, MEDIUM, LOW, NONE)
 
 
+def _opt_str(v) -> Optional[str]:
+    """感知字段的宽容取值：空 / null / 缺失统一归 ``None``（**不是空串**）。
+
+    消费方的判据只能是"有没有值"，所以"没有"必须只有一个表示。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _opt_float(v) -> Optional[float]:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_bool(v) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    return None
+
+
 def _tier(v) -> str:
     """把服务端下发的档位归一成四值之一；未知/缺失 → ``NONE``。"""
     s = str(v or "").upper()
@@ -371,6 +402,24 @@ class AsrState:
     asr_confidence: str = NONE
     turn_complete_confidence: str = NONE
 
+    # ---- 感知字段（2026-10-29 起透传，服务端 ``enable_perception=true``）----
+    #
+    # ⚠️ 这些值**只在 ``2pass-offline`` 那一帧里有**（online 帧里服务端发
+    #    ``null``），所以它们描述的是「**刚说完的这一段**」，不是"此刻"。
+    #    段结束后随 `说`/`抢` 一起在两拍里清掉（见 `expire_if_idle`）。
+    #
+    # 全部 ``None`` = 服务端没开感知 / 还没出结果。消费方**必须容忍** None：
+    # 线上两种配置（5 键 / 14 键）并存，判据只能是"这个键有没有值"。
+    language: Optional[str] = None          # 语种码，如 'zh'
+    language_prob: Optional[float] = None
+    language_switch: Optional[bool] = None  # 本段内发生过语种切换？
+    emotion: Optional[str] = None           # 语音情绪标签，如 'neutral'
+    emotion_prob: Optional[float] = None
+    speech_event: Optional[str] = None      # 如 'speech' / 'laugh' …
+    noise: Optional[dict] = None            # {'floor_dbfs','burst':{...},…}
+    overlap: Optional[dict] = None          # {'detected','prob','regions',…}
+    snr_db: Optional[float] = None
+
     def to_dict(self) -> dict:
         return {
             "user_speaking_confidence": self.user_speaking_confidence,
@@ -378,6 +427,17 @@ class AsrState:
             "transcript": self.transcript,
             "asr_confidence": self.asr_confidence,
             "turn_complete_confidence": self.turn_complete_confidence,
+            # 感知字段原样带出（IC 只读它认识的键，多出来的键无害；
+            # UI / 调试 / 后续消费方靠它们拿到服务端的感知结果）。
+            "language": self.language,
+            "language_prob": self.language_prob,
+            "language_switch": self.language_switch,
+            "emotion": self.emotion,
+            "emotion_prob": self.emotion_prob,
+            "speech_event": self.speech_event,
+            "noise": self.noise,
+            "overlap": self.overlap,
+            "snr_db": self.snr_db,
         }
 
 
@@ -458,6 +518,16 @@ class AsrStateTracker:
                 asr_confidence=_tier(st.get("asr_confidence")),
                 turn_complete_confidence=_tier(
                     st.get("turn_complete_confidence")),
+                language=_opt_str(st.get("language")),
+                language_prob=_opt_float(st.get("language_prob")),
+                language_switch=_opt_bool(st.get("language_switch")),
+                emotion=_opt_str(st.get("emotion")),
+                emotion_prob=_opt_float(st.get("emotion_prob")),
+                speech_event=_opt_str(st.get("speech_event")),
+                noise=st.get("noise") if isinstance(st.get("noise"), dict) else None,
+                overlap=(st.get("overlap")
+                         if isinstance(st.get("overlap"), dict) else None),
+                snr_db=_opt_float(st.get("snr_db")),
             )
 
         # 段末判定：只有「服务端关掉了一个 VAD 段」才需要走清零两步。
@@ -487,6 +557,17 @@ class AsrStateTracker:
                 transcript=self._state.transcript,
                 asr_confidence=self._state.asr_confidence,
                 turn_complete_confidence=self._state.turn_complete_confidence,
+                # 感知字段是**本轮结论**（描述刚说完的那一段），与 信/完
+                # 同档保留一拍；下一拍一起清空。
+                language=self._state.language,
+                language_prob=self._state.language_prob,
+                language_switch=self._state.language_switch,
+                emotion=self._state.emotion,
+                emotion_prob=self._state.emotion_prob,
+                speech_event=self._state.speech_event,
+                noise=self._state.noise,
+                overlap=self._state.overlap,
+                snr_db=self._state.snr_db,
             )
             self._settled = True
         else:

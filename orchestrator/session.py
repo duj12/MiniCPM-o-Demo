@@ -2044,6 +2044,17 @@ class OrchestratorSession:
                      cur.get("barge_in_confidence"), cur.get("asr_confidence"),
                      cur.get("turn_complete_confidence"),
                      (cur.get("transcript") or "")[:20])
+        # 感知字段只在那一条 2pass-offline 的快照里非空 —— 打出来就能确认
+        # 「编排层真的拿到了」，而不是靠猜（它们不参与任何判定）。
+        if cur.get("language") is not None or cur.get("snr_db") is not None:
+            logger.info("[%s] 感知字段: lang=%s(%.2f) emo=%s(%.2f) ev=%s "
+                        "snr=%s overlap=%s noise=%s",
+                        self.session_id, cur.get("language"),
+                        cur.get("language_prob") or 0.0, cur.get("emotion"),
+                        cur.get("emotion_prob") or 0.0, cur.get("speech_event"),
+                        cur.get("snr_db"),
+                        (cur.get("overlap") or {}).get("detected"),
+                        (cur.get("noise") or {}).get("burst", {}).get("type"))
 
         from .downstream.interface import AsrStateUpdate
         from .protocol import AsrDisplay

@@ -135,11 +135,21 @@ def test_turn_clearing():
 
     tr.expire_if_idle()            # 拍二
     s = tr.state
-    check(s.to_dict() == {"user_speaking_confidence": "NONE",
-                          "barge_in_confidence": "NONE", "transcript": "",
-                          "asr_confidence": "NONE",
-                          "turn_complete_confidence": "NONE"},
-          f"拍二：全部清空（实际 {s.to_dict()}）")
+    # 拍二：五个基础字段回到默认，**感知字段也一起清成 None**
+    # （它们是"刚说完那一段"的结论，段结束两拍后就没有意义了）
+    check(all(v is None for k, v in s.to_dict().items()
+              if k in ("language", "language_prob", "language_switch",
+                       "emotion", "emotion_prob", "speech_event",
+                       "noise", "overlap", "snr_db")),
+          f"拍二：感知字段清成 None（实际 {s.to_dict()}）")
+    check({k: s.to_dict()[k] for k in (
+              "user_speaking_confidence", "barge_in_confidence", "transcript",
+              "asr_confidence", "turn_complete_confidence")}
+          == {"user_speaking_confidence": "NONE",
+              "barge_in_confidence": "NONE", "transcript": "",
+              "asr_confidence": "NONE",
+              "turn_complete_confidence": "NONE"},
+          f"拍二：五个基础字段全部清空（实际 {s.to_dict()}）")
     check(settled["turn_complete_confidence"] == "HIGH",
           "两拍之间确实存在'安静但已拍板'的快照")
 
@@ -203,6 +213,44 @@ def test_reset():
           f"reset_turn 后全空（实际 {d}）")
 
 
+def test_perception_passthrough():
+    print("\n[10b] 感知字段透传（语种 / 情绪 / 事件 / 噪声 / 交叠 / SNR）")
+    from orchestrator.asr.client import AsrStateTracker
+
+    tr = AsrStateTracker()
+    noise = {"calibrated": True, "floor_dbfs": -53.8,
+             "burst": {"detected": True, "prob": 0.65, "type": "pop"}}
+    overlap = {"detected": False, "prob": 0.098, "regions": []}
+    s = tr.update(offline(
+        "给我介绍一下星云吧",
+        language="zh", language_prob=1, language_switch=False,
+        emotion="neutral", emotion_prob=0.97, speech_event="speech",
+        noise=noise, overlap=overlap, snr_db=17.8,
+    ))
+    check(s.language == "zh" and s.language_prob == 1.0, "语种字段透传")
+    check(s.emotion == "neutral" and s.emotion_prob == 0.97, "语音情绪字段透传")
+    check(s.speech_event == "speech", "声学事件字段透传")
+    check(s.noise == noise and s.overlap == overlap and s.snr_db == 17.8,
+          "噪声 / 交叠 / SNR 原样透传（嵌套 dict 不改写）")
+    d = s.to_dict()
+    check(d["language"] == "zh" and d["snr_db"] == 17.8,
+          "to_dict() 带出感知字段（IC/UI 才拿得到）")
+
+    # 拍一：与 信/完 同档保留（它们是"刚说完那一段"的结论）
+    tr.expire_if_idle()
+    check(tr.state.language == "zh" and tr.state.snr_db == 17.8,
+          "拍一：感知字段保留")
+    tr.expire_if_idle()
+    check(tr.state.language is None and tr.state.snr_db is None,
+          "拍二：感知字段清空")
+
+    # 5 键服务端（感知关闭）：没有这些 key ⇒ 全为 None，不报错
+    tr2 = AsrStateTracker()
+    s2 = tr2.update(online("今天"))
+    check(s2.language is None and s2.noise is None and s2.overlap is None,
+          "服务端不带感知字段时全为 None（两种配置并存不炸）")
+
+
 def test_perception_switch():
     import json
 
@@ -223,6 +271,7 @@ def main() -> int:
     test_passthrough()
     test_turn_clearing()
     test_reset()
+    test_perception_passthrough()
     test_perception_switch()
     print("=" * 68)
     if _failures:

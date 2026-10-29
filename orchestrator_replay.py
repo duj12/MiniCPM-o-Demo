@@ -1243,12 +1243,30 @@ def _fmt_asr_state(state: dict) -> str:
     """
     if not state:
         return ""
-    return "[说{} 抢{} 信{} 完{}]".format(
+    line = "[说{} 抢{} 信{} 完{}]".format(
         state.get("user_speaking_confidence", "-"),
         state.get("barge_in_confidence", "-"),
         state.get("asr_confidence", "-"),
         state.get("turn_complete_confidence", "-"),
     )
+    # 感知字段只在 2pass-offline 那一拍有值（其余消息是 null），有才拼。
+    perc = [
+        ("语", state.get("language")),
+        ("情", state.get("emotion")),
+        ("事", state.get("speech_event")),
+        ("SNR", state.get("snr_db")),
+    ]
+    bits = [f"{k}{v}" for k, v in perc if v not in (None, "")]
+    ov = state.get("overlap") or {}
+    if ov and ov.get("detected") is not None:
+        bits.append(f"交叠{'Y' if ov.get('detected') else 'N'}"
+                    f"({ov.get('prob', 0):.2f})")
+    nz = state.get("noise") or {}
+    if nz.get("floor_dbfs") is not None:
+        bits.append(f"噪底{nz['floor_dbfs']:.0f}dB")
+    if bits:
+        line += "[" + " ".join(bits) + "]"
+    return line
 
 
 # ============================================================================
