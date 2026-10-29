@@ -2047,14 +2047,17 @@ class OrchestratorSession:
         # 感知字段只在那一条 2pass-offline 的快照里非空 —— 打出来就能确认
         # 「编排层真的拿到了」，而不是靠猜（它们不参与任何判定）。
         if cur.get("language") is not None or cur.get("snr_db") is not None:
+            _nz = cur.get("noise") or {}
+            _burst = _nz.get("burst") or {}
             logger.info("[%s] 感知字段: lang=%s(%.2f) emo=%s(%.2f) ev=%s "
-                        "snr=%s overlap=%s noise=%s",
+                        "snr=%s overlap=%s 噪底=%s 突发=%s",
                         self.session_id, cur.get("language"),
                         cur.get("language_prob") or 0.0, cur.get("emotion"),
                         cur.get("emotion_prob") or 0.0, cur.get("speech_event"),
                         cur.get("snr_db"),
                         (cur.get("overlap") or {}).get("detected"),
-                        (cur.get("noise") or {}).get("burst", {}).get("type"))
+                        _nz.get("floor_dbfs"),
+                        _burst.get("type") if _burst.get("detected") else None)
 
         from .downstream.interface import AsrStateUpdate
         from .protocol import AsrDisplay
