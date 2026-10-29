@@ -3,10 +3,16 @@
 Agent Platform（魔珐科技）已实现四个端点，对应 InteractionCore 的
 ``AgentSink`` 四类 Action：
 
-    POST {target}/interaction/on_answer   {"transcript","identity_id","display_name"}
-    POST {target}/interaction/on_insert   {}
-    POST {target}/interaction/on_yield    {}
-    POST {target}/interaction/on_end      {}
+    POST {target}/interaction/on_answer   {"transcript","identity_id","display_name",
+                                           "session_id","callback_ic"}
+    POST {target}/interaction/on_insert   {"session_id","callback_ic"}
+    POST {target}/interaction/on_yield    {"session_id","callback_ic"}
+    POST {target}/interaction/on_end      {"session_id","callback_ic"}
+
+⚠️ `session_id` / `callback_ic` 在 Agent 端已改**必填**（缺任一字段 → 422）。
+四类事件的实际发送方是 IC 的 `AgentSink`（总会带）；本文件只有
+`engine_on_session_end`（`ORCH_AGENT_END_NOTIFY=1` 才发）直接投 `on_end`，
+它的 payload 同样带上这两个字段。
 
 **四个端点都是单向的**（响应体被丢弃）—— 回复文本**不从这里回来**。
 Agent 生成后调 orchestrator 的 ``POST /v1/speak``，走既有 TTS 链路。
@@ -37,12 +43,12 @@ _POST_TIMEOUT = 5.0
 
 #: 会话收尾时是否通知 Agent（默认**关**）。
 #:
-#: ⚠️ 默认关是因为这个通知会**跨会话误杀** —— 详见
-#: `AgentClient.engine_on_session_end` 的说明（实测：旧会话迟到的 on_end
-#: 撞上新会话，新会话播报中被打断）。
+#: ⚠️ 默认关是历史遗留：早先的 `on_end` 不带会话标识，会**跨会话误杀**
+#: —— 详见 `AgentClient.engine_on_session_end` 的说明（实测：旧会话迟到的
+#: on_end 撞上新会话，新会话播报中被打断）。
 #:
-#: 等 Agent 侧支持按 `session_id` 区分后，设 `ORCH_AGENT_END_NOTIFY=1` 打开
-#: —— payload 里已经带了 `session_id`。
+#: 现在 Agent 侧已按 `session_id` 区分会话、且两个会话字段**必填** ——
+#: 要启用设 `ORCH_AGENT_END_NOTIFY=1`。
 _END_NOTIFY = os.environ.get("ORCH_AGENT_END_NOTIFY", "0") == "1"
 
 
@@ -50,11 +56,15 @@ class AgentClient:
     """一路会话一个实例。所有投递非阻塞，失败只告警。"""
 
     def __init__(self, target: str = DEFAULT_AGENT_URL,
-                 session_id: str = "") -> None:
+                 session_id: str = "", callback_ic: str = "") -> None:
         self.target = (target or DEFAULT_AGENT_URL).rstrip("/")
         #: 本会话 id。**必须随每个请求带给 Agent** —— 见 `engine_on_session_end`
         #: 的说明（不带它 = Agent 分不清这是哪一路会话的结束，会**跨会话误杀**）。
         self.session_id = session_id or ""
+        #: 本会话的 IC 回写地址（编排的服务端配置，如 `https://<编排>/v1/ic`）
+        #: —— Agent 端 `session_id` / `callback_ic` 已改**必填**，缺它会被 422 拒；
+        #: 空则 Agent 侧回落到它自己的默认回写目标。
+        self.callback_ic = callback_ic or ""
         self._q: "queue.Queue" = queue.Queue(maxsize=_QUEUE_MAX)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -155,15 +165,18 @@ class AgentClient:
 
         ## 恢复方式
 
-        等 Agent 侧支持按会话区分后：把 `ORCH_AGENT_END_NOTIFY=1` 打开即可
-        —— payload 里已经带了 `session_id`，届时 Agent 直接可用。
+        Agent 侧已支持按 `session_id` 区分会话（`BridgePool` 每会话一桥接），
+        且 `session_id` / `callback_ic` 已改**必填** —— 打开
+        `ORCH_AGENT_END_NOTIFY=1` 即可；payload 两个字段都带上（`callback_ic`
+        来自构造参数，空则 Agent 侧回落到它的默认回写目标）。
         """
         if not _END_NOTIFY:
-            logger.debug("跳过 on_end 通知（%s）—— 未带会话标识会误杀其他会话，"
-                         "需 Agent 支持后设 ORCH_AGENT_END_NOTIFY=1 打开",
+            logger.debug("跳过 on_end 通知（%s）—— 历史默认关（跨会话误杀），"
+                         "要启用设 ORCH_AGENT_END_NOTIFY=1 打开",
                          self.session_id or "?")
             return
-        self._post("on_end", {"session_id": self.session_id})
+        self._post("on_end", {"session_id": self.session_id,
+                              "callback_ic": self.callback_ic})
 
     # ------------------------------------------------------------------ #
 
