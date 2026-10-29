@@ -53,8 +53,17 @@ class AsrConfig:
     enable_turnsense: bool = True
     turnsense_incomplete_wait_ms: int = 1000
     enable_timestamp: bool = True
-    confidence_threshold: float = 0.8
-    online_confidence_threshold: float = 0.6
+    # ---- 置信度：**两套独立阈值**，别混用 ----
+    # 过滤：只决定文本要不要清空（清空后消息照发，带 ``confidence_filtered``）。
+    #   0.5 ⇒ 「0.5 以下不认字」，0.5~0.8 的文本会正常下发。
+    confidence_threshold: float = 0.5
+    online_confidence_threshold: float = 0.5
+    # 分档：只决定服务端 ``state.asr_confidence`` 落 HIGH / MEDIUM / LOW，
+    #   与上面的过滤线互不影响。0.5 ⇒ 0.5~0.8 判 MEDIUM（编排层照常作答），
+    #   ≥0.8 判 HIGH；<0.5 判 LOW（编排层走 SOP 01/02 重问）。
+    #   传 None 表示不下发，服务端退回用过滤阈值分档（老行为）。
+    high_confidence_threshold: Optional[float] = 0.8
+    medium_confidence_threshold: Optional[float] = 0.5
 
     # ---- 感知（SOP 03/12/13/14/15）：语种 / 情绪 / 音频事件 / SNR /
     #      突发噪声 / 交叠语音。字段并入服务端下发的 ``state``，本层只透传。
@@ -81,8 +90,12 @@ class AsrConfig:
     CLIENT_OVERRIDABLE = {
         "vad_tail_sil": int,
         "turnsense_incomplete_wait_ms": int,
+        # 过滤阈值（文本是否下发）
         "confidence_threshold": float,
         "online_confidence_threshold": float,
+        # 分档阈值（state.asr_confidence 落在哪一档）
+        "high_confidence_threshold": float,
+        "medium_confidence_threshold": float,
     }
 
     def apply_overrides(self, overrides: Optional[dict]) -> list:
@@ -128,6 +141,10 @@ class AsrConfig:
             "enable_timestamp": self.enable_timestamp,
             "confidence_threshold": self.confidence_threshold,
             "online_confidence_threshold": self.online_confidence_threshold,
+            # 分档阈值与上面的过滤阈值是两套独立参数；None = 不下发，服务端
+            # 退回用过滤阈值分档（老行为）。这里显式发，避免被误当成过滤线。
+            "high_confidence_threshold": self.high_confidence_threshold,
+            "medium_confidence_threshold": self.medium_confidence_threshold,
             "enable_perception": self.enable_perception,
             "perception_language": self.perception_language,
             "perception_emotion": self.perception_emotion,

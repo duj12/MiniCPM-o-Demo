@@ -154,8 +154,10 @@ async def run_probe(url: str, x: np.ndarray, duration_s: float, chunk_ms: int,
             "spk_diar": False,
             "enable_turnsense": True,
             "enable_timestamp": True,
-            "confidence_threshold": 0.8,
-            "online_confidence_threshold": 0.6,
+            "confidence_threshold": 0.5,
+            "online_confidence_threshold": 0.5,
+            "high_confidence_threshold": 0.8,
+            "medium_confidence_threshold": 0.5,
         }
         await ws.send(json.dumps(cfg))
         res.t_start = time.perf_counter()
