@@ -9,7 +9,9 @@ OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`）—— 靠的是编
 
 ⚠️ 后来 IC 把四类事件统一改投 `on_action`（payload 里 `act` 指明动作类型；
 四个旧端点保留兼容）—— 那只动了投递层 `_post`，覆写点 `_send` 未变。
-本脚本的捕获靶子与键集断言已随之更新（§⑤ 契约漂移测试锁着这一点）。
+本脚本的捕获对两种形态**都兼容**（`_answers()` 同时认 `on_action` + `act`
+和旧的 `on_{action_name}` 专用端点），键集断言照现行 IC 行为（§⑤ 契约漂移
+测试锁着这一点）。
 
 本脚本用**真组件**跑：真 `InteractionDownstream`（inprocess）+ 真 IC `Engine`
 + 真 `VlmAgentSink`（打到本机的捕获端口）。只有 OmniLLM 换成假的
@@ -97,21 +99,31 @@ def _start_capture() -> tuple:
 
 
 def _answers() -> list:
-    """捕获到的 on_answer 类事件（解析后的 body）。
+    """捕获到的 on_answer 类事件（解析后的 body）—— **两种投递形态都收**：
 
-    ⚠️ IC 现统一投 `on_action`（payload 里 `act` 指明动作类型）—— 这里只收
-    `act == "ANSWER"` 的那些，语义与旧的 `/interaction/on_answer` 靶子一致。
+    - 统一入口 `/interaction/on_action`（IC 现投这里）⇒ 必须看 `act`，
+      只收 `act == "ANSWER"` 的那些；
+    - 旧专用端点 `/interaction/on_answer`（原逻辑，旧 IC / 兼容保留）⇒ 路
+      径本身就是 ANSWER，payload 带不带 `act` 都算；但若带了别的 `act`
+      （同一批捕获里混投时）必须按统一入口同样地过滤掉，否则会错收。
     """
     out = []
     for h in HITS:
-        if not h["path"].endswith("/interaction/on_action") or not h["body"]:
+        if not h["body"]:
+            continue
+        path = h["path"]
+        unified = path.endswith("/interaction/on_action")
+        legacy = path.endswith("/interaction/on_answer")
+        if not (unified or legacy):
             continue
         try:
             body = json.loads(h["body"])
         except ValueError:
             continue
-        if body.get("act") == "ANSWER":
-            out.append((h, body))
+        # 统一入口必带 act；旧端点通常不带 —— 带了就必须是 ANSWER
+        if body.get("act", "ANSWER") != "ANSWER":
+            continue
+        out.append((h, body))
     return out
 
 
