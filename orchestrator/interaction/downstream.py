@@ -180,10 +180,12 @@ class InteractionDownstream:
             self.ic = InteractionClient(ic_target, owner_key=session_id)
         #: 过渡开关：Agent 尚未支持从 payload 读 callback_ic 时保留 set_target
         self._agent_set_target = bool(agent_set_target)
-        # ⚠️ `session_id` 必须传进去 —— 会话收尾的 `on_end` 要带上它，
-        #    否则 Agent 分不清是哪一路会话结束，会**跨会话误杀**
-        #    （见 `AgentClient.engine_on_session_end` 的实测证据）。
-        self.agent = AgentClient(agent_url, session_id=session_id)
+        # ⚠️ `session_id` / `callback_ic` 都必须传进去 —— 会话收尾的
+        #    `on_end` 要带上它们（Agent 端已改必填，缺了会被 422 拒；
+        #    且 session_id 缺失会**跨会话误杀**，
+        #    见 `AgentClient.engine_on_session_end` 的实测证据）。
+        self.agent = AgentClient(agent_url, session_id=session_id,
+                                 callback_ic=ic_callback_ic or "")
         self.session_id = session_id
         #: 会话结束时把 Agent 的 IC 目标**归还**到哪 —— 传服务端配置里的
         #: 默认 IC（**对外可回连的地址**）。空 = 不归还（调用方没给默认值）。

@@ -3,10 +3,15 @@
 
 ## 验的是什么
 
-发给 Agent 的 `on_answer` 里原本**只有 ASR 转写**。本次改动让它多带一份
-OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`），而 interactioncore
-**一行没改** —— 靠的是编排侧给 `AgentSink` 包一层子类覆写 `_send`
-（见 `orchestrator/interaction/agent_sink.py`）。
+发给 Agent 的 `on_answer` 类事件里原本**只有 ASR 转写**。本次改动让它多带一份
+OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`）—— 靠的是编排侧给
+`AgentSink` 包一层子类覆写 `_send`（见 `orchestrator/interaction/agent_sink.py`）。
+
+⚠️ 后来 IC 把四类事件统一改投 `on_action`（payload 里 `act` 指明动作类型；
+四个旧端点保留兼容）—— 那只动了投递层 `_post`，覆写点 `_send` 未变。
+本脚本的捕获对两种形态**都兼容**（`_answers()` 同时认 `on_action` + `act`
+和旧的 `on_{action_name}` 专用端点），键集断言照现行 IC 行为（§⑤ 契约漂移
+测试锁着这一点）。
 
 本脚本用**真组件**跑：真 `InteractionDownstream`（inprocess）+ 真 IC `Engine`
 + 真 `VlmAgentSink`（打到本机的捕获端口）。只有 OmniLLM 换成假的
@@ -94,19 +99,36 @@ def _start_capture() -> tuple:
 
 
 def _answers() -> list:
-    """捕获到的 on_answer（解析后的 body）。"""
+    """捕获到的 on_answer 类事件（解析后的 body）—— **两种投递形态都收**：
+
+    - 统一入口 `/interaction/on_action`（IC 现投这里）⇒ 必须看 `act`，
+      只收 `act == "ANSWER"` 的那些；
+    - 旧专用端点 `/interaction/on_answer`（原逻辑，旧 IC / 兼容保留）⇒ 路
+      径本身就是 ANSWER，payload 带不带 `act` 都算；但若带了别的 `act`
+      （同一批捕获里混投时）必须按统一入口同样地过滤掉，否则会错收。
+    """
     out = []
     for h in HITS:
-        if h["path"].endswith("/interaction/on_answer") and h["body"]:
-            try:
-                out.append((h, json.loads(h["body"])))
-            except ValueError:
-                pass
+        if not h["body"]:
+            continue
+        path = h["path"]
+        unified = path.endswith("/interaction/on_action")
+        legacy = path.endswith("/interaction/on_answer")
+        if not (unified or legacy):
+            continue
+        try:
+            body = json.loads(h["body"])
+        except ValueError:
+            continue
+        # 统一入口必带 act；旧端点通常不带 —— 带了就必须是 ANSWER
+        if body.get("act", "ANSWER") != "ANSWER":
+            continue
+        out.append((h, body))
     return out
 
 
 def _is_background_round(body: dict) -> bool:
-    """这发 on_answer 是不是「**视觉背景轮**」。
+    """这发 on_answer 类事件是不是「**视觉背景轮**」。
 
     判据照 Agent 侧的分流（`openai-agent-demo` 的
     `api/interaction_routes.py`）：`content` 在场 且 `ASR` 空 且
@@ -314,7 +336,7 @@ def test_greet_reentry_not_deduped() -> None:
 
 
 # ====================================================================== #
-#  ② 载荷：on_answer 带 content{ASR,VLM}，transcript 原样保留
+#  ② 载荷：on_action(act=ANSWER) 带 content{ASR,VLM}，transcript 原样保留
 # ====================================================================== #
 
 DESC_FULL = "画面里有一位青年男性，穿深蓝色外套、戴黑框眼镜，站在白色展示桌左侧，正看向镜头。"
@@ -334,7 +356,7 @@ POSITION: 站在展台右侧"""
 def test_payload_dual(srv_url: str) -> None:
     from orchestrator.downstream.interface import OmniDescription
 
-    print("\n[载荷] on_answer 带 content{ASR,VLM}，transcript 仍是字符串")
+    print("\n[载荷] on_action(act=ANSWER) 带 content{ASR,VLM}，transcript 仍是字符串")
     HITS.clear()
     d = _mk_downstream(srv_url, omni_describe=True,
                        agent_transcript_mode="dual")
@@ -391,7 +413,7 @@ def test_no_truncation(srv_url: str) -> None:
     _flush(d)
     bgs = _bg_rounds()
     if not bgs:
-        check(False, "没抓到视觉轮")
+        check(False, "没抓到 on_action(act=ANSWER)")
         d.ic.close()
         return
     got = bgs[0][1].get("content", {}).get("VLM", "")
@@ -430,7 +452,7 @@ def test_no_change_keeps_previous(srv_url: str) -> None:
 
 
 # ====================================================================== #
-#  ②′ 视觉背景轮：全量描述额外投一发 ASR 为空的 on_answer
+#  ②′ 视觉背景轮：全量描述额外投一发 ASR 为空的 on_answer 类事件（act=ANSWER）
 # ====================================================================== #
 
 def test_visual_background_round(srv_url: str) -> None:
@@ -597,7 +619,7 @@ def test_ready_before_asr_final(srv_url: str) -> None:
     ans = _talk_rounds()
     check(d._vlm_miss == 0, f"没有 miss（实际 {d._vlm_miss}）")
     if not ans:
-        check(False, "没抓到 on_answer")
+        check(False, "没抓到 on_action(act=ANSWER)")
         d.ic.close()
         return
     hit, body = ans[0]
@@ -627,7 +649,7 @@ def test_missing_description_never_waits(srv_url: str) -> None:
     ans = _talk_rounds()
     check(d._vlm_miss == 1, f"记了 1 次 miss（实际 {d._vlm_miss}）")
     if not ans:
-        check(False, "没抓到 on_answer")
+        check(False, "没抓到 on_action(act=ANSWER)")
         d.ic.close()
         return
     hit, body = ans[0]
@@ -641,21 +663,22 @@ def test_missing_description_never_waits(srv_url: str) -> None:
 
 
 # ====================================================================== #
-#  ④ 回归：默认态必须与今天逐字节一致
+#  ④ 回归：默认态保持基线形态（旧五键 + act，omni 侧不加料）
 # ====================================================================== #
 
+#: 默认态（legacy）话轮事件的键集 = 旧五键 + IC 统一入口注入的 `act`。
 LEGACY_KEYS = {"session_id", "callback_ic", "identity_id", "display_name",
-               "transcript"}
+               "transcript", "act"}
 
 
-def test_default_is_byte_identical(srv_url: str) -> None:
-    """**什么都不设（默认态）⇒ payload 与今天逐字节一致。**
+def test_default_keeps_legacy_shape(srv_url: str) -> None:
+    """**什么都不设（默认态）⇒ payload 保持基线形态（旧五键 + `act`）。**
 
     这条同时是「没碰 106」的保证：编排代码 105/106 共用，默认值就是 106
     下次重启后的行为。`ORCH_AGENT_TRANSCRIPT_MODE` 默认 `legacy`、
     `ORCH_OMNI_DESCRIBE` 默认 0 —— 见 config.py 里那两个开关的说明。
     """
-    print("\n[回归] 默认态（legacy）payload 逐字节等于旧版")
+    print("\n[回归] 默认态（legacy）payload = 旧五键 + act（omni 侧不加料）")
     HITS.clear()
     d = _mk_downstream(srv_url)                     # 全部默认
     if not check_ic(d):
@@ -667,12 +690,12 @@ def test_default_is_byte_identical(srv_url: str) -> None:
     _flush(d)
     ans = _answers()
     if not ans:
-        check(False, "没抓到 on_answer")
+        check(False, "没抓到 on_action(act=ANSWER)")
         d.ic.close()
         return
     body = ans[0][1]
     check(set(body) == LEGACY_KEYS,
-          f"键集恰好是旧的五个（实际 {sorted(body)}）—— 一个键都不多")
+          f"键集恰好是旧五键 + act（实际 {sorted(body)}）—— 一个键都不多")
     check("content" not in body, "没有 content 键")
     d.ic.close()
 
@@ -695,7 +718,7 @@ def test_legacy_mode_with_describe_on(srv_url: str) -> None:
     _flush(d)
     ans = _answers()
     check(ans and set(ans[0][1]) == LEGACY_KEYS,
-          f"键集仍是旧的五个（实际 {sorted(ans[0][1]) if ans else '无'}）")
+          f"键集仍是旧五键 + act（实际 {sorted(ans[0][1]) if ans else '无'}）")
     d.ic.close()
 
 
@@ -727,7 +750,7 @@ def test_contract_drift(srv_url: str) -> None:
     `content`）—— 正是本仓库反复踩的那类"改了、没生效、不报错"。
     这个测试锁住两件事：
       ① `_send` 仍在投递路径上（不在了 ⇒ 下面的 content 断言会失败）
-      ② `legacy` 下投递行为与旧版一致（恰好 1 次 POST、键集不变）
+      ② `legacy` 下投递行为不变（恰好 1 次 POST、键集 = 旧三件套 + `act`）
     """
     from orchestrator.interaction.agent_sink import make_vlm_agent_sink
 
@@ -744,10 +767,10 @@ def test_contract_drift(srv_url: str) -> None:
     from interaction.runtime import AgentSink
     _send_one(AgentSink(srv_url, **kwargs))
     legacy = _answers()
-    check(len(legacy) == 1, f"旧形态恰好 1 次 POST（实际 {len(legacy)}）")
-    check(legacy and set(legacy[0][1]) == {"identity_id", "display_name",
+    check(len(legacy) == 1, f"恰好 1 次 POST（实际 {len(legacy)}）")
+    check(legacy and set(legacy[0][1]) == {"act", "identity_id", "display_name",
                                            "transcript"},
-          f"envelope 关闭时键集就是旧的三件套（实际 "
+          f"envelope 关闭时键集 = 旧三件套 + act（实际 "
           f"{sorted(legacy[0][1]) if legacy else '无'}）")
 
     HITS.clear()
@@ -1390,7 +1413,7 @@ def main() -> int:
         test_background_not_sent_in_legacy(url)
         test_ready_before_asr_final(url)
         test_missing_description_never_waits(url)
-        test_default_is_byte_identical(url)
+        test_default_keeps_legacy_shape(url)
         test_legacy_mode_with_describe_on(url)
         test_illegal_mode_falls_back_to_legacy(url)
         test_contract_drift(url)
