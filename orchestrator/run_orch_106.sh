@@ -189,7 +189,7 @@ fi
 echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）" >&2
 echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
 echo "  python          = $PY" >&2
-# ---- VLM 描述（两阶段）+ 增量人设 ----
+# ---- VLM 描述（两阶段：起点 full + 每轮 turn 全量）----
 #
 # 2026-10-13 起**开着**（此前一段是关的，原因见下「为什么原先关着」）。
 #
@@ -222,7 +222,6 @@ echo "  python          = $PY" >&2
 # 回退（102 的 Agent 若被退回旧版 —— **先退编排、再退 Agent**，顺序与开时
 # 相反，因为危险的永远是「新编排 + 旧 Agent」这个组合）：
 #     ORCH_OMNI_DESCRIBE=0 ORCH_AGENT_TRANSCRIPT_MODE=legacy \
-#     ORCH_OMNI_DELTA_PERSONA=0 \
 #     nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
 #
 #   `dual`   = 纯增量：`transcript` 仍是字符串，只多一个 `content={ASR,VLM}` 键
@@ -231,20 +230,18 @@ echo "  python          = $PY" >&2
 #   `legacy` = 连子类都不装，payload 逐字节等于旧版（回退用）
 export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
-# 增量人设：全量描述在「八类清单」的连接上做完 ⇒ **关掉重连** ⇒ 用「只报
-# 变化」的短人设接着跑增量。不换的话每轮增量都长成八类分条（3~4s），且
-# 压不短 —— 推演见 `orchestrator/omni/describe.py`「为什么增量轮压不短」。
-# 与 `ORCH_OMNI_DESCRIBE` 同开同关（这一组值与 105 对齐，两边行为一致）。
-export ORCH_OMNI_DELTA_PERSONA="${ORCH_OMNI_DELTA_PERSONA:-1}"
+# 「增量人设 / 换短人设重连」那套机制**已删**（2026-10-28 两阶段定稿，
+# `_switch_delta_persona` 与 `ORCH_OMNI_DELTA_PERSONA` 都不在代码里了）。
+# ⇒ 不再 export、也不在横幅里报，否则横幅会描述一个不存在的行为
+#   （2026-10-29 实测横幅写着「增量人设 = 1」而跑的是两阶段全量）。
 
 # 生效值落日志 —— 切换/回退后**第一眼看这里**，别靠猜。
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（1=omni 只当描述器，0=当对话方）" >&2
 echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
      "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
-echo "  视觉背景轮      = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
-     "（全量描述额外投一发 ASR 空的 on_answer，只存不答）" >&2
-echo "  增量人设        = $ORCH_OMNI_DELTA_PERSONA" \
-     "（1=全量做完后关掉重连、换短人设跑增量）" >&2
+echo "  视觉轮          = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
+     "（每份描述一生成完就投一发 ASR 空的 on_answer，只存不答）" >&2
+echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量）" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \
