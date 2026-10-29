@@ -40,6 +40,17 @@ IC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../interactioncore" && pwd)"
 # ---- Agent：105 专用的那个（**不是** 102）----
 export INTERACTION_AGENT_URL="${INTERACTION_AGENT_URL:-http://192.168.89.103:8081}"
 
+# ---- Agent 会话信封（session_id / callback_ic）—— 现在**必须开** ----
+# ⚠️ Agent 端已把这两个字段改**必填**：缺任一字段事件被 422 拒 ——
+#    不开信封这条回退路径一条事件都送不进去（没有回复、没有播报）。
+#    前置：本机 interactioncore 要支持这两个 env（Pite 主线已支持）。
+export INTERACTION_AGENT_SESSION_ENVELOPE="${INTERACTION_AGENT_SESSION_ENVELOPE:-1}"
+# 本 IC 的对外可回连地址（gRPC 形态 → Agent 直连 gRPC 回写）。
+# ⚠️ 不能写 127.0.0.1 —— Agent 会去连它自己。
+export INTERACTION_CALLBACK_IC="${INTERACTION_CALLBACK_IC:-192.168.89.105:50051}"
+# 独立 IC 没有会话概念，给个固定标识（空着 payload 的 session_id 就是 null → 422）
+export INTERACTION_SESSION_ID="${INTERACTION_SESSION_ID:-ic105-standalone}"
+
 # ---- 表达层（本机编排服务）----
 export INTERACTION_EXPRESSION_URL="${INTERACTION_EXPRESSION_URL:-https://127.0.0.1:8100}"
 

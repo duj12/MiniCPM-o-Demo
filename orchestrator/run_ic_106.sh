@@ -25,18 +25,21 @@
 #    失败**只记 IC 侧日志**，现象是「IC 判了 GREET 但没人播」，极难排查。
 # 3. `--port 50051` —— 编排侧 `ORCH_IC_GRPC` 指向的就是它。
 #
-# ## 回退后若发现 `agent.status` 写不进去
+# ## Agent 会话信封（session_id / callback_ic）—— 现在**必须开**
 #
-# 说明 Agent 已经不认 gRPC 的 `ApplyAgent` 了（只认 HTTP 回调）。那时补上：
+# Agent 端已把这两个字段改**必填**（缺任一字段 → 事件被 422 拒）。
+# 不开信封这条回退路径上 Agent 一条事件都收不到（没有回复、没有播报）。
+# 所以下面 set 段必须配齐三项：
 #
-#     --agent-envelope --callback-ic https://192.168.89.106:8100/v1/ic
+#     INTERACTION_AGENT_SESSION_ENVELOPE=1
+#     INTERACTION_CALLBACK_IC=https://192.168.89.106:8100/v1/ic
+#       （HTTP 形态 → Agent 走 HTTP 回写；编排侧 grpc 模式的
+#        `POST /v1/ic/apply_agent` 会把它转成 gRPC 投给本服务）
+#     INTERACTION_SESSION_ID=<固定标识> —— 独立 IC 没有会话概念，
+#       空着 payload 的 session_id 就是 null，照样 422
 #
-# 让 IC 在 Action payload 里告诉 Agent 往哪写（不加的话 Agent 拿不到
-# `callback_ic`，只能退回它自己配置的地址）。编排侧 grpc 模式的
-# `POST /v1/ic/apply_agent` 会把它转成 gRPC 投给本服务。
-#
-# ⚠️ 当前（抄下来的）那份**没有**加这两个参数 —— 保持与"今天之前一直在跑的
-#    状态"一致，别顺手加：改了协议就同时影响 Agent 和回退行为。
+# ⚠️ 前置：本机 interactioncore 的版本要支持这三个 env（Pite 主线已支持；
+#    老版本没有任何配置能兼容必填后的 Agent —— 先升代码）。
 set -eu
 REPO=/data/megastore/Projects/DuJing/code/MiniCPM-o-Demo
 PY="${IC_PY:-/home/dujing/miniconda3/envs/py310/bin/python}"
@@ -45,7 +48,12 @@ cd /data/megastore/Projects/DuJing/code/interactioncore
 export INTERACTION_AGENT_URL="${INTERACTION_AGENT_URL:-http://192.168.89.102:8081}"
 export INTERACTION_EXPRESSION_URL="${INTERACTION_EXPRESSION_URL:-https://192.168.89.106:8100}"
 export INTERACTION_EXPRESSION_CA="${INTERACTION_EXPRESSION_CA:-$REPO/certs/cert.pem}"
-export INTERACTION_SESSION_ID="${INTERACTION_SESSION_ID:-}"
+
+# ⚠️ Agent 端已把 session_id / callback_ic 改**必填** —— 信封必须开，且
+#    标识 / 地址配齐（原因与形态说明见文件头「Agent 会话信封」段）。
+export INTERACTION_AGENT_SESSION_ENVELOPE="${INTERACTION_AGENT_SESSION_ENVELOPE:-1}"
+export INTERACTION_CALLBACK_IC="${INTERACTION_CALLBACK_IC:-https://192.168.89.106:8100/v1/ic}"
+export INTERACTION_SESSION_ID="${INTERACTION_SESSION_ID:-ic106-standalone}"
 
 LOG="${IC106_LOG:-/data/megastore/Projects/DuJing/code/orch-dumps/106/ic106.log}"
 mkdir -p "$(dirname "$LOG")"
