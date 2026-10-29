@@ -225,7 +225,7 @@ class PlaybackReceipt:
     t: int
     response_id: str = ""
     phase: Literal["armed", "started", "ended", "cancelled",
-                   "playing", "stopped"] = "started"
+                   "playing", "stopped", "paused", "resumed"] = "started"
     ctx_time: float = 0.0
     seq: int = 0
     kind: Literal["playback"] = "playback"
@@ -269,6 +269,10 @@ class Speak:
     stream_id: str = ""
     #: 该轮文本是否已发完（流式收尾信号）
     is_final: bool = True
+    #: **这是一句可以插在"暂停态"之上播的短话术**（如"误打断"提示）。
+    #: 普通 ``Speak`` 会先把暂停封存的那轮丢掉（视作被取代）；``prompt=True``
+    #: 则保留封存内容，等 ``ResumeTts`` 把它接回来。
+    prompt: bool = False
     kind: Literal["speak"] = "speak"
 
 
@@ -285,6 +289,37 @@ class Cancel:
     reason: str
     response_id: Optional[str] = None
     kind: Literal["cancel"] = "cancel"
+
+
+@dataclass(frozen=True)
+class PauseTts:
+    """**暂停**当前播报（软打断）。与 ``Cancel`` 的唯一区别是**可以回来**。
+
+    执行器做三件事：
+      ① 通知浏览器 ``tts.pause`` —— 掐断排程但**保留**缓冲与已播位置，
+         并回一个 ``paused`` 回执（实测已播采样数）
+      ② 把当前 TTS 流**封存**（不 abort、不 end，只是不再取音频）
+      ③ 参考轨裁到"实际播出过"的位置
+
+    ⚠️ 封存期间**不留占"当前播报"槽** —— 所以随后的 ``Speak``（例如
+    "误打断"话术，需带 ``prompt=True``）能正常播，不会把暂停的那轮连带
+    清掉（``_open_stream`` / ``_speak_inner`` 开新语前都会先打断旧的）。
+
+    与 ``ResumeTts`` 配对使用；期间收到硬 ``Cancel`` 则封存内容被丢弃。
+    """
+    reason: str = ""
+    kind: Literal["pause_tts"] = "pause_tts"
+
+
+@dataclass(frozen=True)
+class ResumeTts:
+    """**续播**：把 ``PauseTts`` 封存的那一轮放出来，从暂停点接着播。
+
+    执行器重新要一次浏览器的起播承诺（旧承诺是暂停前的时刻，已失效），
+    据此把剩余的音频重新落位到参考轨，然后放流继续合成。
+    """
+    reason: str = ""
+    kind: Literal["resume_tts"] = "resume_tts"
 
 
 @dataclass(frozen=True)
@@ -322,7 +357,8 @@ class Emit:
     kind: Literal["emit"] = "emit"
 
 
-DownstreamAction = Union[Speak, Cancel, SendToOmni, Describe, Emit]
+DownstreamAction = Union[Speak, Cancel, PauseTts, ResumeTts,
+                         SendToOmni, Describe, Emit]
 
 
 # ====================================================================== #

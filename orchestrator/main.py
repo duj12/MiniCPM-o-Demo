@@ -1083,7 +1083,8 @@ def create_app(cfg: Settings):
             return next(iter(REGISTRY.sessions.values()))
         return None
 
-    def _queue_speak(sess: OrchestratorSession, act) -> None:
+    def _queue_speak(sess: OrchestratorSession, act,
+                     count_speak: bool = True) -> None:
         """把 action 交给执行器。
 
         ⚠️ **不能投 ``sess._down_q``** —— 那个队列装的是"发给 downstream 的
@@ -1106,7 +1107,8 @@ def create_app(cfg: Settings):
         except RuntimeError:
             logger.warning("[%s] 无运行中的 event loop，播报被丢弃", sess.session_id)
             return
-        sess.stats["agent_speaks"] = sess.stats.get("agent_speaks", 0) + 1
+        if count_speak:
+            sess.stats["agent_speaks"] = sess.stats.get("agent_speaks", 0) + 1
         t = loop.create_task(_do())
         # ⚠️ 记下 task 并挂回调 —— `create_task` 的异常**不会**自动冒出来
         #    （除非被 await）。早先没挂，`_do` 里若抛在 logger 之前/之外
@@ -1137,14 +1139,16 @@ def create_app(cfg: Settings):
         if body.get("interrupt"):
             _queue_speak(sess, Cancel(reason="agent_speak"))
         from orchestrator.downstream.interface import Speak as SpeakAction
+        prompt = bool(body.get("prompt"))
         _queue_speak(sess, SpeakAction(
             text=text,
             tts_type=str(body.get("tts_type") or "mltts"),
             speaker_id=body.get("speaker_id"),
+            prompt=prompt,
         ))
-        logger.info("[%s] Agent 播报（%d 字，interrupt=%s）: %s",
+        logger.info("[%s] Agent 播报（%d 字，interrupt=%s，prompt=%s）: %s",
                     sess.session_id, len(text), bool(body.get("interrupt")),
-                    text[:40])
+                    prompt, text[:40])
         return {"ok": True, "session_id": sess.session_id}
 
     @app.post("/v1/speak/stream")
@@ -1211,6 +1215,65 @@ def create_app(cfg: Settings):
         _queue_speak(sess, Cancel(reason=reason))
         logger.info("[%s] 外部请求停止播报（reason=%s）—— 掐断当前播报"
                     "（来源不问：IC 模板与 Agent 回复一视同仁）",
+                    sess.session_id, reason)
+        return {"ok": True, "session_id": sess.session_id, "reason": reason}
+
+    # ---- 软打断：暂停 / 续播 ------------------------------------------- #
+    #
+    # 与 `/v1/stop` 的硬中断配对使用。IC 判「用户可能只是插了一嘴」时：
+    #
+    #     POST /v1/tts/pause                  ← 先挂起
+    #     POST /v1/speak  {prompt: true}      ← 播「误打断」话术（不碰暂停的内容）
+    #     POST /v1/tts/resume                 ← 把原来那句接回来
+    #
+    # ⚠️ `/v1/tts/pause` 之后**不要**再发普通 `/v1/speak` —— 那会把暂停的那轮
+    #    当成"被取代"丢掉。要插话术就必须带 `prompt: true`。
+    # ⚠️ 判错了（用户是真的在说）就发 `/v1/stop`，封存的内容会被一并丢弃。
+
+    @app.post("/v1/tts/pause")
+    async def tts_pause(request: Request):
+        """**暂停**当前播报（软打断）。可从 ``/v1/tts/resume`` 回来。
+
+        返回的是「请求已受理」——真正的暂停结果是异步的（要等浏览器回
+        ``paused`` 回执、参考轨裁剪完）。当前没有在播的回复时也返回
+        ``ok:true``（幂等，IC 不必先查状态）。
+        """
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            pass          # body 可选
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        from orchestrator.downstream.interface import PauseTts
+        reason = str(body.get("reason") or "ic_pause")
+        _queue_speak(sess, PauseTts(reason=reason), count_speak=False)
+        logger.info("[%s] 外部请求**暂停**播报（reason=%s）—— 软打断，"
+                    "等 /v1/tts/resume 接回来", sess.session_id, reason)
+        return {"ok": True, "session_id": sess.session_id, "reason": reason}
+
+    @app.post("/v1/tts/resume")
+    async def tts_resume(request: Request):
+        """**续播**：把上次 ``/v1/tts/pause`` 挂起的那一轮接回来。"""
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            pass
+        sess = _find_session(request)
+        if sess is None:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "找不到活跃会话"
+                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
+        from orchestrator.downstream.interface import ResumeTts
+        reason = str(body.get("reason") or "ic_resume")
+        _queue_speak(sess, ResumeTts(reason=reason), count_speak=False)
+        logger.info("[%s] 外部请求**续播**（reason=%s）—— 接回暂停的那一轮",
                     sess.session_id, reason)
         return {"ok": True, "session_id": sess.session_id, "reason": reason}
 

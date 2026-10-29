@@ -293,6 +293,21 @@ class RefTrack:
             n_zeroed += hi - lo
         return n_zeroed
 
+    def forget(self, response_id: str) -> None:
+        """丢掉某 response 的落位记录与跨度（**不清音频**）。
+
+        续播时用。暂停已经用 ``resize()`` 把未播段清零了，但
+        ``_span_start/_span_end`` 里留着**暂停前**的起点；续播是在更晚的
+        时刻重新落位，若沿用旧跨度，之后打断时的 ``resize()`` 会按旧起点
+        算 ``cut = 旧起点 + keep`` → 落在续播尾巴之后 → 该清的一段没清，
+        AEC 会去追一个不存在的回声（比不给参考更糟）。
+
+        ⚠️ 只删记录，不动环形缓冲 —— 已经播出去的那段还可能正在被读。
+        """
+        self._placed.pop(response_id, None)
+        self._span_start.pop(response_id, None)
+        self._span_end.pop(response_id, None)
+
     # ------------------------------------------------------------------ #
 
     def read_raw(self, t0: int, n: int) -> np.ndarray:

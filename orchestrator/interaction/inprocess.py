@@ -72,11 +72,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Callable, Optional
 
 from .agent_sink import make_vlm_agent_sink, normalize_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """环境变量布尔开关（与 `interaction.grpc_server._env_flag` 同语义）。"""
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
+
 
 #: 与方法名无关的失败计数上限，避免 dict 无限增长
 _MAX_FAIL_METHODS = 64
@@ -267,6 +274,14 @@ class InProcessICClient:
                 expression_sink=expression_sink,
                 agent_sink=agent_sink,
                 thresholds=self._thresholds,
+                # 软打断：默认**关**（行为与旧版逐字节一致）。开关在启动脚本
+                # 的环境变量里，与独立 IC（grpc_server）用同一组名字 ——
+                # 两种部署模式切过去不用改代码。
+                soft_interrupt=_env_flag("ORCH_IC_SOFT_INTERRUPT"),
+                soft_yield_grace_ms=int(
+                    os.environ.get("ORCH_IC_SOFT_YIELD_GRACE_MS") or 1000),
+                false_yield_prompt=os.environ.get(
+                    "ORCH_IC_FALSE_YIELD_PROMPT", "不好意思，您继续说。"),
             )
         except Exception as exc:  # noqa: BLE001
             self.error = f"{type(exc).__name__}: {exc}"

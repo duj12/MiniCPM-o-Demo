@@ -237,6 +237,11 @@ class OrchestratorSession:
         # 执行器等这个值来 place()。等不到就退回预测（见 _resolve_play_at）。
         self._armed: Dict[str, int] = {}
         self._armed_evt: Dict[str, asyncio.Event] = {}
+        # 暂停回执：response_id → 浏览器实测**已播**采样数（16k 基准）。
+        # 软打断（tts.pause）后用它把参考轨裁到"真正播出过"的位置，
+        # 续播时再从这里接着落位。
+        self._paused_played: Dict[str, int] = {}
+        self._paused_evt: Dict[str, asyncio.Event] = {}
         self.anchor_source = "none"      # ack | predicted | none
         self.anchor_delta_ms = 0.0
         # 播放提前量（前端起播预留的时间）—— 校准时要从中扣除
@@ -1037,6 +1042,27 @@ class OrchestratorSession:
                     )
             self._post_downstream_playback(response_id, phase, ctx_time, seq)
             return
+        if phase == "paused":
+            # 软打断：浏览器**保留**了缓冲与精确的已播位置，只是把源掐了。
+            # ``sample_offset`` = 已播采样数（16k 基准）—— 执行器据此裁剪
+            # 参考轨，并在这里等着它（见 `wait_paused`）。
+            #
+            # ⚠️ 这里**只记录、不动参考轨** —— 裁剪由执行器在**打包封存时**
+            #    一次性做完（它还要顺带把流停掉），两边各裁一刀会互相打架。
+            played = int(sample_offset) if sample_offset > 0 else 0
+            self._paused_played[response_id] = played
+            w = self._paused_evt.get(response_id)
+            if w is not None:
+                w.put(played)
+            self._post_downstream_playback(response_id, phase, ctx_time, seq)
+            return
+
+        if phase == "resumed":
+            # 续播已开始。落位由执行器按随后的 ``armed`` 承诺做，这里只转发
+            # 给下游（IC 可据此继续维持"在说"的判定）。
+            self._post_downstream_playback(response_id, phase, ctx_time, seq)
+            return
+
         # ⚠️ **回执一律不截断参考轨**（`started` / `ended` / `cancelled` 都不）。
         #
         # 这是踩过两次的地方，两次都是"在回执里按 clock.now() 截断"惹的祸：
@@ -1139,6 +1165,44 @@ class OrchestratorSession:
 
     def release_waiter(self, response_id: str) -> None:
         self._armed_evt.pop(response_id, None)
+
+    def clear_armed(self, response_id: str) -> None:
+        """丢掉某 response 的**旧**起播承诺与等待点。
+
+        续播专用：暂停前那次 ``armed`` 承诺指向的是暂停前的时刻，早已过期。
+        不清掉的话 `arm_waiter` 会把它当成"回执先到了"直接返回，参考轨就被
+        落位到过去，续播那一段的回声完全对不上。
+        """
+        self._armed.pop(response_id, None)
+        self._armed_evt.pop(response_id, None)
+
+    # ---- 暂停回执（软打断）----
+
+    def pause_waiter(self, response_id: str) -> "_OrchestratorSession._ArmedEvent":  # type: ignore[name-defined]
+        """为某 response 注册「暂停已生效」等待点（执行器在发 tts.pause 前调用）。"""
+        w = self._ArmedEvent()
+        # ⚠️ 每次暂停都要**新读数**：把上一轮的已播量清掉，否则同一句被暂停
+        #    两次时第二次会立刻拿到第一次的值（相当于没停）。
+        #    这里不做「回执先到」的预填 —— 等待点是在发 `tts.pause` **之前**
+        #    注册的，回执不可能更早。
+        self._paused_played.pop(response_id, None)
+        self._paused_evt[response_id] = w
+        return w
+
+    def release_pause_waiter(self, response_id: str) -> None:
+        self._paused_evt.pop(response_id, None)
+
+    async def wait_paused(self, response_id: str,
+                          timeout: float) -> Optional[int]:
+        """等浏览器回报「已停 + 已播多少」；超时返回 None（→ 用估算回退）。"""
+        w = self._paused_evt.get(response_id)
+        if w is None:
+            return None
+        try:
+            await asyncio.wait_for(w.evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        return w.value
 
     async def wait_armed(self, response_id: str,
                          timeout: float) -> Optional[int]:
@@ -2338,6 +2402,14 @@ class OrchestratorSession:
                 await self.downstream.on_session_end(reason)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("downstream.on_session_end 异常: %s", exc)
+        # 暂停封存的那一轮要先丢掉 —— 它的消费任务卡在暂停闸门后面，
+        # 不主动唤醒就永远不退（任务泄漏，`_speak_inflight` 也降不到零）。
+        if self.executor is not None:
+            try:
+                await asyncio.wait_for(
+                    self.executor.drop_parked(self, reason=reason), timeout=8.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("丢弃暂停中的播报失败: %s", exc)
         # 每个组件的关闭都加超时，避免一个卡住拖死整个会话清理
         for comp, name in ((self.aec, "aec"), (self.asr, "asr"),
                            (self.omni, "omni"), (self.tts, "tts")):

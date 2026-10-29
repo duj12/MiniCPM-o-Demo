@@ -412,6 +412,13 @@ class PcmPlayer {
     this._cancelled = false;    // 上一句是否被 cancel（决定下一句是否重排）
     this._armed = 0;            // 本句**承诺**的起播时刻（ctx 秒）
     this._firstAt = 0;          // 本句**实际**首播时刻（ctx 秒）
+    // ---- 软打断（暂停/续播）----
+    // 服务端发 tts.pause 时，浏览器**不丢弃**已收到的音频：把已排程的源
+    // 掐断，记下精确的已播位置，等 tts.resume 从那一采样接着播。
+    this._chunks = [];          // 本 response 收到的 int16 块（源采样率）
+    this._paused = false;       // 当前是否处于暂停
+    this._baseSec = 0;          // 当前 _sources 时间轴在整句里的起点（秒）
+    this._pauseSec = 0;         // 整句时间轴上"已播到"的位置（秒）
     this.gain = ctx.createGain();
     this.gain.gain.value = 1.0;
     this.gain.connect(ctx.destination);
@@ -440,6 +447,14 @@ class PcmPlayer {
    *  实际占比），求和即"播出了多少"。
    */
   playedSamples() {
+    return Math.round(this.playedSeconds() * 16000);   // 换算到 16k 采样
+  }
+  /** 当前这批已排程的源**播了多少秒**（与采样率无关）。
+   *
+   *  续播要按采样切片，所以必须拿到"秒"再乘源采样率 —— 用 16k 的整数
+   *  采样数回推会有 1/16000 s 的台阶，切点会漂到相邻采样上。
+   */
+  playedSeconds() {
     const now = this.ctx.currentTime;
     let played = 0;
     for (const n of (this._sources || [])) {
@@ -450,7 +465,7 @@ class PcmPlayer {
       }
       // now <= n._at：还没起播 → 不计
     }
-    return Math.round(played * 16000);           // 换算到 16k 采样
+    return played;
   }
   /**
    * 还有多少秒**没播完**（按已排程的源算）。
@@ -480,6 +495,11 @@ class PcmPlayer {
     this._firstAt = 0;
     this._armed = 0;
     this._leadMs = (leadMs == null ? 200 : leadMs);
+    // 新的一句：清掉上一句的缓冲与暂停态（续播走 resume()，不会到这里）
+    this._chunks = [];
+    this._paused = false;
+    this._baseSec = 0;
+    this._pauseSec = 0;
     if (this._cancelled) {
       // 打断后的新一句：排程指针必须从**当前时刻**重新开始，不能沿用
       // 停在旧句末尾的位置（实测踩过：新句被排到旧句之后，参考轨对不上）
@@ -527,6 +547,12 @@ class PcmPlayer {
       i16[i] = (bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8)) << 16 >> 16;
     }
     const srcRate = sr || this.srcRate;
+    // 留住原始 int16 —— 暂停后要从"已播采样"处切出剩余部分接着播。
+    // 存源采样率（24k）的原始数据，不做任何重采样，切点才不漂。
+    (this._chunks || (this._chunks = [])).push(i16);
+    // 暂停中：**只收不排** —— 排上去就出声了，暂停等于没停。
+    // 恢复时从 `_pauseSec` 统一切片重排，这些块自然接在后面。
+    if (this._paused) return 0;
     // int16 → float32 + 峰值统计（诊断用：能区分"没送到"与"送到了但没响"）
     let peak = 0;
     const f32src = new Float32Array(n);
@@ -619,6 +645,72 @@ class PcmPlayer {
     return at;
   }
   endResponse() { /* 队列自然播完 */ }
+
+  /* ---------- 软打断：暂停 / 续播 ---------- */
+
+  /** 暂停：掐断已排程的源，但**保留**缓冲与精确的已播位置。
+   *
+   *  与 `stop()` 的区别只有一条：`stop()` 是"不要了"，本函数是"待会儿接着播"。
+   *  所以这里**不许动 `_cancelled`**（那会让 `beginResponse` 清零重排）、
+   *  也不许清 `_chunks` / `_firstAt`。
+   *
+   *  ⚠️ **不要用 `audioCtx.suspend()`** 来实现暂停：它会把
+   *  `ctx.currentTime` 一起冻住，而 ALSA 路径的 `ctxTime` 换算是拿
+   *  `audioCtx.currentTime` 与帧头时间戳做锚点的 —— 一冻，采样时钟的
+   *  拟合就整个坏掉；顺带还会冻住 worklet 采集。
+   *
+   *  @returns {number} 整句时间轴上**已播**的秒数（回执要用）
+   */
+  pause() {
+    if (this._paused) return this._pauseSec;
+    // 已播位置 = 本轮时间轴起点 + 本批源播了多少
+    this._pauseSec = this._baseSec + this.playedSeconds();
+    if (this._startedTimer) {
+      clearTimeout(this._startedTimer); this._startedTimer = null;
+    }
+    for (const n of (this._sources || [])) {
+      try { n.stop(0); } catch (e) { /* 已播完的源 stop 会抛，忽略 */ }
+      try { n.disconnect(); } catch (e) { /* ignore */ }
+    }
+    this._sources = [];
+    this.nextAt = this.ctx.currentTime + 0.05;
+    this._paused = true;
+    diagUpdate();
+    return this._pauseSec;
+  }
+
+  /** 续播：从暂停点切出剩余音频，重新排程。
+   *
+   *  @returns {number} 承诺的起播时刻（ctx 秒）；没有剩余音频时返回 0
+   */
+  resume() {
+    if (!this._paused) return 0;
+    this._paused = false;
+    const sr = this.srcRate;
+    const off = Math.max(0, Math.round(this._pauseSec * sr));   // 源采样偏移
+
+    let total = 0;
+    for (const c of (this._chunks || [])) total += c.length;
+    let tail = null;
+    if (off < total) {
+      const all = new Int16Array(total);
+      let p = 0;
+      for (const c of this._chunks) { all.set(c, p); p += c.length; }
+      tail = all.subarray(off);
+    }
+    // 之后新到的块直接接在这个尾巴后面
+    this._chunks = tail ? [tail] : [];
+    // 本轮时间轴的起点 = 暂停点：`stop()` 报的已播量因此天然是"续播后
+    // 播了多少"，正好对上服务端给续播尾巴落位的那一段参考轨。
+    this._baseSec = this._pauseSec;
+    this._firstAt = 0;
+    this._armed = 0;
+    this.nextAt = 0;
+    if (!tail || tail.length === 0) { diagUpdate(); return 0; }
+    const f32 = new Float32Array(tail.length);
+    for (let i = 0; i < tail.length; i++) f32[i] = tail[i] / 32768;
+    return this.playFloat32(f32, sr);
+  }
   /** 立刻停止播放并清空已排程的内容。
    *
    *  ⚠️ 早先这个函数是**空操作**：把 gain 设 0 又立刻设回 1（等于没做），
@@ -649,6 +741,12 @@ class PcmPlayer {
     //    它压根没生效（等于空操作）。
     this.nextAt = this.ctx.currentTime + 0.05;
     this._cancelled = true;    // 告诉 beginResponse：下一句从零重排
+    // 硬打断 = 这轮**不要了**：暂停态与缓冲一并清掉，免得之后一条
+    // 迟到的 `tts.resume` 把已经取消的音频又放出来。
+    this._paused = false;
+    this._chunks = [];
+    this._baseSec = 0;
+    this._pauseSec = 0;
     diagUpdate();
   }
 }

@@ -111,6 +111,24 @@ fi
 export ORCH_IC_EXPRESSION_URL="${ORCH_IC_EXPRESSION_URL:-https://127.0.0.1:$PORT}"
 export ORCH_IC_EXPRESSION_CA="${ORCH_IC_EXPRESSION_CA:-$REPO/certs/cert.pem}"
 
+# ---- 软打断（TTS 先暂停，判误打断后播提示语再**续播**）----
+#
+# 2026-10-29 起 106 **默认开**（用户要求启用）。`ORCH_IC_SOFT_INTERRUPT=0`
+# 就是回退：IC 判 YIELD 立刻硬停（/v1/stop），与这批代码出现之前逐字节一致
+# —— 回退不需要改代码、也不需要动 Agent/前端。
+#
+# 开启后 YIELD 变成：/v1/tts/pause → 宽限期 → 若用户没继续说
+#   → /v1/speak(prompt=true)「误打断」提示语 → /v1/tts/resume（从暂停点接着播）
+# 若用户真在接着说 → /v1/stop（硬停，丢弃封存的那一轮）。
+#
+# ⚠️ 前端必须支持 `tts.pause` / `tts.resume` 两个消息（static/orchestrator-test.html
+#    的 PcmPlayer 已实现；更老的页面会忽略它们 → 表现为"暂停无效，声音继续"）。
+# ⚠️ 独立 IC（grpc 模式）不看这三个变量，它读的是 `INTERACTION_SOFT_INTERRUPT`
+#    等同名的一族（见 interactioncore/interaction/grpc_server.py）。
+export ORCH_IC_SOFT_INTERRUPT="${ORCH_IC_SOFT_INTERRUPT:-1}"
+export ORCH_IC_SOFT_YIELD_GRACE_MS="${ORCH_IC_SOFT_YIELD_GRACE_MS:-1000}"
+export ORCH_IC_FALSE_YIELD_PROMPT="${ORCH_IC_FALSE_YIELD_PROMPT:-不好意思，您继续说。}"
+
 # ---- Agent：106 用 102:8081（config.py 的默认值就是它，显式写出来自文档）----
 # （`ORCH_AGENT_SET_TARGET` 随 IC 模式在上面定）
 export ORCH_AGENT_URL="${ORCH_AGENT_URL:-http://192.168.89.102:8081}"
@@ -242,6 +260,9 @@ echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
 echo "  视觉轮          = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
      "（每份描述一生成完就投一发 ASR 空的 on_answer，只存不答）" >&2
 echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量）" >&2
+echo "  软打断          = $ORCH_IC_SOFT_INTERRUPT" \
+     "（1=先暂停，误打断播话术后续播；0=直接硬停；宽限 ${ORCH_IC_SOFT_YIELD_GRACE_MS}ms" \
+     "话术「$ORCH_IC_FALSE_YIELD_PROMPT」）" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

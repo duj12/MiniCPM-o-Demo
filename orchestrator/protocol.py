@@ -106,7 +106,8 @@ class PlaybackReceiptMsg:
                         ``stop_ctx``，服务端据此把参考轨校到"真正播出过"。
     """
     response_id: str
-    phase: Literal["armed", "started", "ended", "cancelled"]
+    phase: Literal["armed", "started", "ended", "cancelled",
+                   "paused", "resumed"]
     ctx_time: float = 0.0        # 兼容保留：服务端已不再读它
     seq: int = 0
     sample_offset: int = 0
@@ -207,6 +208,37 @@ class TtsCancel:
     response_id: str
     reason: str = ""
     type: Literal["tts.cancel"] = "tts.cancel"
+
+
+@dataclass
+class TtsPause:
+    """**暂停**播报（软打断）。浏览器掐断当前排程，但**保留**已收到的
+    音频与精确的已播位置，之后可由 ``TtsResume`` 从同一处接着播。
+
+    ⚠️ 与 ``TtsCancel`` 的区别只有一条：「还回不回得来」。
+      · ``TtsCancel`` —— 丢弃。浏览器 ``player.stop()`` 清空，服务端截断参考轨。
+      · ``TtsPause``  —— 挂起。浏览器保留整段缓冲，服务端把 TTS 流**封存**
+                        （不 abort、不 end，只是不再取音频）。
+
+    浏览器回 ``playback`` / ``phase="paused"``，``sample_offset`` = 已播采样数
+    （16k 基准）—— 服务端据此把参考轨裁到"真正播出过"的位置，续播时从
+    这里接着落位。
+    """
+    response_id: str = ""
+    reason: str = ""
+    type: Literal["tts.pause"] = "tts.pause"
+
+
+@dataclass
+class TtsResume:
+    """**续播**：浏览器从暂停点接着播，服务端把封存的流放出来。
+
+    浏览器回两条回执：先 ``armed``（承诺的续播时刻，服务端据此重新落位
+    参考轨），再 ``resumed``（带续播起点，仅供日志/UI）。
+    """
+    response_id: str = ""
+    reason: str = ""
+    type: Literal["tts.resume"] = "tts.resume"
 
 
 @dataclass

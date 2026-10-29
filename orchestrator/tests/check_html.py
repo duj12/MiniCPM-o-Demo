@@ -364,6 +364,53 @@ def main() -> int:
         if not ok:
             fails.append(desc)
 
+    # ---- 软打断：TTS 暂停 / 续播 ----
+    # 契约是三段：IC 判软打断 → pause；1s 后判误打断 → speak(prompt=True) →
+    # resume。任何一段被改回"硬打断 / 从头重放"，用户听到的就是
+    # 「话没说完就被掐了」或「整句从头再念一遍」。
+    print()
+    print("== 软打断：TTS 暂停 / 续播 ==")
+    sess_py = (Path(__file__).resolve().parents[1] / "session.py")
+    ss = sess_py.read_text(encoding="utf-8") if sess_py.is_file() else ""
+    pause_fn = _body("_pause_tts")
+    resume_fn = _body("_resume_tts")
+    pause_checks = [
+        # ⚠️ 播放器**不能**用 audioCtx.suspend() 暂停：那会冻结 ctx.currentTime，
+        #    ALSA 的 ctxTime 锚点与 SampleClock 拟合随之停摆。只能掐掉已排程的
+        #    source，并把"已收到但没播"的音频留在 _chunks 里等续播切片。
+        ("播放器暂停时保留已收音频并记住已播位置",
+         "this._pauseSec = this._baseSec + this.playedSeconds();" in html
+         and "this._paused = true;" in html
+         and "this._chunks" in html
+         # 注释里提到 `audioCtx.suspend()` 是可以的（那正是"别这么做"的说明），
+         # 所以剥掉注释后再查是否有**真的调用**。
+         and ".suspend(" not in strip(html)),
+        ("续播从暂停点切片（不是从头重放）",
+         "Math.round(this._pauseSec * sr)" in html),
+        ("会话客户端处理 tts.pause / tts.resume",
+         "tts.pause" in js and "tts.resume" in js),
+        ("会话客户端回报 paused / resumed 回执（带实测已播采样数）",
+         "'paused'" in js and "'resumed'" in js
+         and "Math.round(playedSec * 16000)" in js),
+        ("暂停发 tts.pause，**不发** tts.cancel（取消=硬打断，整句作废）",
+         "TtsPause(" in pause_fn and "TtsCancel(" not in pause_fn),
+        ("暂停按实测已播量裁参考轨（回执超时才用估算兜底）",
+         "wait_paused(" in pause_fn and "ref_track.resize(" in pause_fn),
+        ("续播发 tts.resume、清掉旧起播承诺、重新落位",
+         "TtsResume(" in resume_fn and "clear_armed(" in resume_fn
+         and "ref_track.place(" in resume_fn),
+        ("prompt=True 的话术不冲掉封存内容（普通 Speak 才丢）",
+         "keep_parked" in ex and "act.prompt" in ex),
+        ("会话收尾丢弃封存内容（否则流消费任务泄漏）",
+         "drop_parked(" in ss),
+        ("回执 paused/resumed 不按 clock.now() 截断参考轨",
+         'phase == "paused"' in ss and 'phase == "resumed"' in ss),
+    ]
+    for desc, ok in pause_checks:
+        print(f"  [{'OK' if ok else 'FAIL'}] {desc}")
+        if not ok:
+            fails.append(desc)
+
     print()
     if fails:
         print(f"FAILED: {len(fails)} 项")

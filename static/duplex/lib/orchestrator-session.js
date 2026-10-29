@@ -203,6 +203,27 @@
           this.player.endResponse(msg.response_id);
         }
         this._sendPlayback(msg.response_id, 'ended', 0);
+      } else if (t === 'tts.pause') {
+        // 软打断：**保留**缓冲与已播位置，只是把源掐断。
+        // 回执带实测已播采样数 —— 服务端据此裁参考轨、并从这里续播。
+        let playedSec = 0;
+        if (this.player && this.player.pause) playedSec = this.player.pause();
+        this._sendPlayback(msg.response_id, 'paused',
+                           Math.round(playedSec * 16000), {
+          stop_ctx: this.player && this.player.now ? this.player.now() : 0,
+        });
+      } else if (t === 'tts.resume') {
+        // 续播：先交给播放器重排，把**承诺起播时刻**回给服务端（它要据此
+        // 重新落位参考轨 —— 暂停前那次承诺早就过期了），再回一条 resumed
+        // 供 UI/日志。
+        let at = 0;
+        if (this.player && this.player.resume) at = this.player.resume();
+        if (at > 0) {
+          this._sendPlayback(msg.response_id, 'armed', 0, { start_ctx: at });
+        }
+        const from = (this.player && this.player._pauseSec) || 0;
+        this._sendPlayback(msg.response_id, 'resumed',
+                           Math.round(from * 16000), { start_ctx: at });
       } else if (t === 'tts.cancel') {
         if (this.player && this.player.stop) this.player.stop();
         // 取消立即回执，带上**实际播出了多少采样**与**实际停下的时刻** ——

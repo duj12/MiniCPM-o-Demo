@@ -354,7 +354,41 @@ POST {callback_ic}/interaction/on_answer
 | `GET /metrics` | 全局指标 + 最近会话快照（可接 Prometheus） |
 | `POST /v1/speak` | **Agent 回调**：整段播报（见下节） |
 | `POST /v1/speak/stream` | **Agent 回调**：流式播报 |
+| `POST /v1/stop` | 硬打断：立刻停播并丢弃当前那轮 |
+| `POST /v1/tts/pause` | **软打断**：暂停播报，**保留**已收到的音频与精确已播位置 |
+| `POST /v1/tts/resume` | **软打断**：从暂停点接着播（见下节） |
 | `WS /v1/orchestrator` | 会话主通道 |
+
+### 软打断：`/v1/tts/pause` + `/v1/tts/resume`
+
+给 IC 用的两步式打断。语义与 `/v1/stop` 的区别只有一条：
+
+| | `/v1/stop`（硬打断） | `pause` → `resume`（软打断） |
+|---|---|---|
+| 当前那轮 | 丢掉，不再播 | **封存**，之后从暂停点接着播 |
+| 参考轨 | 从缓冲里清掉未播部分 | 只留**已播**部分（等 `resumed` 后重新落位） |
+| 用途 | 用户真的抢话 | 先判"可能是误打断"，1s 后再定 |
+
+典型时序（IC 侧）：
+
+```
+IC 判 YIELD → POST /v1/tts/pause
+  ├─ 宽限期（默认 1s）内用户继续说话 → POST /v1/stop        # 真抢话，丢掉封存
+  └─ 没继续说（误打断）→ POST /v1/speak {"prompt": true}     # 插一句提示语
+                        → POST /v1/tts/resume                 # 接着播原来那句
+```
+
+要点：
+
+- `prompt: true` 的 `Speak` **不会**冲掉封存内容；普通 `Speak` 会（视作被取代）。
+- `resume` 会先等当前那句（提示语）**播完**再续播（最多等 6s），不会把它掐掉同行。
+- 暂停期间 TTS 侧仍在合成 —— 服务端只是**不再从队列里取**，所以续播的第一声
+  几乎无延迟；代价是暂停期间已合成的音频占内存（一条回复几 MB 量级）。
+- 会话关闭时封存的流会被显式丢弃（`drop_parked`），不会泄漏消费任务。
+- **默认不启用**：IC 侧要显式打开（inprocess：`ORCH_IC_SOFT_INTERRUPT=1`；
+  独立 IC：`INTERACTION_SOFT_INTERRUPT=1`）。关着时行为与旧版逐字节一致。
+- 前端必须认 `tts.pause` / `tts.resume` 两条消息（`static/orchestrator-test.html`
+  已实现）。老页面会忽略它们 → 表现为「暂停没生效，声音继续」。
 
 ---
 

@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from ..protocol import TtsAudio, TtsCancel, TtsDelta, TtsEnd, TtsStart
-from ..downstream.interface import Cancel, Describe, Emit, SendToOmni, Speak
+from ..protocol import (TtsAudio, TtsCancel, TtsDelta, TtsEnd, TtsPause,
+                        TtsResume, TtsStart)
+from ..downstream.interface import (Cancel, Describe, Emit, PauseTts,
+                                    ResumeTts, SendToOmni, Speak)
 
 if TYPE_CHECKING:
     from ..session import OrchestratorSession
@@ -72,6 +74,23 @@ class ActionExecutor:
         #: 当前流是否已发过结束信号。发过之后不能再 feed（见 _speak_stream）
         self._stream_ended = False
 
+        # ---- 暂停 / 续播（软打断）----
+        #
+        # 暂停时把「正在播的那一轮」整体**搬进** `_parked`，"当前播报"槽
+        # 随之清空 —— 于是「误打断」话术（一次普通 Speak）走 `_open_stream`
+        # 时看不到"有句在播"，不会把暂停的内容连带掐掉。`ResumeTts` 再
+        # 把它搬回来。
+        self._parked: Optional[dict] = None
+        #: 暂停回执（浏览器实测已播采样数）的等待上限
+        self.pause_ack_timeout_ms = 300
+        #: 整段合成（非流式）那一路的完整 PCM —— 续播要从暂停点切片
+        self._current_pcm: Optional[np.ndarray] = None
+        #: 流式那一路的暂停闸门（整段合成没有消费循环，保持 None）
+        self._pause_gate: Optional[asyncio.Event] = None
+        #: 流式那一路的消费游标：seq / 参考轨落位位置 / 已收 PCM / 作废标志。
+        #: 与消费任务共享同一个 dict 对象 —— 暂停/续播要**原地**改它。
+        self._cursor: Optional[dict] = None
+
     # ------------------------------------------------------------------ #
 
     async def execute(self, act, session: "OrchestratorSession") -> None:
@@ -79,6 +98,10 @@ class ActionExecutor:
             await self._speak(act, session)
         elif isinstance(act, Cancel):
             await self._cancel(act, session)
+        elif isinstance(act, PauseTts):
+            await self._pause_tts(session, act.reason or "pause")
+        elif isinstance(act, ResumeTts):
+            await self._resume_tts(session, act.reason or "resume")
         elif isinstance(act, SendToOmni):
             await self._send_to_omni(act, session)
         elif isinstance(act, Describe):
@@ -233,7 +256,10 @@ class ActionExecutor:
                            session: "OrchestratorSession") -> bool:
         """开一路新的 TTS 流，并起后台任务消费它的音频。"""
         # 打断上一句：与整段合成同一条路径（浏览器掐断 + 参考轨截断）
-        await self._interrupt_current(session, reason="superseded")
+        # ``prompt=True``（"误打断"这类短话术）例外：它是要**插在暂停态
+        # 之上**播的，封存的那一轮必须留着等 ResumeTts 接回来。
+        await self._interrupt_current(session, reason="superseded",
+                                      keep_parked=act.prompt)
         # 上一句的流任务要等它退干净，否则旧音频会串进新的消费循环
         await self._await_stream_task()
 
@@ -242,6 +268,7 @@ class ActionExecutor:
         self._tts_seq = 0
         self._stream_text = []
         self._current_text = act.text or ""
+        self._current_pcm = None      # 流式那一路的 PCM 在 cursor 里
 
         # ⚠️ 流式下此刻还不知道全文，text 只能给空 —— 字幕靠 tts.end 补
         await session.send_to_client(TtsStart(
@@ -261,41 +288,61 @@ class ActionExecutor:
         self._stream_id = act.stream_id
         self._stream_ended = False
         self._speak_inflight += 1
+        # 暂停闸门 + 消费游标：两者都要能被 `_pause_tts` **原地**改到，
+        # 否则恢复后消费循环还拿着暂停前的落位位置和 seq。
+        gate = asyncio.Event()
+        gate.set()
+        self._pause_gate = gate
+        cursor = {"seq": 0, "at": None, "pcm": [], "dead": False}
+        self._cursor = cursor
+        text_list = self._stream_text
         self._stream_task = asyncio.create_task(
-            self._consume_stream(session, response_id, arm, stream))
+            self._consume_stream(session, response_id, arm, stream,
+                                 gate, cursor, text_list))
         session.stats["tts_streams"] = session.stats.get("tts_streams", 0) + 1
         return True
 
     async def _consume_stream(self, session: "OrchestratorSession",
-                              response_id: str, arm, stream) -> None:
+                              response_id: str, arm, stream, gate,
+                              cursor: dict, text_list: list) -> None:
         """后台任务：收流式音频 → 下发浏览器 → **逐块**落位参考轨。
 
         与整段合成的关键差异：参考轨不再是「整段一次 place」，而是每收到
         一块就续着写。这是安全的 —— RefTrack 的 ``StatefulResampler`` 跨
         ``place()`` 保持相位，逐块落位与整段落位**逐采样一致**（已实测）。
+
+        ``gate`` / ``cursor`` / ``text_list`` 是**按流**传进来的（不是读
+        ``self.*``）：暂停会把这一路整体封存，恢复时 `self.*` 属于别人。
         """
-        seq = 0
-        at_sample: Optional[int] = None
         n_chunks = 0
         t0 = time.monotonic()
         try:
             async for pcm24 in stream.audio_iter():
                 if session.closed:
                     break
+                # ---- 暂停闸门 ----
+                # 暂停期间**不取音频、不下发** —— 已合成的块留在
+                # `TtsStream._audio_q`（无界队列）里，恢复后接着发。
+                # 不能反过来"照发、让浏览器攒着"：浏览器是按绝对时刻
+                # 排程的，攒下来就会在恢复时一起炸出来。
+                await gate.wait()
+                if cursor.get("dead"):
+                    break
+                cursor["pcm"].append(pcm24)
                 await session.send_to_client(
-                    TtsAudio.from_int16(pcm24, response_id, seq))
-                seq += 1
+                    TtsAudio.from_int16(pcm24, response_id, cursor["seq"]))
+                cursor["seq"] += 1
                 n_chunks += 1
-                if at_sample is None:
+                if cursor["at"] is None:
                     # 第一块到达才要锚点 —— 浏览器的 armed 承诺是在第一块
                     # 音频到达时给出的（见 PcmPlayer._armNow 的说明）
-                    at_sample = await self._resolve_play_at(
+                    cursor["at"] = await self._resolve_play_at(
                         session, response_id, arm)
-                if session.ref_track is not None and at_sample is not None:
+                if session.ref_track is not None and cursor["at"] is not None:
                     ch = session.ref_track.place(
-                        response_id, seq, pcm24, at_sample)
+                        response_id, cursor["seq"], pcm24, cursor["at"])
                     # 用 place 返回的长度累加（重采样有取整，不能自己乘比例）
-                    at_sample = ch.t1
+                    cursor["at"] = ch.t1
                     self._current_play_until = ch.t1
         except asyncio.CancelledError:
             raise
@@ -306,14 +353,14 @@ class ActionExecutor:
             try:
                 if not session.closed:
                     await session.send_to_client(TtsEnd(
-                        response_id=response_id, text="".join(self._stream_text)))
+                        response_id=response_id, text="".join(text_list)))
             except Exception as exc:  # noqa: BLE001
                 logger.debug("发送 tts.end 失败（忽略）: %s", exc)
             self._speak_inflight -= 1
             self.speaks_done += 1
             logger.info(
                 "TTS 流式完成: %s 共 %d 块 / %d 字，耗时 %.0fms，首块 %.0fms%s",
-                response_id, n_chunks, len("".join(self._stream_text)),
+                response_id, n_chunks, len("".join(text_list)),
                 (time.monotonic() - t0) * 1000,
                 stream.first_chunk_s * 1000,
                 f"，错误={stream.error}" if stream.error else "",
@@ -325,6 +372,8 @@ class ActionExecutor:
         st, self._stream = self._stream, None
         self._stream_id = ""
         self._stream_ended = False
+        self._cursor = None
+        self._pause_gate = None
         if st is not None:
             st.end()          # 幂等；已 end 过就什么都不做
             await st.abort()  # 保证线程退出、音频不再投递
@@ -363,12 +412,14 @@ class ActionExecutor:
         #   ② 截断参考轨
         # ⚠️ 早先只做了② —— 参考轨清对了，但浏览器那边**照旧播完**，
         #    表现为"打断后当前语音不停，然后 ASR 开始识别还在播的音频"。
-        await self._interrupt_current(session, reason="superseded")
+        await self._interrupt_current(session, reason="superseded",
+                                      keep_parked=act.prompt)
 
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
         self._current_text = act.text or ""
+        self._current_pcm = None
 
         # ⚠️ tts.start 必须在**合成之前**发 —— 浏览器要据此承诺起播时刻，
         #    而这段承诺的往返正好藏在 TTS 的合成耗时里（实测首帧 508ms）。
@@ -439,6 +490,9 @@ class ActionExecutor:
         # 若 lead 被调得很小、或 D 极小、或 RTT 异常大，参考轨就会写晚 ——
         # 表现为该句开头一小段回声没有参考。`started` 回执里的偏差会暴露。
         at_sample = await self._resolve_play_at(session, response_id, arm)
+        # 留住整段 PCM —— 软打断后要按"已播多少"切片续播
+        # （见 `_pause_tts` / `_resume_tts`）。一条回复几 MB 量级，可接受。
+        self._current_pcm = pcm24.astype(np.int16, copy=False)
         if session.ref_track is not None:
             session.ref_track.place(
                 response_id, 0, pcm24.astype(np.int16), at_sample
@@ -545,7 +599,9 @@ class ActionExecutor:
 
     async def _interrupt_current(self, session: "OrchestratorSession",
                                  reason: str,
-                                 notify: bool = True) -> Optional[str]:
+                                 notify: bool = True,
+                                 keep_parked: bool = False,
+                                 ) -> Optional[str]:
         """打断当前播报：**通知浏览器停** + 截断参考轨，让两者重新对齐。
 
         返回被打断的 response_id（没有可打断的则 None）。
@@ -583,9 +639,17 @@ class ActionExecutor:
             st, self._stream = self._stream, None
             self._stream_id = ""
             self._stream_ended = False
+            self._cursor = None
+            self._pause_gate = None
             st.end()
             await st.abort()
             logger.debug("打断时已中止 TTS 流")
+
+        # 暂停中封存的那一轮：**硬打断**（IC 抢话/END、Agent 换了新回复）
+        # 时一并丢弃。唯一的例外是 `prompt=True` 的短话术 —— 它就是要插在
+        # 暂停态之上播的，封存内容必须留着等 `ResumeTts` 接回来。
+        if self._parked is not None and not keep_parked:
+            await self.drop_parked(session, reason=reason)
 
         rid = self._current_response_id
         if rid is None:
@@ -646,6 +710,235 @@ class ActionExecutor:
         except Exception:  # noqa: BLE001
             pass
         return rid
+
+    # ------------------------------------------------------------------ #
+    #  暂停 / 续播（软打断）
+    # ------------------------------------------------------------------ #
+
+    async def _pause_tts(self, session: "OrchestratorSession",
+                         reason: str) -> bool:
+        """暂停当前播报，并把整轮**封存**起来等 ``ResumeTts``。
+
+        顺序有讲究：
+
+          ① **先关闸门** —— 否则等浏览器回执的这 300ms 里还在往它推音频，
+             推过去的块会被排到"暂停之后"，恢复时一起炸出来
+          ② 再问浏览器「停在哪了」（``paused`` 回执带实测已播采样数）
+          ③ 用**实测值**裁参考轨（预测值只在回执超时时兜底）
+          ④ 最后才搬进封存槽、清空「当前播报」
+
+        ④ 是关键：清空之后，紧接着的「误打断」话术走 `_open_stream` 时
+        看不到"有句在播"，就不会把它连带掐掉。
+        """
+        rid = self._current_response_id
+        if rid is None:
+            logger.info("暂停请求（%s）忽略：当前没有在播的回复", reason)
+            return False
+        if self._parked is not None:
+            logger.info("暂停请求（%s）忽略：已经有一轮处于暂停中", reason)
+            return False
+
+        gate = self._pause_gate
+        if gate is not None:
+            gate.clear()
+
+        session.pause_waiter(rid)
+        try:
+            await session.send_to_client(
+                TtsPause(response_id=rid, reason=reason))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送 tts.pause 失败: %s", exc)
+        played = await session.wait_paused(
+            rid, self.pause_ack_timeout_ms / 1000.0)
+        session.release_pause_waiter(rid)
+
+        started = (session.ref_track.started_at(rid)
+                   if session.ref_track is not None else None)
+        if played is None:
+            est = self._estimate_played_to(session, session.clock.now())
+            played = max(0, est - started) if started is not None else 0
+            logger.warning(
+                "未收到 %s 的 paused 回执（%dms 超时）—— 用估算的已播位置 "
+                "%.2fs 裁剪参考轨", rid, self.pause_ack_timeout_ms,
+                played / 16000.0)
+        if session.ref_track is not None and played > 0:
+            n = session.ref_track.resize(rid, int(played))
+            logger.info("暂停 %s（%s）：参考轨保留 %.2fs，清掉其后 %d 采样"
+                        "（%.2fs）", rid, reason, played / 16000.0,
+                        n, n / 16000.0)
+
+        # ---- 封存 ----
+        self._parked = {
+            "response_id": rid,
+            "text": self._current_text,
+            "play_until": self._current_play_until,
+            "reason": reason,
+            "played": int(played),
+            "stream": self._stream,
+            "stream_id": self._stream_id,
+            "stream_text": self._stream_text,
+            "stream_ended": self._stream_ended,
+            "stream_task": self._stream_task,
+            "gate": self._pause_gate,
+            "cursor": self._cursor,
+            "pcm": self._current_pcm,
+        }
+        # 清空「当前播报」槽（见上面的 ④）
+        self._current_response_id = None
+        self._current_play_until = 0
+        self._current_text = ""
+        self._current_pcm = None
+        self._stream = None
+        self._stream_id = ""
+        self._stream_text = []
+        self._stream_ended = False
+        self._stream_task = None
+        self._pause_gate = None
+        self._cursor = None
+        try:
+            session._notify_playback_active(False)
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("已暂停 %s（%s）：已播 %.2fs%s", rid, reason,
+                    played / 16000.0,
+                    "，流式（未合成的部分继续在 TTS 侧缓冲）"
+                    if self._parked["stream"] is not None else "")
+        return True
+
+    async def _resume_tts(self, session: "OrchestratorSession",
+                          reason: str) -> bool:
+        """把封存的那一轮放出来，从暂停点接着播。"""
+        parked, self._parked = self._parked, None
+        if parked is None:
+            logger.info("续播请求（%s）忽略：没有处于暂停的回复", reason)
+            return False
+        rid = parked["response_id"]
+
+        # ① 先等「当前」那一路（通常是"误打断"话术）**播完**。
+        #    ⚠️ 不能打断它：话术与续播是有先后顺序的，掐了就成了"话术没说完
+        #       就接回原句"。IC 侧是把 speak 与 resume 按 FIFO 排队的，
+        #       所以这里正好接在话术之后；本方法跑在 HTTP 请求的 task 里，
+        #       等一会儿不占 `run_downstream` 的事件循环。
+        if self._current_response_id is not None:
+            await self._wait_playback_idle(session)
+
+        # ② 搬回来
+        self._stream = parked["stream"]
+        self._stream_id = parked["stream_id"]
+        self._stream_text = parked["stream_text"]
+        self._stream_ended = parked["stream_ended"]
+        self._stream_task = parked["stream_task"]
+        self._pause_gate = parked["gate"]
+        self._cursor = parked["cursor"]
+        self._current_response_id = rid
+        self._current_text = parked["text"]
+        self._current_pcm = parked["pcm"]
+        self._tts_seq = (self._cursor or {}).get("seq", 0)
+
+        played16 = int(parked["played"])
+        off24 = int(round(played16 * TTS_SR / 16000.0))
+
+        # ③ 剩余 PCM：整段合成直接切；流式用游标里**已收**的全部块。
+        #    还没合成出来的部分不用管 —— 放流之后消费循环会接着发、接着落位。
+        if self._current_pcm is not None:
+            tail = self._current_pcm[off24:]
+        elif self._cursor is not None and self._cursor["pcm"]:
+            tail = np.concatenate(self._cursor["pcm"])[off24:]
+        else:
+            tail = None
+
+        # ④ 重新要一次起播承诺 —— 旧的承诺指向暂停前的时刻，已失效。
+        session.clear_armed(rid)
+        arm = self._arm(session, rid)
+        try:
+            await session.send_to_client(
+                TtsResume(response_id=rid, reason=reason))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送 tts.resume 失败: %s", exc)
+        at = await self._resolve_play_at(session, rid, arm)
+
+        if session.ref_track is not None and tail is not None and tail.size:
+            # `forget` 必须先做：暂停前的跨度还留着，续播落位在更晚的时刻，
+            # 之后打断时按旧起点算 cut 会把这段尾巴整段漏掉。
+            session.ref_track.forget(rid)
+            ch = session.ref_track.place(rid, 0, tail, at)
+            end = ch.t1
+        else:
+            end = at
+        if self._cursor is not None:
+            self._cursor["at"] = end
+        self._current_play_until = end
+
+        # ⑤ 放流
+        if self._pause_gate is not None:
+            self._pause_gate.set()
+        try:
+            session._notify_playback_active(True)
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("续播 %s（%s）：从 %.2fs 处接着播，重新落位于 %d（%.2fs）",
+                    rid, reason, played16 / 16000.0, at,
+                    at / session.clock.sr)
+        return True
+
+    async def _wait_playback_idle(self, session: "OrchestratorSession",
+                                  timeout_s: float = 6.0) -> None:
+        """等「当前播报」播完（或消失）。
+
+        判据用**预计播完位置** ``_current_play_until``，不用回执 ——
+        回执路径在流式下只反映"送到"，不反映"播完"（见 PcmPlayer.remaining
+        的说明）。超时就放弃等待、直接续播（预案：宁可把话术尾巴切掉，
+        也不要把续播无限期挂住）。
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._current_response_id is None:
+                return
+            until = self._current_play_until
+            if until > 0 and session.clock.now() >= until:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            logger.warning("等当前播报结束超时（%.1fs），直接续播", timeout_s)
+            return
+        # 播完了：只清簿记，不发 tts.cancel（凭空掐一下没有意义）
+        self._current_response_id = None
+        self._current_play_until = 0
+        self._current_text = ""
+        self._current_pcm = None
+
+    async def drop_parked(self, session: "OrchestratorSession",
+                          reason: str = "") -> None:
+        """丢弃封存的那一轮（不再续播）。会话收尾/硬打断时调用。"""
+        p, self._parked = self._parked, None
+        if p is None:
+            return
+        rid = p["response_id"]
+        cursor = p.get("cursor")
+        if cursor is not None:
+            cursor["dead"] = True
+        gate = p.get("gate")
+        if gate is not None:
+            # 放闸让消费循环醒来看到 `dead` 后自己退出 —— 否则它永远卡在
+            # `gate.wait()` 上，任务泄漏、`_speak_inflight` 也降不下来。
+            gate.set()
+        st = p.get("stream")
+        if st is not None:
+            try:
+                st.end()
+                await st.abort()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("丢弃暂停流时 abort 失败（忽略）: %s", exc)
+        task = p.get("stream_task")
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                logger.debug("暂停流消费任务未在 5s 内退出，已取消")
+        if session.ref_track is not None:
+            session.ref_track.forget(rid)
+        logger.info("丢弃暂停中的播报 %s（%s）：不再续播", rid, reason)
 
     async def _cancel(self, act: Cancel, session: "OrchestratorSession") -> None:
         """中断播报（下游显式请求）。通知浏览器 + 截断参考轨，两者原子做。"""
