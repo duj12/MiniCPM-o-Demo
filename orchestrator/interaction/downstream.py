@@ -211,6 +211,8 @@ class InteractionDownstream:
         #: 每份描述都会尝试投递（见 `_emit_visual_background`），gRPC / legacy
         #: 这类交不出去的配置下别每轮刷一条 warning。
         self._bg_fail_logged = False
+        #: 「视觉通知已由 IC 自己发、编排侧让路」这件事只记一次（每会话）
+        self._ic_vision_logged = False
         #: 「IC 版本不支持某组新状态」的告警去重（见 `_warn_capability_once`）。
         #: 这只是**日志**去重 —— 每次仍会重新探测（`ic.supports` 自己有缓存），
         #: IC 升级并重连后自动恢复推送，不用重编排。
@@ -327,6 +329,14 @@ class InteractionDownstream:
         #    ⚠️ 用 `reset_session`（**不通知** agent/TTS），不是 `end_session`
         #       —— 后者是"用户主动结束"用的。
         self.ic.reset_session()
+        # P05：把**本路会话**的信封绑到 IC 的两个 sink。
+        # ⚠️ 远端 IC（`:50051`）是**进程级单例**，它的 session_id / callback_ic
+        #    只在进程启动时取一次 —— 不重绑的话，`on_*` 一直带着**上一个会话**
+        #    的信封，Agent 会把 apply_agent 写回旧会话（或 422）。进程内模式
+        #    构造时已写过，这里再写一次是为了与远端走**同一条启动序列**。
+        # `callback_ic` 为空 = 没配对外地址，IC 会整次忽略（两边都告警）。
+        # 旧 IC 没有 BindSession ⇒ 客户端内部只告警并返回 False，不阻断会话。
+        self.ic.bind_session(self.session_id, self.agent.callback_ic)
         # ⚠️ VLM 缓存与 `_prev_atype` 都必须**随新会话清掉**：
         #   · 描述属于**上一个人/上一个场景**，新会话的首个 GREET 全量描述
         #     还没到之前，留着旧的比空着更糟（Agent 会照着一个不属于眼前
@@ -343,6 +353,7 @@ class InteractionDownstream:
         self._prev_atype = ""
         # 告警去重标记随会话复位（不是闩，投递本身每份都做）
         self._bg_fail_logged = False
+        self._ic_vision_logged = False
         self.agent.start()          # 幂等（_thread 非空直接返回）
         self._sync_agent_ic_target()
         return []
@@ -767,7 +778,38 @@ class InteractionDownstream:
         # **必须在 `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
         # 传**缓存里那份**（已渲染成快照），不是模型原文 —— 日志里的字数要能
         # 对上 Agent 实际收到的东西。
+        #
+        # ⚠️ 新版 IC 自己会发：ea4ea22 起 `Engine.apply_vision` 写完状态就调
+        #    `agent_sink.on_vision(...)`（ASR 空的 ANSWER）。IC 的 ADR 0001
+        #    要求编排侧**同一会话不要再投** `emit_visual_background`，否则每份
+        #    描述变成两轮、后一轮覆盖前一轮。
+        #    只在 `parsed` 时让路：解析失败时 `_push_vision_to_ic` 什么也没写
+        #    ⇒ IC 不会发；此时原文仍要走编排侧那一轮（保底不丢数据）。
+        if parsed and self._ic_owns_vision_round():
+            return
         self._emit_visual_background(len(self._vlm))
+
+    def _ic_owns_vision_round(self) -> bool:
+        """IC 自己会不会把这份快照当 Vision 通知发给 Agent（见上）。
+
+        IC 客户端用鸭子接口回答（进程内：探测 sink 上的 `on_vision`；
+        gRPC：恒假）。老客户端 / 探测异常一律当"不会" —— 编排侧照旧补一轮，
+        宁可多一轮也不能让 Agent 收不到画面。
+        """
+        fn = getattr(self.ic, "ic_owns_vision_round", None)
+        if not callable(fn):
+            return False
+        try:
+            owns = bool(fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] 探测 IC 的 Vision 通知能力失败：%s",
+                         self.session_id, exc)
+            return False
+        if owns and not self._ic_vision_logged:
+            self._ic_vision_logged = True
+            logger.info("[%s] 视觉通知改由 IC 自己发（ApplyVision → on_vision）"
+                        "—— 编排侧不再补视觉背景轮", self.session_id)
+        return owns
 
     def _emit_visual_background(self, n_chars: int) -> None:
         """把**刚生成完的**一份描述当「视觉轮」立刻投给 Agent（ASR 为空）。

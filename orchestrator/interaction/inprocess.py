@@ -22,9 +22,10 @@
     apply(method, **kwargs)
     apply_agent(status, session_end_pending)
     send_visual_background() -> bool             （编排侧主动投背景轮；gRPC 恒假）
+    ic_owns_vision_round() -> bool               （新版 IC 自己发 Vision 通知）
     async tick(dt_ms) -> Action | None
     async snapshot() -> dict | None
-    reset_session() / end_session() / close()
+    reset_session() / bind_session() / end_session() / close()
 
 > `suspended_ticks` / `suspended_writes` 在这里**恒为 0**：那是「被别的会话
 > 接管」的计数，进程内模式不存在这个状态。保留它们是因为 `session.summary()`
@@ -522,6 +523,25 @@ class InProcessICClient:
                            self.owner_key or "?", type(exc).__name__, exc)
             return False
 
+    def ic_owns_vision_round(self) -> bool:
+        """新版 IC 是否自己把 `ApplyVision` 的快照当 Vision 通知发给 Agent。
+
+        IC 的 ea4ea22 起，`Engine.apply_vision` 在写完状态后自己调
+        ``self.agent_sink.on_vision(...)``（ASR 空的 ANSWER，只存不答）。
+        IC 的 ADR 0001 也明确要求**同一会话里编排侧不再投**
+        `emit_visual_background` —— 否则每份描述会变成两轮，后一轮覆盖前一轮。
+
+        判据就是 sink 上有没有 ``on_vision``：新版 `apply_vision` 正是
+        ``getattr(self.agent_sink, "on_vision", None)``，有才发。旧 IC（P05
+        d3cf041 及以前）没有 ⇒ 返回假，编排侧照旧补自己的背景轮。
+
+        ⚠️ **只探测，不发** —— 不要"先试一次 apply_vision"来判能力。
+        """
+        if self._engine is None:
+            return False
+        sink = getattr(self._engine, "agent_sink", None) or self._agent_sink
+        return callable(getattr(sink, "on_vision", None))
+
     # ------------------------------------------------------------------ #
     #  生命周期
     # ------------------------------------------------------------------ #
@@ -539,6 +559,42 @@ class InProcessICClient:
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("进程内 InteractionCore 重置失败：%s", exc)
+            return False
+
+    def bind_session(self, session_id: str, callback_ic: str) -> bool:
+        """把本路会话的信封重新写到本 Engine 的两个 sink。
+
+        进程内模式下 Engine 是**本会话独占**的，构造时已经把 ``session_id`` /
+        ``callback_ic`` 传给了 sink —— 这里再写一次是为了与 gRPC 模式走**同一条
+        启动序列**（``reset_session`` → ``bind_session``），而不是"进程内靠
+        构造、远端靠 RPC"两套心智模型。
+
+        P05 之前没有这个方法：``getattr`` 探测，缺了只告警一次（老 IC 上会话
+        照常跑），不抛。
+        """
+        if not self.available or self._engine is None:
+            return False
+        if not session_id or not callback_ic:
+            logger.warning("[%s] 跳过 IC 会话绑定：session_id=%r callback_ic=%r"
+                           " —— 任一为空，IC 会整次忽略",
+                           self.owner_key or "?", session_id, callback_ic)
+            return False
+        fn = getattr(self._engine, "bind_session", None)
+        if fn is None:
+            # 每会话只走一次这里（on_session_start），不必额外去重。
+            logger.warning("[%s] 当前 InteractionCore 版本没有 Engine.bind_session"
+                           "（旧版）—— Agent 回写仍靠构造时写入的信封",
+                           self.owner_key or "?")
+            return False
+        try:
+            fn(session_id, callback_ic)
+            logger.info("[%s] 进程内 InteractionCore 已绑定本会话："
+                        "session_id=%s callback_ic=%s",
+                        self.owner_key or "?", session_id, callback_ic)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 绑定进程内 InteractionCore 会话失败：%s",
+                           self.owner_key or "?", exc)
             return False
 
     def end_session(self) -> bool:

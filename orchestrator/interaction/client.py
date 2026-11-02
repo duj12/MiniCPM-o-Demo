@@ -289,6 +289,59 @@ class InteractionClient:
                            self.target, exc)
             return False
 
+    def bind_session(self, session_id: str, callback_ic: str) -> bool:
+        """把**本路会话**的信封写到远端 IC 的两个 sink。**同步调用**。
+
+        ## 为什么需要它（远端 IC 的固有缺陷）
+
+        ``:50051`` 上的 IC 是**进程级单例**，两个 sink 的 ``session_id`` /
+        ``callback_ic`` 只在 **IC 进程启动时**从命令行/环境变量取一次
+        （``INTERACTION_SESSION_ID`` / ``INTERACTION_CALLBACK_IC``）。编排侧
+        每开一路新会话，IC 发出去的 ``on_*`` 仍带着**上一个会话**的信封 ——
+        Agent 于是把 ``apply_agent`` 写回旧会话（或干脆 422），表现为
+        「语音正常、Agent 不回 / 答复落到别的会话」。
+
+        P05 的 ``BindSession(SessionEnvelope)`` 就是修这个：会话启动时把
+        ``session_id`` + ``callback_ic`` 重新绑定到两个 sink（不改交互状态）。
+
+        ## 失败不阻断
+
+        旧 IC 没有这个 RPC（``UNIMPLEMENTED``），或网络抖动时**只告警**并
+        返回 False —— 会话照常跑（退回「Agent 自己 set_ic_target」那套老路）。
+        与 ``reset_session`` 同款语义。
+        """
+        if not self.available or self._client is None:
+            return False
+        if self.suspended:
+            # ⚠️ 被别的会话接管时**绝不能**绑：IC 的 sink 是全局的，绑过去
+            #    就把接管方的 Agent 回写地址改成了我们的（跨会话串话）。
+            logger.info("跳过 IC 会话绑定（%s）—— 本会话已被别的会话接管",
+                        self.owner_key)
+            return False
+        if not session_id or not callback_ic:
+            # IC 自己也要求两个都非空（空的整次忽略）。差异在这里说清楚，
+            # 免得排查时以为「绑定了但没生效」。
+            logger.warning("跳过 IC 会话绑定（%s）：session_id=%r callback_ic=%r"
+                           " —— 任一为空，IC 会整次忽略",
+                           self.target, session_id, callback_ic)
+            return False
+        fn = getattr(self._client, "bind_session", None)
+        if fn is None:
+            logger.warning("当前 InteractionCore 版本没有 BindSession（%s）—— "
+                           "Agent 回写仍走旧的 set_ic_target；升级 IC 后自动生效",
+                           self.target)
+            return False
+        try:
+            fn(session_id, callback_ic)
+            logger.info("InteractionCore 已绑定本会话（%s）：session_id=%s "
+                        "callback_ic=%s", self.target, session_id, callback_ic)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("绑定 InteractionCore 会话失败（%s）：%s —— "
+                           "若 IC 是旧版本可忽略；否则 Agent 回写可能落到"
+                           "旧会话", self.target, exc)
+            return False
+
     def end_session(self) -> bool:
         """**用户主动结束**：让 IC 收尾（**通知 agent / TTS**，再清状态）。
 
@@ -386,6 +439,17 @@ class InteractionClient:
             logger.warning(
                 "gRPC 模式（%s）不支持视觉背景轮 —— sink 在远端 IC 进程里，"
                 "编排侧够不到。需要它请用 ORCH_IC_MODE=inprocess", self.target)
+        return False
+
+    def ic_owns_vision_round(self) -> bool:
+        """**恒假** —— 但这里返回假不改变行为。
+
+        gRPC 模式下编排侧本来就不发视觉背景轮（见上一条），远端 IC 自己
+        持有 Agent sink：新版 IC 的 `apply_vision` 会自己发 Vision 通知，
+        旧版则两边都不发。所以"编排侧要不要让路"在这个模式下没有意义，
+        返回假只是保持鸭子接口（调用方据此继续走 `send_visual_background`，
+        而它会立刻返回假并只告警一次）。
+        """
         return False
 
     def supports(self, method: str, *keys: str) -> bool:
