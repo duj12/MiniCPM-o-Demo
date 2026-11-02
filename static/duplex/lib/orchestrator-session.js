@@ -204,20 +204,30 @@
         }
         this._sendPlayback(msg.response_id, 'ended', 0);
       } else if (t === 'tts.pause') {
-        // 软打断：**保留**缓冲与已播位置，只是把源掐断。
-        // 回执带实测已播采样数 —— 服务端据此裁参考轨、并从这里续播。
-        let playedSec = 0;
-        if (this.player && this.player.pause) playedSec = this.player.pause();
-        this._sendPlayback(msg.response_id, 'paused',
-                           Math.round(playedSec * 16000), {
-          stop_ctx: this.player && this.player.now ? this.player.now() : 0,
-        });
+        // 软打断：**先把音量淡出**（`fade_ms`，默认 1s），淡完才把源掐断，
+        // 但**保留**缓冲与已播位置。
+        //
+        // ⚠️ 回执必须从**回调**里发：淡出是异步的，`pause()` 返回时播放还
+        //    没停（返回值是 NaN）。服务端等回执的上限已经加上了 fade_ms。
+        const reportPaused = (playedSec) => {
+          const n = Number.isFinite(playedSec) ? Math.round(playedSec * 16000) : 0;
+          this._sendPlayback(msg.response_id, 'paused', n, {
+            stop_ctx: this.player && this.player.now ? this.player.now() : 0,
+          });
+        };
+        if (this.player && this.player.pause) {
+          this.player.pause(Number(msg.fade_ms) || 0, reportPaused);
+        } else {
+          reportPaused(0);
+        }
       } else if (t === 'tts.resume') {
-        // 续播：先交给播放器重排，把**承诺起播时刻**回给服务端（它要据此
-        // 重新落位参考轨 —— 暂停前那次承诺早就过期了），再回一条 resumed
-        // 供 UI/日志。
+        // 续播：先交给播放器重排（并淡入），把**承诺起播时刻**回给服务端
+        // （它要据此重新落位参考轨 —— 暂停前那次承诺早就过期了），再回一条
+        // resumed 供 UI/日志。
         let at = 0;
-        if (this.player && this.player.resume) at = this.player.resume();
+        if (this.player && this.player.resume) {
+          at = this.player.resume(Number(msg.fade_ms) || 0);
+        }
         if (at > 0) {
           this._sendPlayback(msg.response_id, 'armed', 0, { start_ctx: at });
         }

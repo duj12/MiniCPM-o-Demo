@@ -71,11 +71,13 @@ IC 的停播才真正落地。
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, Callable, Optional
 
 from .agent_sink import make_vlm_agent_sink, normalize_mode
+from .client import _signature_accepts
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,12 @@ logger = logging.getLogger(__name__)
 def _env_flag(name: str) -> bool:
     """环境变量布尔开关（与 `interaction.grpc_server._env_flag` 同语义）。"""
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
+
+
+def _env_flag_default_on(name: str) -> bool:
+    """默认**开**的布尔开关：只有显式 ``0/false/no/off`` 才关。"""
+    v = (os.environ.get(name) or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 #: 与方法名无关的失败计数上限，避免 dict 无限增长
@@ -114,6 +122,25 @@ _CONF_FIELDS: dict[str, tuple[str, ...]] = {
     "apply_vad": ("user_speaking_confidence", "barge_in_confidence"),
     "apply_asr": ("asr_confidence", "turn_complete_confidence"),
 }
+
+
+def _supported_kwargs(cls: Any, kwargs: dict) -> dict:
+    """按 ``cls.__init__`` 的签名裁剪关键字 —— **IC 版本兼容**用。
+
+    典型场景：软打断那组参数（``soft_interrupt`` / ``soft_yield_grace_ms`` /
+    ``false_yield_prompt``）是 ``feat/soft-interrupt-tts-pause`` 加的，而
+    P05 那条线（视觉/语音感知）的 ``Engine`` 没有它们 —— 原样传会
+    ``TypeError``，而 `connect()` 的兜底是**整个会话降级为 OmniLLM 回复**
+    （现象是「IC 明明升级了，编排却完全不决策」）。所以按签名裁剪：
+    哪一版认哪组就传哪组。
+    """
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _to_confidence(value: Any) -> Any:
@@ -171,6 +198,9 @@ class InProcessICClient:
         #: 本会话的 Agent sink（`connect()` 里构造）。留引用是为了让编排侧能
         #: **主动**投一发视觉背景轮 —— 见 `send_visual_background`。
         self._agent_sink: Any = None
+        #: P05 的打断探针（`interaction.decision_probe.DecisionProbe`）。
+        #: 老 IC / 显式关掉时为 None，见 `_make_decision_probe`。
+        self._decision_probe: Any = None
         self.available = False
         self.error: Optional[str] = None
 
@@ -187,6 +217,8 @@ class InProcessICClient:
         self.suspended_ticks = 0
         self.suspended_writes = 0
         self.dropped = 0
+        #: `supports()` 的结论缓存（探测的是 IC 版本，Engine 建好后不会变）
+        self._caps: dict = {}
 
     # ------------------------------------------------------------------ #
 
@@ -194,6 +226,45 @@ class InProcessICClient:
     def engine(self) -> Any:
         """本会话的 Engine（测试/诊断用）。未连接时为 None。"""
         return self._engine
+
+    def _make_decision_probe(self, Engine: Any) -> Any:
+        """按需造 P05 的 ``DecisionProbe``；老 IC / 显式关掉时返回 None。
+
+        ⚠️ **没有它，P05 的打断整条失效**：``policy.decide()`` 只在
+        ``barge_phase is HARD`` 时出 YIELD，而 HARD 由 ``interaction/barge.py``
+        依据 ``probes.barge_class`` 推进 —— 探针不跑，用户开口就永远不打断。
+
+        独立 IC（``grpc_server``）默认自己建（``DECISION_PROBE=1``）；
+        进程内模式**没有别的人负责**，只能编排补上，否则升级到 P05 后
+        「软打断换成 barge 状态机」这一步会静默退回「不打断」。
+
+        开关 ``ORCH_IC_DECISION_PROBE``（**默认开**，显式 0/false/no/off 才关）。
+        StartLux 不可达时探针只是一直拿不到答案（2s 超时、后台线程，
+        不阻塞 tick），但打断同样等于没有 —— 排查打断失效先看这里。
+        """
+        try:
+            accepts = "decision_probe" in inspect.signature(
+                Engine.__init__).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if not accepts:
+            return None              # 老 IC（软打断那条线）没有这个参数
+        if not _env_flag_default_on("ORCH_IC_DECISION_PROBE"):
+            logger.info("[%s] ORCH_IC_DECISION_PROBE=0 —— 不建打断探针"
+                        "（P05 下等于不打断）", self.owner_key or "?")
+            return None
+        try:
+            from interaction.decision_probe import DecisionProbe
+            probe = DecisionProbe()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 打断探针装配失败（%s: %s）—— "
+                           "P05 下等于不打断；StartLux 与 IC 包版本都要查",
+                           self.owner_key or "?", type(exc).__name__, exc)
+            return None
+        logger.info("[%s] 打断探针已装配（StartLux %s）",
+                    self.owner_key or "?",
+                    getattr(getattr(probe, "client", None), "base_url", "?"))
+        return probe
 
     def connect(self) -> bool:
         """建本会话的 Engine。失败返回 False（**不抛** —— 调用方降级到 OmniLLM）。
@@ -269,29 +340,60 @@ class InProcessICClient:
         #    engine）不经过这里，也不该覆盖既有引用。
         self._agent_sink = agent_sink
 
+        # 软打断：默认**关**（行为与旧版逐字节一致）。开关在启动脚本
+        # 的环境变量里，与独立 IC（grpc_server）用同一组名字 ——
+        # 两种部署模式切过去不用改代码。
+        #
+        # ⚠️ 按签名裁剪：这组参数只有软打断那条 IC 分支有，P05（视觉/语音
+        #    感知）的 Engine 认不出来 —— 原样传会 TypeError，兜底是本会话
+        #    **整个降级为 OmniLLM**（看起来像「IC 升级后编排不决策了」）。
+        soft_kwargs = dict(
+            soft_interrupt=_env_flag("ORCH_IC_SOFT_INTERRUPT"),
+            soft_yield_grace_ms=int(
+                os.environ.get("ORCH_IC_SOFT_YIELD_GRACE_MS") or 1000),
+            false_yield_prompt=os.environ.get(
+                "ORCH_IC_FALSE_YIELD_PROMPT", "不好意思，您继续说。"),
+        )
+        kept_soft = _supported_kwargs(Engine, soft_kwargs)
+        dropped = sorted(set(soft_kwargs) - set(kept_soft))
+        if dropped:
+            # P05 不是"不认这几个开关"，而是**把软打断换成了 barge 状态机**
+            # （`interaction/barge.py`：quick_check → soft → hard，暂停/续播
+            #  由探针的 barge_class 推进）。所以这是版本差异，不是开关失效。
+            logger.info(
+                "[%s] 当前 InteractionCore 的 Engine 不认 %s —— 该版本用"
+                "自身的打断状态机（P05 = barge/探针）代替，"
+                "ORCH_IC_SOFT_* 在此版本下不生效",
+                self.owner_key or "?", ", ".join(dropped))
+        engine_kwargs = dict(
+            expression_sink=expression_sink,
+            agent_sink=agent_sink,
+            thresholds=self._thresholds,
+        )
+        # P05 的打断探针：只有认 ``decision_probe`` 的那个 Engine 才建
+        # （见 `_make_decision_probe`；老 IC 返回 None，参数都不出现）。
+        probe = self._make_decision_probe(Engine)
+        if probe is not None:
+            engine_kwargs["decision_probe"] = probe
+        engine_kwargs.update(kept_soft)
         try:
-            self._engine = Engine(
-                expression_sink=expression_sink,
-                agent_sink=agent_sink,
-                thresholds=self._thresholds,
-                # 软打断：默认**关**（行为与旧版逐字节一致）。开关在启动脚本
-                # 的环境变量里，与独立 IC（grpc_server）用同一组名字 ——
-                # 两种部署模式切过去不用改代码。
-                soft_interrupt=_env_flag("ORCH_IC_SOFT_INTERRUPT"),
-                soft_yield_grace_ms=int(
-                    os.environ.get("ORCH_IC_SOFT_YIELD_GRACE_MS") or 1000),
-                false_yield_prompt=os.environ.get(
-                    "ORCH_IC_FALSE_YIELD_PROMPT", "不好意思，您继续说。"),
-            )
+            self._engine = Engine(**engine_kwargs)
         except Exception as exc:  # noqa: BLE001
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:  # noqa: BLE001
+                    pass
             self.error = f"{type(exc).__name__}: {exc}"
             logger.error("[%s] 进程内 InteractionCore 装配失败：%s",
                          self.owner_key or "?", self.error)
             self.available = False
             return False
+        self._decision_probe = probe
 
         self.available = True
         self.error = None
+        self._caps.clear()      # 新 Engine = 重新探测 IC 版本
         logger.info(
             "进程内 InteractionCore 已就绪（会话 %s expression=%s agent=%s "
             "callback_ic=%s）",
@@ -302,6 +404,33 @@ class InProcessICClient:
     # ------------------------------------------------------------------ #
     #  写
     # ------------------------------------------------------------------ #
+
+    def supports(self, method: str, *keys: str) -> bool:
+        """IC 的这个 ``apply_*`` 是否接受这些关键字参数（**版本探测**）。
+
+        ⚠️ 探测的是 ``engine.state`` 上的**真方法**，不是 ``engine.apply_asr``：
+        ``Engine.__init__`` 用 ``_locked`` 把它们包成 ``(*args, **kwargs)``
+        的壳子（没有 ``__wrapped__``），拿壳子做签名检查**永远返回"接受"**
+        —— 旧 IC 上照样放行，然后每秒几十次 TypeError（进程内模式下只累加
+        ``failures`` 计数，症状是 IC 字段恒为默认值）。
+
+        ``getattr(self._engine, method)`` 的存在性检查也不能省：旧 IC
+        根本没有 ``apply_vision`` 这个属性。
+        """
+        if not self.available or self._engine is None:
+            return False
+        if getattr(self._engine, method, None) is None:
+            return False
+        cache_key = (method,) + tuple(keys)
+        hit = self._caps.get(cache_key)
+        if hit is None:
+            state = getattr(self._engine, "state", None)
+            fn = getattr(state, method, None) if state is not None else None
+            if fn is None:      # 没有 state 的非常规实现 —— 退回引擎上的方法
+                fn = getattr(self._engine, method, None)
+            hit = _signature_accepts(fn, tuple(keys))
+            self._caps[cache_key] = hit
+        return hit
 
     def apply(self, method: str, **kwargs: Any) -> None:
         """直接调 `Engine` 上的同名方法（**同步、无队列**）。
@@ -500,6 +629,14 @@ class InProcessICClient:
 
         ⚠️ **同步、可能阻塞数秒** —— 调用方必须 off-loop。
         """
+        # 打断探针挂在 Engine 之外，先关（不涉及队列排空，是线程池停机）。
+        probe, self._decision_probe = self._decision_probe, None
+        if probe is not None:
+            try:
+                probe.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("decision_probe.close 异常: %s", exc)
+
         engine, self._engine = self._engine, None
         if engine is None:
             self.available = False

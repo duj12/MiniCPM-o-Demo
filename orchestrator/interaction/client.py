@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import threading
@@ -31,6 +32,31 @@ _QUEUE_MAX = 256
 
 #: 调用的默认超时（秒）。IC 是本地服务，正常 1ms 级。
 _CALL_TIMEOUT = 2.0
+
+
+def _signature_accepts(fn: Any, keys: tuple) -> bool:
+    """``fn`` 是否接受**全部** ``keys``（按关键字）—— IC 版本探测的唯一手段。
+
+    P05 给 ``apply_asr`` 加了感知字段、新开了 ``apply_vision``；之前的 IC
+    两个都没有。硬发过去不会"报错"，而是**每秒几十条 TypeError**：gRPC 模式
+    在消费线程里被吞成 warning（见 ``_run``），进程内模式只累加
+    ``failures`` 计数 —— 调用侧完全看不出来。所以调用前先问一句。
+
+    签名是 ``*args, **kwargs`` 的一律当作"接受"：``Engine`` 的 ``_locked``
+    壳子就是这种形态，**不能**拿它做判断（进程内模式探测的是
+    ``engine.state`` 上的真方法，见 ``InProcessICClient.supports``）。
+    """
+    if fn is None:
+        return False
+    if not keys:
+        return True
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return all(k in params for k in keys)
 
 
 def normalize_agent_status(raw):
@@ -143,6 +169,8 @@ class InteractionClient:
         #: `send_visual_background`）—— 它是**每会话每全量描述**都会被问一次的
         #: 路径，不节流会把日志淹掉。
         self._bg_unsupported_logged = False
+        #: `supports()` 的结论缓存 —— 探测的是**IC 的版本**，连上后不会变。
+        self._caps: dict = {}
 
     def activate(self) -> None:
         """声明本实例为 IC 的**唯一驱动者**，把上一个挂起。
@@ -191,6 +219,8 @@ class InteractionClient:
 
         self.available = True
         self.error = None
+        # 换了连接就是重新探一次版本（方法签名随 IC 版本变）
+        self._caps.clear()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name="ic-apply", daemon=True)
@@ -357,6 +387,26 @@ class InteractionClient:
                 "gRPC 模式（%s）不支持视觉背景轮 —— sink 在远端 IC 进程里，"
                 "编排侧够不到。需要它请用 ORCH_IC_MODE=inprocess", self.target)
         return False
+
+    def supports(self, method: str, *keys: str) -> bool:
+        """IC 的这个 ``apply_*`` 是否接受这些关键字参数（**版本探测**）。
+
+        为什么要探测：P05 之前 IC 没有 ``apply_vision``、``apply_asr`` 也只
+        认三个参数。直接发不报错 —— 异常在消费线程里被吞成 warning（见
+        ``_run``），调用侧什么也看不到，只会表现为「IC 那边字段永远是默认值」。
+
+        探测结论**按方法+参数缓存**：连上后 IC 版本不会变（``connect`` 时清
+        缓存）。被接管（``suspended``）时一律 False —— 本会话本来就停止写 IC。
+        """
+        if not self.available or self._client is None or self.suspended:
+            return False
+        cache_key = (method,) + tuple(keys)
+        hit = self._caps.get(cache_key)
+        if hit is None:
+            hit = _signature_accepts(getattr(self._client, method, None),
+                                     tuple(keys))
+            self._caps[cache_key] = hit
+        return hit
 
     def apply(self, method: str, **kwargs: Any) -> None:
         """把一次 ``apply_*`` 投进队列（**立即返回**）。

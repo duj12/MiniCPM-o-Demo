@@ -212,13 +212,18 @@ class TtsCancel:
 
 @dataclass
 class TtsPause:
-    """**暂停**播报（软打断）。浏览器掐断当前排程，但**保留**已收到的
-    音频与精确的已播位置，之后可由 ``TtsResume`` 从同一处接着播。
+    """**暂停**播报（软打断）。浏览器把音量**淡出**后再停稳，但**保留**已收到
+    的音频与精确的已播位置，之后可由 ``TtsResume`` 从同一处接着播。
 
     ⚠️ 与 ``TtsCancel`` 的区别只有一条：「还回不回得来」。
       · ``TtsCancel`` —— 丢弃。浏览器 ``player.stop()`` 清空，服务端截断参考轨。
       · ``TtsPause``  —— 挂起。浏览器保留整段缓冲，服务端把 TTS 流**封存**
                         （不 abort、不 end，只是不再取音频）。
+
+    ``fade_ms`` 是要**渐渐退出去**的时长（默认 1000ms）：浏览器在这段时间里
+    把音量线性降到 0（听感是"声音慢慢退远"，不是"啪一下断了"），到点才真正
+    停稳 —— 所以回执会**晚 fade_ms** 才回来。淡出期间播放仍在继续，服务端
+    照常推流；那些块是"真的播了（只是越来越轻）"，参考轨要保留。
 
     浏览器回 ``playback`` / ``phase="paused"``，``sample_offset`` = 已播采样数
     （16k 基准）—— 服务端据此把参考轨裁到"真正播出过"的位置，续播时从
@@ -226,6 +231,8 @@ class TtsPause:
     """
     response_id: str = ""
     reason: str = ""
+    #: 音量淡出的时长（毫秒）。0 = 老行为（立刻停稳）。
+    fade_ms: float = 0.0
     type: Literal["tts.pause"] = "tts.pause"
 
 
@@ -233,11 +240,16 @@ class TtsPause:
 class TtsResume:
     """**续播**：浏览器从暂停点接着播，服务端把封存的流放出来。
 
+    ``fade_ms`` 是接回来时的**淡入**时长（默认 300ms）—— 从 0 渐强，
+    避免"啪"一下接回原音量。
+
     浏览器回两条回执：先 ``armed``（承诺的续播时刻，服务端据此重新落位
     参考轨），再 ``resumed``（带续播起点，仅供日志/UI）。
     """
     response_id: str = ""
     reason: str = ""
+    #: 音量淡入的时长（毫秒）。0 = 直接回到原音量。
+    fade_ms: float = 0.0
     type: Literal["tts.resume"] = "tts.resume"
 
 

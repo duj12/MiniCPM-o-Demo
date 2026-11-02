@@ -240,6 +240,43 @@ export ORCH_DUMP_AUDIO="$CODE/orchdump/s"
 **为什么回复要绕回 orchestrator 播**：浏览器播放必须和 AEC 参考轨、播放回执
 严格对齐（回声消除靠它）。Agent 直接调 TTS 会绕过这些，回声消不掉。
 
+### 感知状态透传（IC P05：语音子集 + 视觉八键）
+
+IC 的 P05 给 `apply_asr` 加了感知字段，并新开了 `apply_vision`。编排侧现在
+把两路状态都送进去：
+
+| 来源 | 目标 | 字段 |
+|---|---|---|
+| `AsrState.to_dict()`（只在 `2pass-offline` 那一帧有值） | `apply_asr` 新增参数 | `language / language_prob / language_switch / emotion / emotion_prob / speech_event / snr_db`，另把嵌套字典拆平：`noise.burst.detected→noise_burst_detected`、`noise.burst.type→noise_burst_type`、`overlap.detected→overlap_detected`、`overlap.prob→overlap_prob` |
+| `omni.describe.parse_state()` 的 8 键快照（每份描述更新一次） | `apply_vision` | `ATTENTION/ACTION/…/POSITION` → 小写参数名；`updated_at_ms` 由 IC 自己打 |
+
+两条链路都**按 IC 版本自适应**：调用前用 `ic.supports(method, *keys)` 探
+（进程内模式探的是 `engine.state` 上的真方法，不是 `Engine` 那层
+`(*args, **kwargs)` 壳子）。旧 IC 上整组静默跳过，每会话只告警一条
+`当前 InteractionCore 版本不支持 …`；IC 升级并重开会话后自动开始透传，
+**编排不用改、两种模式（inprocess / grpc）行为一致**。
+
+取值语义：`None`（服务端没开感知 / 还没出结果）**不写** —— proto 是
+"省略 = 不改"，所以 IC 会保留上一段的感知值；VLM 解析失败（模型没按格式答）
+时同样不写，避免拿空值覆盖。`InProcessICClient` 还会按 `Engine.__init__`
+签名裁剪软打断那组参数 —— IC 的 P05 分支用 barge 状态机代替了软打断，
+原样传会让整个会话降级为 OmniLLM。
+
+#### P05 的打断探针（`ORCH_IC_DECISION_PROBE`，默认 1）
+
+P05 把打断换成了 `interaction/barge.py` 的状态机（`NONE → QUICK_CHECK →
+SOFT → HARD`）。`SOFT`/`HARD` 的判据 `barge_class` 只能由
+`DecisionProbe` 问 StartLux（`POST /v1/systemone`）得到 —— **探针不跑，
+用户开口也不会打断**。独立 IC（`grpc_server`）默认自己建；进程内模式的
+`Engine` 是编排造的，碰不到那段代码，所以 `InProcessICClient.connect()`
+按 `Engine.__init__` 签名装配：老 IC（软打断那条线）没有
+`decision_probe` 参数 → 自动跳过、不报错。
+
+```bash
+export ORCH_IC_DECISION_PROBE=0   # 只在排障时关（= P05 下不打断）
+export DECISION_BASE_URL=http://192.168.89.101:8094   # 不设就用包里默认
+```
+
 ### 配置
 
 ```bash
@@ -355,8 +392,8 @@ POST {callback_ic}/interaction/on_answer
 | `POST /v1/speak` | **Agent 回调**：整段播报（见下节） |
 | `POST /v1/speak/stream` | **Agent 回调**：流式播报 |
 | `POST /v1/stop` | 硬打断：立刻停播并丢弃当前那轮 |
-| `POST /v1/tts/pause` | **软打断**：暂停播报，**保留**已收到的音频与精确已播位置 |
-| `POST /v1/tts/resume` | **软打断**：从暂停点接着播（见下节） |
+| `POST /v1/tts/pause` | **软打断**：音量**淡出**（默认 1s）后再暂停，保留音频与精确已播位置 |
+| `POST /v1/tts/resume` | **软打断**：从暂停点接着播，音量**淡入**（默认 300ms） |
 | `WS /v1/orchestrator` | 会话主通道 |
 
 ### 软打断：`/v1/tts/pause` + `/v1/tts/resume`
@@ -377,6 +414,20 @@ IC 判 YIELD → POST /v1/tts/pause
   └─ 没继续说（误打断）→ POST /v1/speak {"prompt": true}     # 插一句提示语
                         → POST /v1/tts/resume                 # 接着播原来那句
 ```
+
+**渐进式音量（不"啪一下断掉"）**：`pause` 默认不立刻静音，而是让浏览器在
+`fade_ms`（默认 1000，环境变量 `ORCH_TTS_PAUSE_FADE_MS`）里把音量线性降到 0，
+听感是"声音慢慢退出去"；淡出**走完**才真正停稳，所以 `paused` 回执会比请求晚
+约 `fade_ms`（服务端的等待上限是 `fade_ms + 300ms`）。淡出期间播放**没停**，
+服务端照常推流 —— 那些块是真播了（只是越来越轻），参考轨保留它们，续播位置
+也更靠后、更贴近用户实际听到的地方。`resume` 对应淡入（默认 300ms，
+`ORCH_TTS_RESUME_FADE_MS`），从 0 渐强接回来。
+
+- 请求体可带 `"fade_ms": 0..5000` 覆盖默认值；`0` = 老行为（立刻停稳 / 立刻回原音量）。
+- 淡出期间若来了 `/v1/stop`（IC 判成真抢话），执行器会放弃封存 —— 不会把已经
+  不要的那一轮挂起来等续播。
+- `pause` / `resume` 在服务端**串行化**（IC 的宽限期和淡出都是 1s，两条指令
+  很可能前后脚到）；先到者做完，后者再接上。
 
 要点：
 

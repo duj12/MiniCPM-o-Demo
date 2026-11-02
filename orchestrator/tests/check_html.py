@@ -334,6 +334,18 @@ def main() -> int:
         ends = [e for e in (j, k) if e > 0]
         return ex[i:min(ends)] if ends else ex[i:]
 
+    def _js_body(name: str) -> str:
+        """取页面里某个 JS 方法的方法体（两空格缩进，到方法收尾的 `\\n  }`）。
+
+        只针对 `PcmPlayer` 这类顶层类方法 —— 页面里的方法都是
+        `  name(args) {` 开头、`  }` 收尾，中间嵌套块的缩进更深。
+        """
+        i = html.find(f"\n  {name}(")
+        if i < 0:
+            return ""
+        j = html.find("\n  }", i)
+        return html[i:j] if j > 0 else html[i:]
+
     def _ordered(seg: str) -> bool:
         """段内是否满足「先发音频 → 等承诺 → 落位参考轨」。"""
         a = seg.find("TtsAudio.from_int16")
@@ -372,8 +384,10 @@ def main() -> int:
     print("== 软打断：TTS 暂停 / 续播 ==")
     sess_py = (Path(__file__).resolve().parents[1] / "session.py")
     ss = sess_py.read_text(encoding="utf-8") if sess_py.is_file() else ""
-    pause_fn = _body("_pause_tts")
-    resume_fn = _body("_resume_tts")
+    # ⚠️ 方法体要取 `*_impl`：外层 `_pause_tts` / `_resume_tts` 现在只是
+    #    持 `_tts_pause_lock` 的薄壳（串行化并发到达的 pause/resume）。
+    pause_fn = _body("_pause_tts_impl")
+    resume_fn = _body("_resume_tts_impl")
     pause_checks = [
         # ⚠️ 播放器**不能**用 audioCtx.suspend() 暂停：那会冻结 ctx.currentTime，
         #    ALSA 的 ctxTime 锚点与 SampleClock 拟合随之停摆。只能掐掉已排程的
@@ -405,6 +419,26 @@ def main() -> int:
          "drop_parked(" in ss),
         ("回执 paused/resumed 不按 clock.now() 截断参考轨",
          'phase == "paused"' in ss and 'phase == "resumed"' in ss),
+        # ---- 淡出 / 淡入（"渐渐退出去"，不是"啪一下断了"）----
+        ("暂停走**音量渐变**（共享 gain 线性 ramp），不是立刻静音",
+         "_rampGain(" in html and "linearRampToValueAtTime(" in html
+         and "cancelAndHoldAtTime" in html),
+        ("淡出是异步的：到点才真正停稳，回执从回调里发",
+         "this._pauseTimer" in html
+         and "this.player.pause(Number(msg.fade_ms) || 0, reportPaused)" in js),
+        ("淡出/暂停中被打断时把音量**复位**（否则下一句是哑的）",
+         "_rampGain(1.0, 0)" in _js_body("stop")
+         and "_rampGain(1.0, 0)" in _js_body("beginResponse")),
+        ("暂停/续播都把 fade_ms 透传给浏览器",
+         "fade_ms=fade_ms" in pause_fn and "fade_ms=fade_ms" in resume_fn),
+        ("淡出期间**不关闸门**（声音还在放，得继续推流）",
+         pause_fn.find("wait_paused(") < pause_fn.find("gate.clear()")),
+        ("等回执的上限 = fade_ms + ack（回执要晚一个淡出）",
+         "fade_ms + self.pause_ack_timeout_ms" in pause_fn),
+        ("淡出期间被硬打断就不要封存（复核 _current_response_id）",
+         "_current_response_id != rid" in pause_fn),
+        ("pause / resume **串行化**（IC 宽限期与淡出都是 1s，会撞车）",
+         "_tts_pause_lock" in ex),
     ]
     for desc, ok in pause_checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {desc}")

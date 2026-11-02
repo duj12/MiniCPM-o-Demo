@@ -419,6 +419,9 @@ class PcmPlayer {
     this._paused = false;       // 当前是否处于暂停
     this._baseSec = 0;          // 当前 _sources 时间轴在整句里的起点（秒）
     this._pauseSec = 0;         // 整句时间轴上"已播到"的位置（秒）
+    // 淡出还没走完时挂着的定时器：到点才真正停稳。`stop()` / `beginResponse()`
+    // 必须把它清掉，否则一个早已作废的定时器会在新句上"停稳"，把新句掐了。
+    this._pauseTimer = null;
     this.gain = ctx.createGain();
     this.gain.gain.value = 1.0;
     this.gain.connect(ctx.destination);
@@ -500,6 +503,10 @@ class PcmPlayer {
     this._paused = false;
     this._baseSec = 0;
     this._pauseSec = 0;
+    // 上一轮可能停在"淡出/暂停"里（gain≈0）—— 新句必须**原音量**出声。
+    // 软打断里这正是「误打断」话术能听见的原因：它是一轮新的 Speak。
+    if (this._pauseTimer) { clearTimeout(this._pauseTimer); this._pauseTimer = null; }
+    this._rampGain(1.0, 0);
     if (this._cancelled) {
       // 打断后的新一句：排程指针必须从**当前时刻**重新开始，不能沿用
       // 停在旧句末尾的位置（实测踩过：新句被排到旧句之后，参考轨对不上）
@@ -648,7 +655,67 @@ class PcmPlayer {
 
   /* ---------- 软打断：暂停 / 续播 ---------- */
 
-  /** 暂停：掐断已排程的源，但**保留**缓冲与精确的已播位置。
+  /** 在 `sec` 秒内把**共享**音量从当前值线性推到 `target`（0=静音，1=原音量）。
+   *
+   *  软打断的"渐渐退出去"就是靠它：暂停不是"啪一下断了"，而是把 gain 在
+   *  `fade_ms` 里拉到 0；续播再从 0 渐强回来。
+   *
+   *  ⚠️ 先 `cancelAndHoldAtTime` 再 ramp —— 只用 `cancelScheduledValues`
+   *    会把参数弹回**上一次 setValueAtTime 的值**（可能是 1.0），正在淡出的
+   *    声音会"忽然弹响一下"再继续淡。
+   */
+  _rampGain(target, sec) {
+    const now = this.ctx.currentTime;
+    const g = this.gain.gain;
+    try {
+      if (g.cancelAndHoldAtTime) {
+        g.cancelAndHoldAtTime(now);
+      } else {
+        const v = g.value;
+        g.cancelScheduledValues(now);
+        g.setValueAtTime(v, now);
+      }
+      if (sec > 0) g.linearRampToValueAtTime(target, now + sec);
+      else g.setValueAtTime(target, now);
+    } catch (e) {
+      // 个别老 WebView 没有这两个方法 —— 退化成直接赋值（至少音量对）
+      try { g.value = target; } catch (e2) { /* ignore */ }
+    }
+  }
+
+  /** 暂停：**先把音量淡出**，淡完才掐断已排程的源，并**保留**缓冲与精确的
+   *  已播位置。
+   *
+   *  淡出期间播放**没有停**（只是越来越轻）—— 服务端在这段时间照常推流，
+   *  那些块是真的播出去了，参考轨要保留。所以回执也在**淡出结束**才回。
+   *
+   *  @param {number} [fadeMs] 淡出时长（毫秒）。0 或不传 = 立刻停稳（老行为）。
+   *  @param {Function} [onDone] 淡出结束、真正停稳后的回调，参数=已播秒数。
+   *         淡出是异步的，回执必须从这里发，不能拿返回值。
+   *  @returns {number} 已停稳时返回已播秒数；淡出进行中返回 NaN（还没停稳）。
+   */
+  pause(fadeMs, onDone) {
+    if (this._paused) {
+      if (onDone) onDone(this._pauseSec);
+      return this._pauseSec;
+    }
+    if (this._pauseTimer) { clearTimeout(this._pauseTimer); this._pauseTimer = null; }
+    const fade = Math.max(0, Number(fadeMs) || 0) / 1000;
+    if (fade > 0) {
+      this._rampGain(0.0, fade);
+      this._pauseTimer = setTimeout(() => {
+        this._pauseTimer = null;
+        const sec = this._park();
+        if (onDone) onDone(sec);
+      }, fade * 1000);
+      return NaN;              // 还没停稳
+    }
+    const sec = this._park();
+    if (onDone) onDone(sec);
+    return sec;
+  }
+
+  /** 真正停稳：掐断已排程的源，记下精确的已播位置（淡出结束时调）。
    *
    *  与 `stop()` 的区别只有一条：`stop()` 是"不要了"，本函数是"待会儿接着播"。
    *  所以这里**不许动 `_cancelled`**（那会让 `beginResponse` 清零重排）、
@@ -661,8 +728,7 @@ class PcmPlayer {
    *
    *  @returns {number} 整句时间轴上**已播**的秒数（回执要用）
    */
-  pause() {
-    if (this._paused) return this._pauseSec;
+  _park() {
     // 已播位置 = 本轮时间轴起点 + 本批源播了多少
     this._pauseSec = this._baseSec + this.playedSeconds();
     if (this._startedTimer) {
@@ -675,16 +741,33 @@ class PcmPlayer {
     this._sources = [];
     this.nextAt = this.ctx.currentTime + 0.05;
     this._paused = true;
+    // ⚠️ 这里**不要**把 gain 复位成 1：暂停期间要一直保持静音，否则之后
+    //    只要有一个没排过程的杂音就会原音量冒出来；复位由 `resume()` /
+    //    `beginResponse()` / `stop()` 负责。
     diagUpdate();
     return this._pauseSec;
   }
 
-  /** 续播：从暂停点切出剩余音频，重新排程。
+  /** 续播：从暂停点切出剩余音频，重新排程，并把音量**淡入**回来。
    *
+   *  @param {number} [fadeMs] 淡入时长（毫秒）。0 或不传 = 直接回到原音量。
    *  @returns {number} 承诺的起播时刻（ctx 秒）；没有剩余音频时返回 0
    */
-  resume() {
-    if (!this._paused) return 0;
+  resume(fadeMs) {
+    const fade = Math.max(0, Number(fadeMs) || 0) / 1000;
+    // 淡出还没走完就来了续播（IC 宽限期与淡出时长默认都是 1s，这很常见，
+    // 不过服务端已把 pause/resume 串行化，正常走不到这里）：取消"停稳"，
+    // 就地取消暂停 —— 播放一直没停过，位置没冻，什么都不用重排。
+    if (this._pauseTimer) {
+      clearTimeout(this._pauseTimer); this._pauseTimer = null;
+      this._rampGain(1.0, Math.max(0.05, fade));
+      diagUpdate();
+      return 0;                // ⚠️ 没重排 ⇒ 不能报 armed（那会骗服务端落位）
+    }
+    if (!this._paused) {
+      this._rampGain(1.0, 0.05);
+      return 0;
+    }
     this._paused = false;
     const sr = this.srcRate;
     const off = Math.max(0, Math.round(this._pauseSec * sr));   // 源采样偏移
@@ -706,6 +789,8 @@ class PcmPlayer {
     this._firstAt = 0;
     this._armed = 0;
     this.nextAt = 0;
+    // 先把音量淡入回来（与尾巴**同时**开始，所以接回来听着是连续的）
+    this._rampGain(1.0, fade > 0 ? fade : 0.05);
     if (!tail || tail.length === 0) { diagUpdate(); return 0; }
     const f32 = new Float32Array(tail.length);
     for (let i = 0; i < tail.length; i++) f32[i] = tail[i] / 32768;
@@ -730,15 +815,19 @@ class PcmPlayer {
     this._playedOnStop = this.playedSamples();
     // 取消掉"等真正出声"那个定时器：都被打断了，不该再报「开始播」
     if (this._startedTimer) { clearTimeout(this._startedTimer); this._startedTimer = null; }
+    // 淡出到一半被打断：这个定时器到点会把**下一句**当成"暂停"掐掉，必须清
+    if (this._pauseTimer) { clearTimeout(this._pauseTimer); this._pauseTimer = null; }
     for (const n of (this._sources || [])) {
       try { n.stop(0); } catch (e) { /* 已播完的源 stop 会抛，忽略 */ }
       try { n.disconnect(); } catch (e) { /* ignore */ }
     }
     this._sources = [];
-    // ⚠️ 不要再动 gain 做"静音"：`stop(0)` 已经掐断了源，gain 是**共享**
-    //    的（下一句也走它），把它短暂置 0 会把紧随其后的新句一起消音。
-    //    早先那版"gain 设 0 又立刻设回 1"虽然没有这个副作用，但那是因为
-    //    它压根没生效（等于空操作）。
+    // ⚠️ 不要在这里把 gain 置 0 做"静音"：`stop(0)` 已经掐断了源，gain 是
+    //    **共享**的（下一句也走它），置 0 会把紧随其后的新句一起消音。
+    //    但反过来**必须复位成 1.0**：打断可能发生在淡出/暂停中途，那时
+    //    gain 是 0（或正在往下走），不复位下一句就"哑了"。早先实测踩过
+    //    "新句被排到旧句之后"，这一条同理 —— 状态要显式复位。
+    this._rampGain(1.0, 0);
     this.nextAt = this.ctx.currentTime + 0.05;
     this._cancelled = true;    // 告诉 beginResponse：下一句从零重排
     // 硬打断 = 这轮**不要了**：暂停态与缓冲一并清掉，免得之后一条

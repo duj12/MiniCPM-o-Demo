@@ -72,6 +72,35 @@ fi
 export ORCH_IC_EXPRESSION_URL="${ORCH_IC_EXPRESSION_URL:-https://127.0.0.1:$PORT}"
 export ORCH_IC_EXPRESSION_CA="${ORCH_IC_EXPRESSION_CA:-$REPO/certs/cert.pem}"
 
+# ---- 软打断（TTS 先**淡出**暂停，判误打断后播话术再续播）----
+#
+# 2026-11-02 起 105 默认开（与 106 对齐）。`ORCH_IC_SOFT_INTERRUPT=0` 就是回退：
+# IC 判 YIELD 立刻硬停（/v1/stop），与这批代码出现之前逐字节一致 ——
+# 回退不需要改代码、也不需要动 Agent/前端。
+#
+# ⚠️ 这组变量只对 **inprocess** 模式生效（每会话一份 Engine，见
+#    `interaction/inprocess.py`）。`ORCH_IC_MODE=grpc` 时 Engine 在 :50051 的
+#    独立 IC 进程里，它读的是 `INTERACTION_SOFT_INTERRUPT` 一族（见 run_ic_105.sh）。
+# ⚠️ 前端必须认 `tts.pause` / `tts.resume` 两条消息（static/orchestrator-test.html
+#    已实现）。老页面会忽略它们 → 「暂停没生效，声音继续」。
+export ORCH_IC_SOFT_INTERRUPT="${ORCH_IC_SOFT_INTERRUPT:-1}"
+export ORCH_IC_SOFT_YIELD_GRACE_MS="${ORCH_IC_SOFT_YIELD_GRACE_MS:-1000}"
+export ORCH_IC_FALSE_YIELD_PROMPT="${ORCH_IC_FALSE_YIELD_PROMPT:-不好意思，您继续说。}"
+# `/v1/tts/pause` 不"啪一下断掉"，而是把音量**淡出**（渐弱）到 0 —— "渐渐退
+# 出去"的听感；`/v1/tts/resume` 再淡入回来。0 = 关闭渐变（立刻停稳/立刻回音量）。
+export ORCH_TTS_PAUSE_FADE_MS="${ORCH_TTS_PAUSE_FADE_MS:-1000}"
+export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
+
+# ---- 打断探针（IC P05 的 DecisionProbe → StartLux `:8094`）----
+#
+# P05 把打断换成了 barge 状态机（QUICK_CHECK → SOFT → HARD），SOFT/HARD 的
+# 判据 `barge_class` **只能由探针问出来** —— 没有探针，用户开口也不打断。
+# 独立 IC（grpc_server）默认自己建；进程内模式的 Engine 是编排造的，
+# 碰不到那段代码 ⇒ 这里默认开，由 `InProcessICClient` 按 Engine 签名装配
+# （老 IC 没有 `decision_probe` 参数，自动跳过，不会报错）。
+# `DECISION_BASE_URL` 不设时用包里默认 `http://192.168.89.101:8094`。
+export ORCH_IC_DECISION_PROBE="${ORCH_IC_DECISION_PROBE:-1}"
+
 # ---- Agent：105 专用（103）----
 #
 # **两种 IC 模式都走 8081**（2026-10-10 起）。
@@ -180,6 +209,18 @@ echo "  视觉轮          = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT
 # 两阶段定稿后日志里应能看到 `描述完成 stage=full`（起点一次）与
 # `描述完成 stage=turn`（之后每轮 8 键全量、值压短）。
 echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量）" >&2
+# 软打断生效值 —— 回退后**第一眼看这里**，别靠猜。
+if [ "$ORCH_IC_MODE" = "grpc" ]; then
+  echo "  软打断          = 本机变量不生效（Engine 在独立 IC :50051，" \
+       "看它的 INTERACTION_SOFT_INTERRUPT）" >&2
+else
+  echo "  软打断          = $ORCH_IC_SOFT_INTERRUPT" \
+       "（1=先淡出暂停，误打断播话术后续播；0=直接硬停；" \
+       "宽限 ${ORCH_IC_SOFT_YIELD_GRACE_MS}ms 话术「$ORCH_IC_FALSE_YIELD_PROMPT」）" >&2
+fi
+echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
+echo "  打断探针        = $ORCH_IC_DECISION_PROBE" \
+     "（仅 inprocess：1=P05 barge 状态机可用；0=不建探针 ⇒ 不打断）" >&2
 
 exec "$ORCH_PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

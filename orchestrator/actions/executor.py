@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Optional
@@ -83,6 +84,16 @@ class ActionExecutor:
         self._parked: Optional[dict] = None
         #: 暂停回执（浏览器实测已播采样数）的等待上限
         self.pause_ack_timeout_ms = 300
+        #: 音量**淡出**时长（毫秒）：软打断不要"啪一下断了"，要"渐渐退出去"。
+        #: 浏览器在这个时长内把音量线性降到 0，到点才真正停稳并回执 ——
+        #: 所以等回执的上限是 ``fade_ms + pause_ack_timeout_ms``。
+        self.pause_fade_ms = float(os.environ.get("ORCH_TTS_PAUSE_FADE_MS", "1000"))
+        #: 续播时音量**淡入**的时长（毫秒）
+        self.resume_fade_ms = float(os.environ.get("ORCH_TTS_RESUME_FADE_MS", "300"))
+        #: 暂停 / 续播串行化。IC 的宽限期和淡出时长都默认 1s，``resume`` 很可能
+        #: 在 ``pause`` 还等着回执时就到了 —— 并发进来会一个在等回执、另一个
+        #: 直接搬封存槽，状态错位（编排侧两个指令走的是各自 HTTP task）。
+        self._tts_pause_lock = asyncio.Lock()
         #: 整段合成（非流式）那一路的完整 PCM —— 续播要从暂停点切片
         self._current_pcm: Optional[np.ndarray] = None
         #: 流式那一路的暂停闸门（整段合成没有消费循环，保持 None）
@@ -99,9 +110,9 @@ class ActionExecutor:
         elif isinstance(act, Cancel):
             await self._cancel(act, session)
         elif isinstance(act, PauseTts):
-            await self._pause_tts(session, act.reason or "pause")
+            await self._pause_tts(session, act)
         elif isinstance(act, ResumeTts):
-            await self._resume_tts(session, act.reason or "resume")
+            await self._resume_tts(session, act)
         elif isinstance(act, SendToOmni):
             await self._send_to_omni(act, session)
         elif isinstance(act, Describe):
@@ -716,20 +727,35 @@ class ActionExecutor:
     # ------------------------------------------------------------------ #
 
     async def _pause_tts(self, session: "OrchestratorSession",
-                         reason: str) -> bool:
-        """暂停当前播报，并把整轮**封存**起来等 ``ResumeTts``。
+                         act: PauseTts) -> bool:
+        # 与 `_resume_tts` 串行（见 `_tts_pause_lock` 的说明）
+        async with self._tts_pause_lock:
+            return await self._pause_tts_impl(session, act)
+
+    async def _pause_tts_impl(self, session: "OrchestratorSession",
+                              act: PauseTts) -> bool:
+        """暂停当前播报（**先淡出**），并把整轮**封存**起来等 ``ResumeTts``。
 
         顺序有讲究：
 
-          ① **先关闸门** —— 否则等浏览器回执的这 300ms 里还在往它推音频，
-             推过去的块会被排到"暂停之后"，恢复时一起炸出来
-          ② 再问浏览器「停在哪了」（``paused`` 回执带实测已播采样数）
-          ③ 用**实测值**裁参考轨（预测值只在回执超时时兜底）
-          ④ 最后才搬进封存槽、清空「当前播报」
+          ① **闸门先开着** —— ``fade_ms`` 这段里播放**没停**，只是音量在往下
+             走。这段时间照常推流：推过去的块是"真的播了（越来越轻）"，
+             参考轨要保留它们，浏览器回执里的已播位置也包含它们
+          ② 问浏览器「停在哪了」—— 它在淡出结束才真正停稳，所以回执晚
+             ``fade_ms``；等待上限是 ``fade_ms + pause_ack_timeout_ms``
+          ③ 回执到手后**才关闸门**（此时浏览器那边已经没声音了）
+          ④ 用**实测值**裁参考轨（预测值只在回执超时时兜底）
+          ⑤ 最后才搬进封存槽、清空「当前播报」
 
-        ④ 是关键：清空之后，紧接着的「误打断」话术走 `_open_stream` 时
+        ⑤ 是关键：清空之后，紧接着的「误打断」话术走 `_open_stream` 时
         看不到"有句在播"，就不会把它连带掐掉。
+
+        ⚠️ 淡出期间可能来了一条 ``Cancel``（IC 判成真打断）—— 那这一轮已经
+        不要了，**不能**再把它封存起来等续播。所以回执之后要复核
+        ``_current_response_id``。
         """
+        reason = act.reason or "pause"
+        fade_ms = max(0.0, float(getattr(act, "fade_ms", 0.0) or 0.0))
         rid = self._current_response_id
         if rid is None:
             logger.info("暂停请求（%s）忽略：当前没有在播的回复", reason)
@@ -738,19 +764,28 @@ class ActionExecutor:
             logger.info("暂停请求（%s）忽略：已经有一轮处于暂停中", reason)
             return False
 
+        session.pause_waiter(rid)
+        try:
+            try:
+                await session.send_to_client(
+                    TtsPause(response_id=rid, reason=reason, fade_ms=fade_ms))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("发送 tts.pause 失败: %s", exc)
+            played = await session.wait_paused(
+                rid, (fade_ms + self.pause_ack_timeout_ms) / 1000.0)
+        finally:
+            session.release_pause_waiter(rid)
+
+        # 淡出期间被硬打断 / 被新回复取代：这一轮已经死了，别再封存
+        if self._current_response_id != rid:
+            logger.info("暂停 %s（%s）作废：淡出期间该轮已被停止或取代",
+                        rid, reason)
+            return False
+
+        # 浏览器已经停稳，现在才关闸门
         gate = self._pause_gate
         if gate is not None:
             gate.clear()
-
-        session.pause_waiter(rid)
-        try:
-            await session.send_to_client(
-                TtsPause(response_id=rid, reason=reason))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("发送 tts.pause 失败: %s", exc)
-        played = await session.wait_paused(
-            rid, self.pause_ack_timeout_ms / 1000.0)
-        session.release_pause_waiter(rid)
 
         started = (session.ref_track.started_at(rid)
                    if session.ref_track is not None else None)
@@ -759,8 +794,8 @@ class ActionExecutor:
             played = max(0, est - started) if started is not None else 0
             logger.warning(
                 "未收到 %s 的 paused 回执（%dms 超时）—— 用估算的已播位置 "
-                "%.2fs 裁剪参考轨", rid, self.pause_ack_timeout_ms,
-                played / 16000.0)
+                "%.2fs 裁剪参考轨", rid,
+                int(fade_ms) + self.pause_ack_timeout_ms, played / 16000.0)
         if session.ref_track is not None and played > 0:
             n = session.ref_track.resize(rid, int(played))
             logger.info("暂停 %s（%s）：参考轨保留 %.2fs，清掉其后 %d 采样"
@@ -799,15 +834,24 @@ class ActionExecutor:
             session._notify_playback_active(False)
         except Exception:  # noqa: BLE001
             pass
-        logger.info("已暂停 %s（%s）：已播 %.2fs%s", rid, reason,
-                    played / 16000.0,
+        logger.info("已暂停 %s（%s）：淡出 %.0fms 后停在 %.2fs%s", rid, reason,
+                    fade_ms, played / 16000.0,
                     "，流式（未合成的部分继续在 TTS 侧缓冲）"
                     if self._parked["stream"] is not None else "")
         return True
 
     async def _resume_tts(self, session: "OrchestratorSession",
-                          reason: str) -> bool:
+                          act: ResumeTts) -> bool:
+        # 与 `_pause_tts` 串行：IC 很可能在暂停的淡出还没走完时就发了续播，
+        # 让它等这一小会儿，比两边同时改 `_parked` / 游标安全得多。
+        async with self._tts_pause_lock:
+            return await self._resume_tts_impl(session, act)
+
+    async def _resume_tts_impl(self, session: "OrchestratorSession",
+                               act: ResumeTts) -> bool:
         """把封存的那一轮放出来，从暂停点接着播。"""
+        reason = act.reason or "resume"
+        fade_ms = max(0.0, float(getattr(act, "fade_ms", 0.0) or 0.0))
         parked, self._parked = self._parked, None
         if parked is None:
             logger.info("续播请求（%s）忽略：没有处于暂停的回复", reason)
@@ -852,7 +896,7 @@ class ActionExecutor:
         arm = self._arm(session, rid)
         try:
             await session.send_to_client(
-                TtsResume(response_id=rid, reason=reason))
+                TtsResume(response_id=rid, reason=reason, fade_ms=fade_ms))
         except Exception as exc:  # noqa: BLE001
             logger.warning("发送 tts.resume 失败: %s", exc)
         at = await self._resolve_play_at(session, rid, arm)
@@ -876,8 +920,9 @@ class ActionExecutor:
             session._notify_playback_active(True)
         except Exception:  # noqa: BLE001
             pass
-        logger.info("续播 %s（%s）：从 %.2fs 处接着播，重新落位于 %d（%.2fs）",
-                    rid, reason, played16 / 16000.0, at,
+        logger.info("续播 %s（%s）：从 %.2fs 处接着播（淡入 %.0fms），"
+                    "重新落位于 %d（%.2fs）",
+                    rid, reason, played16 / 16000.0, fade_ms, at,
                     at / session.clock.sr)
         return True
 

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from orchestrator.actions.executor import ActionExecutor  # noqa: E402
 from orchestrator.audio.ref_track import TTS_SR, RefTrack  # noqa: E402
 from orchestrator.downstream.interface import (  # noqa: E402
+    Cancel,
     PauseTts,
     ResumeTts,
     Speak,
@@ -65,7 +66,8 @@ class Harness:
     """真 `OrchestratorSession` + 假 TTS + 记账的 send_to_client。"""
 
     def __init__(self, pause_played_s: float = 2.0,
-                 answer_pause: bool = True) -> None:
+                 answer_pause: bool = True,
+                 pause_delay_s: float = 0.0) -> None:
         self.session = OrchestratorSession(
             "pause", config={"aec_default_delay_ms": 250})
         self.session.ref_track = RefTrack()
@@ -74,15 +76,27 @@ class Harness:
         self.sent: list = []
         self.pause_played_s = pause_played_s
         self.answer_pause = answer_pause
+        #: 模拟浏览器的**淡出**：回执晚这么久才回来（0 = 旧行为，立刻停稳）
+        self.pause_delay_s = pause_delay_s
         self.session.send_to_client = self._send
 
     async def _send(self, msg) -> None:
         self.sent.append(msg)
-        # 模拟浏览器：收到 tts.pause 立刻回报「停在哪了」
+        # 模拟浏览器：收到 tts.pause 淡出 ``pause_delay_s`` 后回报「停在哪了」
         if answer_pause_needed(self, msg):
-            await self.session.on_playback_receipt(
-                msg.response_id, "paused", 0.0,
-                sample_offset=int(self.pause_played_s * 16000))
+            if self.pause_delay_s > 0:
+                rid = msg.response_id
+                asyncio.create_task(
+                    self._reply_paused(rid, self.pause_delay_s))
+            else:
+                await self._reply_paused(msg.response_id, 0.0)
+
+    async def _reply_paused(self, rid: str, delay_s: float) -> None:
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+        await self.session.on_playback_receipt(
+            rid, "paused", 0.0,
+            sample_offset=int(self.pause_played_s * 16000))
 
     def of(self, typ: str) -> list:
         return [m for m in self.sent if getattr(m, "type", "") == typ]
@@ -157,9 +171,11 @@ async def test_resume_continues_from_pause_point() -> None:
     parked_pcm_len = int(ex._current_pcm.size)
     await ex.execute(PauseTts(reason="ic_soft_yield"), h.session)
 
-    await ex.execute(ResumeTts(reason="ic_false_yield"), h.session)
+    await ex.execute(ResumeTts(reason="ic_false_yield", fade_ms=300), h.session)
     check(True, "resume 走通了 execute() 的分派")
     check(len(h.of("tts.resume")) == 1, "要发一条 tts.resume")
+    check(h.of("tts.resume")[0].fade_ms == 300,
+          "续播要把淡入时长带给浏览器（否则会'啪'一下弹回原音量）")
     check(ex._parked is None, "续播后封存槽必须清空")
     check(ex._current_response_id == rid, "续播的是**同一个** response_id")
 
@@ -203,13 +219,76 @@ async def test_normal_speak_drops_parked() -> None:
           "被丢掉的那句要从参考轨上除名（forget）")
 
 
+async def test_pause_fades_before_parking() -> None:
+    print("\n== 暂停：先淡出（fade_ms），淡出期间闸门要开着 ==")
+    h = Harness(pause_played_s=2.0, pause_delay_s=0.15)
+    ex = ActionExecutor(playback_delay_ms=200)
+    await ex.execute(Speak(text="6"), h.session)
+    rid = ex._current_response_id
+    task = asyncio.create_task(
+        ex.execute(PauseTts(reason="ic_soft_yield", fade_ms=150), h.session))
+    await asyncio.sleep(0.05)          # 淡出进行中
+
+    check(h.of("tts.pause") and h.of("tts.pause")[0].fade_ms == 150,
+          "tts.pause 必须带上 fade_ms（浏览器据此做音量渐变）")
+    # 整段合成那一路没有消费循环，`_pause_gate` 是 None；流式才有关闭动作 ——
+    # 有闸门时它必须是**开着**的：淡出期间声音还在放，得继续推流。
+    check(ex._pause_gate is None or ex._pause_gate.is_set(),
+          "淡出期间闸门必须开着 —— 声音还在放（越来越轻），要接着推流")
+    check(ex._current_response_id == rid,
+          "淡出期间这一轮仍是「当前播报」（还没停稳，不能提前搬走）")
+    check(ex._parked is None, "淡出没走完时**不能**封存")
+
+    await task                         # 等淡出 + 回执
+    check(ex._parked is not None, "淡出结束、拿到回执后才封存")
+    check(ex._pause_gate is None, "封存后闸门交给封存槽（当前槽清空）")
+    check(ex._parked["played"] == 32000, "封存的是淡出结束时的已播量")
+
+
+async def test_stop_during_fade_does_not_park() -> None:
+    print("\n== 暂停：淡出期间被硬打断（判成真抢话）→ 不要封存 ==")
+    h = Harness(pause_played_s=2.0, answer_pause=False)
+    ex = ActionExecutor(playback_delay_ms=200)
+    ex.pause_ack_timeout_ms = 60
+    await ex.execute(Speak(text="6"), h.session)
+
+    task = asyncio.create_task(
+        ex.execute(PauseTts(reason="ic_soft_yield", fade_ms=20), h.session))
+    await asyncio.sleep(0.01)
+    await ex.execute(Cancel(reason="user_barge"), h.session)   # IC 判真打断
+    await task
+
+    check(ex._parked is None,
+          "淡出期间被硬打断 → **不能**把它封存起来等续播（内容已经不要了）")
+    check(not h.of("tts.resume"), "也不该自发续播")
+
+
+async def test_resume_arriving_during_fade_waits_then_works() -> None:
+    print("\n== 续播：淡出还没走完就到了 → 等淡出走完再正常接回 ==")
+    h = Harness(pause_played_s=2.0, pause_delay_s=0.12)
+    ex = ActionExecutor(playback_delay_ms=200)
+    await ex.execute(Speak(text="6"), h.session)
+    rid = ex._current_response_id
+
+    t1 = asyncio.create_task(
+        ex.execute(PauseTts(reason="p", fade_ms=120), h.session))
+    await asyncio.sleep(0.02)
+    t2 = asyncio.create_task(
+        ex.execute(ResumeTts(reason="r", fade_ms=300), h.session))
+    await asyncio.gather(t1, t2)
+
+    check(ex._parked is None, "并发进来也不能把封存槽留在原地")
+    check(ex._current_response_id == rid, "续播的是**同一个** response_id")
+    check(len(h.of("tts.resume")) == 1, "正好发一条 tts.resume（不重复）")
+
+
 async def test_idle_pause_resume_are_noop() -> None:
     print("\n== 空转：没有在播 / 没有封存时都要无害 ==")
     h = _mk()
     ex = ActionExecutor(playback_delay_ms=200)
-    check(await ex._pause_tts(h.session, "x") is False,
+    check(await ex._pause_tts(h.session, PauseTts(reason="x")) is False,
           "没在播时 pause → False")
-    check(await ex._resume_tts(h.session, "x") is False,
+    check(await ex._resume_tts(h.session, ResumeTts(reason="x")) is False,
           "没封存时 resume → False")
     check(not h.of("tts.pause") and not h.of("tts.resume"),
           "两种空转都**不发**任何消息")
@@ -234,6 +313,9 @@ async def main_async() -> None:
     await test_pause_parks_instead_of_cancelling()
     await test_pause_falls_back_when_no_receipt()
     await test_resume_continues_from_pause_point()
+    await test_pause_fades_before_parking()
+    await test_stop_during_fade_does_not_park()
+    await test_resume_arriving_during_fade_waits_then_works()
     await test_prompt_speak_keeps_parked()
     await test_normal_speak_drops_parked()
     await test_idle_pause_resume_are_noop()

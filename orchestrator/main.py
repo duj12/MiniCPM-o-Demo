@@ -1230,9 +1230,33 @@ def create_app(cfg: Settings):
     #    当成"被取代"丢掉。要插话术就必须带 `prompt: true`。
     # ⚠️ 判错了（用户是真的在说）就发 `/v1/stop`，封存的内容会被一并丢弃。
 
+    def _fade_ms_of(body: dict, env_key: str, default: float) -> float:
+        """取淡出/淡入时长：请求体 ``fade_ms`` 优先，否则环境变量。
+
+        ``fade_ms<=0`` = 关掉渐变（老行为：立刻停稳 / 立刻回到原音量）。
+        上限 5s —— 再长就不是"软打断"而是"渐渐消失"了。
+        """
+        v = body.get("fade_ms")
+        if v is None:
+            v = os.environ.get(env_key, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = default
+        return max(0.0, min(5000.0, v))
+
+    # `/v1/pause`、`/v1/resume` 是 **IC P05 的 ExpressionSink 用的路径**
+    # （`runtime.py` 里 `pause()`/`resume()` 直接 POST 这两个）。
+    # 与 `/v1/tts/pause` 是同一条处理逻辑 —— 两个路径都留着，IC 版本不用改。
     @app.post("/v1/tts/pause")
+    @app.post("/v1/pause")
     async def tts_pause(request: Request):
         """**暂停**当前播报（软打断）。可从 ``/v1/tts/resume`` 回来。
+
+        ``fade_ms``（默认 ``ORCH_TTS_PAUSE_FADE_MS`` = 1000）是**淡出**时长：
+        播放**不会立刻断**，而是在这段时间里把音量渐渐降到 0，淡完才真正
+        停稳 —— 给用户"声音慢慢退出去"的感觉。淡出结束回执才回来，所以
+        真正的暂停结果比请求晚 ``fade_ms``。
 
         返回的是「请求已受理」——真正的暂停结果是异步的（要等浏览器回
         ``paused`` 回执、参考轨裁剪完）。当前没有在播的回复时也返回
@@ -1251,14 +1275,23 @@ def create_app(cfg: Settings):
                          "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
         from orchestrator.downstream.interface import PauseTts
         reason = str(body.get("reason") or "ic_pause")
-        _queue_speak(sess, PauseTts(reason=reason), count_speak=False)
-        logger.info("[%s] 外部请求**暂停**播报（reason=%s）—— 软打断，"
-                    "等 /v1/tts/resume 接回来", sess.session_id, reason)
-        return {"ok": True, "session_id": sess.session_id, "reason": reason}
+        fade_ms = _fade_ms_of(body, "ORCH_TTS_PAUSE_FADE_MS", 1000.0)
+        _queue_speak(sess, PauseTts(reason=reason, fade_ms=fade_ms),
+                     count_speak=False)
+        logger.info("[%s] 外部请求**暂停**播报（reason=%s，淡出 %.0fms）—— "
+                    "软打断，等 /v1/tts/resume 接回来",
+                    sess.session_id, reason, fade_ms)
+        return {"ok": True, "session_id": sess.session_id, "reason": reason,
+                "fade_ms": fade_ms}
 
     @app.post("/v1/tts/resume")
+    @app.post("/v1/resume")
     async def tts_resume(request: Request):
-        """**续播**：把上次 ``/v1/tts/pause`` 挂起的那一轮接回来。"""
+        """**续播**：把上次 ``/v1/tts/pause`` 挂起的那一轮接回来。
+
+        ``fade_ms``（默认 ``ORCH_TTS_RESUME_FADE_MS`` = 300）是接回来时的
+        **淡入**时长 —— 从 0 渐强，避免"啪"一下弹回原音量。
+        """
         body = {}
         try:
             body = await request.json()
@@ -1272,10 +1305,13 @@ def create_app(cfg: Settings):
                          "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
         from orchestrator.downstream.interface import ResumeTts
         reason = str(body.get("reason") or "ic_resume")
-        _queue_speak(sess, ResumeTts(reason=reason), count_speak=False)
-        logger.info("[%s] 外部请求**续播**（reason=%s）—— 接回暂停的那一轮",
-                    sess.session_id, reason)
-        return {"ok": True, "session_id": sess.session_id, "reason": reason}
+        fade_ms = _fade_ms_of(body, "ORCH_TTS_RESUME_FADE_MS", 300.0)
+        _queue_speak(sess, ResumeTts(reason=reason, fade_ms=fade_ms),
+                     count_speak=False)
+        logger.info("[%s] 外部请求**续播**（reason=%s，淡入 %.0fms）—— "
+                    "接回暂停的那一轮", sess.session_id, reason, fade_ms)
+        return {"ok": True, "session_id": sess.session_id, "reason": reason,
+                "fade_ms": fade_ms}
 
     @app.post("/v1/ic/apply_agent")
     async def ic_apply_agent(request: Request):

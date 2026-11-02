@@ -128,6 +128,20 @@ export ORCH_IC_EXPRESSION_CA="${ORCH_IC_EXPRESSION_CA:-$REPO/certs/cert.pem}"
 export ORCH_IC_SOFT_INTERRUPT="${ORCH_IC_SOFT_INTERRUPT:-1}"
 export ORCH_IC_SOFT_YIELD_GRACE_MS="${ORCH_IC_SOFT_YIELD_GRACE_MS:-1000}"
 export ORCH_IC_FALSE_YIELD_PROMPT="${ORCH_IC_FALSE_YIELD_PROMPT:-不好意思，您继续说。}"
+# /v1/tts/pause 不"啪一下断掉"，而是把音量淡出（渐弱）到 0 —— "渐渐退出去"
+# 的听感；/v1/tts/resume 再淡入回来。0 = 关闭渐变（立刻停稳/立刻回原音量）。
+export ORCH_TTS_PAUSE_FADE_MS="${ORCH_TTS_PAUSE_FADE_MS:-1000}"
+export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
+
+# ---- 打断探针（IC P05 的 DecisionProbe → StartLux `:8094`）----
+#
+# P05 把打断换成了 barge 状态机（QUICK_CHECK → SOFT → HARD），SOFT/HARD 的
+# 判据 `barge_class` **只能由探针问出来** —— 没有探针，用户开口也不打断。
+# 独立 IC（grpc_server）默认自己建；进程内模式的 Engine 是编排造的，
+# 碰不到那段代码 ⇒ 这里默认开，由 `InProcessICClient` 按 Engine 签名装配
+# （老 IC 没有 `decision_probe` 参数，自动跳过，不会报错）。
+# `DECISION_BASE_URL` 不设时用包里默认 `http://192.168.89.101:8094`。
+export ORCH_IC_DECISION_PROBE="${ORCH_IC_DECISION_PROBE:-1}"
 
 # ---- Agent：106 用 102:8081（config.py 的默认值就是它，显式写出来自文档）----
 # （`ORCH_AGENT_SET_TARGET` 随 IC 模式在上面定）
@@ -263,6 +277,9 @@ echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 
 echo "  软打断          = $ORCH_IC_SOFT_INTERRUPT" \
      "（1=先暂停，误打断播话术后续播；0=直接硬停；宽限 ${ORCH_IC_SOFT_YIELD_GRACE_MS}ms" \
      "话术「$ORCH_IC_FALSE_YIELD_PROMPT」）" >&2
+echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
+echo "  打断探针        = $ORCH_IC_DECISION_PROBE" \
+     "（仅 inprocess：1=P05 barge 状态机可用；0=不建探针 ⇒ 不打断）" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

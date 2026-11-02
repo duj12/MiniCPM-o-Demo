@@ -92,6 +92,63 @@ def _conf(v: Any, default: str = NONE) -> str:
     return s if s in _VALID_CONF else default
 
 
+#: ASR 感知字段 → IC `apply_asr` 的**同名**关键字（P05 新增）。
+#:
+#: 值直接取自 `AsrState.to_dict()`。见 `_asr_perception_kwargs` 的映射说明。
+_ASR_PERCEPTION_KEYS: tuple = (
+    "language", "language_prob", "language_switch",
+    "emotion", "emotion_prob", "speech_event", "snr_db",
+)
+
+#: VLM 八键在 `parse_state()` 里是**大写**（那是提示词里的字段名），
+#: 而 IC 的 `apply_vision` 参数名是**小写** —— 两边差的就是这个 `.lower()`。
+_VISION_KEYS: tuple = (
+    "ATTENTION", "ACTION", "EMOTION", "FEATURE",
+    "BEHAVIOR", "RELATION", "ENV", "POSITION",
+)
+
+#: `supports("apply_asr", …)` 的探测键 —— 认 `language` 就说明是 P05 及以后
+#: （P05 之前 `apply_asr` 只有 transcript / asr_confidence / turn_complete）。
+_ASR_CAP_PROBE: tuple = ("language", "noise_burst_detected", "overlap_prob")
+
+
+def _asr_perception_kwargs(st: Dict[str, Any]) -> Dict[str, Any]:
+    """把 `AsrState.to_dict()` 的感知字段拆成 IC `apply_asr` 的 kwargs。
+
+    proto 里是**拆平的**四个噪声/交叠键，而编排侧的快照是嵌套字典：
+
+        noise.burst.detected → noise_burst_detected
+        noise.burst.type     → noise_burst_type
+        overlap.detected     → overlap_detected
+        overlap.prob         → overlap_prob
+
+    ⚠️ 值为 ``None`` 的**不放进去** —— proto 的语义是"省略 = 不改"，
+    而这里的 ``None`` 是"这一段没测出来"（服务端没开感知 / 还没出结果），
+    不是"清空 IC 上的值"。感知值本来就只在一帧里出现（描述的是**刚说完的
+    那一段**），IC 保留上一段的值才对。
+    """
+    out: Dict[str, Any] = {}
+    for k in _ASR_PERCEPTION_KEYS:
+        v = st.get(k)
+        if v is not None:
+            out[k] = v
+    noise = st.get("noise")
+    if isinstance(noise, dict):
+        burst = noise.get("burst")
+        if isinstance(burst, dict):
+            if burst.get("detected") is not None:
+                out["noise_burst_detected"] = bool(burst["detected"])
+            if burst.get("type"):
+                out["noise_burst_type"] = str(burst["type"])
+    overlap = st.get("overlap")
+    if isinstance(overlap, dict):
+        if overlap.get("detected") is not None:
+            out["overlap_detected"] = bool(overlap["detected"])
+        if overlap.get("prob") is not None:
+            out["overlap_prob"] = float(overlap["prob"])
+    return out
+
+
 class InteractionDownstream:
     """把事件接到 InteractionCore，把其 Action 派给 Agent / 模板播报。"""
 
@@ -154,6 +211,10 @@ class InteractionDownstream:
         #: 每份描述都会尝试投递（见 `_emit_visual_background`），gRPC / legacy
         #: 这类交不出去的配置下别每轮刷一条 warning。
         self._bg_fail_logged = False
+        #: 「IC 版本不支持某组新状态」的告警去重（见 `_warn_capability_once`）。
+        #: 这只是**日志**去重 —— 每次仍会重新探测（`ic.supports` 自己有缓存），
+        #: IC 升级并重连后自动恢复推送，不用重编排。
+        self._cap_warned: set = set()
         self.ic_mode = (ic_mode or "grpc").strip().lower()
         if self.ic_mode == "inprocess":
             #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
@@ -449,12 +510,13 @@ class InteractionDownstream:
                 user_speaking_confidence=_conf(st.get("user_speaking_confidence")),
                 barge_in_confidence=_conf(st.get("barge_in_confidence")),
             )
-            self.ic.apply(
-                "apply_asr",
+            asr_kwargs: Dict[str, Any] = dict(
                 transcript=str(st.get("transcript") or ""),
                 asr_confidence=_conf(st.get("asr_confidence")),
                 turn_complete_confidence=_conf(st.get("turn_complete_confidence")),
             )
+            asr_kwargs.update(self._asr_perception_kwargs(st))
+            self.ic.apply("apply_asr", **asr_kwargs)
 
         elif isinstance(ev, AsrPartial):
             # 流式帧只更新"用户在说话"的证据；转写等 final 更准
@@ -576,6 +638,66 @@ class InteractionDownstream:
             pass
 
     # ------------------------------------------------------------------ #
+    #  感知状态透传（IC P05：apply_asr 的语音子集 + 新的 apply_vision）
+    # ------------------------------------------------------------------ #
+    #
+    # 两条新链路都**按 IC 版本自适应**：`ic.supports()` 探到不认识就整组不发，
+    # 只告警一次。这样编排与 IC 的部署顺序**互不牵连** —— 共享树上还是旧 IC
+    # 时，这里静默跳过；IC 换成 P05 后（重连会话即可）自动开始透传。
+
+    def _asr_perception_kwargs(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        """`apply_asr` 的感知字段部分（不支持/没值的键一律不带）。"""
+        kw = _asr_perception_kwargs(st)
+        if not kw:
+            return {}
+        if not self.ic.supports("apply_asr", *_ASR_CAP_PROBE):
+            self._warn_capability_once(
+                "asr_perception",
+                "apply_asr 的感知字段（语种/情绪/突发事件/SNR/交叠）")
+            return {}
+        return kw
+
+    def _push_vision_to_ic(self) -> None:
+        """把刚更新的 VLM 八键快照推给 IC 的 `apply_vision`（P05）。
+
+        ⚠️ **`updated_at_ms` 不传** —— 由 IC 在自己收到时打时间戳
+        （`state.apply_vision` 里有值变化就 `now_ms()`）。编排与 IC 的墙钟
+        未必同源，传我们的反而是个"看起来更准、实际更不准"的数。
+
+        ⚠️ 空快照（`parse_state` 没解析出任何键 —— 模型没按格式答）直接
+        跳过：那种情况下 `_vlm` 已退回原文给 Agent，但 IC 的八个字段是
+        结构化的，没有可写的东西，**不要**拿空串去覆盖上一份。
+        """
+        if not self._vlm_state:
+            return
+        if not self.ic.available:
+            return
+        if not self.ic.supports("apply_vision", *(k.lower() for k in _VISION_KEYS)):
+            self._warn_capability_once(
+                "vision", "apply_vision（VLM 八键：注意力/动作/情绪/…）")
+            return
+        kwargs = {k.lower(): v for k, v in self._vlm_state.items() if v}
+        if not kwargs:
+            return
+        logger.debug("[%s] → IC: apply_vision %d 键（stage=%s）",
+                     self.session_id, len(kwargs), self._vlm_stage or "-")
+        self.ic.apply("apply_vision", **kwargs)
+
+    def _warn_capability_once(self, key: str, what: str) -> None:
+        """「IC 版本不支持 X」只告警一次（每会话每能力）。
+
+        这不是闩：`_feed` / `_on_vlm_description` 每次都会再问 `supports`
+        （结论按方法缓存），IC 升级重连后立刻恢复推送。
+        """
+        if key in self._cap_warned:
+            return
+        self._cap_warned.add(key)
+        logger.warning(
+            "[%s] 当前 InteractionCore 版本不支持 %s —— 这部分状态不会传给 IC"
+            "（属于预期：共享树上的 IC 还是 P05 之前；升级 IC 并重开会话后"
+            "自动生效，编排侧不用改）", self.session_id, what)
+
+    # ------------------------------------------------------------------ #
     #  VLM 描述缓存（`Describe` 触发 → `OmniDescription` 落这里）
     # ------------------------------------------------------------------ #
 
@@ -625,6 +747,13 @@ class InteractionDownstream:
         logger.info("[%s] VLM 描述已更新（stage=%s）%d 字，快照 %d 键：%r",
                     self.session_id, ev.stage, len(self._vlm),
                     len(self._vlm_state), self._vlm[:400])
+        # ---- IC 的视觉状态（P05 `apply_vision`）----
+        # 与下面推给 Agent 的「视觉轮」**各走各的出口**：这里进 IC 的状态机
+        # （以后 policy 能用上画面），下面那条进 Agent 的 `scene` 背景。
+        # 两者都只读快照，谁先谁后不影响正确性 —— 但放在这里（而不是
+        # `_emit_visual_background` 里）是为了"IC 掉线时也更新"，
+        # 与 `_vlm` 缓存的取向保持一致。
+        self._push_vision_to_ic()
         # ---- 有了就推：VLM **不与 ASR 强行同步**（2026-10-28 用户口径）----
         #
         # 每份描述（full 与 turn 一样）一生成完就**立刻**作为「ASR 空的视觉轮」
