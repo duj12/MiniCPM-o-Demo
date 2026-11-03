@@ -90,4 +90,4 @@ build_image:
       done
   extends: .send-feishu-build-msg
   tags:
-    - node-140
+    - xingyun
