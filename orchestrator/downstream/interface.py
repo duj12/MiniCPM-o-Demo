@@ -273,6 +273,8 @@ class Speak:
     #: 普通 ``Speak`` 会先把暂停封存的那轮丢掉（视作被取代）；``prompt=True``
     #: 则保留封存内容，等 ``ResumeTts`` 把它接回来。
     prompt: bool = False
+    # Rechecked by the host executor immediately before consuming queued text.
+    guard: Optional[Callable[[], bool]] = field(default=None, repr=False, compare=False)
     kind: Literal["speak"] = "speak"
 
 

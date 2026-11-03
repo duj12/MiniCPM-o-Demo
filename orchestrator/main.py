@@ -387,28 +387,12 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             mode == "omni" and \
             bool(getattr(sess.tts, "supports_streaming", False))
 
-        # IC 的地址：客户端可在 session.start 里覆盖（离线套件传 --ic-grpc）
         ic_cfg = (hello or {}).get("ic") or {}
-        ic_target = str(ic_cfg.get("grpc") or cfg.ic_grpc)
-        agent_target = str(ic_cfg.get("agent_url") or cfg.agent_url)
-
-        # ⚠️⚠️ **IC 模式也要能让客户端按会话指定**，否则 IC 开发人员那套
-        #     「replay 带 --ic-grpc 指定自己的 IC」会**静默失效**。
-        #
-        #     模式本身是全局配置（`ORCH_IC_MODE`），但 `ic.grpc` 是**按会话**
-        #     传进来的，语义就是「这一路要连我指定的那个远端 IC」。若只看全局
-        #     模式，在 `inprocess` 部署上会**忽略它、改跑进程内 Engine** ——
-        #     不报错、不告警，只是被测的不是他那份 IC（判题全错而看不出原因）。
-        #
-        #     优先级：显式给了 `ic.grpc` ⇒ 按客户端说的用 grpc（远端 IC）；
-        #     没给 ⇒ 跟随全局 `ORCH_IC_MODE`（默认行为不变）。
+        ic_target = "inprocess"
+        agent_target = str(ic_cfg.get("agent_grpc") or cfg.agent_grpc)
         ic_mode = cfg.ic_mode
-        if ic_cfg.get("grpc") and (ic_mode or "").strip().lower() != "grpc":
-            ic_mode = "grpc"
-            logger.info(
-                "[%s] 客户端在 session.start 里指定了 ic.grpc=%s —— "
-                "本会话改用**远端 IC**（覆盖全局 ORCH_IC_MODE=%s）",
-                sid, ic_target, cfg.ic_mode)
+        if ic_cfg.get("grpc") or ic_cfg.get("agent_url"):
+            raise ValueError("ic.grpc/ic.agent_url are retired; use ic.agent_grpc for the independent Agent service")
         # ⚠️ `echo` 模式保持纯桩 —— test_duplex_sim 靠它起一个"永不 Speak"
         #    的服务再自己替换 downstream，不能被 IC 抢走。
         # 客户端可显式覆盖（`ic.enabled`）—— replay 的 --no-ic 走这条。
@@ -461,35 +445,10 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 ic_target, agent_target, session_id=sid,
                 on_action=_on_ic_action,
                 report_interval_s=cfg.ic_report_interval_s,
-                # 会话结束时把 Agent 的 IC 目标**归还到哪**。
-                #
-                # ⚠️⚠️ **绝不能退回 `ic_advertise`**（那是**本机**的对外地址）。
-                #    归还的语义是"还给**大家共用的**那个 IC"，不是"还给我自己"。
-                #    实测踩过：105 归还成 `192.168.89.105:50051`（它自己），
-                #    于是 106 的下一个会话又得重新抢一次、每次都打冲突告警。
-                #
-                # `ORCH_IC_RESTORE` 显式指定共享 IC 的地址（多机部署**应该**配）；
-                # 未配则退回 `ic_grpc` —— 单机部署时它就是本机 IC，语义正确，
-                # 与旧行为一致。
-                restore_ic_target=(cfg.ic_restore or cfg.ic_grpc),
-                # Agent 回连用的地址。跨机**必须**显式配；
-                # 空则退回编排服务去连 IC 的那个地址（同机部署没问题）。
-                ic_advertise=cfg.ic_advertise,
                 ic_mode=ic_mode,
-                # inprocess 模式下 ExpressionSink 打本机 /v1/speak 的地址与 CA。
-                # 空地址 ⇒ 由端口推导；空 CA ⇒ 用编排自己的自签证书当 CA。
-                ic_expression_url=_resolve_ic_expression_url(cfg),
-                ic_expression_ca=(cfg.ic_expression_ca or _orch_cert_path()),
-                # Agent 写 apply_agent 的回调根地址（转发给 Agent 用）。
-                ic_callback_ic=_resolve_ic_callback_base(cfg),
-                agent_set_target=cfg.agent_set_target,
-                # VLM 描述（两阶段）：`omni_describe` 决定 IC 判 GREET 时要不
-                # 要派 `Describe("full")`，`agent_transcript_mode` 决定 Agent
-                # 收到的 payload 形态。**两个默认值都是关/legacy**（见
-                # config 的说明：编排代码 105/106 共用，默认值就是 106 下次
-                # 重启后的行为）。
-                omni_describe=cfg.omni_describe,
-                agent_transcript_mode=cfg.agent_transcript_mode)
+                on_output=sess.execute_action,
+                agent_mcp_servers=cfg.agent_mcp_servers,
+                omni_describe=cfg.omni_describe)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
@@ -500,10 +459,10 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                             sid, ic_mode, ic_target, agent_target)
                 if cfg.omni_describe:
                     logger.info(
-                        "[%s] VLM 描述已开：transcript 模式=%s；"
+                        "[%s] VLM 描述已开："
                         "起点全量挂 IC 的 GREET（只发一次作背景），"
                         "之后每轮全量、断句点触发 / %.1fs 心跳兜底",
-                        sid, cfg.agent_transcript_mode, cfg.omni_delta_interval_s)
+                        sid, cfg.omni_delta_interval_s)
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
@@ -961,39 +920,6 @@ def _orch_cert_path() -> Optional[str]:
     return str(p) if p.is_file() else None
 
 
-def _resolve_ic_expression_url(cfg: Settings) -> str:
-    """`inprocess` 模式下 ExpressionSink 打哪 —— 本编排服务的 `/v1/speak`。
-
-    默认 `https://127.0.0.1:<port>`：IC 与编排在**同一个进程**里，走本机回环
-    最省事，也避免"告诉自己要经过网关"的绕路。
-
-    ⚠️ 依赖证书 SAN 含 `127.0.0.1`。不匹配时校验会失败，而失败**只记在 IC 侧
-    日志里**（历史上表现为「IC 判了 GREET 但没人播」，排查很久）。
-    所以这里给出警告，让配置问题在启动时就能看见。
-    """
-    if cfg.ic_expression_url:
-        return cfg.ic_expression_url
-    return f"https://127.0.0.1:{cfg.port}"
-
-
-def _resolve_ic_callback_base(cfg: Settings) -> Optional[str]:
-    """`inprocess` 模式下告诉 Agent 的回调根地址。
-
-    优先用显式的 `ORCH_IC_CALLBACK_BASE`；否则从 `ic_advertise`
-    （形如 `192.168.89.105:50051`）取主机部分拼出来 —— 那本来就是这个
-    编排服务对外可回连的地址，语义正好。
-    """
-    if cfg.ic_callback_base:
-        return cfg.ic_callback_base.rstrip("/")
-    host = (cfg.ic_advertise or "").strip()
-    if host:
-        host = host.split("://", 1)[-1].split("/", 1)[0]
-        host = host.split(":", 1)[0]
-    if not host:
-        return None
-    return f"https://{host}:{cfg.port}/v1/ic"
-
-
 def create_app(cfg: Settings):
     from fastapi import FastAPI
     from fastapi.staticfiles import StaticFiles
@@ -1312,60 +1238,6 @@ def create_app(cfg: Settings):
                     "接回暂停的那一轮", sess.session_id, reason, fade_ms)
         return {"ok": True, "session_id": sess.session_id, "reason": reason,
                 "fade_ms": fade_ms}
-
-    @app.post("/v1/ic/apply_agent")
-    async def ic_apply_agent(request: Request):
-        """**Agent → IC**：写智脑薄投影（`agent.status` / `session_end_pending`）。
-
-        语义与 InteractionCore 的 gRPC ``ApplyAgent`` **逐字对齐**：
-        省略字段 = 不改该字段。
-
-        ## 为什么有这个端点
-
-        进程内模式（`ORCH_IC_MODE=inprocess`）下每路会话的 `Engine` 在**本进程
-        里**，没有 gRPC 端口可连 —— Agent 原来直连 IC 的 ``ApplyAgent`` 那条路
-        就不存在了。Agent 从 IC 的 Action payload 里拿到 `callback_ic` 之后，
-        把写入投到这里即可。
-
-        ⚠️ **这是切换的硬前置**。Agent 不改，`agent.status` /
-        `session_end_pending` 永远写不进去 ⇒ Policy 的 **SOP 39 与
-        PENDING_ANNOUNCE 两条分支失效**。
-
-        ## grpc 模式下会转发
-
-        `ORCH_IC_MODE=grpc` 时这里**转发**到远端 IC 的 gRPC ``ApplyAgent``
-        —— 于是这个端点在切换**之前**就能上线、能灰度、能用同一份 curl 验证，
-        而不必等到 Agent 改完。
-        """
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001
-            pass
-        sess = _find_session(request)
-        if sess is None:
-            return JSONResponse(
-                status_code=404,
-                content={"ok": False, "error": "找不到活跃会话"
-                         "（请在 X-Session-Id 头或 ?session_id= 里指明）"})
-        # body 里的 session_id 只是给日志/诊断用的；**路由以 header 为准**
-        # （与 /v1/speak 一致 —— 两处口径不同会让 404 变得莫名其妙）
-        status = str(body.get("status") or "").strip() or None
-        sep = body.get("session_end_pending")
-        end_pending = None if sep is None else bool(sep)
-
-        ic_ds = getattr(sess, "interaction", None)
-        if ic_ds is None:
-            return {"ok": False,
-                    "error": "本会话没有 IC 决策链路（未启用或已降级）"}
-        # ⚠️ **必须 off-loop**：grpc 模式是一次 gRPC 往返，进程内模式虽然
-        #    是纯内存操作，但走同一条路径 —— 统一丢线程里最省心，
-        #    也免得「换模式后这里突然阻塞事件循环」。
-        await asyncio.to_thread(
-            ic_ds.apply_agent, status=status,
-            session_end_pending=end_pending)
-        return {"ok": True, "session_id": sess.session_id,
-                "mode": getattr(ic_ds, "ic_mode", "grpc")}
 
     @app.get("/healthz")
     async def healthz():

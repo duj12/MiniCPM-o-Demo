@@ -227,3 +227,12 @@ Suggested migration order:
 6. Apply `unary` to non-streaming turn-based chat, and keep streaming turn-based chat on `push` / `pull`.
 
 This lets PyTorch and C++ backends share the same stateful backend contract without forcing either side to expose low-level compute steps as public protocol.
+
+## 7. InteractionCore / Agent orchestration
+
+`orchestrator` owns each local IC Engine, its two synchronous callback Sinks, the
+independent Agent gRPC connection, TTS output, interruption execution and real
+playback observations. IC owns State/Policy/Engine/DecisionProbe; Agent owns LLM
+and tool execution. Sink events are queued locally; only host adapters assign
+wire session/turn identities. Agent generation completion never substitutes for
+playback completion. This binding does not change the inference backend contract.

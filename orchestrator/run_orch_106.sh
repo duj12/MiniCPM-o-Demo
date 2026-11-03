@@ -1,202 +1,61 @@
 #!/bin/bash
-# 106 生产编排 —— 默认**并发版**（进程内 IC，每会话一份 Engine）。
-# `ORCH_IC_MODE=grpc` 一行可回退到单会话版（见下「回退」）。
+# 106 生产编排：每会话进程内 IC + 独立 Agent gRPC。
 #
-# 用法（106 上）：
-#     nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
-#
-#     # 影子实例：不碰 8100 生产，只换端口 —— 回调地址/日志会自动跟着端口走
-#     ORCH_PORT=8101 bash .../orchestrator/run_orch_106.sh
-#
-#     # 回退到 grpc 版（先按 PID 停掉在跑的，见下）
-#     ORCH_IC_MODE=grpc nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
-#
-# ## 本脚本管的两件事（都靠环境变量翻，不用换脚本）
-#
-#   · IC   —— `ORCH_IC_MODE`：`inprocess`（默认）↔ `grpc`（回退，见下）
-#   · 人脸 —— `ORCH_FACE_SERVICE_URL`：非空 = 105 的远端服务；
-#             **置空 = 回到本地 `.so`**（单会话；见下面人脸段的说明）
-#
-#   · `ORCH_IC_MODE=inprocess` —— 每路会话在本进程内**独占**一份 IC Engine
-#     （`interaction.runtime.Engine`），并发由构造消解，不需要 session 路由。
-#     ⇒ 106 上那个独立的 IC 服务（:50051）**不再需要**，本脚本不起它。
-#     **但不要杀它** —— 留着就是回退路径。
-#   · `ORCH_AGENT_SET_TARGET=0` —— 不再调 Agent 的 `set_ic_target`，
-#     改由 IC 在 `AgentSink` 的 payload 里带 `callback_ic`。
-#   · 人脸改走 **105 的远端服务**（`http://192.168.89.105:8767`），**不再加载
-#     本地 .so** —— 见下面「为什么人脸必须走远端」。
-#
-# ## 回退到 grpc 版（同一脚本，只翻模式）
-#
-#     # 1) 停掉在跑的进程 —— **按 PID**。别用 `pkill -f orchestrator.main`：
-#     #    那个模式会匹配到 ssh 自己的命令行，把会话一起带走（踩过）
-#     ss -ltnp | grep ':8100' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | xargs -r kill -TERM
-#     # 2) 起 grpc 版
-#     ORCH_IC_MODE=grpc nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
-#
-#     ⚠️ :50051 上那个独立 IC 服务（`run_ic_106.sh` 起，pid 1286618，2026-09-29
-#        起从未重启）**一直在跑 —— 别停它**，它就是回退的依赖。
-#
-#     ⚠️ 回退**不动人脸** —— 仍走 105:8767。人脸服务化是架构定调（见下），与
-#        IC 模式无关。要把人脸也退到本地 .so：`ORCH_FACE_SERVICE_URL=` 置空，
-#        并补 `ORCH_FACE_MODELS` / `ORCH_FACE_DB`（106 的本地 .so 是可用的）。
-#
-#     ⚠️ 回退后若 `agent.status` 写不进去（Agent 已不认 gRPC `ApplyAgent`），
-#        按 `run_ic_106.sh` 末尾那段给 IC 服务补
-#        `--agent-envelope --callback-ic https://192.168.89.106:8100/v1/ic`。
-#
-# ## ⚠️ 前置依赖（不满足会**静默**失效，不报错）
-#
-# Agent（102:8081）必须能从 `on_*` payload 里读 `callback_ic`，并把
-# apply_agent 写到 `POST {callback_ic}/apply_agent`。做不到的话
-# `agent.status` / `session_end_pending` 永远写不进去 ⇒ policy 的
-# **SOP 39 与 PENDING_ANNOUNCE 两条分支失效**。
-#
-# 判据（会话日志里必须有这一行，没有就是没通）：
-#     [<sid>] Agent → IC: apply_agent(status=..., end_pending=...)
-#
-# ## 为什么必须走共享树
-#
-# 105 与 106 读的是**同一份** NFS 代码，`interaction` 包在两边都是指向它的
-# editable install。改共享树不影响两边**正在跑**的进程（Python 启动时就
-# import 完了），只影响下次重启 —— 所以「改了代码」≠「服务更新了」，
-# 更新必须重启。见 docs/多会话并发与云服务化-问题与方案.md。
+# 从哪个目录运行都可以；ORCH_PORT=8101 可启动影子实例。
+# 更新代码后需重启服务；正在运行的进程不会自动重新导入。
+# 重启时按监听端口确认 PID，再 kill -TERM <PID>；勿用 pkill -f 匹配共享命令行。
+# IC 固定使用本仓库 vendor/interactioncore，不再启动独立 IC 服务。
+# 先在仓库根目录初始化 submodule 并安装 orchestrator/requirements.txt。
 set -eu
 SHARED=/data/megastore/Projects/DuJing/code
-REPO=$SHARED/MiniCPM-o-Demo
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 PY="${ORCH_PY:-/home/dujing/miniconda3/envs/py310/bin/python}"
-if [ ! -x "$PY" ]; then
+if ! command -v "$PY" >/dev/null 2>&1; then
   echo "找不到 python: $PY（可用 ORCH_PY=... 覆盖）" >&2
   exit 1
 fi
-
-# 先把端口定下来，回调地址跟着它走 —— 影子实例只要换 ORCH_PORT 就自洽
+if [ ! -f "$REPO/vendor/interactioncore/interaction/runtime.py" ]; then
+  echo "未初始化 InteractionCore：请先执行 git submodule update --init --recursive" >&2
+  exit 1
+fi
+export PYTHONPATH="$REPO/vendor/interactioncore:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 PORT="${ORCH_PORT:-8100}"
 
-# ---- IC：两种模式，`ORCH_IC_MODE` 就是回退开关 ----
-#
-#   `inprocess`（默认）每会话在本进程内**独占**一份 Engine —— 真并发。
-#   `grpc`             回退到 :50051 上的独立 IC 服务（`run_ic_106.sh`）——
-#                      单会话，并发靠 IC 侧的 `_OWNER` 闸门「后来者接管」。
-#
-# ⚠️⚠️ **只翻 `ORCH_IC_MODE`、却把 `ORCH_IC_ADVERTISE` 留在 `:8100` 是最坏的
-#       一种半切换**：8100 是 HTTP(S) 端口，而 Agent 会拿 advertise 当 **gRPC
-#       目标**去回连 IC → 连不上；而**编排侧看不到任何异常**（回连的不是它）。
-#       所以两个模式的三件套在这里一次改全，别在命令行上手工设。
-export ORCH_IC_MODE="${ORCH_IC_MODE:-inprocess}"
-if [ "$ORCH_IC_MODE" = "grpc" ]; then
-  # 编排**自己**去连 IC（同机，localhost 没问题）
-  export ORCH_IC_GRPC="${ORCH_IC_GRPC:-127.0.0.1:50051}"
-  # 告诉 Agent 回连 IC 的地址 —— grpc 模式下 = **IC 的 gRPC 端口**
-  export ORCH_IC_ADVERTISE="${ORCH_IC_ADVERTISE:-192.168.89.106:50051}"
-  # 会话结束归还到本机 IC（grpc 模式每台机器一个，本机那个就是共用的）
-  export ORCH_IC_RESTORE="${ORCH_IC_RESTORE:-192.168.89.106:50051}"
-  # 回退态靠 Agent 的 `set_ic_target` 拿回连地址 ⇒ 必须开
-  export ORCH_AGENT_SET_TARGET="${ORCH_AGENT_SET_TARGET:-1}"
-else
-  # 告诉 Agent 往哪写 apply_agent。必须**外部可回连** —— 写 127.0.0.1 的话
-  # Agent 会去连它自己。
-  export ORCH_IC_ADVERTISE="${ORCH_IC_ADVERTISE:-192.168.89.106:$PORT}"
-  export ORCH_IC_CALLBACK_BASE="${ORCH_IC_CALLBACK_BASE:-https://192.168.89.106:$PORT/v1/ic}"
-  # Agent 已能按 payload 里的 `callback_ic` 回写 ⇒ 关掉进程级全局的 set_target
-  export ORCH_AGENT_SET_TARGET="${ORCH_AGENT_SET_TARGET:-0}"
-fi
-# IC 播报打的是**本机自己**的 /v1/speak；CA 用编排自己的自签证书
-# （证书 SAN 必须覆盖 127.0.0.1，否则校验失败 —— 而失败只记日志，
-#  表现为「IC 判 GREET 但没人播」，很难查）。
-# ⚠️ grpc 模式下这两个变量**在编排侧不生效** —— IC 服务自己带
-#    `--expression-url/--expression-ca`（见 `run_ic_106.sh`）。留着只为少一处 diff。
-export ORCH_IC_EXPRESSION_URL="${ORCH_IC_EXPRESSION_URL:-https://127.0.0.1:$PORT}"
-export ORCH_IC_EXPRESSION_CA="${ORCH_IC_EXPRESSION_CA:-$REPO/certs/cert.pem}"
+# AgentService/Interact 是唯一 Agent 通道；每路会话建立独立双向 RPC。
+# 与旧 IC gRPC 的 :50051 不同，这个端口现在属于独立 Agent 服务。
+export ORCH_IC_MODE=inprocess
+export ORCH_AGENT_GRPC="${ORCH_AGENT_GRPC:-192.168.89.102:50051}"
+export ORCH_OMNI_URL="${ORCH_OMNI_URL:-wss://127.0.0.1:8006/v1/realtime?mode=video}"
 
-# ---- 软打断（TTS 先暂停，判误打断后播提示语再**续播**）----
-#
-# 2026-10-29 起 106 **默认开**（用户要求启用）。`ORCH_IC_SOFT_INTERRUPT=0`
-# 就是回退：IC 判 YIELD 立刻硬停（/v1/stop），与这批代码出现之前逐字节一致
-# —— 回退不需要改代码、也不需要动 Agent/前端。
-#
-# 开启后 YIELD 变成：/v1/tts/pause → 宽限期 → 若用户没继续说
-#   → /v1/speak(prompt=true)「误打断」提示语 → /v1/tts/resume（从暂停点接着播）
-# 若用户真在接着说 → /v1/stop（硬停，丢弃封存的那一轮）。
-#
-# ⚠️ 前端必须支持 `tts.pause` / `tts.resume` 两个消息（static/orchestrator-test.html
-#    的 PcmPlayer 已实现；更老的页面会忽略它们 → 表现为"暂停无效，声音继续"）。
-# ⚠️ 独立 IC（grpc 模式）不看这三个变量，它读的是 `INTERACTION_SOFT_INTERRUPT`
-#    等同名的一族（见 interactioncore/interaction/grpc_server.py）。
-export ORCH_IC_SOFT_INTERRUPT="${ORCH_IC_SOFT_INTERRUPT:-1}"
-export ORCH_IC_SOFT_YIELD_GRACE_MS="${ORCH_IC_SOFT_YIELD_GRACE_MS:-1000}"
-export ORCH_IC_FALSE_YIELD_PROMPT="${ORCH_IC_FALSE_YIELD_PROMPT:-不好意思，您继续说。}"
-# /v1/tts/pause 不"啪一下断掉"，而是把音量淡出（渐弱）到 0 —— "渐渐退出去"
-# 的听感；/v1/tts/resume 再淡入回来。0 = 关闭渐变（立刻停稳/立刻回原音量）。
+# P05 barge 状态机的打断判据由 DecisionProbe 提供。
+# DECISION_BASE_URL 未设时使用 IC 包默认 http://192.168.89.101:8094。
+# ORCH_IC_DECISION_PROBE=0 仅用于排障：关闭后缺少探针判据。
+export ORCH_IC_DECISION_PROBE="${ORCH_IC_DECISION_PROBE:-1}"
+# 暂停/续播的浏览器音量渐变，0 表示关闭渐变。
 export ORCH_TTS_PAUSE_FADE_MS="${ORCH_TTS_PAUSE_FADE_MS:-1000}"
 export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
 
-# ---- 打断探针（IC P05 的 DecisionProbe → StartLux `:8094`）----
-#
-# P05 把打断换成了 barge 状态机（QUICK_CHECK → SOFT → HARD），SOFT/HARD 的
-# 判据 `barge_class` **只能由探针问出来** —— 没有探针，用户开口也不打断。
-# 独立 IC（grpc_server）默认自己建；进程内模式的 Engine 是编排造的，
-# 碰不到那段代码 ⇒ 这里默认开，由 `InProcessICClient` 按 Engine 签名装配
-# （老 IC 没有 `decision_probe` 参数，自动跳过，不会报错）。
-# `DECISION_BASE_URL` 不设时用包里默认 `http://192.168.89.101:8094`。
-export ORCH_IC_DECISION_PROBE="${ORCH_IC_DECISION_PROBE:-1}"
-
-# ---- Agent：106 用 102:8081（config.py 的默认值就是它，显式写出来自文档）----
-# （`ORCH_AGENT_SET_TARGET` 随 IC 模式在上面定）
-export ORCH_AGENT_URL="${ORCH_AGENT_URL:-http://192.168.89.102:8081}"
-
-# ---- 人脸：走 105 的远端服务（按 session 隔离），**不加载本地 .so** ----
-#
-# ## 为什么人脸必须走远端（而不是「106 本地 .so 也能用」）
-#
-# 本地 provider 是 `ctypes.CDLL` 直连 `libsdk_stream.so`。CDLL 在**一个进程里
-# 只加载一次**，.so 内部的跟踪/dwell/身份状态全是**进程级全局** —— 两路会话
-# 各建一个 provider 也**共用同一份**状态，互相覆盖。这正是当初把 8767 单独拆
-# 出来的原因，也是 105 本地 `.so` 路线被放弃的原因。改了进程内 IC 拿到真并发
-# 之后，人脸这边不同步改，并发就只成了一半：IC 状态隔离了，人脸还在串。
-#
-# 服务端按 `session_id` 隔离（`G1_FACE_SESSIONS`），`/face/close` 释放。
-#
-# ## 代价（写清楚，别当没发生）
-#
-#   ① **106 从此依赖 105:8767** —— 105 挂了 106 就没人脸。fail-soft：无人脸
-#      但不报错，表现为「人来了不迎宾」，静默。
-#   ② **与 105 共用 `G1_FACE_MAX_SESSIONS=4` 的额度** —— 两边同时跑会话会打满
-#      → 503 → 那一帧丢；打满时 106 的迎宾可能比 105 先坏。要真隔离得在 106
-#      上再部署一份服务，或把额度提上去。
-#   ③ 每帧多一跳网络（25 fps），`face_service_timeout_s` 是单帧上界。超时只丢
-#      这一帧 —— `offer` 是 `put_nowait`，音频路径不受影响。
-# ⚠️ 这里用 `-` 而不是 `:-` —— 只有 `-` 才让**显式给的空值**保留下来，
-#    从而真的关掉远端模式、退回本地 `.so`。写成 `:-` 的话
-#    `ORCH_FACE_SERVICE_URL= bash ...` 会被默认值顶掉，看着像「改了却没生效」。
+# 人脸走按 session 隔离的远端服务，避免本地 .so 的进程级状态串扰。
+# 105/106 共用 105:8767 的服务额度；超时或额度打满会丢帧。
+# 必须用 "-" 保留显式空值；ORCH_FACE_SERVICE_URL= 才会回到本地 .so。
+# 本地 .so 仅适合单会话；需要时同时指定 ORCH_FACE_DB / ORCH_FACE_MODELS。
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
 export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.105:8767}"
 export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
 export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 
-# ---- 本地 .so 退路（只在 `ORCH_FACE_SERVICE_URL=` 显式置空时走）----
-# 走 `G1FaceProvider`（`ctypes.CDLL` 直连 `libsdk_stream.so`，**单会话**）。
-# `g1_root` 会自动探测「与本仓库同级的 board-face-and-cloud-infer/G1」，
-# 模型目录默认 `<g1_root>/models` ⇒ 这两项通常不用给；**人脸库必须给**，
-# 不给就只剩检测/唇动/唤醒（身份识别静默关闭，启动日志里一句 warning）：
-#
-#     ORCH_FACE_DB="$SHARED/faceidentification/data/face_db.npz" \
-#     ORCH_FACE_SERVICE_URL= bash orchestrator/run_orch_106.sh
-#
-# 要强制用某一份 `.so` 才设 `ORCH_FACE_SO`（provider 会**实测**每份候选 + 验
-# ABI，坏的不会被静默采纳 —— 106 上有几份产物，**不能按目录名猜**）。
-
-# ---- 声学延迟 D：占位 250 等于不生效，真值要跑 tests/measure_delay.py ----
+# 算法 AEC 的 D 必须按设备实测；250ms 只是占位，默认仍为浏览器 AEC。
 export ORCH_AEC_DEFAULT_DELAY_MS="${ORCH_AEC_DEFAULT_DELAY_MS:-250}"
+# 两阶段描述：起点全量 + 后续断句触发/心跳兜底；经 AgentAction.vlm 发送。
+export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 
+# 保留各机现有日志与音视频排障素材的默认目录。
 export ORCH_LOG_LEVEL="${ORCH_LOG_LEVEL:-info}"
 export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$SHARED/orchdump/s}"
-
-# ⚠️ 编排服务**不读** ORCH_LOG_FILE —— 日志重定向必须在这里做（exec）。
-#    日志名带端口，影子实例和生产不会混在一个文件里。
 LOG_FILE="${ORCH_LOG_FILE:-$REPO/orch106-$PORT.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
 echo "=== $(date "+%F %T") 启动（pid $$，port $PORT）—— 日志 $LOG_FILE ===" >&2
 
@@ -209,77 +68,18 @@ else
   echo "⚠️ 未找到证书（$SSL_CERT）—— 将以 HTTP 启动，别的机器访问时采不到音视频" >&2
 fi
 
-echo "106 编排：IC 模式 = $ORCH_IC_MODE" >&2
+echo "106 编排：IC = 进程内 vendor/interactioncore（每会话一份 Engine）" >&2
 echo "  端口            = $PORT" >&2
-if [ "$ORCH_IC_MODE" = "grpc" ]; then
-  echo "  IC 服务         = $ORCH_IC_GRPC（独立进程，回退态；别停它）" >&2
-  echo "  告诉 Agent 的 IC = $ORCH_IC_ADVERTISE（**必须是 :50051**）" >&2
-else
-  echo "  IC 服务         = 无（进程内 Engine，每会话一份）" >&2
-  echo "  apply_agent 回调 = $ORCH_IC_CALLBACK_BASE" >&2
-fi
-echo "  Agent           = $ORCH_AGENT_URL（set_target=$ORCH_AGENT_SET_TARGET）" >&2
-echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（未配远端服务）}" >&2
+echo "  Agent gRPC      = $ORCH_AGENT_GRPC（每会话独立 Interact）" >&2
+echo "  Omni            = $ORCH_OMNI_URL" >&2
+echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（仅单会话）}" >&2
 echo "  python          = $PY" >&2
-# ---- VLM 描述（两阶段：起点 full + 每轮 turn 全量）----
-#
-# 2026-10-13 起**开着**（此前一段是关的，原因见下「为什么原先关着」）。
-#
-# ⚠️⚠️ 打开它的**前置顺序不能反**：必须**先**更新 102 的 Agent，**再**重启
-#     本服务。兼容性是**不对称**的：
-#
-#       新 Agent ← 旧编排   ✅ 安全（`content` 可缺省 = 旧版行为）
-#       旧 Agent ← 新编排   ❌ **会凭空多出一句话**
-#
-#     原因不只在载荷。`dual` 除了给每轮多带一个 `content` 键（旧 Agent 的
-#     pydantic 会当多余字段丢掉，**这一半无害**），还会**多发一轮**「会话
-#     起点的视觉背景轮」—— 一轮 `transcript=""` 的 `on_answer`，语义是
-#     「只存不答」，全靠 Agent 侧的 `handle_visual_background` 认。旧 Agent
-#     里 `handle_answer` 对空 transcript **没有任何护栏**（`openai-agent-demo`
-#     的 2c01305 及之前），会当正常话轮：写 BUSY → 拿空用户文本跑 LLM →
-#     回一句 → IC 收到 ANSWER → **会话开头凭空插一句话**。症状全在 Agent
-#     侧，编排这边看不出来 —— 正是 `config.py` 里警告的那类半切换。
-#
-#     判据（102 侧 `GET /openapi.json`）：`components.schemas` 里要有
-#     `Content`，且 `OnAnswerRequest.properties` 里要有 `content`。
-#     2026-10-13 实测已满足（103 更早就有）。
-#
-# 为什么原先关着：102 的 Agent 那时还没改好 —— 也就是上面那条判据不成立。
-#
-# 为什么落在这个**本机专属**脚本里、而不是 `config.py` 的默认值：编排代码
-# 105/106 共用一份，`config.py` 的默认值就是「**106 下次重启后的行为**」，
-# 动它会连「哪台开了什么」的横幅证据一起抹掉。写在这里，下面几行 echo
-# 才是启动横幅上那条硬证据。
-#
-# 回退（102 的 Agent 若被退回旧版 —— **先退编排、再退 Agent**，顺序与开时
-# 相反，因为危险的永远是「新编排 + 旧 Agent」这个组合）：
-#     ORCH_OMNI_DESCRIBE=0 ORCH_AGENT_TRANSCRIPT_MODE=legacy \
-#     nohup setsid bash .../orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
-#
-#   `dual`   = 纯增量：`transcript` 仍是字符串，只多一个 `content={ASR,VLM}` 键
-#   `dict`   = `transcript` 整个换成 dict（目标态，**当前未启用**：Agent 的
-#              `transcript` 字段是 `str`，背景轮会被 422 挡掉）
-#   `legacy` = 连子类都不装，payload 逐字节等于旧版（回退用）
-export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
-export ORCH_AGENT_TRANSCRIPT_MODE="${ORCH_AGENT_TRANSCRIPT_MODE:-dual}"
-# 「增量人设 / 换短人设重连」那套机制**已删**（2026-10-28 两阶段定稿，
-# `_switch_delta_persona` 与 `ORCH_OMNI_DELTA_PERSONA` 都不在代码里了）。
-# ⇒ 不再 export、也不在横幅里报，否则横幅会描述一个不存在的行为
-#   （2026-10-29 实测横幅写着「增量人设 = 1」而跑的是两阶段全量）。
-
-# 生效值落日志 —— 切换/回退后**第一眼看这里**，别靠猜。
-echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（1=omni 只当描述器，0=当对话方）" >&2
-echo "  Agent 载荷      = $ORCH_AGENT_TRANSCRIPT_MODE" \
-     "（legacy=与旧版逐字节一致，dual=多一个 content 键）" >&2
-echo "  视觉轮          = 随上面两行（$ORCH_OMNI_DESCRIBE / $ORCH_AGENT_TRANSCRIPT_MODE）" \
-     "（每份描述一生成完就投一发 ASR 空的 on_answer，只存不答）" >&2
-echo "  描述阶段        = 起点 full（带细节，只发一次）+ 每轮 turn（8 键全量）" >&2
-echo "  软打断          = $ORCH_IC_SOFT_INTERRUPT" \
-     "（1=先暂停，误打断播话术后续播；0=直接硬停；宽限 ${ORCH_IC_SOFT_YIELD_GRACE_MS}ms" \
-     "话术「$ORCH_IC_FALSE_YIELD_PROMPT」）" >&2
+echo "  音视频转储      = $ORCH_DUMP_AUDIO" >&2
+echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
+echo "  描述阶段        = 起点 full + 每轮 turn，AgentAction.vlm 单独传递" >&2
 echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
-echo "  打断探针        = $ORCH_IC_DECISION_PROBE" \
-     "（仅 inprocess：1=P05 barge 状态机可用；0=不建探针 ⇒ 不打断）" >&2
+echo "  打断探针        = $ORCH_IC_DECISION_PROBE" >&2
+echo "  HTTPS 证书      = $SSL_CERT" >&2
 
 exec "$PY" -u -m orchestrator.main \
   --host "${ORCH_HOST:-0.0.0.0}" --port "$PORT" \

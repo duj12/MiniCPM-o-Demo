@@ -1,268 +1,142 @@
-# Agent 接入指南 —— 把回复文本送进 TTS
+# Agent 接入指南 —— AgentService/Interact
 
-本文给 **Agent 方**看：你生成完回复文本后，怎么让它**在这个终端上说出声**。
-
----
+当前链路使用独立 Agent gRPC 服务。InteractionCore 固定在本仓库的
+`vendor/interactioncore` submodule，每路宿主会话持有独立的 `Engine`。
+IC 的两个同步 Sink 只向宿主回调事件；网络连接和实际播报由宿主负责。
 
 ## 一、整体链路
 
-```
-感知（ASR/人脸/唇动）
-        │  gRPC apply_*
-        ▼
-  InteractionCore ──Tick()→Action──┐
-   （P0 SOP 决策）                  │
-                                   ▼
-                        ANSWER / INSERT / YIELD / END
-                                   │  HTTP POST
-                                   ▼
-                            Agent Platform（你）
-                                   │  生成回复文本
-                                   ▼
-                   POST /v1/speak  ← ★ 本文档讲的接口
-                                   │
-                                   ▼
-                   编排服务（orchestrator）→ TTS → 扬声器
+```text
+ASR / 人脸 / 唇动 / 视觉 / 真实播放回执
+                  │ 本地 apply_* / tick
+                  ▼
+       每会话 InteractionCore Engine
+         │ AgentSink     │ ExpressionSink
+         └────────┬──────┘
+                  ▼
+           orchestrator 宿主
+         │                 │
+         │ AgentAction     │ Speak / Stop / Pause / Resume
+         ▼                 ▼
+AgentService/Interact     ActionExecutor → TTS → 浏览器
+         │ AgentEvent                         │
+         └──────────────► 宿主 ◄── playback ──┘
 ```
 
-**分工**：
-
-| 谁 | 干什么 |
+| 谁 | 职责 |
 |---|---|
-| InteractionCore | 决定**什么时候**该开口（`ANSWER`）、什么时候放行慢结果（`INSERT`） |
-| **Agent（你）** | 决定**说什么**，然后调 `/v1/speak` 让我们播出来 |
-| 编排服务 | 只负责**播**（TTS + 音频调度 + 回声消除），不决定说什么 |
+| InteractionCore | 运行交互策略，交付 Agent 动作与表达事件 |
+| Agent | 生成回复与状态，通过同一条双向 RPC 返回 |
+| orchestrator | 建立每会话 RPC、维护轮次标识、应用 Agent 状态、执行 TTS 和打断 |
+| 浏览器 | 播放音频并上报真实播放回执，供宿主更新参考轨与 `apply_playback_active` |
 
-> **为什么不让 Agent 直接调 TTS 服务？**
-> 因为浏览器播放要和 AEC 参考轨、播放回执严格对齐（回声消除靠它）。
-> 走编排服务，这些全部自动处理；绕过它会导致回声消不掉。
+Agent 的 `done` / `IDLE` 只描述生成状态，不代表音频已经播完。
+实际播放状态以浏览器回执为准。Agent 文本必须经宿主播放，才能保留 AEC
+参考轨、播放定位及暂停/续播的闭环。
 
----
+## 二、协议与会话隔离
 
-## 二、接口
+协议源见 [agent.proto](../../agent_protocol/agent.proto)，生成方式和依赖版本见
+[Agent wire contract](../../agent_protocol/README.md)。
+本仓库副本须与 Agent 服务的 canonical proto 保持一致。
 
-### 2.1 整段播报 `POST /v1/speak`
+唯一 RPC：
 
-回复不长（一次生成完）时用这个。
-
-**请求**
-
-```
-POST http://<orchestrator>:8100/v1/speak
-Content-Type: application/json
-X-Session-Id: <会话 id>          ← 见 §2.3
-
-{
-  "text": "您好，我是小智，建议您先挂内科看看。",   // 必填，要播的文字
-  "interrupt": false,                              // 可选，true = 先掐断当前播报
-  "tts_type": "mltts",                             // 可选，默认 mltts
-  "speaker_id": "17"                               // 可选，默认用服务端配置
+```protobuf
+service AgentService {
+  rpc Interact(stream AgentAction) returns (stream AgentEvent);
 }
 ```
 
-**响应**
+每路 `OrchestratorSession` 拥有自己的 `AgentClient`、请求队列与 RPC。
+每条请求和响应都带 `session_id`、`ci`、`epoch`，Agent 必须原样回传。
+宿主拒绝其他会话、旧轮次及已失效连接的事件。多路会话可以共用同一个 Agent
+服务地址，服务端也必须按 RPC / 会话隔离上下文。
 
-```json
-{"ok": true, "session_id": "ae3e4aa69667"}
-```
-
-失败时：
-
-```json
-{"ok": false, "error": "找不到活跃会话（请在 X-Session-Id 头或 ?session_id= 里指明）"}
-```
-
-| 状态码 | 含义 |
+| 动作 | 宿主发送及预期语义 |
 |---|---|
-| `200` | 已接收（**不代表已经播完**，只是排进播放队列了） |
-| `404` | 找不到会话 —— 会话可能已经结束，或 session id 不对 |
-| `422` | 请求体格式错（缺 `text` 字段等） |
+| `ANSWER`（真实用户话轮） | 新建 `ci`，递增 `epoch`，携带 ASR `transcript` |
+| `ANSWER`（视觉快照） | 空 `transcript`，`vlm` 携带视觉描述，只更新上下文，不凭空回复 |
+| `INSERT` | 复用当前话轮的 `ci/epoch`，放行待播结果 |
+| `YIELD` | 复用当前话轮标识；取消生成和旧待播文本，保留 Agent 上下文 |
+| `END` | 清除 Agent 上下文与旧待播内容，保留 RPC |
 
-### 2.2 流式播报 `POST /v1/speak/stream`
+活动轮期间视觉更新复用轮次标识；首次视觉更新或 END 后的新视觉更新建立新标识。
+ASR 与视觉分别使用字符串 `transcript`、`vlm`，不再使用 HTTP 时代的
+`legacy/dual/dict` 载荷切换。协议还定义了 `identity_id/display_name`、
+`language`、`affect`、`app_id`、`ai_intent/ai_style` 和 `mcp_servers`；
+具体字段及可选性以 proto 为准。
 
-回复很长、希望**边生成边播**（首声更早）时用这个。逐片推送文本片段：
+## 三、Agent 返回什么
 
-```
-POST http://<orchestrator>:8100/v1/speak/stream
-Content-Type: application/json
-X-Session-Id: <会话 id>
-
-{"stream_id": "agent-turn-42", "text": "您好，我是", "is_final": false}
-{"stream_id": "agent-turn-42", "text": "小智，建议您", "is_final": false}
-{"stream_id": "agent-turn-42", "text": "先挂内科看看。", "is_final": true}
-```
-
-**⚠️ 三条铁律**
-
-1. **`stream_id` 同一轮内必须保持不变**，下一轮**必须换一个新的**
-   （比如用 `agent-{轮次}` 或 uuid）。
-   *踩过的坑*：用固定常量当 stream_id 时，第二轮的文本会被追加进
-   第一轮那个已经收尾的流，表现为**第二轮永远不播*。
-2. **最后一片必须 `is_final: true`** —— 否则流不会收尾，最后一句被卡住不播。
-3. **片段会被自动攒批**（攒到句末标点或 ~50 字才送去合成）——
-   这是服务端为了音质做的，你按 token 粒度推即可，不用自己切句。
-
-### 2.3 怎么拿到 `X-Session-Id`
-
-编排服务在会话建立时下发给前端（`session.ready` 消息里的 `session_id`）。
-
-**Agent 如果自己不是那个前端**，有两种拿法：
-
-- **推荐**：由调用方（编排服务）在 `on_answer` / `on_insert` 的请求里带上。
-  目前这四个端点**还没有** session 字段 —— 需要时请找编排服务侧加。
-- **临时**：`GET /healthz` 看活跃会话数，`GET /stats` 列出活跃会话 id。
-  **单会话部署**下，不传 `X-Session-Id` 也能路由到那唯一一个会话。
-
----
-
-## 三、调用时机
-
-| InteractionCore 的 Action | 你该做什么 |
+| AgentEvent payload | 宿主处理 |
 |---|---|
-| **`ANSWER`** | 收到 `POST /interaction/on_answer`（带 `transcript`）→ 生成回复 → **立刻**调 `/v1/speak` |
-| **`INSERT`** | 收到 `POST /interaction/on_insert` → 把**之前备好的慢结果**现在播出来（调 `/v1/speak`） |
-| **`YIELD`** | 收到 `POST /interaction/on_yield` → 用户抢话，**立即停止生成**、别再调 `/v1/speak` |
-| **`END`** | 收到 `POST /interaction/on_end` → 会话结束，丢弃待播内容 |
+| `ack` | 记录动作是否接收；被拒绝时输出诊断日志 |
+| `state` | 将可选 `status/session_end_pending` 投影到本会话 IC |
+| `text: FEEDBACK` | 按 `stream_id` 累积，`is_final=true` 后整段播报 |
+| `text: ANSWER` | 按流推送正文，复用同一 `stream_id`，最后一片须 `is_final=true` |
+| `done` | 标记生成完成，继续等待真实播放回执 |
+| `error` | 使本轮待播文本失效，宿主停止当前输出并记录错误 |
 
-> `ANSWER` = 快回复/快工具，直接播；
-> 慢任务（要查几秒的）应先备好文本但**别播**，等 `INSERT` 放行 —— 
-> 否则会在用户还在说话时插话。
+`TextChunk.stream_id` 在同一文本流内保持不变，新流使用新值。
+FEEDBACK 和 ANSWER 是两类文本，不能把 FEEDBACK 当成正文重复返回。
 
----
+断流后当前 RPC 终止，宿主停止输出、清本地活动轮，不重放已发送动作。
+之后新的真实 ANSWER 可以创建新 RPC 与新话轮；新宿主会话同样创建独立 RPC。
+恢复前旧连接、旧 `ci/epoch` 的文本不可继续播放。
 
-## 四、示例代码
+## 四、部署与验证
 
-### 4.1 curl（最快验证）
+首次在其他机器部署前，需先将 InteractionCore 固定提交
+`40921a6c9cff583071aa70c463c65f016607fab2` 发布到 `.gitmodules` 指向的远端，
+并由可获取的分支保留该提交。当前提交尚未发布，直接初始化 submodule 会报
+`not our ref`；本地已有副本不能替代这个部署前置。
+
+从仓库根目录执行：
 
 ```bash
-# 看有没有活跃会话
-curl -k https://<orchestrator>:8100/stats
+git submodule update --init --recursive
+python -m pip install -r orchestrator/requirements.txt
+ORCH_AGENT_GRPC=127.0.0.1:50051 python -m orchestrator.main
+```
 
-# 播一句
+生产配置保留在 `orchestrator/run_orch_105.sh` / `run_orch_106.sh`：
+105 默认连接 `192.168.89.103:50051`，106 默认连接 `192.168.89.102:50051`。
+目标必须运行 AgentService，而非旧的 IC gRPC 服务。可用 `ORCH_AGENT_GRPC`
+覆盖地址，`ORCH_PY` 覆盖已安装依赖的解释器。
+
+不再启动独立 IC；`ORCH_IC_MODE=grpc`、`ic.grpc`、`ORCH_AGENT_URL`、
+HTTP `/interaction/on_*`、`set_target/callback_ic` 和
+`/v1/ic/apply_agent` 已退役。无需给 Agent 配置回连宿主的地址。
+
+```bash
+python -m pytest orchestrator/tests/test_agent_integration.py -q
+# 可选：以实际 Agent 服务源码运行独立进程 loopback
+AGENT_TEST_SOURCE=../openai-agent-demo AGENT_TEST_PYTHON=/path/to/agent/python \
+  python -m pytest orchestrator/tests/test_agent_integration.py -q
+```
+
+## 五、手工播报诊断
+
+HTTP 播报接口继续供手工工具使用；Agent 集成使用上述 gRPC 事件。
+多会话时显式指定 `X-Session-Id`，避免依赖单会话兜底。
+
+```bash
+curl -k https://<orchestrator>:8100/stats
 curl -k -X POST https://<orchestrator>:8100/v1/speak \
   -H "Content-Type: application/json" \
-  -H "X-Session-Id: ae3e4aa69667" \
-  -d '{"text":"您好，我是小智，建议您先挂内科看看。"}'
-# → {"ok":true,"session_id":"ae3e4aa69667"}
+  -H "X-Session-Id: <session_id>" \
+  -d '{"text":"您好，这是播报测试。"}'
 ```
 
-> ⚠️ 编排服务默认跑 **HTTPS**（自签证书），所以是 `https://` +
-> `curl -k`（跳过证书校验）。
+`200/ok:true` 表示已接收，不代表播完；`404` 表示会话不存在。
+长文本可逐次 POST `/v1/speak/stream`，每次请求一个 JSON 对象：
 
-### 4.2 Python
-
-```python
-import json
-import urllib.request
-
-ORCH = "https://192.168.89.106:8100"
-SESSION_ID = "ae3e4aa69667"          # 见 §2.3
-
-
-def _post(path: str, payload: dict) -> dict:
-    req = urllib.request.Request(
-        ORCH + path,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-Session-Id": SESSION_ID,
-        },
-        method="POST",
-    )
-    # 自签证书：跳过校验（生产建议换成带 CA 的正规校验）
-    ctx = ssl._create_unverified_context()
-    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-# ---- 整段播（快回复）----
-print(_post("/v1/speak", {"text": "您好，我是小智，建议您先挂内科看看。"}))
-# → {'ok': True, 'session_id': '...'}
-
-
-# ---- 流式播（长回复，边生成边播）----
-def speak_stream(stream_id: str, chunks):
-    for i, piece in enumerate(chunks):
-        is_last = (i == len(chunks) - 1)
-        print(_post("/v1/speak/stream", {
-            "stream_id": stream_id,      # ⚠️ 同一轮不变，换轮必须换
-            "text": piece,
-            "is_final": is_last,         # ⚠️ 最后一片必须 True
-        }))
-
-speak_stream("agent-turn-1", ["您好，我是小智。", "头痛胸痛建议先挂内科。"])
+```json
+{"stream_id":"manual-turn-1","text":"您好，这是","is_final":false}
+{"stream_id":"manual-turn-1","text":"流式测试。","is_final":true}
 ```
 
-### 4.3 在 FastAPI 里接 InteractionCore 的 Action
-
-```python
-from fastapi import FastAPI
-import threading, uuid
-
-app = FastAPI()
-_lock = threading.Lock()
-_session_id = ""
-
-@app.post("/interaction/on_answer")
-async def on_answer(body: dict):
-    """InteractionCore 判定'该回答了'。"""
-    transcript = body.get("transcript", "")
-    name = body.get("display_name")
-    # ↓ 换成你自己的生成逻辑（LLM / 工具 / 快 skill）
-    reply = f"{name + '，' if name else ''}您说的是：{transcript}。" \
-            f"我这就帮您查。"
-    _post("/v1/speak", {"text": reply})
-    return {"status": "ok"}
-
-@app.post("/interaction/on_insert")
-async def on_insert():
-    """放行慢结果 —— 把之前备好的文本现在播出来。"""
-    with _lock:
-        pending = _take_pending_result()
-    if pending:
-        _post("/v1/speak", {"text": pending, "interrupt": False})
-    return {"status": "ok"}
-
-@app.post("/interaction/on_yield")
-async def on_yield():
-    """用户抢话 —— 停止生成，别再播。"""
-    _cancel_generation()
-    return {"status": "ok"}
-
-@app.post("/interaction/on_end")
-async def on_end():
-    """会话结束。"""
-    _clear_pending()
-    return {"status": "ok"}
-```
-
----
-
-## 五、常见问题
-
-**Q：接口返回 `ok:true`，但没听到声音？**
-
-按顺序查：
-
-1. **会话是否还活着** —— `curl -k https://<orchestrator>:8100/healthz`，
-   `active_sessions` 是不是 0。会话结束后调用会返回 `404`
-2. **`X-Session-Id` 对不对** —— 多会话部署下必须给对，否则 404
-3. **`text` 是不是空的** —— 空文本会返回 `{"ok":false,"error":"text 为空"}`
-4. 看编排服务日志有没有 `Agent 播报（N 字）` —— 有这行说明收到了
-
-**Q：`text` 里能放 Markdown 吗？**
-
-不建议。这是**语音播报**，`**加粗**`、列表符号会被念出来。用平白的口语。
-
-**Q：能连续调多次吗？**
-
-可以。默认是**排队**（依次播）；后一句想打断前一句就带 `"interrupt": true`。
-
-**Q：我们能在播完之后拿到通知吗？**
-
-暂时没有。需要的话告诉编排服务侧加一个回调。
-
-**Q：端口/协议？**
-
-- 默认 `https://<orchestrator>:8100`（自签证书，客户端要跳过校验）
-- 也可以用 `http://`（如果编排服务以 HTTP 起），或经 Tailscale 的域名访问
+同一流复用 `stream_id`，换轮更换，最后一片必须终结。文本会按标点和长度攒批后
+送 TTS。用口语文本，Markdown 标记可能被直接念出来。暂停、续播与停止接口见
+[orchestrator README](../README.md#http-接口)。

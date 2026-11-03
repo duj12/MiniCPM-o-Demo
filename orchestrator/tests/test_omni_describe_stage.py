@@ -1,348 +1,25 @@
-#!/usr/bin/env python3
-"""VLM 描述随 ASR 一起发给 Agent —— **纯离线端到端验证**（不连任何服务）。
-
-## 验的是什么
-
-发给 Agent 的 `on_answer` 类事件里原本**只有 ASR 转写**。本次改动让它多带一份
-OmniLLM 的**画面/语音描述**（`content: {ASR, VLM}`）—— 靠的是编排侧给
-`AgentSink` 包一层子类覆写 `_send`（见 `orchestrator/interaction/agent_sink.py`）。
-
-⚠️ 后来 IC 把四类事件统一改投 `on_action`（payload 里 `act` 指明动作类型；
-四个旧端点保留兼容）—— 那只动了投递层 `_post`，覆写点 `_send` 未变。
-本脚本的捕获对两种形态**都兼容**（`_answers()` 同时认 `on_action` + `act`
-和旧的 `on_{action_name}` 专用端点），键集断言照现行 IC 行为（§⑤ 契约漂移
-测试锁着这一点）。
-
-本脚本用**真组件**跑：真 `InteractionDownstream`（inprocess）+ 真 IC `Engine`
-+ 真 `VlmAgentSink`（打到本机的捕获端口）。只有 OmniLLM 换成假的
-（`FakeOmni`：记下收到的指令，done 由测试手工回灌 —— 真模型跑不动、
-也不该在单元测试里跑）。
-
-## 硬指标（本次改动的主指标）
-
-**`AsrFinal`（`2pass-offline`，即 offline 文本）到达时，VLM 描述已经在缓存里**
-—— 也就是"**发送的那一刻不生成**"：断句 → Agent 那条链路上**没有**任何等待。
-所以这里既验证"该有描述时有描述"，也验证"没有描述时**照样立刻发**"
-（只记 `vlm_miss`，不等待）。
-
-    python -m orchestrator.tests.test_omni_describe_stage
-"""
+"""Description staging plus callback-to-Agent protobuf mapping, without network I/O."""
 from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import sys
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import pytest
 
-_failures: list = []
+from agent_protocol import agent_pb2 as pb
+from orchestrator.downstream.interface import AsrFinal, Describe, OmniDescription
+from orchestrator.interaction.downstream import InteractionDownstream
 
 
 def check(cond: bool, msg: str) -> None:
-    print(f"  [{'OK' if cond else 'FAIL'}] {msg}")
-    if not cond:
-        _failures.append(msg)
+    assert cond, msg
 
 
-# ====================================================================== #
-#  捕获端口：假装是 Agent 的 /interaction/on_*
-# ====================================================================== #
-
-HITS: list = []
-
-
-class _Handler(BaseHTTPRequestHandler):
-    """把收到的 POST 全记下来（含**到达时刻**，用于量端到端时延）。"""
-
-    protocol_version = "HTTP/1.1"          # keep-alive，需自带 Content-Length
-
-    def _record(self, body: str) -> None:
-        HITS.append({
-            "mono": time.monotonic(),
-            "method": self.command,
-            "path": self.path,
-            "session_header": self.headers.get("X-Session-Id"),
-            "body": body,
-        })
-
-    def _reply(self) -> None:
-        payload = json.dumps({"ok": True}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_POST(self) -> None:  # noqa: N802
-        n = int(self.headers.get("Content-Length") or 0)
-        self._record(self.rfile.read(n).decode("utf-8", "replace"))
-        self._reply()
-
-    def do_GET(self) -> None:  # noqa: N802
-        self._record("")
-        self._reply()
-
-    def log_message(self, *a) -> None:     # 静音 —— 自己打印
-        pass
-
-
-def _start_capture() -> tuple:
-    """起捕获端口（随机空闲端口），返回 (server, url)。"""
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
-
-
-def _answers() -> list:
-    """捕获到的 on_answer 类事件（解析后的 body）—— **两种投递形态都收**：
-
-    - 统一入口 `/interaction/on_action`（IC 现投这里）⇒ 必须看 `act`，
-      只收 `act == "ANSWER"` 的那些；
-    - 旧专用端点 `/interaction/on_answer`（原逻辑，旧 IC / 兼容保留）⇒ 路
-      径本身就是 ANSWER，payload 带不带 `act` 都算；但若带了别的 `act`
-      （同一批捕获里混投时）必须按统一入口同样地过滤掉，否则会错收。
-    """
-    out = []
-    for h in HITS:
-        if not h["body"]:
-            continue
-        path = h["path"]
-        unified = path.endswith("/interaction/on_action")
-        legacy = path.endswith("/interaction/on_answer")
-        if not (unified or legacy):
-            continue
-        try:
-            body = json.loads(h["body"])
-        except ValueError:
-            continue
-        # 统一入口必带 act；旧端点通常不带 —— 带了就必须是 ANSWER
-        if body.get("act", "ANSWER") != "ANSWER":
-            continue
-        out.append((h, body))
-    return out
-
-
-def _is_background_round(body: dict) -> bool:
-    """这发 on_answer 类事件是不是「**视觉背景轮**」。
-
-    判据照 Agent 侧的分流（`openai-agent-demo` 的
-    `api/interaction_routes.py`）：`content` 在场 且 `ASR` 空 且
-    `transcript` 空 ⇒ 走 `handle_visual_background`（**只存不答**），
-    不是一次真实话轮。编排侧发它的地方见 `downstream._emit_visual_background`。
-    """
-    content = body.get("content") or {}
-    return (bool(content)
-            and not (content.get("ASR") or "").strip()
-            and not (body.get("transcript") or "").strip())
-
-
-def _bg_rounds() -> list:
-    """捕获到的视觉背景轮。"""
-    return [(h, b) for h, b in _answers() if _is_background_round(b)]
-
-
-def _talk_rounds() -> list:
-    """捕获到的**真实话轮**（排除背景轮）。
-
-    ⚠️ 断言"这一发是第几发"的老测试必须用它：补了背景轮之后，
-    `_answers()[0]` 往往**是**背景轮（它在 `_feed(OmniDescription)` 那一刻
-    就入队了，早于 `_answer_path`），拿 `[0]` 会静默断言到错的那一发上。
-    """
-    return [(h, b) for h, b in _answers() if not _is_background_round(b)]
-
-
-# ====================================================================== #
-#  真组件装配
-# ====================================================================== #
-
-#: 与 `interaction/downstream.py` 的 `_feed` 完全一致的字段集。
-#: ⚠️ 少一个键就会让 IC 的某个档位停在默认值 —— 而症状是"决策不对"，
-#:    不是报错。照抄 `_feed` 里的写入。
-_FACE = {
-    "face_present_confidence": "HIGH", "bbox_area_ratio": 0.12,
-    "track_id": 7, "dwell_ms": 2500, "lip_speaking_confidence": "LOW",
-    "identity_id": "uid-a", "identity_confidence": "HIGH",
-    "display_name": "甲",
-}
-_ASR_FINAL = {
-    "user_speaking_confidence": "HIGH", "barge_in_confidence": "LOW",
-    "asr_confidence": "HIGH", "turn_complete_confidence": "HIGH",
-}
-
-_TALK = "你好，请介绍一下这个展厅"
-
-
-def _mk_downstream(agent_url: str, **kw):
-    """真 `InteractionDownstream`（进程内 IC + 真 AgentSink）。"""
-    from orchestrator.interaction.downstream import InteractionDownstream
-    d = InteractionDownstream(
-        "inprocess", agent_url, session_id="t-desc",
-        ic_mode="inprocess",
-        # ⚠️ 关掉 set_target：那会往捕获端口打 /v1/ic/... 之外的东西，
-        #    而且真实部署里它是进程级全局状态，测试不该碰。
-        agent_set_target=False,
-        # 不装 ExpressionSink（没有 /v1/speak），只测 AgentSink 这条链
-        ic_expression_url="",
-        ic_callback_ic="https://example.invalid:8100/v1/ic",
-        **kw)
-    return d
-
-
-def _tick(d, n: int = 10, dt: float = 0.0) -> list:
-    """连 tick 若干拍，收集下游产出的动作（= `_dispatch` 的结果）。
-
-    ⚠️ `dt` 是**两拍之间的真实等待** —— 不是可有可无的节奏控制。IC 的
-    `dt_ms` 由墙钟算（`interaction/downstream.py:_on_tick`：`now - _last_tick`），
-    所以紧循环跑出来的 `dt_ms≈0`，`advance_*`（迎宾时钟、说话保持）**一拍都
-    推不动**，policy 永远回不到 ANSWER。只看状态的测试用默认 0 即可；
-    `_answer_path` 必须给真值。
-    """
-    from orchestrator.downstream.interface import Tick
-
-    async def _run():
-        out = []
-        for _ in range(n):
-            if dt:
-                await asyncio.sleep(dt)
-            out.extend(await d.on_event(Tick(t=0)))
-        return out
-
-    return asyncio.run(_run())
-
-
-def _greet_path(d) -> list:
-    """走「先看到人（未开口）」这条路 —— IC 会判 GREET。"""
-    from orchestrator.downstream.interface import FaceState
-    d._feed(FaceState(t=0, state=dict(_FACE)))
-    return _tick(d, 10)
-
-
-#: offline 之后**下一拍**的 ASR 快照 —— `说/抢` 转 NONE，`完` 与 `transcript`
-#: 保留。为什么需要它（这是本测试最容易写错的一处）：
-#:
-#:   · `2pass-offline` 到达的那一拍带**服务端原值**：`说/抢`=HIGH，
-#:     `完=HIGH`、`transcript=离线文本`
-#:   · **下一拍** tick 调 `expire_if_idle()` ⇒ `说/抢`→NONE，而
-#:     `完/信/transcript` 保留（再下一拍才全部清空，见 `docs/asr-state.md`）
-#:   · 编排侧 tick 里 `_push_asr_state_if_changed()` 会把这个变化推给 IC
-#:
-#: ⚠️ **少了这一条，IC 到不了 ANSWER**。`AsrFinal` 自己那条 `完=HIGH` 会被
-#: IC 同拍的 `advance_*` 吃掉（实测 `turn=NONE`、只回 HOLD），必须再有一条
-#: "已经安静下来、但本轮已拍板"的快照，policy 的
-#: `fresh_turn → ANSWER`（`interaction/policy.py:473-506`）才成立。
-_ASR_SETTLED = {
-    "user_speaking_confidence": "NONE", "barge_in_confidence": "NONE",
-    "asr_confidence": "HIGH", "turn_complete_confidence": "HIGH",
-}
-
-
-def _answer_path(d, text: str = _TALK) -> list:
-    """走「见到人 + 已经开口」这条路 —— IC 判 ANSWER（跳过 GREET）。
-
-    ⚠️ ASR 必须在 tick **之前**写进去：`policy` 判 GREET 的前提是
-    "用户还没开口"（`user_has_spoken`），先 tick 就会先迎宾。
-
-    ⚠️ tick 必须带**真实间隔**（`dt=0.05`）：IC 的 `dt_ms` 取自墙钟，
-    紧循环跑出来恒为 0，`advance_*` 推不动，永远回不出 ANSWER。
-    """
-    from orchestrator.downstream.interface import (
-        AsrFinal, AsrStateUpdate, FaceState)
-    d._feed(FaceState(t=0, state=dict(_FACE)))
-    d._feed(AsrFinal(t0=0, t1=500, text=text, state=dict(_ASR_FINAL)))
-    d._feed(AsrStateUpdate(t=1, state=dict(_ASR_SETTLED, transcript=text)))
-    return _tick(d, 12, dt=0.05)
-
-
-def _flush(d) -> None:
-    """排空 sink 的投递队列（POST 在 worker 线程里，断言前必须等它发完）。
-
-    ⚠️ 顺序照 `InProcessICClient.close` 的用法：先 `flush` 再 `close` ——
-    `close` 会 join 线程，队列里没发出的东西会被停机哨兵直接丢掉。
-    """
-    sink = getattr(getattr(d.ic, "engine", None), "agent_sink", None)
-    if sink is not None:
-        try:
-            sink.flush(2.0)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# ====================================================================== #
-#  ① 触发点：GREET ⇒ Describe("full")
-# ====================================================================== #
-
-def test_greet_triggers_full(srv_url: str) -> None:
-    from orchestrator.downstream.interface import Describe
-
-    print("\n[触发] IC 判 GREET ⇒ 派 Describe('full')")
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    acts = _greet_path(d)
-    descs = [a for a in acts if isinstance(a, Describe)]
-    print(f"      IC 走过的动作：{sorted(d.counts)}")
-    check(d.counts.get("GREET", 0) >= 1,
-          f"真 IC policy 判出了 GREET（实际动作：{sorted(d.counts)}）")
-    check(len(descs) == 1 and descs[0].stage == "full",
-          f"GREET 那一拍恰好返回 1 个 Describe(full)（实际 {descs}）")
-    # 再连 tick 若干拍，不能重复触发（GREET 会连着好几拍）
-    more = _tick(d, 5)
-    check(not [a for a in more if isinstance(a, Describe)],
-          "GREET 持续期间**不重复**触发全量描述（否则每 50ms 一次全量推理）")
-    check(type(d.ic.engine.agent_sink).__name__ == "VlmAgentSink",
-          f"IC 的 sink 是包装过的子类（实际 {type(d.ic.engine.agent_sink).__name__}）")
-    d.ic.close()
-
-
-def test_greet_reentry_not_deduped() -> None:
-    """**换人后的第二次 GREET 必须再触发一次** —— 判据是「切入 GREET」而不是
-    既有的 `fresh`。
-
-    `_last_action_key` 只在非 QUIET 动作时更新，IC 迎宾后会长久停在
-    LISTEN/WAIT/HOLD，于是第二次 GREET 的 `(atype, sop, transcript)` 与
-    上一次**完全相同** ⇒ 用 `fresh` 会漏掉重迎宾。这里直接喂两个相同的
-    GREET 动作，中间夹若干 QUIET 拍。
-    """
-    from orchestrator.downstream.interface import Describe
-
-    print("\n[触发] 换人后再次 GREET 仍要触发（不能用 fresh 判据）")
-    d = _mk_downstream("http://127.0.0.1:1", omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    greet = SimpleNamespace(type=SimpleNamespace(value="GREET"), sop="15",
-                            text="您好", transcript=None)
-    quiet = SimpleNamespace(type=SimpleNamespace(value="HOLD"), sop=None,
-                            text=None, transcript=None)
-
-    first = [a for a in d._dispatch(greet) if isinstance(a, Describe)]
-    for _ in range(5):                       # 迎宾后的稳态
-        d._dispatch(quiet)
-    second = [a for a in d._dispatch(greet) if isinstance(a, Describe)]
-    check(len(first) == 1, f"首次 GREET 触发全量（实际 {len(first)}）")
-    check(len(second) == 1,
-          f"中间夹了 5 拍 HOLD 之后的又一次 GREET 仍触发（实际 {len(second)}）"
-          " —— 若为 0 说明判据退化成了 fresh")
-    # 同一拍连着来（GREET 连着好几拍）只算一次
-    again = [a for a in d._dispatch(greet) if isinstance(a, Describe)]
-    check(not again, "紧接着的重复 GREET 不重复触发")
-    d.ic.close()
-
-
-# ====================================================================== #
-#  ② 载荷：on_action(act=ANSWER) 带 content{ASR,VLM}，transcript 原样保留
-# ====================================================================== #
-
-DESC_FULL = "画面里有一位青年男性，穿深蓝色外套、戴黑框眼镜，站在白色展示桌左侧，正看向镜头。"
-
-#: 8 键契约下的**标准全量描述**（顺序与 `STATE_KEYS` 一致 —— `render_state`
-#: 必须逐字还原它，这是"合并成快照"最容易错的地方）。
 _STATE_FULL = """ATTENTION: 面向屏幕，注视镜头
 ACTION: 无
 EMOTION: 平静
@@ -353,481 +30,106 @@ ENV: 室内展厅，光线明亮
 POSITION: 站在展台右侧"""
 
 
-def test_payload_dual(srv_url: str) -> None:
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[载荷] on_action(act=ANSWER) 带 content{ASR,VLM}，transcript 仍是字符串")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    # 描述先到（`response.done` → main.py 分流 → `_feed`）
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    _answer_path(d)
-    _flush(d)
-    ans = _talk_rounds()
-    check(len(ans) == 1, f"恰好 1 个**真实话轮**（实际 {len(ans)}；"
-                         f"另有 {len(_bg_rounds())} 个背景轮 —— 那条走 "
-                         f"`test_visual_background_round` 单独验）")
-    if not ans:
-        d.ic.close()
-        return
-    _hit, body = ans[0]
-    check(isinstance(body.get("transcript"), str),
-          f"transcript 仍是**字符串**（dual = 过渡期双发）"
-          f"，实际 {type(body.get('transcript')).__name__}")
-    check(body.get("transcript") == _TALK,
-          f"transcript 内容不变：{body.get('transcript')!r}")
-    check(body.get("content", {}).get("ASR") == _TALK,
-          "content.ASR == transcript（两个字段说的是同一件事）")
-    check(body.get("content", {}).get("VLM") == "",
-          "正常话轮**只带 ASR**，content.VLM 为空（VLM 与 ASR 不同步，"
-          "视觉状态走单独的视觉轮；实际 "
-          f"{body.get('content', {}).get('VLM')!r}）")
-    check(body.get("session_id") == "t-desc" and body.get("callback_ic"),
-          "会话信封（session_id / callback_ic）仍在 —— 没被覆写挤掉")
-    check(body.get("identity_id") == "uid-a"
-          and body.get("display_name") == "甲",
-          "身份字段仍来自 IC state（没有自己重拼 payload）")
+@pytest.fixture
+def downstream(monkeypatch):
+    monkeypatch.setenv("ORCH_IC_DECISION_PROBE", "0")
+    d = InteractionDownstream("inprocess", "127.0.0.1:1", session_id="description",
+                              omni_describe=True)
+    assert d.ic.connect(), d.ic.error
+    yield d
+    d.agent.close()
     d.ic.close()
 
 
-def test_no_truncation(srv_url: str) -> None:
-    """**不做本地截断**：多长的描述都原样进 payload。
-
-    早先的方案是"截断到 50 字"。用户否了 —— 要的是**快**（`AsrFinal` 一到
-    就有得发），短只是手段。本地砍字会把信息丢掉却不改变生成耗时
-    （耗时在生成那一刻就已经花掉了）。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[截断] 长描述**原样**进 payload（本地不砍字）")
-    HITS.clear()
-    long_desc = DESC_FULL * 6           # ≈300 字
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="turn", text=long_desc))
-    _flush(d)
-    bgs = _bg_rounds()
-    if not bgs:
-        check(False, "没抓到 on_action(act=ANSWER)")
-        d.ic.close()
-        return
-    got = bgs[0][1].get("content", {}).get("VLM", "")
-    check(got == long_desc and len(got) == len(long_desc),
-          f"{len(long_desc)} 字原样推送（实际 {len(got)} 字）")
-    d.ic.close()
+def wire_actions(d):
+    async def drain():
+        d._drain_events()
+        await asyncio.sleep(0)
+    asyncio.run(drain())
+    actions = []
+    while True:
+        try:
+            item = d.agent._queue.get_nowait()
+        except queue.Empty:
+            return actions
+        if item is not None:
+            actions.append(item)
+        d.agent._queue.task_done()
 
 
-def test_no_change_keeps_previous(srv_url: str) -> None:
-    """空 / 「无变化」**不覆盖**缓存 —— 缓存里始终留着一份非空描述。
-
-    否则断句时发出去的是空串，等于白丢了一路的描述。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[覆盖] 空 / 「无变化」不清掉已有的描述")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    d._feed(OmniDescription(t=1, stage="turn", text="无变化"))
-    d._feed(OmniDescription(t=2, stage="turn", text="   "))
-    check(d._vlm == DESC_FULL, "「无变化」/空 之后缓存仍是那份有效描述")
-    # 但**真变化**的描述（含"无变化"字样）不能被误丢
-    mixed = "人物无变化，但桌上多了一个红色的杯子。"
-    d._feed(OmniDescription(t=3, stage="turn", text=mixed))
-    check(d._vlm == mixed,
-          "「人物无变化，但…」这种**有信息**的描述要收下（判据是整句相等，不是 in）")
-    _flush(d)
-    bgs = _bg_rounds()
-    check(bgs and bgs[-1][1].get("content", {}).get("VLM") == mixed,
-          "推给 Agent 的是最新那份（视觉轮，ASR 空）")
-    d.ic.close()
+def test_greet_entry_and_reentry_trigger_full_description(downstream):
+    d = downstream
+    greet = SimpleNamespace(type=SimpleNamespace(value="GREET"), sop="15",
+                            text="您好", transcript=None)
+    quiet = SimpleNamespace(type=SimpleNamespace(value="HOLD"), sop=None,
+                            text=None, transcript=None)
+    assert [act.stage for act in d._dispatch(greet) if isinstance(act, Describe)] == ["full"]
+    assert not [act for act in d._dispatch(greet) if isinstance(act, Describe)]
+    d._dispatch(quiet)
+    assert [act.stage for act in d._dispatch(greet) if isinstance(act, Describe)] == ["full"]
 
 
-# ====================================================================== #
-#  ②′ 视觉背景轮：全量描述额外投一发 ASR 为空的 on_answer 类事件（act=ANSWER）
-# ====================================================================== #
-
-def test_visual_background_round(srv_url: str) -> None:
-    """全量描述 ⇒ 额外投一发「ASR 为空的背景轮」，Agent 走 `handle_visual_background`。
-
-    没有这一发，Agent 收到的 `scene.visual_change` 就在**引用一个它从没收到过
-    的背景**（全量只活在编排侧缓存里、随即被增量覆盖），`scene.visual_background`
-    恒空。IC 结构上产生不了这一轮（它的 `on_answer` 只在 ANSWER 时发、
-    `transcript` 必非空），所以由编排侧合成。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[背景轮] 全量描述 ⇒ 多一发 on_answer（ASR 空，只存不答）")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    _flush(d)
-    bgs = _bg_rounds()
-    check(len(bgs) == 1, f"恰好 1 个视觉轮（实际 {len(bgs)}）")
-    if bgs:
-        body = bgs[0][1]
-        check(body.get("content", {}).get("VLM") == DESC_FULL,
-              f"content.VLM 就是那份全量描述（{len(DESC_FULL)} 字，不做截断）")
-        check(body.get("content", {}).get("ASR") == ""
-              and body.get("transcript") == "",
-              "ASR 与 transcript **都空** —— Agent 据此判「会话起点背景」")
-        check(isinstance(body.get("content"), dict),
-              "content 是 dict（Agent 的分流判据；是字符串就会被当普通话轮）")
-        check(body.get("session_id") == "t-desc" and body.get("callback_ic"),
-              "会话信封在场 —— 否则 Agent 路由不到本会话的桥接")
-        check(body.get("identity_id") is None
-              and body.get("display_name") is None,
-              "身份字段为空（背景轮不是「某个人说的」）")
-    d.ic.close()
+def test_description_callback_maps_to_vision_then_answer_without_changing_transcript(downstream):
+    d = downstream
+    d._feed(OmniDescription(t=0, stage="full", text=_STATE_FULL))
+    d.ic.engine.agent_sink.on_answer(identity_id="uid-甲", display_name="甲",
+                                     transcript="介绍一下展厅", language="zh",
+                                     affect={"label": "happy", "confidence": 0.9})
+    visual, answer = wire_actions(d)
+    assert visual.act == pb.AgentAction.ANSWER and visual.transcript == ""
+    assert visual.vlm == _STATE_FULL
+    assert answer.act == pb.AgentAction.ANSWER
+    assert answer.transcript == "介绍一下展厅" and answer.vlm == ""
+    assert answer.identity_id == "uid-甲" and answer.display_name == "甲"
+    assert answer.language == "zh"
+    assert answer.affect.label == "happy" and answer.affect.confidence == pytest.approx(0.9)
+    assert answer.session_id == "description" and answer.epoch > visual.epoch
 
 
-def test_turn_pushes_visual_round(srv_url: str) -> None:
-    """每轮描述**也**单独推一发视觉轮（ASR 空），正常话轮只带 ASR。
-
-    VLM 与 ASR 不同步（2026-10-28）：描述一生成完就推，不等下一次
-    `on_answer` 捎带 —— 断句触发的描述本来就晚于本句，缓存只会让 Agent
-    永远看到"上一句那时候"的画面。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[背景轮] 每轮描述也单独推一发（ASR 空），正常话轮 VLM 为空")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    turn = "EMOTION: 不耐烦\nBEHAVIOR: 站立 6 秒"
-    d._feed(OmniDescription(t=0, stage="turn", text=turn))
-    _flush(d)
-    bgs = _bg_rounds()
-    check(len(bgs) == 1, f"每轮描述 ⇒ 1 个视觉轮（实际 {len(bgs)}）")
-    if bgs:
-        check("EMOTION: 不耐烦" in (bgs[0][1].get("content", {}).get("VLM") or ""),
-              "推出去的就是这份描述")
-        check(bgs[0][1].get("content", {}).get("ASR") == ""
-              and bgs[0][1].get("transcript") == "",
-              "ASR 与 transcript 都空（Agent 据此走「只存不答」）")
-    _answer_path(d)
-    _flush(d)
-    ans = _talk_rounds()
-    check(len(ans) == 1, f"真实话轮 1 个（实际 {len(ans)}）")
-    if ans:
-        check(ans[0][1].get("content", {}).get("VLM") == "",
-              "正常话轮不带 VLM（视觉状态已经单独推过了）")
-        check(ans[0][1].get("content", {}).get("ASR") == _TALK,
-              "ASR 照常送达")
-    d.ic.close()
+def test_state_merge_publishes_one_complete_snapshot_per_description(downstream):
+    d = downstream
+    d._feed(OmniDescription(t=0, stage="full", text=_STATE_FULL))
+    first = wire_actions(d)
+    assert len(first) == 1
+    d._feed(OmniDescription(t=1, stage="turn", text="EMOTION: 不耐烦\nACTION: 摇头（3 次）"))
+    second = wire_actions(d)
+    assert len(second) == 1
+    assert "EMOTION: 不耐烦" in second[0].vlm
+    assert "ACTION: 摇头（3 次）" in second[0].vlm
+    assert "FEATURE: 青年女性，灰色短袖上衣" in second[0].vlm
+    assert second[0].vlm.count("\n") == 7
+    d._feed(OmniDescription(t=2, stage="turn", text="无变化"))
+    d._feed(OmniDescription(t=3, stage="turn", text=""))
+    assert wire_actions(d) == []
+    assert d._vlm_state["EMOTION"] == "不耐烦"
 
 
-def test_visual_push_every_description(srv_url: str) -> None:
-    """**每份**描述都推（没有"只发第一份"的闩）；换会话照推。
-
-    旧方案的闩是为「每轮只报变化 + 换短人设重连」设的（第二份 full 只有
-    几十字，覆盖 476 字的起点背景是净损失）。现在每份都是 8 键全量快照、
-    语义就是"此刻的完整状态" ⇒ 越新越准，留闩反而让 Agent 停在起点那份。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[背景轮] 每份描述都推（无闩）；换会话照推")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    _flush(d)
-    check(len(_bg_rounds()) == 1, "第一份 ⇒ 1 个视觉轮")
-
-    d._feed(OmniDescription(t=1, stage="full", text="画面里换了一位访客。"))
-    _flush(d)
-    bgs = _bg_rounds()
-    check(len(bgs) == 2, f"第二份 **也**推（实际共 {len(bgs)} 个）")
-    check(bgs and (bgs[-1][1].get("content", {}).get("VLM") or "").find("换了一位访客") >= 0,
-          "Agent 手上换成了**最新**那份（背景 = 当前视觉状态）")
-
-    # 新会话：清场标记复位，之后照推
-    asyncio.run(d.on_session_start(None))
-    check(d._bg_fail_logged is False, "on_session_start 复位告警去重标记")
-    HITS.clear()
-    d._feed(OmniDescription(t=2, stage="full", text=DESC_FULL))
-    _flush(d)
-    check(len(_bg_rounds()) == 1, "新会话的第一份照样推出去")
-    d.ic.close()
+def test_unstructured_description_is_preserved_for_agent(downstream):
+    d = downstream
+    description = "画面里一位青年男性穿深蓝色外套，站在展示桌左侧。" * 80
+    d._feed(OmniDescription(t=0, stage="full", text=description))
+    messages = wire_actions(d)
+    assert len(messages) == 1
+    assert messages[0].transcript == "" and messages[0].vlm == description
+    assert d._vlm_state == {}
 
 
-def test_background_not_sent_in_legacy(srv_url: str) -> None:
-    """`transcript=legacy` ⇒ sink 根本没被包装 ⇒ 不发背景轮、也不改 payload。
-
-    这条同时验**鸭子判定**：裸 `AgentSink` 上没有 `emit_visual_background`，
-    不能用 `isinstance` 去认（那个子类定义在函数体内、没有模块级名字）。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[背景轮] legacy 载荷下不发（sink 未被包装）")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="legacy")
-    if not check_ic(d):
-        return
-    check(type(d.ic.engine.agent_sink).__name__ == "AgentSink",
-          "legacy 下 sink 是裸 AgentSink")
-    check(d.ic.send_visual_background() is False,
-          "裸 sink ⇒ send_visual_background 返回假（鸭子判定，不抛）")
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    _flush(d)
-    check(_answers() == [], "一条都没发 —— 视觉轮不该在 legacy 下冒出来")
-    check(d._bg_fail_logged is True,
-          "交不出去 ⇒ 只告警一次（每题描述都重试，但日志不刷屏）")
-    d.ic.close()
+def test_description_delivery_does_not_wait_for_asr(downstream):
+    d = downstream
+    d._feed(OmniDescription(t=0, stage="full", text=_STATE_FULL))
+    visual = wire_actions(d)
+    assert len(visual) == 1 and visual[0].transcript == ""
+    d._feed(AsrFinal(t0=0, t1=100, text="你好"))
+    assert wire_actions(d) == []  # ASR state write does not duplicate the vision notice.
 
 
-# ====================================================================== #
-#  ③ 时序：主指标
-# ====================================================================== #
+def test_missing_description_does_not_delay_agent_action(downstream):
+    d = downstream
+    d.ic.engine.agent_sink.on_answer(identity_id=None, display_name=None, transcript="你好")
+    messages = wire_actions(d)
+    assert len(messages) == 1
+    assert messages[0].transcript == "你好" and messages[0].vlm == ""
 
-def test_ready_before_asr_final(srv_url: str) -> None:
-    """(a) 描述**早于** `AsrFinal` ⇒ 它已经单独推过了，ASR 轮不再等。"""
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[时序] 描述早于断句 ⇒ 已单独推送；ASR 轮不生成、不等待")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="full", text=DESC_FULL))
-    _flush(d)
-    bgs = _bg_rounds()
-    check(len(bgs) == 1
-          and bgs[0][1].get("content", {}).get("VLM") == DESC_FULL,
-          "描述一到就推给了 Agent（不等 ASR）")
-    HITS.clear()
-    t_feed = time.monotonic()
-    _answer_path(d)
-    _flush(d)
-    ans = _talk_rounds()
-    check(d._vlm_miss == 0, f"没有 miss（实际 {d._vlm_miss}）")
-    if not ans:
-        check(False, "没抓到 on_action(act=ANSWER)")
-        d.ic.close()
-        return
-    hit, body = ans[0]
-    check(body.get("content", {}).get("VLM") == "",
-          "ASR 轮只带 ASR（视觉状态已经单独推过）")
-    check(hit["mono"] - t_feed < 0.5,
-          "断句 → Agent 收到 POST 用时 "
-          f"{(hit['mono'] - t_feed) * 1000:.0f}ms（< 500ms）")
-    d.ic.close()
-
-
-def test_missing_description_never_waits(srv_url: str) -> None:
-    """(b) 描述**晚于** `AsrFinal` ⇒ VLM 为空、`vlm_miss`+1，**但绝不等待**。
-
-    这是"发送的那一刻不生成"的**反证**：如果这里为了等描述而变慢，
-    说明我们把生成耗时加到了 ASR→Agent 这条链路上 —— 正是硬指标要禁的。
-    """
-    print("\n[时序] 描述未就绪 ⇒ VLM 空 + vlm_miss，**不等待**")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    t_feed = time.monotonic()
-    _answer_path(d)
-    _flush(d)
-    ans = _talk_rounds()
-    check(d._vlm_miss == 1, f"记了 1 次 miss（实际 {d._vlm_miss}）")
-    if not ans:
-        check(False, "没抓到 on_action(act=ANSWER)")
-        d.ic.close()
-        return
-    hit, body = ans[0]
-    check(body.get("content", {}).get("VLM") == "",
-          "VLM 是空串（不是上一轮的、也不是半句话）")
-    check(body.get("content", {}).get("ASR") == _TALK, "ASR 照常送达")
-    check(hit["mono"] - t_feed < 0.5,
-          f"仍按时送达：{(hit['mono'] - t_feed) * 1000:.0f}ms"
-          " —— 没有为等描述而阻塞")
-    d.ic.close()
-
-
-# ====================================================================== #
-#  ④ 回归：默认态保持基线形态（旧五键 + act，omni 侧不加料）
-# ====================================================================== #
-
-#: 默认态（legacy）话轮事件的键集 = 旧五键 + IC 统一入口注入的 `act`。
-LEGACY_KEYS = {"session_id", "callback_ic", "identity_id", "display_name",
-               "transcript", "act"}
-
-
-def test_default_keeps_legacy_shape(srv_url: str) -> None:
-    """**什么都不设（默认态）⇒ payload 保持基线形态（旧五键 + `act`）。**
-
-    这条同时是「没碰 106」的保证：编排代码 105/106 共用，默认值就是 106
-    下次重启后的行为。`ORCH_AGENT_TRANSCRIPT_MODE` 默认 `legacy`、
-    `ORCH_OMNI_DESCRIBE` 默认 0 —— 见 config.py 里那两个开关的说明。
-    """
-    print("\n[回归] 默认态（legacy）payload = 旧五键 + act（omni 侧不加料）")
-    HITS.clear()
-    d = _mk_downstream(srv_url)                     # 全部默认
-    if not check_ic(d):
-        return
-    check(type(d.ic.engine.agent_sink).__name__ == "AgentSink",
-          f"没包装 sink（实际 {type(d.ic.engine.agent_sink).__name__}）"
-          " —— legacy 下连子类都不该存在")
-    _answer_path(d)
-    _flush(d)
-    ans = _answers()
-    if not ans:
-        check(False, "没抓到 on_action(act=ANSWER)")
-        d.ic.close()
-        return
-    body = ans[0][1]
-    check(set(body) == LEGACY_KEYS,
-          f"键集恰好是旧五键 + act（实际 {sorted(body)}）—— 一个键都不多")
-    check("content" not in body, "没有 content 键")
-    d.ic.close()
-
-
-def test_legacy_mode_with_describe_on(srv_url: str) -> None:
-    """`omni_describe=1` 但 transcript 模式仍是 legacy ⇒ **也不改 payload**。
-
-    两个开关是**与**关系：描述算出来了也可以不发（Agent 还没改好时
-    正是这个状态 —— 先看日志里的 VLM 是否可用，再决定切不切载荷）。
-    """
-    print("\n[回归] 描述开着 + transcript=legacy ⇒ 仍不改 payload")
-    HITS.clear()
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="legacy")
-    if not check_ic(d):
-        return
-    check(type(d.ic.engine.agent_sink).__name__ == "AgentSink",
-          "legacy 下 sink 不被包装")
-    _answer_path(d)
-    _flush(d)
-    ans = _answers()
-    check(ans and set(ans[0][1]) == LEGACY_KEYS,
-          f"键集仍是旧五键 + act（实际 {sorted(ans[0][1]) if ans else '无'}）")
-    d.ic.close()
-
-
-def test_illegal_mode_falls_back_to_legacy(srv_url: str) -> None:
-    """非法模式名**归一为 legacy**（安全侧）+ 告警，别静默变成"开了"。"""
-    from orchestrator.interaction.agent_sink import normalize_mode
-    print("\n[回归] 非法 transcript 模式 → 归一为 legacy（安全侧）")
-    # ⚠️ 这里只能放**真的不合法**的值。`"Dict"` 看着像错的，其实用例规整后
-    #    是合法值 `dict`（大小写不敏感 + 去空白），拿它当非法用例是在
-    #    把正确行为判成失败。
-    check(normalize_mode("duall") == "legacy", "拼错 → legacy")
-    check(normalize_mode("") == "legacy", "空 → legacy")
-    check(normalize_mode(None) == "legacy", "None → legacy")
-    check(normalize_mode("dual") == "dual", "合法值原样")
-    check(normalize_mode(" DICT ") == "dict", "合法值去空白+小写")
-    check(normalize_mode("Dict") == "dict",
-          "`Dict` 是合法值（大小写不敏感）—— 别误判成非法")
-
-
-# ====================================================================== #
-#  ⑤ 契约漂移：覆写点必须真的在投递路径上
-# ====================================================================== #
-
-def test_contract_drift(srv_url: str) -> None:
-    """真 `AgentSink` / `VlmAgentSink` 各打一次，看**键集与投递次数**。
-
-    ⚠️ 这是本方案唯一的结构性风险：`_send` 是 IC 的**私有**方法，被改名或
-    改签名后覆写会**静默失效**（基类的 `on_answer` 照常工作，只是不带
-    `content`）—— 正是本仓库反复踩的那类"改了、没生效、不报错"。
-    这个测试锁住两件事：
-      ① `_send` 仍在投递路径上（不在了 ⇒ 下面的 content 断言会失败）
-      ② `legacy` 下投递行为不变（恰好 1 次 POST、键集 = 旧三件套 + `act`）
-    """
-    from orchestrator.interaction.agent_sink import make_vlm_agent_sink
-
-    print("\n[契约] 覆写点 `_send` 是否在投递路径上")
-    HITS.clear()
-    kwargs = dict(timeout=5.0, session_id="drift", callback_ic=None,
-                  session_envelope=False)
-
-    def _send_one(sink):
-        sink.on_answer(identity_id="u", display_name="n", transcript="转写")
-        sink.flush(2.0)
-        sink.close(2.0)
-
-    from interaction.runtime import AgentSink
-    _send_one(AgentSink(srv_url, **kwargs))
-    legacy = _answers()
-    check(len(legacy) == 1, f"恰好 1 次 POST（实际 {len(legacy)}）")
-    check(legacy and set(legacy[0][1]) == {"act", "identity_id", "display_name",
-                                           "transcript"},
-          f"envelope 关闭时键集 = 旧三件套 + act（实际 "
-          f"{sorted(legacy[0][1]) if legacy else '无'}）")
-
-    HITS.clear()
-    sink = make_vlm_agent_sink(target=srv_url, vlm_getter=lambda: "描述文本",
-                               mode="dual", **kwargs)
-    _send_one(sink)
-    wrapped = _answers()
-    check(len(wrapped) == 1,
-          f"包装后仍恰好 1 次 POST（实际 {len(wrapped)}）—— 没多发也没漏发")
-    if wrapped:
-        body = wrapped[0][1]
-        check(body.get("content") == {"ASR": "转写", "VLM": ""},
-              f"content 注进去了，且**正常话轮 VLM 为空**"
-              f"（实际 {body.get('content')!r}）—— 缺 content 说明 `_send` "
-              "已不在投递路径上（IC 改版了？）；VLM 非空说明同步发送的老行为"
-              "又回来了")
-        check(body.get("transcript") == "转写",
-              "transcript 未被改动（dual 是**追加**一个键）")
-
-    # ---- 视觉背景轮：与真实轮共用同一根 sink，两发都要在、按序、互不串味 ----
-    #
-    # `vlm_getter` 用**可变**缓存：这样能同时证明「背景轮取的是**调用那一刻**
-    # 的缓存」—— 那是 `emit_visual_background` 不收文本参数的前提条件。
-    HITS.clear()
-    cache = {"v": "描述文本"}
-    sink = make_vlm_agent_sink(target=srv_url, vlm_getter=lambda: cache["v"],
-                               mode="dual", **kwargs)
-    sink.emit_visual_background()
-    cache["v"] = "后来的描述"
-    sink.on_answer(identity_id="u", display_name="n", transcript="转写")
-    sink.flush(2.0)
-    sink.close(2.0)
-    both = _answers()
-    check(len(both) == 2, f"背景轮 + 真实轮 = 2 次 POST（实际 {len(both)}）")
-    if len(both) == 2:
-        check(both[0][1].get("content") == {"ASR": "", "VLM": "描述文本"}
-              and both[0][1].get("transcript") == "",
-              f"#1 是背景轮（ASR / transcript 都空，VLM = 投递那一刻的缓存）"
-              f"，实际 {both[0][1]!r} —— 少 content 说明 `_send` 不在投递路径上")
-        check(both[1][1].get("content") == {"ASR": "转写", "VLM": ""},
-              f"#2 是真实轮：**只带 ASR**，VLM 留空（视觉状态走单独那一路）"
-              f"（实际 {both[1][1].get('content')!r}）")
-
-    # ---- dict 模式：背景轮必被 Agent 的 `transcript: str` 挡掉 ⇒ 明确拒绝 ----
-    HITS.clear()
-    d_sink = make_vlm_agent_sink(target=srv_url, vlm_getter=lambda: "描述文本",
-                                 mode="dict", **kwargs)
-    check(d_sink.emit_visual_background() is False,
-          "dict 模式拒绝发背景轮（返回假，而不是发一条会被 422 的）")
-    d_sink.flush(2.0)
-    d_sink.close(2.0)
-    check(_answers() == [], "dict 模式下**一条都没发出去**")
-
-
-# ====================================================================== #
-#  ⑥ session 侧：两阶段指令 + 滚动刷新（不重叠、可自愈）
-# ====================================================================== #
 
 class FakeOmni:
     """假 OmniLLM：只记下收到的指令，不发网络。"""
@@ -1175,69 +477,6 @@ def test_state_contract_prompts() -> None:
     check(render_state({}) == "", "空快照渲染为空串")
 
 
-def test_state_merge_snapshot(srv_url: str) -> None:
-    """每轮描述 ⇒ 编排侧合并成**完整快照**再送 Agent。
-
-    `content.VLM` 必须是 8 键的完整快照。每轮也是全量，所以正常情况下
-    `update` 与 `replace` 等价；这里用**只给 2 个键**的输入验的是兜底：
-    某一行被截断/没答时，缺的键保旧值而不是丢掉。同时验三条安全阀：
-
-    * 解析失败 ⇒ 退回原文（一个字节都不丢）；
-    * 「无变化」⇒ 快照一字不变；
-    * 换会话 ⇒ 快照复位（否则新人会继承上一个人的 FEATURE）。
-    """
-    from orchestrator.downstream.interface import OmniDescription
-
-    print("\n[合并] 每轮 ⇒ 完整快照；解析失败回退原文；换会话复位")
-    d = _mk_downstream(srv_url, omni_describe=True,
-                       agent_transcript_mode="dual")
-    if not check_ic(d):
-        return
-    d._feed(OmniDescription(t=0, stage="full", text=_STATE_FULL))
-    check(d._vlm_state.get("ATTENTION") == "面向屏幕，注视镜头"
-          and len(d._vlm_state) == 8, "全量写满 8 键")
-    check(d._vlm == _STATE_FULL.strip(), "渲染结果与全量原文逐字一致（顺序未乱）")
-
-    d._feed(OmniDescription(t=1, stage="turn",
-                            text="EMOTION: 不耐烦\nACTION: 摇头（3 次）"))
-    check(d._vlm_state.get("EMOTION") == "不耐烦"
-          and d._vlm_state.get("ACTION") == "摇头（3 次）",
-          "增量覆盖出现过的键")
-    check(d._vlm_state.get("FEATURE") == "青年女性，灰色短袖上衣"
-          and d._vlm_state.get("ENV") == "室内展厅，光线明亮",
-          "没出现的键保留旧值（这就是「合并成快照」的全部含义）")
-    check(d._vlm.count("\n") == 7, f"快照仍是 8 行（实际 {d._vlm.count(chr(10)) + 1} 行）")
-    check("ACTION: 摇头（3 次）" in d._vlm and "EMOTION: 不耐烦" in d._vlm,
-          "快照里是新值")
-
-    d._feed(OmniDescription(t=2, stage="turn", text="无变化"))
-    check(d._vlm_state.get("EMOTION") == "不耐烦"
-          and "ACTION: 摇头（3 次）" in d._vlm,
-          "「无变化」不动快照")
-
-    d._feed(OmniDescription(t=3, stage="turn", text="画面上还是刚才那个人。"))
-    check(d._vlm == "画面上还是刚才那个人。",
-          "解析失败 ⇒ content.VLM 就是原文（不丢数据）")
-    check(d._vlm_state == {}, "同时清掉快照 —— 免得下一条增量合并到过时底座上")
-
-    # 跨会话复位：换人后 FEATURE 不能还是上一个人的
-    d._feed(OmniDescription(t=4, stage="full", text=_STATE_FULL))
-    asyncio.run(d.on_session_start(None))
-    check(d._vlm_state == {} and d._vlm == "",
-          "on_session_start 清空快照与缓存")
-
-    # 送出去的是快照 —— 走**视觉轮**（ASR 空），不是正常话轮
-    d._feed(OmniDescription(t=5, stage="full", text=_STATE_FULL))
-    d._feed(OmniDescription(t=6, stage="turn", text="BEHAVIOR: 持续远离 6 秒"))
-    _flush(d)
-    bgs = _bg_rounds()
-    vlm = bgs[-1][1].get("content", {}).get("VLM") if bgs else ""
-    check(bool(vlm) and "BEHAVIOR: 持续远离 6 秒" in vlm and vlm.count("\n") == 7,
-          f"推给 Agent 的是 8 行完整快照（实际 {len(vlm)} 字）")
-    check(len(bgs) >= 2, f"两份描述 ⇒ 两个视觉轮（实际 {len(bgs)}）")
-    d.ic.close()
-
-
 class _FakeSCC:
     """假 `StreamingChatClient` —— 只模拟「握手窗口」这一段时序。
 
@@ -1382,59 +621,6 @@ def test_desc_loop_rate_limits_failures() -> None:
     check(n_calls == 0, "触发根本没送出去（FakeOmni 已断）")
 
 
-def check_ic(d) -> bool:
-
-
-    """连进程内 IC；连不上（没装 interaction 包）就明确报失败。"""
-    if d.ic.connect():
-        return True
-    check(False, f"进程内 IC 不可用：{d.ic.error} —— 本测试需要 interactioncore")
-    return False
-
-
-def main() -> int:
-    from orchestrator.interaction.agent_sink import MODES
-
-    print("=" * 68)
-    print("VLM 描述（两阶段）随 ASR 发给 Agent —— 离线端到端验证")
-    print("-" * 68)
-    srv, url = _start_capture()
-    try:
-        check(MODES == ("legacy", "dual", "dict"),
-              f"三种载荷模式（当前 {MODES}）—— 契约变更测试会跟着失败")
-        test_greet_triggers_full(url)
-        test_greet_reentry_not_deduped()
-        test_payload_dual(url)
-        test_no_truncation(url)
-        test_no_change_keeps_previous(url)
-        test_visual_background_round(url)
-        test_turn_pushes_visual_round(url)
-        test_visual_push_every_description(url)
-        test_background_not_sent_in_legacy(url)
-        test_ready_before_asr_final(url)
-        test_missing_description_never_waits(url)
-        test_default_keeps_legacy_shape(url)
-        test_legacy_mode_with_describe_on(url)
-        test_illegal_mode_falls_back_to_legacy(url)
-        test_contract_drift(url)
-        test_state_contract_prompts()
-        test_state_merge_snapshot(url)
-        test_two_stage_prompts_and_loop()
-        test_answer_path_starts_desc_without_greet()
-        test_vad_boundary_trigger()
-        test_connect_publishes_client_last()
-        test_desc_loop_rate_limits_failures()
-    finally:
-        srv.shutdown()
-    print("=" * 68)
-    if _failures:
-        print(f"FAILED: {len(_failures)} 项")
-        for f in _failures:
-            print("  -", f)
-        return 1
-    print("通过")
-    return 0
-
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(pytest.main([__file__]))
