@@ -1,10 +1,10 @@
 # Omni-LLM-Server 镜像构建 CI
 #
-# 构建两个镜像（depend_on SVN 下载模型到 checkpoints/，随 `COPY . .` 打进镜像）：
+# 构建两个镜像（SVN 下载模型到 checkpoints/，由 build-image.sh 打包进镜像）：
 #   - omnillm-cpp-backend : worker+后端 镜像（C++ llama 服务 + worker.py + VAD/TurnSense）
 #   - omnillm-gateway     : gateway 镜像（网页入口 :8006，不加载模型）
 # 模型仓库：svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM
-#   - latest 分支（默认）：qwen3omni-gguf/ fsmn-vad-onnx/ TurnSense/
+#   - latest 分支（默认）：checkpoints/{qwen3omni-gguf,fsmn-vad-onnx,TurnSense}/
 # 分支映射（同 Fun-ASR-deploy）：master/pre 各对应 SVN 子目录，其他分支用 latest。
 
 variables:
@@ -56,11 +56,11 @@ build_image:
       fi
     - echo "Exporting checkpoints from SVN..."
     - rm -rf ./checkpoints
-    - svn export "$SVN_LOCAL_PATH" ./checkpoints
+    - svn export "$SVN_LOCAL_PATH/checkpoints" ./checkpoints
     - ls -la ./checkpoints/
     - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
-    # worker+backend 镜像：git clone llama.cpp-omni + 模型打包进镜像（默认打包）
-    - docker/build-image.sh
+    # worker+backend 镜像：使用构建机的 llama.cpp-omni 源码并打包模型
+    - bash docker/build-image.sh
     # gateway 镜像（纯转发，无模型）
     - docker compose -f docker-compose.cpp.yml build gateway
     - |
