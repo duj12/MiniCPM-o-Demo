@@ -11,7 +11,7 @@
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS cpp-build
+FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS cpp-build
 
 ARG LLAMA_OMNI_REPO=https://github.com/duj12/llama.cpp-omni.git
 ARG LLAMA_OMNI_REFSPEC=dev
