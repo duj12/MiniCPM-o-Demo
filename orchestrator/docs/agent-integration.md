@@ -97,8 +97,11 @@ FEEDBACK 和 ANSWER 是两类文本，不能把 FEEDBACK 当成正文重复返�
 ```bash
 git submodule update --init --recursive
 python -m pip install -r orchestrator/requirements.txt
-ORCH_AGENT_GRPC=127.0.0.1:50051 python -m orchestrator.main
 ```
+
+本地完整启动命令见 [Orchestrator README](../README.md#开发调试直接起)。
+直接启动会读取仓库根目录 `.env`；需同时配置 Agent、Omni 描述与人脸服务，
+终端环境变量高于 `.env`。
 
 生产配置保留在 `orchestrator/run_orch_105.sh` / `run_orch_106.sh`：
 105 默认连接 `192.168.89.103:50051`，106 默认连接 `192.168.89.102:50051`。

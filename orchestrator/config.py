@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
 
 # ---------------- 外部服务默认地址（阶段 0 实测确认） ---------------- #
 
@@ -271,6 +274,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        # Load the repository config regardless of cwd; shell/script values win.
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
         s = cls()
         if os.environ.get("ORCH_DOWNSTREAM_MODE"):
             s.downstream_mode = os.environ["ORCH_DOWNSTREAM_MODE"]

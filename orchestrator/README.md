@@ -17,8 +17,9 @@
 ```bash
 git submodule update --init --recursive
 python -m pip install -r orchestrator/requirements.txt
-ORCH_AGENT_GRPC=127.0.0.1:50051 python -m orchestrator.main
 ```
+
+安装完成后，按下文[开发/调试启动命令](#开发调试直接起)配置并启动本地完整链路。
 
 部署脚本按自身位置定位仓库和 submodule，用 `ORCH_PY` 选择已配置的解释器。
 不再启动独立 IC 服务，`ORCH_IC_MODE=grpc`、`ic.grpc`、Agent 的 HTTP on_*、
@@ -139,10 +140,60 @@ tail -20 /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/orch106-8100.log
 
 ### 开发/调试：直接起
 
-```bash
-cd MiniCPM-o-Demo
-python -m orchestrator.main --port 8100
+以下命令分别在对应仓库根目录执行，使用各项目同名 Conda 环境。
+先在 `openai-agent-demo` 配好模型凭据，再在独立终端启动 Agent gRPC 服务：
+
+```powershell
+# 终端一：openai-agent-demo 仓库根目录
+conda activate openai-agent-demo
+python app.py
 ```
+
+编排服务启动时自动读取本仓库根目录的 `.env`，终端中已设置的环境变量优先。
+`.env.example` 已提供本地 Agent + 远端感知/TTS 的完整配置；现有 `.env` 请合并
+其中的 `ORCH_*` 配置。关键项如下，按实际部署修改地址：
+
+| 配置 | 本地联调示例 |
+|---|---|
+| `ORCH_AGENT_GRPC` | `127.0.0.1:50051`（本地 Agent gRPC） |
+| `ORCH_OMNI_URL` | `wss://192.168.89.106:8006/v1/realtime?mode=video` |
+| `ORCH_OMNI_DESCRIBE` | `1`（Omni 生成视觉描述） |
+| `ORCH_ENABLE_FACE` | `1` |
+| `ORCH_FACE_SERVICE_URL` | `http://192.168.89.105:8767` |
+| `ORCH_ASR_URL` | `ws://192.168.88.101:31366` |
+| `ORCH_TTS_HOST / ORCH_TTS_PORT` | `192.168.88.253 / 31058` |
+| `ORCH_AEC_MODE` | `browser`（浏览器原生 AEC） |
+
+IC 从初始状态放行语音 ANSWER 需要人脸在场；没有人脸状态时可能一直 HOLD，
+即使 ASR 已识别出文本、视觉描述也已发送给 Agent。启动时应看到
+“人脸预检通过（远端）”、能力清单 `face=True` 以及本地 Agent 地址。
+
+```powershell
+# 终端二：omni-llm-server 仓库根目录
+conda activate omni-llm-server
+# 已有 .env 时保留，先按上表检查配置。
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+python -m pip install -r orchestrator/requirements.txt
+python -m orchestrator.main --host 0.0.0.0 --port 8100
+```
+
+Bash 下在同一仓库根目录执行：
+
+```bash
+conda activate omni-llm-server
+[ -f .env ] || cp .env.example .env
+python -m pip install -r orchestrator/requirements.txt
+python -m orchestrator.main --host 0.0.0.0 --port 8100
+```
+
+本机浏览器打开 **http://localhost:8100/**（或 `http://127.0.0.1:8100/`），允许
+摄像头和麦克风权限后开始会话。`0.0.0.0` 仅用于服务监听，不用作浏览器访问地址。
+从另一台设备访问时，成对传入 `--ssl-cert certs/cert.pem --ssl-key certs/key.pem`
+启用 HTTPS，并使用证书包含的服务器地址访问。
+
+修改 `.env` 后重启编排服务，再重新开始网页会话。若终端保留了旧的 `ORCH_*`
+环境变量，需先修改或移除它们；生产启动脚本提前 `export` 的值同样高于 `.env`。
+脚本自身的 `ORCH_PY/ORCH_PORT/ORCH_SSL_CERT/ORCH_SSL_KEY` 仍需在调用脚本时设置。
 
 ### 参数
 
