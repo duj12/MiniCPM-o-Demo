@@ -43,6 +43,11 @@ message AgentAction {
   optional string ai_style = 12;
   Affect affect = 13;
   optional string language = 14;
+  // ASR 感知（P05）：噪声突发与信噪比。只在 IC 真正给出时才置位，
+  // 用 optional 保留"没测出来"与"值为 false / 0"的区别。
+  optional bool noise_burst_detected = 15;
+  optional string noise_burst_type = 16;
+  optional double snr_db = 17;
 }
 
 message AgentState {

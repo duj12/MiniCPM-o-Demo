@@ -51,6 +51,26 @@ def test_control_and_vision_correlation_and_optional_payload():
         client.close()
 
 
+def test_answer_carries_asr_perception_fields():
+    """P05 感知字段要真的上线；没测到的那些必须保持"未置位"。"""
+    client = AgentClient("127.0.0.1:1", session_id="room", on_event=lambda event: None)
+    try:
+        msg = action(client, "answer", transcript="喂",
+                     noise_burst_detected=True, noise_burst_type="pop", snr_db=21.5)
+        assert msg.HasField("noise_burst_detected") and msg.noise_burst_detected is True
+        assert msg.HasField("noise_burst_type") and msg.noise_burst_type == "pop"
+        assert msg.HasField("snr_db") and msg.snr_db == 21.5
+        # 0.0 也是实测值，不能被当成"缺省"
+        zero = action(client, "answer", transcript="喂", snr_db=0.0)
+        assert zero.HasField("snr_db") and zero.snr_db == 0.0
+        plain = action(client, "answer", transcript="喂")
+        assert not plain.HasField("noise_burst_detected")
+        assert not plain.HasField("noise_burst_type")
+        assert not plain.HasField("snr_db")
+    finally:
+        client.close()
+
+
 def test_sink_events_are_local_and_sessions_have_independent_state():
     a, b = host(sid="a"), host(sid="b")
     try:

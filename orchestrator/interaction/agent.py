@@ -117,6 +117,15 @@ class AgentClient:
             if affect:
                 msg.affect.label = str(affect.get("label") or "")
                 msg.affect.confidence = float(affect.get("confidence") or 0.0)
+            # ASR 感知（P05）：IC 只在测到时才带这几个键。存在性要单独判断 ——
+            # 落成默认值（False / "" / 0.0）会把「这段没测出来」伪装成
+            # 「测了，没噪声」，语义正好反了。
+            if event.get("noise_burst_detected") is not None:
+                msg.noise_burst_detected = bool(event["noise_burst_detected"])
+            if event.get("noise_burst_type"):
+                msg.noise_burst_type = str(event["noise_burst_type"])
+            if event.get("snr_db") is not None:
+                msg.snr_db = float(event["snr_db"])
             for server in self._mcp_servers:
                 msg.mcp_servers.servers.add(**server)
             try:
