@@ -67,6 +67,11 @@ ASR 与视觉分别使用字符串 `transcript`、`vlm`，不再使用 HTTP 时�
 `language`、`affect`、`app_id`、`ai_intent/ai_style` 和 `mcp_servers`；
 具体字段及可选性以 proto 为准。
 
+ASR 感知字段 `noise_burst_detected` / `noise_burst_type` / `snr_db` 只在
+IC 测到这一段时才置位（proto 里是 `optional`，用 `HasField` 判断）；
+缺省意味着"这段没测出来"，不是"没噪声"。Agent 旧版本不认识这些字段时
+按 protobuf 规则忽略，不影响既有行为。
+
 ## 三、Agent 返回什么
 
 | AgentEvent payload | 宿主处理 |
