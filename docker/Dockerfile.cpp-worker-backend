@@ -22,7 +22,11 @@ ARG LLAMA_QWEN3OMNI_SERVER_TARGET=llama-qwen3omni-server
 ARG LLAMA_QWEN3OMNI_SERVER_BIN=llama-qwen3omni-server
 ARG CMAKE_CUDA_ARCHITECTURES=80;86;120
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E \
+            -e 's|https?://([[:alnum:].-]+\.)?archive\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' \
+            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' {} + \
+    && apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     cmake \
@@ -66,7 +70,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E \
+            -e 's|https?://([[:alnum:].-]+\.)?archive\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' \
+            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' {} + \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     ffmpeg \
@@ -81,7 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
+    pip install --index-url https://mirrors.aliyun.com/pypi/simple/ \
     "fastapi>=0.128.0" \
     "httpx>=0.28.0" \
     "kaldi_native_fbank>=1.0.0" \

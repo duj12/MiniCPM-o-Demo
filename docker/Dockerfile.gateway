@@ -48,7 +48,11 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
 # 轻量系统依赖:curl 仅用于健康检查
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E \
+            -e 's|https?://deb\.debian\.org/debian|http://mirrors.aliyun.com/debian|g' \
+            -e 's|https?://security\.debian\.org/debian-security|http://mirrors.aliyun.com/debian-security|g' {} + \
+    && apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -56,7 +60,7 @@ WORKDIR /app
 
 # gateway 的全部 Python 依赖(无 torch / transformers / minicpmo-utils)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
+    pip install --index-url https://mirrors.aliyun.com/pypi/simple/ \
         "fastapi>=0.128.0" \
         "uvicorn>=0.40.0" \
         "httpx>=0.28.0" \
