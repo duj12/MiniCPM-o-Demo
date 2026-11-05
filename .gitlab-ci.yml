@@ -10,6 +10,8 @@
 variables:
   SVN_REPO_URL: 'svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest'
   SVN_LOCAL_PATH: '/data/nas/xmov_app/omni-llm/svn/latest'
+  # node-140 上预置的 llama.cpp-omni dev 源码（53bec7a），由本地同步。
+  LLAMA_SRC: '/data/nas/xmov_app/omni-llm/llama.cpp-omni-dev'
   WORKER_IMAGE: 'omnillm-cpp-backend'
   GATEWAY_IMAGE: 'omnillm-gateway'
 
@@ -39,6 +41,11 @@ build_image:
   resource_group: $CI_PROJECT_NAME
   script:
     - |
+      if [ ! -r "$LLAMA_SRC/CMakeLists.txt" ]; then
+        echo "llama source missing or unreadable: $LLAMA_SRC/CMakeLists.txt" >&2
+        exit 1
+      fi
+    - |
       if [[ "$CI_COMMIT_REF_NAME" == "master" || "$CI_COMMIT_REF_NAME" == "pre" ]]; then
         echo "Working at $CI_COMMIT_REF_NAME branch, changing svn path..."
         SVN_REPO_URL=svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/$CI_COMMIT_REF_NAME
@@ -59,19 +66,8 @@ build_image:
     - svn export "$SVN_LOCAL_PATH/checkpoints" ./checkpoints
     - ls -la ./checkpoints/
     - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
-    # worker+backend 镜像：宿主机拉取源码，再由构建脚本打包源码和模型
-    - |
-      (
-        set -e
-        if [ -z "${LLAMA_SRC:-}" ]; then
-          LLAMA_SRC="$(mktemp -d)"
-          trap 'rm -rf "$LLAMA_SRC"' EXIT
-          git clone --depth 1 --branch "${LLAMA_OMNI_REFSPEC:-dev}" \
-            "${LLAMA_OMNI_REPO:-https://github.com/duj12/llama.cpp-omni.git}" "$LLAMA_SRC"
-        fi
-        export LLAMA_SRC
-        bash docker/build-image.sh
-      )
+    # worker+backend 镜像：使用 Runner 上预置的源码并打包模型
+    - bash docker/build-image.sh
     # gateway 镜像（纯转发，无模型）
     - docker compose -f docker-compose.cpp.yml build gateway
     - |
