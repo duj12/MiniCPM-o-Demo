@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# 使用 BuildKit 内置 Dockerfile 前端，避免额外拉取 docker/dockerfile 镜像。
 #
 # gateway 镜像(torch-free 轻量控制面)。
 #
