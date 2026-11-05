@@ -57,7 +57,7 @@ RUN cmake -S . -B build -G Ninja \
     && mkdir -p /opt/llama.cpp-omni/bin \
     && cp -a "build/bin/${LLAMA_OMNI_SERVER_BIN}" "build/bin/${LLAMA_QWEN3OMNI_SERVER_BIN}" build/bin/*.so* /opt/llama.cpp-omni/bin/
 
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/opt/llama.cpp-omni/bin:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \

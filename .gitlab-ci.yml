@@ -8,6 +8,8 @@
 # 分支映射（同 Fun-ASR-deploy）：master/pre 各对应 SVN 子目录，其他分支用 latest。
 
 variables:
+  # 保留模型缓存，配合 rsync 增量更新；其他未跟踪文件仍正常清理。
+  GIT_CLEAN_FLAGS: '-ffdx -e checkpoints/'
   SVN_REPO_URL: 'svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM/latest'
   SVN_LOCAL_PATH: '/data/nas/xmov_app/omni-llm/svn/latest'
   # node-140 上预置的 llama.cpp-omni dev 源码（53bec7a），由本地同步。
@@ -61,9 +63,8 @@ build_image:
         echo "No SVN working copy found. Checking out..."
         svn checkout "$SVN_REPO_URL" "$SVN_LOCAL_PATH" --username "$SVN_USERNAME" --password "$SVN_PASSWORD"
       fi
-    - echo "Exporting checkpoints from SVN..."
-    - rm -rf ./checkpoints
-    - svn export "$SVN_LOCAL_PATH/checkpoints" ./checkpoints
+    - echo "Syncing checkpoints from SVN cache..."
+    - rsync -aL --delete --delete-excluded --exclude='.svn/' --stats "$SVN_LOCAL_PATH/checkpoints/" ./checkpoints/
     - ls -la ./checkpoints/
     - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
     # worker+backend 镜像：使用 Runner 上预置的源码并打包模型

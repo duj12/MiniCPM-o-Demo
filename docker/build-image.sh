@@ -8,13 +8,13 @@
 #   ./docker/build-image.sh --push          # 打包并推送（需 REGISTRY/IMAGE_TAG 环境变量）
 #
 # 模型打包原理：
-#   checkpoints/ 是指向外部目录的软链（gitignore，不入库）。docker build 的
-#   COPY 不会解析软链（拷成悬空链），所以这里先把软链解析成实体文件到
-#   .bundle-checkpoints/checkpoints/（-L 跟随软链拷贝），Dockerfile 在
+#   checkpoints/ 可为实体目录或外部目录的软链。docker build 的 COPY
+#   不会解析软链，所以这里先将模型暂存到 .bundle-checkpoints/checkpoints/。
+#   优先跟随软链创建硬链接，不支持时回退为普通复制。Dockerfile 在
 #   BUNDLE_MODELS=1 时把它 COPY 进 /app/checkpoints。
 #
 #   .bundle-checkpoints/ 是构建临时目录（.dockerignore 未排除以便 COPY），
-#   构建后自动清理。
+#   构建后自动清理。CI 保留 checkpoints/，通过 rsync 增量更新模型。
 # ============================================================================
 set -euo pipefail
 
@@ -69,12 +69,18 @@ if [ "$BUNDLE" = "1" ]; then
         echo "[build-image] ERROR: checkpoints/ not found (softlink dir required)" >&2
         exit 1
     fi
-    # 只打包三个必需子目录，软链实体化
+    # 只打包三个必需子目录；每次重建硬链接，避免残留旧模型。
+    rm -rf "$BUNDLE_DIR"
     mkdir -p "$BUNDLE_DIR/checkpoints"
     for sub in qwen3omni-gguf fsmn-vad-onnx TurnSense; do
-        if [ -e "checkpoints/$sub" ]; then
-            echo "[build-image]   copying $sub -> $BUNDLE_DIR/checkpoints/$sub"
-            cp -Lr "checkpoints/$sub" "$BUNDLE_DIR/checkpoints/$sub"
+        if [ -d "checkpoints/$sub" ]; then
+            echo "[build-image]   linking $sub -> $BUNDLE_DIR/checkpoints/$sub"
+            if ! cp -Lrl "checkpoints/$sub" "$BUNDLE_DIR/checkpoints/$sub"; then
+                # 跨文件系统等场景无法硬链接，清理不完整结果后普通复制。
+                echo "[build-image]   hard links unavailable for $sub, copying instead"
+                rm -rf "$BUNDLE_DIR/checkpoints/$sub"
+                cp -Lr "checkpoints/$sub" "$BUNDLE_DIR/checkpoints/$sub"
+            fi
         else
             echo "[build-image] WARNING: checkpoints/$sub not found, skipped" >&2
         fi
