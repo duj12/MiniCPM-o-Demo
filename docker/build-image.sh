@@ -10,8 +10,8 @@
 # 模型打包原理：
 #   checkpoints/ 可为实体目录或外部目录的软链。docker build 的 COPY
 #   不会解析软链，所以这里先将模型暂存到 .bundle-checkpoints/checkpoints/。
-#   优先跟随软链创建硬链接，不支持时回退为普通复制。Dockerfile 在
-#   BUNDLE_MODELS=1 时把它 COPY 进 /app/checkpoints。
+#   优先跟随软链创建硬链接，不支持时回退为普通复制。Dockerfile
+#   直接 COPY 到 /app/checkpoints，模型在镜像内只保留一份。
 #
 #   .bundle-checkpoints/ 是构建临时目录（.dockerignore 未排除以便 COPY），
 #   构建后自动清理。CI 保留 checkpoints/，通过 rsync 增量更新模型。
@@ -22,7 +22,6 @@ cd "$(dirname "$0")/.."   # 项目根
 
 BUNDLE=1    # 默认打包模型进镜像；--no-bundle 关闭（开发/调试用挂载）
 PUSH=0
-CACHE_BUST="$(date +%s)"
 for arg in "$@"; do
     case "$arg" in
         --no-bundle) BUNDLE=0 ;;
@@ -59,10 +58,6 @@ mkdir -p "$LLAMA_SRC_DIR"
 cp -r "$LLAMA_SRC"/. "$LLAMA_SRC_DIR"/
 echo "[build-image]   llama source staged ($(du -sh "$LLAMA_SRC_DIR" | cut -f1))"
 
-build_args=(
-    --build-arg "CACHE_BUST=${CACHE_BUST}"
-)
-
 if [ "$BUNDLE" = "1" ]; then
     echo "[build-image] bundling models into image..."
     if [ ! -d checkpoints ]; then
@@ -85,17 +80,13 @@ if [ "$BUNDLE" = "1" ]; then
             echo "[build-image] WARNING: checkpoints/$sub not found, skipped" >&2
         fi
     done
-    build_args+=(--build-arg "BUNDLE_MODELS=1")
 else
     echo "[build-image] no --bundle: model NOT baked into image (mount /models at runtime)"
 fi
 
-echo "[build-image] docker build (cache_bust=${CACHE_BUST})..."
-# compose build 会把 build.args 默认值（LLAMA_OMNI_REPO/REFSPEC）传给 Dockerfile，
-# 这里用 --build-arg 追加 CACHE_BUST 和可选的 BUNDLE_MODELS。
+echo "[build-image] docker build (bundle_models=${BUNDLE})..."
 docker compose -f docker-compose.cpp.yml build \
-    --build-arg "CACHE_BUST=${CACHE_BUST}" \
-    "${build_args[@]}" \
+    --build-arg "BUNDLE_MODELS=${BUNDLE}" \
     cpp-worker-backend
 
 if [ "$PUSH" = "1" ]; then

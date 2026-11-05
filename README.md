@@ -61,7 +61,7 @@ GATEWAY_HOST_PORT=8006
 
 ### 2. 构建并启动
 ```bash
-# 构建镜像（llama.cpp-omni 自动 git clone duj12/dev）。默认打包模型进镜像
+# 构建镜像（使用宿主机 ../llama.cpp-omni-dev，可用 LLAMA_SRC 覆盖）。默认打包模型进镜像
 ./docker/build-image.sh
 # 不打包（运行时挂载 /models，适合开发调试）
 ./docker/build-image.sh --no-bundle
@@ -75,6 +75,9 @@ docker compose -f docker-compose.cpp.yml up -d
 > - **默认打进镜像**：构建时把 `checkpoints/` 三子目录（qwen3omni-gguf/fsmn-vad-onnx/TurnSense）
 >   拷贝进镜像 `/app/checkpoints`。适合 CI 分发、新机器即拉即用（镜像约 +20G）。
 > - **`--no-bundle` 挂载**：模型在宿主机 `checkpoints/`（或 `MODEL_HOST_PATH`），compose 挂 `/models`。
+>
+> 模型放在独立的 Docker 缓存层中，镜像内只保留一份；worker 只复制所需的运行文件。
+> 代码变化时由 Docker 自动复用未变的模型层。首次切换到此布局需要完整构建、上传一次。
 >
 > 容器内由 **supervisord** 管理两个服务（llama-server + worker），autorestart + 日志落位
 > `/app/logs/`（llama 日志、worker.log）。容器 HEALTHCHECK 走 worker `/health`。
