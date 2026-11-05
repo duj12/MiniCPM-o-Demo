@@ -41,7 +41,7 @@ RUN mkdir -p /src/static && bun run build
 # 产物现在位于 /src/static/docs
 
 # ---- 阶段 2:最终 gateway 镜像(torch-free,无 bun)----
-FROM python:3.12-slim-bookworm
+FROM harbor.xmov.ai/xmov/python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
