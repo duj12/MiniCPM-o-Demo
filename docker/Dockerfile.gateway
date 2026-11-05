@@ -19,7 +19,7 @@
 # (static/ 下其它页面如 omni/turnbased/mobile-omni 是已提交的静态文件,随 COPY . . 带入。)
 
 # ---- 阶段 1a:移动端构建器(临时,不进最终镜像)----
-FROM oven/bun:1-slim AS mobile-builder
+FROM harbor.xmov.ai/xmov/bun:1-slim AS mobile-builder
 WORKDIR /src/frontend/mobile
 # 只拷构建移动端需要的源码,最大化缓存
 COPY frontend/mobile/package.json frontend/mobile/bun.lock ./
@@ -31,7 +31,7 @@ RUN mkdir -p /src/static && bun run build:static
 # 产物现在位于 /src/static/mobile
 
 # ---- 阶段 1b:文档站构建器(Next.js static export,临时)----
-FROM oven/bun:1-slim AS docs-builder
+FROM harbor.xmov.ai/xmov/bun:1-slim AS docs-builder
 WORKDIR /src/docs-app
 COPY docs-app/package.json docs-app/bun.lock ./
 RUN bun install --frozen-lockfile
