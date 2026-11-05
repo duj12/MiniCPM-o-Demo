@@ -9,3 +9,8 @@
 # 顺带的好处：以前 `diff 本地 远端` 会显示"整个文件全变了"（其实只是行尾），
 # 钉死之后这类假差异消失，真差异才看得见。
 *.sh text eol=lf
+
+# `agent_protocol/agent.proto` 必须与 Agent 服务仓库的 canonical proto
+# **逐字节一致**（见 agent_protocol/README.md）。Windows 工作区若按
+# core.autocrlf=true 检出会变成 CRLF，本地对比会误报"整个文件全变了"。
+*.proto text eol=lf

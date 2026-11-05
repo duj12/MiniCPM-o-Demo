@@ -2,7 +2,9 @@
 -e ./vendor/interactioncore
 grpcio==1.84.0
 protobuf==7.35.1
-numpy>=2.2.0
+# 编排只用到基础数组操作，1.26 足够；106 的 py310 里 numpy 1.26.4 与
+# torch 2.4 绑定，装 numpy 2.x 会把训练/推理环境一起顶坏。
+numpy>=1.26
 fastapi>=0.128.0
 uvicorn>=0.40.0
 websockets>=16.0

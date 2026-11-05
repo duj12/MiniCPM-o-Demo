@@ -452,6 +452,14 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
+                agent_error = await asyncio.to_thread(_probe_agent_grpc, agent_target)
+                if agent_error:
+                    logger.error(
+                        "[%s] Agent gRPC 不可达（%s）：%s —— 会话仍会启动，"
+                        "但本轮不会有 Agent 回复；下一次真实 ANSWER 会尝试重连。"
+                        "请确认目标主机跑的是 AgentService/Interact（不是旧 IC 服务），"
+                        "并用 ORCH_AGENT_GRPC 指向正确的 host:port。",
+                        sid, agent_target, agent_error)
                 ic_ds.agent.start()
                 sess.downstream = ic_ds
                 sess.interaction = ic_ds
@@ -909,15 +917,27 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
 #  FastAPI app
 # ====================================================================== #
 
-def _orch_cert_path() -> Optional[str]:
-    """编排服务自己的自签证书路径（当 CA 用）。
+def _probe_agent_grpc(target: str, timeout: float = 2.0) -> Optional[str]:
+    """探测独立 Agent 的 gRPC 端口（``ORCH_AGENT_GRPC``）。
 
-    自签证书的签发者就是它自己，所以 `cafile=<它>` 能校验通过 ——
-    IC 侧 `scripts/run_ic.sh` 一直就是这么做的（`INTERACTION_EXPRESSION_CA`）。
+    返回 ``None`` = 可连；否则返回错误串。
+
+    只做 channel readiness，**不发任何 RPC** —— 不会替会话建流。Agent 断流
+    本身是异步的（``AgentClient`` 会在下一次真实 ANSWER 时重建），没有这条
+    日志时症状与 IC 积压那类问题一样：**能识别、有迎宾 TTS、没有 Agent 回复**。
     """
-    from pathlib import Path
-    p = Path(__file__).resolve().parents[1] / "certs" / "cert.pem"
-    return str(p) if p.is_file() else None
+    try:
+        import grpc
+    except Exception as exc:  # pragma: no cover - 只在依赖缺失时走到
+        return f"grpc 不可用: {exc}"
+    channel = grpc.insecure_channel(target)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=timeout)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    finally:
+        channel.close()
 
 
 def create_app(cfg: Settings):
