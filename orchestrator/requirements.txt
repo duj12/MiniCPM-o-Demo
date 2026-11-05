@@ -1,0 +1,15 @@
+# Install from repository root: python -m pip install -r orchestrator/requirements.txt
+-e ./vendor/interactioncore
+grpcio==1.84.0
+protobuf==7.35.1
+numpy>=2.2.0
+fastapi>=0.128.0
+uvicorn>=0.40.0
+websockets>=16.0
+httpx>=0.28.0
+python-dotenv>=1.0.0
+soundfile>=0.12.1
+# Tests and protocol regeneration
+pytest>=9.0.0
+pytest-asyncio>=1.3.0
+grpcio-tools==1.84.0

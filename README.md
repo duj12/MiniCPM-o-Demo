@@ -9,6 +9,14 @@
 
 ---
 
+## 编排服务：本地 Agent 联调
+
+编排服务使用本地 InteractionCore，通过 gRPC 连接独立 Agent，并接入 ASR、视觉描述、
+人脸和 TTS 服务。完整启动命令见 [Orchestrator README](orchestrator/README.md#开发调试直接起)。
+启动时会读取根目录 `.env` 中的 `ORCH_*` 配置；示例见 `.env.example`。
+
+---
+
 ## 一、模型目录约定
 
 模型统一放项目根 `checkpoints/` 下（三子目录，可从 SVN 下载或用软链指向已有模型）：

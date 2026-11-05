@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
 
 # ---------------- 外部服务默认地址（阶段 0 实测确认） ---------------- #
 
@@ -103,87 +106,14 @@ class Settings:
     # downstream 桩模式：asr | omni | echo | none
     downstream_mode: str = "omni"
 
-    # ---- InteractionCore + Agent 决策链路 ----
-    # 打开后**回复不再由 OmniLLM 生成**：IC 做 SOP 决策 → Agent 生成 →
-    # Agent 回调 orchestrator 的 /v1/speak 播报。OmniLLM 只产出音视频描述。
-    #
-    # ⚠️ **默认开**。两个例外：
-    #   · `downstream_mode == "echo"` 时保持纯桩（测试用它起"永不 Speak"的服务）
-    #   · IC 连不上 → 明确告警并**降级回 OmniLLM 回复**
-    #     （否则会变成"能识别、永远不回复"，与之前 OmniLLM 断线那个 bug
-    #      同一病理，极难排查）
+    # Per-session local IC; the host owns independent Agent gRPC and real output.
     interaction_enabled: bool = field(default_factory=lambda: os.environ.get(
-        "ORCH_INTERACTION", "1") not in ("0", "false", "False", ""))
-    #: InteractionCore 的 gRPC 地址。**由编排服务去连**（不是客户端连）——
-    #: 这样 web 和 python 客户端自动都具备。
-    ic_grpc: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_GRPC", "localhost:50051"))
-    #: **告诉 Agent 回连 IC 用哪个地址** —— 与 `ic_grpc` 是**两件事**。
-    #:
-    #: `ic_grpc`   是**编排服务自己去连** IC 的地址。
-    #: `ic_advertise` 是**Agent 回连** IC 的地址（Agent 在 192.168.89.102，
-    #: 它收到 IC 的 Action 后要 `POST {target}/interaction/on_*`）。
-    #:
-    #: ⚠️ 同机部署时两者可以一样（都是 localhost）。但**跨主机时不填这个就错**
-    #:    —— 实测踩过：105 把 `127.0.0.1:50051` 告诉 Agent，而这个地址从
-    #:    Agent 视角看是**它自己**，于是
-    #:      · 105 会话期间：Agent 把 Action 派到错误的地方
-    #:      · 105 会话结束归还后：留下的还是这个错地址 → **106 的会话也跟着错**
-    #:    这就是两台机器互相影响的真实通道之一。
-    #: 空 = 退回 `ic_grpc`（同机部署的常见情形，行为与旧版一致）。
-    ic_advertise: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_ADVERTISE", ""))
-    #: 会话结束时把 Agent 的 IC 目标**归还到哪** —— 应当是**大家共用的**
-    #: 那个 IC，不是本机自己的。
-    #:
-    #: ⚠️ 多机部署**必须**配它。实测踩过：105 归还成自己的地址
-    #:    （`192.168.89.105:50051`），于是 106 的下一个会话又得抢一次，
-    #:    每次都打冲突告警，而且抢的窗口内 106 的 Action 是派错的。
-    #: 空 = 退回 `ic_grpc`（单机部署语义正确：本机 IC 就是共享的那个）。
-    ic_restore: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_RESTORE", ""))
-
-    # ---- IC 部署模式：远端 gRPC 服务 vs 进程内 Engine ----
-    #
-    #   "grpc"      远端 InteractionCore 服务（**今天的行为，默认**）
-    #   "inprocess" 每路会话在编排进程内**独占**一份 `interaction.runtime.Engine`
-    #
-    # 为什么要有 inprocess：远端 IC 的 `InteractionState` 是**进程内全局一份**，
-    # 多会话同时驱动会互相覆盖（现象是「ASR 识别完美却零决策」）。进程内
-    # Engine 把并发问题从根上消掉 —— 每路会话一份状态机，不需要 session 路由，
-    # 也不需要单独的 IC 进程。
-    #
-    # ⚠️ **切换前置条件**：Agent Platform 必须能按 `callback_ic` 把
-    # `apply_agent`（写 agent.status / session_end_pending）投回编排服务的
-    # `POST /v1/ic/apply_agent`。它现在走的是 IC 的 gRPC `ApplyAgent`，
-    # Agent 不改就会丢掉 SOP 39 / PENDING_ANNOUNCE 两条分支。
+        "ORCH_INTERACTION", "1").lower() not in ("0", "false", "off", ""))
     ic_mode: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_MODE", "grpc"))
-    #: inprocess 模式下告诉 Agent 的 IC 回调根地址（本编排服务的**对外**地址）。
-    #: 空 = 由 `ic_advertise` 的 host 推导（`https://<host>:<port>/v1/ic`）。
-    ic_callback_base: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_CALLBACK_BASE", ""))
-    #: inprocess 模式下 `ExpressionSink` 打自己 `/v1/speak` 用的基地址。
-    #: 空 = `https://127.0.0.1:<port>`（本机自调）。
-    #: ⚠️ 依赖证书 SAN 含该地址；不匹配时校验失败，而失败**只记 IC 侧日志**
-    #:    （历史上表现为「IC 判了 GREET 但没人播」，极难排查）。
-    ic_expression_url: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_EXPRESSION_URL", ""))
-    #: inprocess 模式下 ExpressionSink 校验用的 CA。空 = 用编排服务自己的
-    #: 自签证书（`certs/cert.pem`，自签证书的签发者就是自己）。
-    ic_expression_ca: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_IC_EXPRESSION_CA", ""))
-    #: 过渡开关：是否继续调 Agent 的 `set_ic_target`（默认 1 = 今天的行为）。
-    #: 置 0 的前提是 Agent 已改为从 payload 里读 `callback_ic`。
-    agent_set_target: bool = field(default_factory=lambda: os.environ.get(
-        "ORCH_AGENT_SET_TARGET", "1") not in ("0", "false", "False", ""))
-    #: Agent Platform 地址（IC 的四类 Action 派给它）
-    agent_url: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_AGENT_URL", "http://192.168.89.102:8081"))
-    #: IC 决策下发给客户端（UI / replay JSONL）的**稳态心跳间隔**（秒）。
-    #: 状态变化时**立即**下发，不受它影响 —— 这个值只管「状态没变时多久
-    #: 补一条」，用来证明决策还在跑、viz 时间轴不会看起来断掉。
-    #: 设 0 = 关掉心跳（只在变化时发）。
+        "ORCH_IC_MODE", "inprocess"))
+    agent_grpc: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_AGENT_GRPC", "127.0.0.1:50051"))
+    agent_mcp_servers: list = field(default_factory=list)
     ic_report_interval_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_IC_REPORT_S", "10")))
 
@@ -231,28 +161,10 @@ class Settings:
 
     # ---- VLM 描述（两阶段）------------------------------------------------
     #
-    # ⚠️⚠️ **这两个开关的默认值就是 `legacy` / 关，且不许改。**
-    #
-    # `orchestrator/` 是 **105/106 共用**的一份代码（`run_orch_106.sh` 跑的
-    # 也是这个 main.py，连的是 102 的 Agent）。默认打开 = 替 106 决定了
-    # 「重启后给 102 的 Agent 多发一个 `content` 字段」—— 而那个 Agent 还没
-    # 改好。症状出现在 Agent 侧（可能直接把 `dict` 当字符串、回复变空），
-    # **编排这边看不出来**。这正是 `run_orch_*.sh` 里警告的那类**半切换**。
-    #
-    # 与 IC 自己的取舍完全同款（`interactioncore/interaction/runtime.py`
-    # `session_envelope` 那段）：确认目标 Agent 能接受之后，**在那一台的
-    # 启动脚本里显式打开**，而不是改默认值。
-    #
-    # 106 重启横幅上应显示 `描述模式=关 / transcript 模式=legacy` ——
-    # 这是「没碰 106」的唯一硬证据。
+    # Omni description generation remains opt-in; Agent wire shape is fixed.
     omni_describe: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE", "0") not in ("0", "false", "False", ""))
-    #: Agent 载荷形态（见 `interaction/agent_sink.py` 的 `MODES`）：
-    #:   `legacy` 与今天**逐字节一致**（也是默认，回退用）
-    #:   `dual`   额外带 `content:{ASR,VLM}`，`transcript` 原样保留（过渡）
-    #:   `dict`   `transcript` 本身换成 `{ASR,VLM}`（目标态，Agent 改好后）
-    agent_transcript_mode: str = field(default_factory=lambda: os.environ.get(
-        "ORCH_AGENT_TRANSCRIPT_MODE", "legacy").strip().lower())
+
     #: 每轮描述的**心跳间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
     #: （见 `session._desc_loop`）。
     #:
@@ -362,6 +274,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        # Load the repository config regardless of cwd; shell/script values win.
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
         s = cls()
         if os.environ.get("ORCH_DOWNSTREAM_MODE"):
             s.downstream_mode = os.environ["ORCH_DOWNSTREAM_MODE"]

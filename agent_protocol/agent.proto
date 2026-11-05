@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package agent;
+
+service AgentService {
+  rpc Interact(stream AgentAction) returns (stream AgentEvent);
+}
+
+message McpServer {
+  string name = 1;
+  string transport = 2;
+  string url = 3;
+}
+
+message McpServers {
+  repeated McpServer servers = 1;
+}
+
+message Affect {
+  string label = 1;
+  double confidence = 2;
+}
+
+message AgentAction {
+  enum Type {
+    UNSPECIFIED = 0;
+    ANSWER = 1;
+    INSERT = 2;
+    YIELD = 3;
+    END = 4;
+  }
+  Type act = 1;
+  string session_id = 2;
+  string ci = 3;
+  int64 epoch = 4;
+  string transcript = 5;
+  optional string identity_id = 6;
+  optional string display_name = 7;
+  string vlm = 8;
+  McpServers mcp_servers = 9;
+  string app_id = 10;
+  optional string ai_intent = 11;
+  optional string ai_style = 12;
+  Affect affect = 13;
+  optional string language = 14;
+}
+
+message AgentState {
+  enum Status {
+    UNSET = 0;
+    IDLE = 1;
+    BUSY = 2;
+    PENDING_ANNOUNCE = 3;
+  }
+  optional Status status = 1;
+  optional bool session_end_pending = 2;
+}
+
+message TextChunk {
+  enum Kind {
+    UNSET = 0;
+    FEEDBACK = 1;
+    ANSWER = 2;
+  }
+  Kind kind = 1;
+  string stream_id = 2;
+  string text = 3;
+  bool is_final = 4;
+}
+
+message ActionAck {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message TurnDone {}
+
+message AgentError {
+  string message = 1;
+}
+
+message AgentEvent {
+  string session_id = 1;
+  string ci = 2;
+  int64 epoch = 3;
+  AgentAction.Type act = 4;
+  oneof payload {
+    ActionAck ack = 10;
+    AgentState state = 11;
+    TextChunk text = 12;
+    TurnDone done = 13;
+    AgentError error = 14;
+  }
+}

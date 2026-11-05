@@ -1,121 +1,16 @@
-"""进程内 InteractionCore —— 每路会话**独占**一份 `Engine`，不走 gRPC。
+"""One in-process InteractionCore algorithm object per orchestrator session.
 
-## 为什么有这个
-
-`interactioncore` 的远端服务只装配**一个** `Engine`（内含一个
-`InteractionState`），所有客户端共用。两个会话同时驱动会互相覆盖
-`mode` / `barge_hold_ms` / `turn`，现象是「ASR 识别完美却零决策」。
-编排侧此前的应对是 `client.py` 里的 `_OWNER` 模块级单例 ——「后来者接管，
-先来的挂起」，本质是把静默出错变成显式踢人。
-
-本模块把那个问题**从根上消掉**：每路会话在自己的进程内建一份 Engine，
-天然隔离，不需要 session 路由，也不需要单独跑一个 IC 服务。
-
-## 与 `InteractionClient` 的关系
-
-**同鸭子接口**，由 `InteractionDownstream` 按 `ORCH_IC_MODE` 二选一
-（见 `downstream.py`）。两者必须保持接口一致：
-
-    available / error / tick_calls / bad_ticks / last_action / failures
-    suspended_ticks / suspended_writes        （恒 0，见下）
-    connect() -> bool
-    apply(method, **kwargs)
-    apply_agent(status, session_end_pending)
-    send_visual_background() -> bool             （编排侧主动投背景轮；gRPC 恒假）
-    ic_owns_vision_round() -> bool               （新版 IC 自己发 Vision 通知）
-    async tick(dt_ms) -> Action | None
-    async snapshot() -> dict | None
-    reset_session() / bind_session() / end_session() / close()
-
-> `suspended_ticks` / `suspended_writes` 在这里**恒为 0**：那是「被别的会话
-> 接管」的计数，进程内模式不存在这个状态。保留它们是因为 `session.summary()`
-> 会读 —— 等 `client.py` 那套闸门删掉后可以一起删。
-
-## ⚠️ 三个必须 off-loop 的调用
-
-`tick()` / `end_session()` / `close()` 里有**同步 HTTP**：
-
-  · `tick` → `Engine.tick()` → 判 `YIELD`/`END` 时经 `_notify_sinks` 调
-    `ExpressionSink.stop()`，打 `POST /v1/stop`，超时 `STOP_TIMEOUT_S = 1.0`
-  · `end_session` → `Engine.end_session()` → 同上（`/v1/stop`）
-  · `close` → `flush_sinks()` / `close_sinks()`，每个各 join worker 线程
-    （各 2s 超时）
-
-走 gRPC 时它们跑在**服务端线程**里，编排侧感觉不到；进程内会**阻塞事件循环**。
-所以 `tick()` 自己走 `asyncio.to_thread`（见那里），而
-`Downstream.on_session_end` 必须把 `end_session()` / `close()` 用
-`asyncio.to_thread` 包起来。
-
-### 为什么 tick 这条最要命：**自锁**
-
-`/v1/stop` 打的是 `https://127.0.0.1:<本进程端口>` —— **编排自己**的 HTTPS
-端口，而唯一的服务者就是事件循环。在循环上直呼 ⇒ 循环被这一行攥住 ⇒
-没人去握手 ⇒ 只能等满 1s 超时。
-
-实测（2026-10-13，106，`orch106-8100.log`）：
-
-  · 84 次 `_ssl.c:1000 handshake operation timed out` ≈ `END(sop=24)` 51 次
-    + `YIELD` 30 次 —— 正好是 tick 路径的全部停播调用
-  · 每次冻结 0.6~1s，**且是进程级的**：同一毫秒三个会话同时报卡顿
-    （`15:28:24,958/959/961` → 848/530/531ms）
-  · `POST /v1/stop` 成功次数 **0** —— IC 的「掐断正在出声的音频」
-    从未生效过，全靠紧随其后的新播报 `superseded` 顶掉才听不出来
-    （D24「持续说话不停播」的根因就是这个）
-
-挪进线程后：循环空出来服务 `/v1/stop`，请求**几毫秒**返回 —— 冻结消失，
-IC 的停播才真正落地。
-
-⚠️ `Engine._lock` 在 `tick()` 里覆盖到 `_notify_sinks`（`runtime.py:432-447`），
-所以挪到线程后，循环上的 `apply_*` 会等这把锁。但锁的持有时间正是从
-「1s 超时」降到「几毫秒」—— 这不是代价，就是本改动要的效果。
+Sinks synchronously enqueue events to the host. All Agent connections, TTS,
+interrupt execution, and real playback observations belong to the host.
 """
 from __future__ import annotations
-
-import asyncio
-import inspect
 import logging
 import os
 from typing import Any, Callable, Optional
-
-from .agent_sink import make_vlm_agent_sink, normalize_mode
 from .client import _signature_accepts
-
 logger = logging.getLogger(__name__)
-
-
-def _env_flag(name: str) -> bool:
-    """环境变量布尔开关（与 `interaction.grpc_server._env_flag` 同语义）。"""
-    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
-
-
-def _env_flag_default_on(name: str) -> bool:
-    """默认**开**的布尔开关：只有显式 ``0/false/no/off`` 才关。"""
-    v = (os.environ.get(name) or "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
-
-
-#: 与方法名无关的失败计数上限，避免 dict 无限增长
 _MAX_FAIL_METHODS = 64
 
-#: 每个 `apply_*` 里**取 Confidence 枚举**的参数名。
-#:
-#: ⚠️⚠️ **必须做这个转换，否则 IC 会在第一次 tick 就崩。**
-
-#: 走 gRPC 时，`grpc_codec.conf_field` 已经把 proto 枚举转成了
-#: `state.Confidence` **枚举成员**；进程内路径是直接调 `Engine.apply_*`，
-#: 传进去的是编排侧 `_conf()` 给的**裸字符串** `'HIGH'`。
-#:
-#: 危险之处在于它**看起来能用**：`Confidence` 是 `str` 枚举，值是**大写**
-#: （`'HIGH' == Confidence.HIGH` 为真），所以 `==` 比较全对、状态也存得进去。
-#: 但 `policy.py` 有一批判据是**调方法**的 ——
-#: `person.face_present_confidence.at_least(Confidence.MEDIUM)`
-#: （policy.py:138/140/233/352）—— 裸字符串没有 `at_least`，于是抛
-#: `AttributeError: 'str' object has no attribute 'at_least'`，
-#: `tick()` 直接失败 ⇒ `_mark_dead` ⇒ **整个会话降级为无决策**。
-#:
-#: 单元测试没暴露它是因为只 `apply_asr` 就 tick（那条路上 `at_least` 恰好
-#: 没被走到）；真会话会 `apply_face`/`apply_vad`/`apply_lip`，一 tick 就炸。
-#: 实测就是这么发现的 —— **别只靠单元测试验这条路径**。
 _CONF_FIELDS: dict[str, tuple[str, ...]] = {
     "apply_face": ("face_present_confidence",),
     "apply_lip": ("lip_speaking_confidence",),
@@ -123,25 +18,6 @@ _CONF_FIELDS: dict[str, tuple[str, ...]] = {
     "apply_vad": ("user_speaking_confidence", "barge_in_confidence"),
     "apply_asr": ("asr_confidence", "turn_complete_confidence"),
 }
-
-
-def _supported_kwargs(cls: Any, kwargs: dict) -> dict:
-    """按 ``cls.__init__`` 的签名裁剪关键字 —— **IC 版本兼容**用。
-
-    典型场景：软打断那组参数（``soft_interrupt`` / ``soft_yield_grace_ms`` /
-    ``false_yield_prompt``）是 ``feat/soft-interrupt-tts-pause`` 加的，而
-    P05 那条线（视觉/语音感知）的 ``Engine`` 没有它们 —— 原样传会
-    ``TypeError``，而 `connect()` 的兜底是**整个会话降级为 OmniLLM 回复**
-    （现象是「IC 明明升级了，编排却完全不决策」）。所以按签名裁剪：
-    哪一版认哪组就传哪组。
-    """
-    try:
-        params = inspect.signature(cls.__init__).parameters
-    except (TypeError, ValueError):
-        return dict(kwargs)
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return dict(kwargs)
-    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _to_confidence(value: Any) -> Any:
@@ -166,245 +42,56 @@ def _to_confidence(value: Any) -> Any:
 
 
 class InProcessICClient:
-    """一路会话一个实例 —— 本实例**独占**一个 `interaction.runtime.Engine`。"""
-
     def __init__(self, session_id: str = "", *,
-                 expression_url: str = "",
-                 agent_url: str = "",
-                 agent_timeout: float = 5.0,
-                 expression_ca: Optional[str] = None,
-                 expression_verify: bool = True,
-                 callback_ic: Optional[str] = None,
-                 thresholds: Any = None,
-                 vlm_getter: Optional[Callable[[], str]] = None,
-                 agent_transcript_mode: str = "legacy") -> None:
-        self.owner_key = session_id or ""
+                 on_agent_event: Callable[[dict], None] | None = None,
+                 on_expression_event: Callable[[dict], None] | None = None,
+                 thresholds: Any = None):
+        self.owner_key = session_id
         self.target = "inprocess"
-        self.expression_url = expression_url
-        self.agent_url = agent_url
-        self._agent_timeout = float(agent_timeout)
-        self._expression_ca = expression_ca
-        self._expression_verify = bool(expression_verify)
-        self._callback_ic = callback_ic
+        self._on_agent_event = on_agent_event
+        self._on_expression_event = on_expression_event
         self._thresholds = thresholds
-        #: VLM 描述取值回调（见 `agent_sink.make_vlm_agent_sink`）。
-        #: **None = 不包装 sink** ⇒ payload 与今天逐字节一致。
-        self._vlm_getter = vlm_getter
-        #: ⚠️ 默认必须是 `legacy`（安全侧）—— 这个参数与
-        #:    `ORCH_AGENT_TRANSCRIPT_MODE` 的默认值必须一致，否则"只在
-        #:    config 层把关"会被这里悄悄改成 dual（编排代码是 105/106 共用的）。
-        self._agent_transcript_mode = normalize_mode(agent_transcript_mode)
-
-        self._engine: Any = None
-        #: 本会话的 Agent sink（`connect()` 里构造）。留引用是为了让编排侧能
-        #: **主动**投一发视觉背景轮 —— 见 `send_visual_background`。
-        self._agent_sink: Any = None
-        #: P05 的打断探针（`interaction.decision_probe.DecisionProbe`）。
-        #: 老 IC / 显式关掉时为 None，见 `_make_decision_probe`。
-        self._decision_probe: Any = None
+        self._engine = self._agent_sink = self._decision_probe = None
         self.available = False
-        self.error: Optional[str] = None
-
-        # ---- 诊断字段（与 InteractionClient 同名同义）----
-        #: `tick` 真调到 IC 并拿到返回的次数
-        self.tick_calls = 0
-        #: 没调到的次数（未连接 / 没装包）
-        self.bad_ticks = 0
-        self.last_action = ""
-        #: 各方法写失败计数（按方法名）
-        self.failures: dict = {}
-        #: 进程内模式**不存在**「被接管」，恒 0（见模块文档）
+        self.error = None
+        self.tick_calls = self.bad_ticks = self.dropped = 0
         self.suspended = False
-        self.suspended_ticks = 0
-        self.suspended_writes = 0
-        self.dropped = 0
-        #: `supports()` 的结论缓存（探测的是 IC 版本，Engine 建好后不会变）
-        self._caps: dict = {}
-
-    # ------------------------------------------------------------------ #
+        self.suspended_ticks = self.suspended_writes = 0
+        self.last_action = ""
+        self.failures = {}
+        self._caps = {}
 
     @property
-    def engine(self) -> Any:
-        """本会话的 Engine（测试/诊断用）。未连接时为 None。"""
+    def engine(self):
         return self._engine
 
-    def _make_decision_probe(self, Engine: Any) -> Any:
-        """按需造 P05 的 ``DecisionProbe``；老 IC / 显式关掉时返回 None。
-
-        ⚠️ **没有它，P05 的打断整条失效**：``policy.decide()`` 只在
-        ``barge_phase is HARD`` 时出 YIELD，而 HARD 由 ``interaction/barge.py``
-        依据 ``probes.barge_class`` 推进 —— 探针不跑，用户开口就永远不打断。
-
-        独立 IC（``grpc_server``）默认自己建（``DECISION_PROBE=1``）；
-        进程内模式**没有别的人负责**，只能编排补上，否则升级到 P05 后
-        「软打断换成 barge 状态机」这一步会静默退回「不打断」。
-
-        开关 ``ORCH_IC_DECISION_PROBE``（**默认开**，显式 0/false/no/off 才关）。
-        StartLux 不可达时探针只是一直拿不到答案（2s 超时、后台线程，
-        不阻塞 tick），但打断同样等于没有 —— 排查打断失效先看这里。
-        """
-        try:
-            accepts = "decision_probe" in inspect.signature(
-                Engine.__init__).parameters
-        except (TypeError, ValueError):
-            accepts = False
-        if not accepts:
-            return None              # 老 IC（软打断那条线）没有这个参数
-        if not _env_flag_default_on("ORCH_IC_DECISION_PROBE"):
-            logger.info("[%s] ORCH_IC_DECISION_PROBE=0 —— 不建打断探针"
-                        "（P05 下等于不打断）", self.owner_key or "?")
-            return None
-        try:
-            from interaction.decision_probe import DecisionProbe
-            probe = DecisionProbe()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] 打断探针装配失败（%s: %s）—— "
-                           "P05 下等于不打断；StartLux 与 IC 包版本都要查",
-                           self.owner_key or "?", type(exc).__name__, exc)
-            return None
-        logger.info("[%s] 打断探针已装配（StartLux %s）",
-                    self.owner_key or "?",
-                    getattr(getattr(probe, "client", None), "base_url", "?"))
-        return probe
-
     def connect(self) -> bool:
-        """建本会话的 Engine。失败返回 False（**不抛** —— 调用方降级到 OmniLLM）。
-
-        懒 import：`interaction` 包没装时**只该让本会话降级**，不该让
-        orchestrator 起不来（与 `InteractionClient.connect` 的 `ImportError`
-        兜底同款）。
-        """
         if self._engine is not None:
-            self.available = True
-            return True
+            return self.available
         try:
             from interaction.runtime import AgentSink, Engine, ExpressionSink
-        except ImportError as exc:
-            self.error = f"未安装 interactioncore 包（{exc}）"
-            logger.warning("进程内 InteractionCore 不可用：%s", self.error)
-            self.available = False
-            return False
-
-        expression_sink = None
-        if self.expression_url:
-            expression_sink = ExpressionSink(
-                self.expression_url,
-                session_id=self.owner_key or None,
-                ca_file=self._expression_ca,
-                verify_ssl=self._expression_verify,
-            )
-        else:
-            logger.warning("[%s] 未配 ic_expression_url —— IC 的 GREET/UTTER "
-                           "与 YIELD/END 将无处播报/停播", self.owner_key or "?")
-
-        agent_sink = None
-        if self.agent_url:
-            sink_kwargs = dict(
-                timeout=self._agent_timeout,
-                session_id=self.owner_key or None,
-                callback_ic=self._callback_ic,
-                # ⚠️ 进程内模式下**直接开**：这里没有「共用 IC 的第三方」
-                #    顾虑 —— Agent 收到的就是我们这一路会话的 Action，
-                #    补上 session_id / callback_ic 正是我们要的。
-                session_envelope=True,
-            )
-            # VLM 描述随 on_answer 发给 Agent。
-            #
-            # ⚠️ `legacy` 模式**不包装**（走下面那个分支）—— 不是"包装里
-            #    再判一次"。回退路径必须连这段代码都不过，才能保证 payload
-            #    与今天逐字节一致（106 的重启横幅判据就靠这个）。
-            if self._vlm_getter is not None \
-                    and self._agent_transcript_mode != "legacy":
-                agent_sink = make_vlm_agent_sink(
-                    target=self.agent_url,
-                    vlm_getter=self._vlm_getter,
-                    mode=self._agent_transcript_mode,
-                    **sink_kwargs,
-                )
-                logger.info(
-                    "[%s] IC 的 on_answer 将携带 VLM 描述"
-                    "（transcript 模式=%s）—— 仅本会话，IC 代码未改动",
-                    self.owner_key or "?", self._agent_transcript_mode)
-            else:
-                agent_sink = AgentSink(self.agent_url, **sink_kwargs)
-                if self._agent_transcript_mode == "legacy":
-                    logger.info(
-                        "[%s] IC 的 on_answer 不带 VLM 描述"
-                        "（transcript 模式=legacy，payload 与旧版一致）",
-                        self.owner_key or "?")
-        else:
-            logger.warning("[%s] 未配 agent_url —— IC 的 ANSWER/INSERT "
-                           "派不出去", self.owner_key or "?")
-
-        # 留一份引用供编排侧**主动**投递视觉背景轮（见 `send_visual_background`）。
-        # ⚠️ 只在真造出 sink 的这条路径上赋值 —— `:167-169` 的早返回（已有
-        #    engine）不经过这里，也不该覆盖既有引用。
-        self._agent_sink = agent_sink
-
-        # 软打断：默认**关**（行为与旧版逐字节一致）。开关在启动脚本
-        # 的环境变量里，与独立 IC（grpc_server）用同一组名字 ——
-        # 两种部署模式切过去不用改代码。
-        #
-        # ⚠️ 按签名裁剪：这组参数只有软打断那条 IC 分支有，P05（视觉/语音
-        #    感知）的 Engine 认不出来 —— 原样传会 TypeError，兜底是本会话
-        #    **整个降级为 OmniLLM**（看起来像「IC 升级后编排不决策了」）。
-        soft_kwargs = dict(
-            soft_interrupt=_env_flag("ORCH_IC_SOFT_INTERRUPT"),
-            soft_yield_grace_ms=int(
-                os.environ.get("ORCH_IC_SOFT_YIELD_GRACE_MS") or 1000),
-            false_yield_prompt=os.environ.get(
-                "ORCH_IC_FALSE_YIELD_PROMPT", "不好意思，您继续说。"),
-        )
-        kept_soft = _supported_kwargs(Engine, soft_kwargs)
-        dropped = sorted(set(soft_kwargs) - set(kept_soft))
-        if dropped:
-            # P05 不是"不认这几个开关"，而是**把软打断换成了 barge 状态机**
-            # （`interaction/barge.py`：quick_check → soft → hard，暂停/续播
-            #  由探针的 barge_class 推进）。所以这是版本差异，不是开关失效。
-            logger.info(
-                "[%s] 当前 InteractionCore 的 Engine 不认 %s —— 该版本用"
-                "自身的打断状态机（P05 = barge/探针）代替，"
-                "ORCH_IC_SOFT_* 在此版本下不生效",
-                self.owner_key or "?", ", ".join(dropped))
-        engine_kwargs = dict(
-            expression_sink=expression_sink,
-            agent_sink=agent_sink,
-            thresholds=self._thresholds,
-        )
-        # P05 的打断探针：只有认 ``decision_probe`` 的那个 Engine 才建
-        # （见 `_make_decision_probe`；老 IC 返回 None，参数都不出现）。
-        probe = self._make_decision_probe(Engine)
-        if probe is not None:
-            engine_kwargs["decision_probe"] = probe
-        engine_kwargs.update(kept_soft)
-        try:
-            self._engine = Engine(**engine_kwargs)
-        except Exception as exc:  # noqa: BLE001
-            if probe is not None:
-                try:
-                    probe.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            agent_sink = (AgentSink(self._on_agent_event, session_id=self.owner_key)
+                          if self._on_agent_event is not None else None)
+            expression_sink = (ExpressionSink(self._on_expression_event, session_id=self.owner_key)
+                               if self._on_expression_event is not None else None)
+            probe = None
+            if os.environ.get("ORCH_IC_DECISION_PROBE", "1").lower() not in ("0", "false", "off", "no"):
+                from interaction.decision_probe import DecisionProbe
+                probe = DecisionProbe()
+            self._decision_probe = probe
+            self._agent_sink = agent_sink
+            self._engine = Engine(agent_sink=agent_sink, expression_sink=expression_sink,
+                                  thresholds=self._thresholds, decision_probe=probe)
+            self.available = True
+            self.error = None
+            return True
+        except Exception as exc:
+            if self._decision_probe is not None:
+                self._decision_probe.close()
+                self._decision_probe = None
             self.error = f"{type(exc).__name__}: {exc}"
-            logger.error("[%s] 进程内 InteractionCore 装配失败：%s",
-                         self.owner_key or "?", self.error)
-            self.available = False
+            logger.warning("[%s] Local InteractionCore unavailable: %s", self.owner_key, self.error)
             return False
-        self._decision_probe = probe
-
-        self.available = True
-        self.error = None
-        self._caps.clear()      # 新 Engine = 重新探测 IC 版本
-        logger.info(
-            "进程内 InteractionCore 已就绪（会话 %s expression=%s agent=%s "
-            "callback_ic=%s）",
-            self.owner_key or "?", self.expression_url or "-",
-            self.agent_url or "-", self._callback_ic or "-")
-        return True
-
-    # ------------------------------------------------------------------ #
-    #  写
-    # ------------------------------------------------------------------ #
 
     def supports(self, method: str, *keys: str) -> bool:
         """IC 的这个 ``apply_*`` 是否接受这些关键字参数（**版本探测**）。
@@ -499,224 +186,50 @@ class InProcessICClient:
             return
         self.apply("apply_agent", **kwargs)
 
-    def send_visual_background(self) -> bool:
-        """把本会话当前缓存的 VLM 描述当「视觉背景轮」投给 Agent（ASR 为空）。
-
-        调用方是**编排侧**（`InteractionDownstream._on_vlm_description`，在全量
-        描述刚写进缓存之后同步调用）。它转给 sink 的
-        `emit_visual_background()`，语义与前提条件见那里。
-
-        ⚠️ **只用鸭子判定**，不能用 `isinstance` —— `VlmAgentSink` 是定义在
-        `agent_sink.make_vlm_agent_sink` **函数体内**的类，没有模块级名字可引。
-        没有这个方法的 sink（`legacy` 模式装的是裸 `AgentSink`、未配 agent_url
-        时是 None）⇒ 返回假，调用方据此不打"已投递"的日志、也不置闩。
-        """
-        emit = getattr(self._agent_sink, "emit_visual_background", None)
-        if not callable(emit):
-            return False
-        try:
-            return bool(emit())
-        except Exception as exc:  # noqa: BLE001
-            # 投递面失败不该把编排侧的事件循环带下去（与 _mark_dead 的取向一致：
-            # 记下来、别抛）。返回假 ⇒ 调用方下次全量还能再试。
-            logger.warning("进程内 IC 投递视觉背景失败（会话 %s）：%s: %s",
-                           self.owner_key or "?", type(exc).__name__, exc)
-            return False
 
     def ic_owns_vision_round(self) -> bool:
-        """新版 IC 是否自己把 `ApplyVision` 的快照当 Vision 通知发给 Agent。
-
-        IC 的 ea4ea22 起，`Engine.apply_vision` 在写完状态后自己调
-        ``self.agent_sink.on_vision(...)``（ASR 空的 ANSWER，只存不答）。
-        IC 的 ADR 0001 也明确要求**同一会话里编排侧不再投**
-        `emit_visual_background` —— 否则每份描述会变成两轮，后一轮覆盖前一轮。
-
-        判据就是 sink 上有没有 ``on_vision``：新版 `apply_vision` 正是
-        ``getattr(self.agent_sink, "on_vision", None)``，有才发。旧 IC（P05
-        d3cf041 及以前）没有 ⇒ 返回假，编排侧照旧补自己的背景轮。
-
-        ⚠️ **只探测，不发** —— 不要"先试一次 apply_vision"来判能力。
-        """
-        if self._engine is None:
-            return False
-        sink = getattr(self._engine, "agent_sink", None) or self._agent_sink
-        return callable(getattr(sink, "on_vision", None))
-
-    # ------------------------------------------------------------------ #
-    #  生命周期
-    # ------------------------------------------------------------------ #
+        return self._engine is not None
 
     def reset_session(self) -> bool:
-        """新会话开始：清全部交互状态（**不通知** agent / TTS）。
-
-        进程内模式下这是新 Engine，本来就是干净的 —— 保留它是为了与 grpc
-        模式的启动序列一致（显式优于隐式），并作为双保险。
-        """
-        if not self.available or self._engine is None:
+        if not self.available:
             return False
-        try:
-            self._engine.reset_session()
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("进程内 InteractionCore 重置失败：%s", exc)
-            return False
-
-    def bind_session(self, session_id: str, callback_ic: str) -> bool:
-        """把本路会话的信封重新写到本 Engine 的两个 sink。
-
-        进程内模式下 Engine 是**本会话独占**的，构造时已经把 ``session_id`` /
-        ``callback_ic`` 传给了 sink —— 这里再写一次是为了与 gRPC 模式走**同一条
-        启动序列**（``reset_session`` → ``bind_session``），而不是"进程内靠
-        构造、远端靠 RPC"两套心智模型。
-
-        P05 之前没有这个方法：``getattr`` 探测，缺了只告警一次（老 IC 上会话
-        照常跑），不抛。
-        """
-        if not self.available or self._engine is None:
-            return False
-        if not session_id or not callback_ic:
-            logger.warning("[%s] 跳过 IC 会话绑定：session_id=%r callback_ic=%r"
-                           " —— 任一为空，IC 会整次忽略",
-                           self.owner_key or "?", session_id, callback_ic)
-            return False
-        fn = getattr(self._engine, "bind_session", None)
-        if fn is None:
-            # 每会话只走一次这里（on_session_start），不必额外去重。
-            logger.warning("[%s] 当前 InteractionCore 版本没有 Engine.bind_session"
-                           "（旧版）—— Agent 回写仍靠构造时写入的信封",
-                           self.owner_key or "?")
-            return False
-        try:
-            fn(session_id, callback_ic)
-            logger.info("[%s] 进程内 InteractionCore 已绑定本会话："
-                        "session_id=%s callback_ic=%s",
-                        self.owner_key or "?", session_id, callback_ic)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] 绑定进程内 InteractionCore 会话失败：%s",
-                           self.owner_key or "?", exc)
-            return False
+        self._engine.reset_session()
+        return True
 
     def end_session(self) -> bool:
-        """用户主动结束：通知 TTS 停播、Agent 收工，再清状态。
-
-        ⚠️ **同步 HTTP**（`ExpressionSink.stop` 最长 1s）—— 调用方必须
-        off-loop（见模块文档）。
-        """
-        if not self.available or self._engine is None:
+        if not self.available:
             return False
-        try:
-            self._engine.end_session()
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("进程内 InteractionCore 收尾失败：%s", exc)
-            return False
-
-    # ------------------------------------------------------------------ #
-    #  读
-    # ------------------------------------------------------------------ #
+        self._engine.end_session()
+        return True
 
     async def tick(self, dt_ms: int = 0):
-        """调一次 `Engine.tick()`，返回 `Action`；失败返回 `None`。
-
-        ⚠️⚠️ **必须 off-loop —— `tick()` 不是纯计算**。
-
-        policy 判 `YIELD`/`END` 时，`Engine.tick()` 会经 `_notify_sinks` 调
-        `ExpressionSink.stop()` —— 那是**同步 HTTP**（`POST /v1/stop`，
-        超时 1s）。在事件循环上直呼会**自锁**：`/v1/stop` 打的是本进程
-        自己的 HTTPS 端口，唯一能服务它的就是被这一行攥住的同一个循环。
-        完整证据见模块文档「为什么 tick 这条最要命：自锁」。
-
-        放进线程后循环空出来服务那个请求，`stop()` 几毫秒返回 ——
-        既消掉 0.6~1s 的进程级冻结，IC 的停播也才**真正生效**。
-
-        ⚠️ **顺序仍然严格**：调用方 `await` 完一次才发下一次，所以同一个
-        会话不会并发 tick。不同会话各在自己的线程上跑，Engine 各自独占。
-
-        ⚠️ `tick()` 会推进状态机（`advance_*` → `decide()` →
-        `apply_action()`），**不是只读的**。挪到线程后与循环上的 `apply_*`
-        之间靠 `Engine._lock` 串行 —— tick 整段持锁，所以 `apply_*` 要么
-        整段在 tick 前、要么整段在 tick 后，与「两者都在循环上」时**语义
-        相同**（那时也不可能交错，同样是这把锁）。
-        """
-        if not self.available or self._engine is None:
+        if not self.available:
             self.bad_ticks += 1
             return None
         try:
-            # ⚠️ 不要为了省一次线程跳转改回直呼 —— 那会把 1s 自锁带回来。
-            action = await asyncio.to_thread(self._engine.tick, dt_ms)
-        except Exception as exc:  # noqa: BLE001
+            action = self._engine.tick(dt_ms)
+        except Exception as exc:
             self.bad_ticks += 1
-            self._mark_dead(f"tick 失败: {type(exc).__name__}: {exc}")
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.available = False
+            logger.exception("[%s] InteractionCore tick failed", self.owner_key)
             return None
         self.tick_calls += 1
-        self.last_action = getattr(getattr(action, "type", None), "value",
-                                   str(getattr(action, "type", "?")))
+        self.last_action = action.type.value
         return action
 
-    async def snapshot(self) -> Optional[dict]:
-        """读整份状态（调试/诊断用）。"""
-        if not self.available or self._engine is None:
-            return None
-        try:
-            from interaction.snapshot import state_to_blocks
-            return state_to_blocks(self._engine.state)
-        except Exception as exc:  # noqa: BLE001
-            self._mark_dead(f"snapshot 失败: {type(exc).__name__}: {exc}")
-            return None
-
-    # ------------------------------------------------------------------ #
-
-    def _mark_dead(self, why: str) -> None:
-        """连接失效 —— 置位并告警，调用方据此降级。"""
+    async def snapshot(self):
         if not self.available:
-            return
-        self.available = False
-        self.error = why
-        logger.warning("进程内 InteractionCore 失效（会话 %s）—— %s",
-                       self.owner_key or "?", why)
+            return None
+        from interaction.snapshot import state_to_blocks
+        return state_to_blocks(self._engine.state)
 
     def close(self) -> None:
-        """收尾：把两个 sink 的队列排空再关线程。
-
-        ⚠️ `flush` 必须在 `close` **之前** —— `close` 会 join worker 线程，
-        队列里还没发出的 `on_end` / speak 会被停机哨兵直接丢掉
-        （这正是「Agent 收不到会话结束」那类故障的成因）。
-
-        ⚠️ **同步、可能阻塞数秒** —— 调用方必须 off-loop。
-        """
-        # 打断探针挂在 Engine 之外，先关（不涉及队列排空，是线程池停机）。
-        probe, self._decision_probe = self._decision_probe, None
-        if probe is not None:
-            try:
-                probe.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("decision_probe.close 异常: %s", exc)
-
-        engine, self._engine = self._engine, None
-        if engine is None:
-            self.available = False
-            return
-        for name in ("flush_sinks", "close_sinks"):
-            fn = getattr(engine, name, None)
-            if fn is None:
-                # 老版本 interactioncore 没有这两个方法 —— 退回逐个 sink 处理
-                continue
-            try:
-                fn(2.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("%s 异常: %s", name, exc)
-        if not hasattr(engine, "close_sinks"):
-            for sink in (getattr(engine, "expression_sink", None),
-                         getattr(engine, "agent_sink", None)):
-                if sink is None:
-                    continue
-                for name in ("flush", "close"):
-                    fn = getattr(sink, name, None)
-                    if fn is not None:
-                        try:
-                            fn(2.0)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("sink.%s 异常: %s", name, exc)
+        if self._decision_probe is not None:
+            self._decision_probe.close()
+            self._decision_probe = None
+        if self._engine is not None:
+            self._engine.flush_sinks()
+            self._engine.close_sinks()
+            self._engine = None
         self.available = False
-        logger.info("进程内 InteractionCore 已关闭（会话 %s）", self.owner_key or "?")

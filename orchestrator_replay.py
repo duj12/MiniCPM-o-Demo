@@ -1284,7 +1284,7 @@ class OrchestratorReplayClient:
                  face_log_every: int = 5,
                  asr_params: Optional[dict] = None,
                  system_prompt: str = "",
-                 ic_grpc: str = "", ic_agent_url: str = "",
+                 agent_grpc: str = "",
                  ic_enabled: Optional[bool] = None) -> None:
         self.url = url
         self.clock = clock
@@ -1297,9 +1297,8 @@ class OrchestratorReplayClient:
         #   asr_params    —— ASR 调参，受服务端白名单限制
         #   system_prompt —— OmniLLM 系统提示词，覆盖服务端默认
         self.asr_params: dict = dict(asr_params or {})
-        # InteractionCore：**连接由服务端建**，这里只是把地址传过去
-        self.ic_grpc = ic_grpc
-        self.ic_agent_url = ic_agent_url
+        # Independent Agent connection is owned by the orchestrator.
+        self.agent_grpc = agent_grpc
         self.ic_enabled = ic_enabled
         #: IC 的 Action 流（收到就记；可选落 JSONL 供 viz 工具用）
         self.ic_actions: List[dict] = []
@@ -1375,15 +1374,10 @@ class OrchestratorReplayClient:
             payload["asr"] = dict(self.asr_params)
         if self.system_prompt:
             payload["system_prompt"] = self.system_prompt
-        # InteractionCore：地址由客户端指定，但**连接建在服务端**
-        # （这样 web 客户端也自动具备，不用各写一份）。
-        if self.ic_grpc:
-            payload["ic"] = {"grpc": self.ic_grpc}
-            if self.ic_agent_url:
-                payload["ic"]["agent_url"] = self.ic_agent_url
-        elif self.ic_enabled is False:
-            # 显式关掉（覆盖服务端默认开的设置）—— 用于回归/对照实验
-            payload["ic"] = {"enabled": False}
+        if self.agent_grpc:
+            payload["ic"] = {"agent_grpc": self.agent_grpc}
+        if self.ic_enabled is False:
+            payload.setdefault("ic", {})["enabled"] = False
         await self.ws.send(json.dumps(payload, ensure_ascii=False))
         # 等 session.ready
         while True:
@@ -2288,14 +2282,14 @@ async def main_async(args) -> int:
         save_tts_dir=args.save_tts, verbose=args.verbose,
         speaker=speaker, face_log_every=args.face_log_every,
         asr_params=asr_params, system_prompt=args.system_prompt,
-        ic_grpc=args.ic_grpc, ic_agent_url=args.ic_agent_url,
+        agent_grpc=args.agent_grpc,
         ic_enabled=(False if args.no_ic else None))
     if asr_params:
         print(f"  ASR 参数覆盖：{asr_params}")
     if args.system_prompt:
         print(f"  系统提示词覆盖（{len(args.system_prompt)} 字）")
-    if args.ic_grpc and not args.no_ic:
-        print(f"  InteractionCore：{args.ic_grpc}"
+    if args.agent_grpc and not args.no_ic:
+        print(f"  Agent gRPC：{args.agent_grpc}"
               f"（回复由 IC+Agent 负责，服务端建连接）")
     elif args.no_ic:
         print("  InteractionCore：显式关闭（回复走 OmniLLM）")
@@ -2405,13 +2399,9 @@ def main() -> None:
                    help="ASR: 离线（最终）置信度阈值。调低更容易触发回复")
     p.add_argument("--system-prompt", default="",
                    help="OmniLLM 系统提示词，覆盖服务端默认（空=用服务端默认）")
-    # ---- InteractionCore（地址传给服务端，连接由服务端建）----
-    p.add_argument("--ic-grpc", default="",
-                   help="InteractionCore 的 gRPC 地址（如 localhost:50051）。"
-                        "给了就打开 IC 决策链路 —— 回复由 IC+Agent 负责，"
-                        "不再是 OmniLLM。**连接由编排服务建**，这里只是传地址。")
-    p.add_argument("--ic-agent-url", default="",
-                   help="Agent Platform 地址（默认用服务端配置）")
+    # IC is local; only the independent Agent target is overridable.
+    p.add_argument("--agent-grpc", default="",
+                   help="Independent AgentService gRPC target (host:50051); empty uses server config")
     p.add_argument("--no-ic", action="store_true",
                    help="显式关掉 IC（覆盖服务端默认开）—— 回归/对照实验用")
     p.add_argument("--ic-events-out", default="",

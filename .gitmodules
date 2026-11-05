@@ -1,0 +1,3 @@
+[submodule "vendor/interactioncore"]
+	path = vendor/interactioncore
+	url = git@git.xmov.ai:jinshihao/interactioncore.git

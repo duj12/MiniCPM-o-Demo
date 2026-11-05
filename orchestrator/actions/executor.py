@@ -106,6 +106,8 @@ class ActionExecutor:
 
     async def execute(self, act, session: "OrchestratorSession") -> None:
         if isinstance(act, Speak):
+            if act.guard is not None and not act.guard():
+                return
             await self._speak(act, session)
         elif isinstance(act, Cancel):
             await self._cancel(act, session)
@@ -274,6 +276,8 @@ class ActionExecutor:
         # 上一句的流任务要等它退干净，否则旧音频会串进新的消费循环
         await self._await_stream_task()
 
+        if act.guard is not None and not act.guard():
+            return False
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
@@ -426,6 +430,8 @@ class ActionExecutor:
         await self._interrupt_current(session, reason="superseded",
                                       keep_parked=act.prompt)
 
+        if act.guard is not None and not act.guard():
+            return
         response_id = uuid.uuid4().hex[:8]
         self._current_response_id = response_id
         self._tts_seq = 0
@@ -455,6 +461,9 @@ class ActionExecutor:
             if not session.closed:
                 await session.send_to_client(TtsEnd(response_id=response_id))
             return
+        if act.guard is not None and not act.guard():
+            self._release_arm(session, response_id)
+            return
         # 指标：合成耗时与音频时长
         if session.metrics is not None:
             session.metrics.tts_total.record((_time.monotonic() - t_synth0) * 1000)
@@ -476,6 +485,9 @@ class ActionExecutor:
         #    所以必须先把音频推出去，承诺才有意义。
         chunk = TTS_SR // 2
         for i in range(0, len(pcm24), chunk):
+            if act.guard is not None and not act.guard():
+                self._release_arm(session, response_id)
+                return
             part = pcm24[i:i + chunk]
             await session.send_to_client(
                 TtsAudio.from_int16(part, response_id, self._tts_seq)
@@ -501,6 +513,8 @@ class ActionExecutor:
         # 若 lead 被调得很小、或 D 极小、或 RTT 异常大，参考轨就会写晚 ——
         # 表现为该句开头一小段回声没有参考。`started` 回执里的偏差会暴露。
         at_sample = await self._resolve_play_at(session, response_id, arm)
+        if act.guard is not None and not act.guard():
+            return
         # 留住整段 PCM —— 软打断后要按"已播多少"切片续播
         # （见 `_pause_tts` / `_resume_tts`）。一条回复几 MB 量级，可接受。
         self._current_pcm = pcm24.astype(np.int16, copy=False)

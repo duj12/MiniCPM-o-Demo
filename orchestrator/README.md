@@ -1,10 +1,55 @@
+# 当前接入方式（2026-11-03）
+
+每路 `OrchestratorSession` 持有自己的进程内 InteractionCore `Engine`，源码固定在
+`vendor/interactioncore` submodule。两个 Sink 只向宿主回调入队，IC 不建网络连接。
+编排服务通过 `ORCH_AGENT_GRPC=host:50051` 连接独立的 AgentService/Interact，
+把动作映射为带 session_id/ci/epoch 的 AgentAction，接收状态及 FEEDBACK/ANSWER 文本。
+正文经既有 ActionExecutor → TTS → 浏览器输出；暂停、续播、停播也由宿主执行。
+`playing/stopped` 真实回执负责更新 `apply_playback_active`；Agent 的 done/IDLE 不代表播完。
+
+首次在其他机器部署前，需先将 InteractionCore 固定提交
+`40921a6c9cff583071aa70c463c65f016607fab2` 发布到 `.gitmodules` 指向的远端，
+并由可获取的分支保留该提交。当前提交尚未发布，直接初始化 submodule 会报
+`not our ref`；本地已有副本不能替代这个部署前置。
+
+从仓库根目录初始化和安装：
+
+```bash
+git submodule update --init --recursive
+python -m pip install -r orchestrator/requirements.txt
+```
+
+安装完成后，按下文[开发/调试启动命令](#开发调试直接起)配置并启动本地完整链路。
+
+部署脚本按自身位置定位仓库和 submodule，用 `ORCH_PY` 选择已配置的解释器。
+不再启动独立 IC 服务，`ORCH_IC_MODE=grpc`、`ic.grpc`、Agent 的 HTTP on_*、
+set_target/callback_ic 及 `/v1/ic/apply_agent` 回写均已退役。完整接入约定见
+[Agent 接入指南](docs/agent-integration.md)。手动 HTTP speak/stop/pause/resume 仍可用于既有工具。
+
+每个真实 ANSWER 建新 ci 并递增 epoch；INSERT/YIELD 复用当前轮标识。
+YIELD 立即使宿主已排队旧文本失效，保留 Agent 上下文；END 清上下文且保留 RPC。
+视觉快照通过空 transcript 的 ANSWER/vlm 更新，活动轮期间复用标识；END 后视觉更新
+提高 epoch。断流后当前客户端终止、清本地活动轮，不重放旧动作；下一真实 ANSWER 或新宿主会话创建新 RPC。
+协议源与生成命令见 [agent_protocol/README.md](../agent_protocol/README.md)。
+
+## 验证
+
+```bash
+python -m pytest orchestrator/tests/test_agent_integration.py -q
+# 可选：对实际 Agent 服务源码执行可控 Runtime 的独立进程 loopback
+AGENT_TEST_SOURCE=../openai-agent-demo AGENT_TEST_PYTHON=/path/to/agent/python \
+  python -m pytest orchestrator/tests/test_agent_integration.py -q
+```
+
+---
+
 # Orchestrator —— 音视频输入 + TTS 输出模块
 
 把浏览器端的**音视频采集**与 **TTS 播报**做成一个可独立部署的服务：
 音频经云端 AEC 清洗后扇出给 ASR 与 OmniLLM，视频驱动人脸/唇动，TTS
 合成结果回浏览器播放并闭环进 AEC 参考。
 
-**本模块不含 Policy / Agent** —— 只预留接口，决策逻辑后续接入。
+交互策略使用每会话进程内 InteractionCore，回复由独立 Agent 服务生成。
 
 ```
 ┌─ Browser ─────────────────────────────────────────────────────────┐
@@ -22,7 +67,7 @@
 │  · AecClient ─────────────────────────────────────┼──┘  │  │    │   │
 │  · FaceWorker（G1 + FaceService，专用线程）────────┼─────┘  │    │   │
 │  · AsrClient / OmniClient / TtsClient ────────────┼────────┼────┘   │
-│  · Downstream（Policy/Agent 预留）────────────────┼────────┼────────┤
+│  · Downstream（IC/Agent 适配）────────────────┼────────┼────────┤
 └───┬──────────────┬──────────────┬───────────────┬┴────────┴────────┘
     │              │              │               │
 [AEC 服务]      [ASR 服务]    [Qwen3-Omni]    [TTS 服务]
@@ -39,11 +84,11 @@ AEC 只调一次，扇出在其后 —— 绝不两路各自调 AEC（它是有�
 
 ### 依赖
 
+从仓库根目录初始化并安装当前 IC、Agent 和 TTS 所需依赖：
+
 ```bash
-# 运行环境：Python 3.10（106 上为 py310）
-pip install websockets fastapi uvicorn numpy
-# TTS 需要 grpc（proto 生成代码已随本仓库分发在 protos/，不再依赖 TTS 仓库）
-pip install grpcio protobuf
+git submodule update --init --recursive
+python -m pip install -r orchestrator/requirements.txt
 ```
 
 ---
@@ -52,53 +97,103 @@ pip install grpcio protobuf
 
 ### 生产：用对应的启动脚本
 
-**推荐用脚本，不要手工 `nohup`** —— 人脸 / IC 相关的环境变量漏一个，
-表现往往**不报错**：人脸模块突然没了（`face=False`），或 Agent 的 Action
-派到别的机器上。
+脚本按自身位置定位仓库，保留各台机器原有的解释器、日志和音视频转储目录。
+运行前先初始化 submodule，并用该机 `ORCH_PY` 指定的解释器安装依赖。
 
-| 脚本 | 用途 |
-|---|---|
-| `orchestrator/run_orch_105.sh` / `run_orch_106.sh` | 105 / 106 的编排（生产） |
-| `orchestrator/run_ic_105.sh` / `run_ic_106.sh` | 本机 IC gRPC 服务（`:50051`）。**平时不参与业务**（编排走进程内 IC），仅作 `ORCH_IC_MODE=grpc` 的**回退依赖** —— **别停它** |
-| 真机/设备端（本地 `.so` 人脸） | 见 `run_orch_106.sh` 里「本地 .so 退路」那段注释 |
+| 脚本 | 默认解释器 | Agent gRPC |
+|---|---|---|
+| `orchestrator/run_orch_105.sh` | `/home/dujing/miniconda3/envs/orch105/bin/python` | `192.168.89.103:50051` |
+| `orchestrator/run_orch_106.sh` | `/home/dujing/miniconda3/envs/py310/bin/python` | `192.168.89.102:50051` |
 
 ```bash
-# 路径都写死在脚本里（共享树），从哪个目录跑都行
 setsid nohup bash orchestrator/run_orch_106.sh </dev/null >/dev/null 2>&1 &
 
-# 影子实例：换个端口就自洽 —— 回调地址与 IC 播报地址都跟着 ORCH_PORT 走
+# 影子实例：端口、106 的日志文件名随 ORCH_PORT 变化
 ORCH_PORT=8101 bash orchestrator/run_orch_106.sh
+# 使用其他 Agent 服务或解释器
+ORCH_AGENT_GRPC=192.168.89.103:50051 ORCH_PY=/path/to/python \
+  bash orchestrator/run_orch_106.sh
 ```
 
-两个生产脚本**结构完全相同**，只有地址/环境不同；两个模式开关都在脚本里：
+IC 始终在宿主进程内，每会话一份 Engine；`run_ic_105.sh/run_ic_106.sh`
+已退役，不能再切换独立 IC gRPC 模式。Agent 目标必须提供 AgentService/Interact。
 
-| 想切什么 | 怎么切 |
-|---|---|
-| IC：进程内 Engine（默认，支持并发） ↔ 独立 gRPC IC 服务 | `ORCH_IC_MODE=inprocess` / `grpc` |
-| 人脸：远端服务（105:8767） ↔ 本地 `.so` | `ORCH_FACE_SERVICE_URL` 非空 / **显式置空** |
-| VLM 描述随 ASR 给 Agent（两阶段 omni） | `ORCH_OMNI_DESCRIBE` / `ORCH_AGENT_TRANSCRIPT_MODE`（**默认关**，见「决策链路」一节末尾） |
+两台脚本均默认开启 `ORCH_OMNI_DESCRIBE=1`，用 OmniLLM 提供两阶段描述，
+`transcript` 和 `vlm` 通过 canonical gRPC 协议分别传递。
+直接运行 Python 时描述功能默认关闭，可按需要显式设置。
 
-⚠️ 为什么不能只翻 `ORCH_IC_MODE`（`ORCH_IC_ADVERTISE` 必须一起变）、
-人脸为什么必须服务化、`ORCH_FACE_SERVICE_URL=` 为什么要写成**显式空值**
-—— 都在两个脚本的头注释里，别绕过它们手工拼命令行。
-脚本里还集中管理了算法 AEC 的延迟 D、音视频转储、HTTPS 证书；
-`ORCH_PY` 可换解释器。
+人脸默认走 `http://192.168.89.105:8767`，按会话隔离，105/106 共用服务额度。
+`ORCH_FACE_SERVICE_URL=` **显式置空**才会回到本地 provider；106 的本地 `.so`
+持有进程级状态，仅适合单会话，并需配置 `ORCH_FACE_DB/ORCH_FACE_MODELS`。
+105 当前没有可用本地库，置空时应同时设置 `ORCH_ENABLE_FACE=0`。
 
-看启动结果（日志由**脚本自己**落盘，不需要调用方重定向）：
+脚本同时保留算法 AEC 的设备延迟、音视频转储、HTTPS 证书和运行参数诊断；
+`ORCH_SSL_CERT/ORCH_SSL_KEY` 成对覆盖证书。未找到证书时会告警并以 HTTP 启动。
 
 ```bash
-tail -20 /data/megastore/Projects/DuJing/code/orch-dumps/105/orch105.log   # 105
-tail -20 /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/orch106-8100.log  # 106
+tail -20 /data/megastore/Projects/DuJing/code/orch-dumps/105/orch105.log
+tail -20 /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo/orch106-8100.log
+# 启动横幅列出 Agent gRPC、人脸、解释器、转储、描述与证书配置
 # 期望：能力: aec=True asr=True omni=True tts=True face=True downstream=omni
 #       HTTPS 已启用：https://0.0.0.0:8100
 ```
 
 ### 开发/调试：直接起
 
-```bash
-cd MiniCPM-o-Demo
-python -m orchestrator.main --port 8100
+以下命令分别在对应仓库根目录执行，使用各项目同名 Conda 环境。
+先在 `openai-agent-demo` 配好模型凭据，再在独立终端启动 Agent gRPC 服务：
+
+```powershell
+# 终端一：openai-agent-demo 仓库根目录
+conda activate openai-agent-demo
+python app.py
 ```
+
+编排服务启动时自动读取本仓库根目录的 `.env`，终端中已设置的环境变量优先。
+`.env.example` 已提供本地 Agent + 远端感知/TTS 的完整配置；现有 `.env` 请合并
+其中的 `ORCH_*` 配置。关键项如下，按实际部署修改地址：
+
+| 配置 | 本地联调示例 |
+|---|---|
+| `ORCH_AGENT_GRPC` | `127.0.0.1:50051`（本地 Agent gRPC） |
+| `ORCH_OMNI_URL` | `wss://192.168.89.106:8006/v1/realtime?mode=video` |
+| `ORCH_OMNI_DESCRIBE` | `1`（Omni 生成视觉描述） |
+| `ORCH_ENABLE_FACE` | `1` |
+| `ORCH_FACE_SERVICE_URL` | `http://192.168.89.105:8767` |
+| `ORCH_ASR_URL` | `ws://192.168.88.101:31366` |
+| `ORCH_TTS_HOST / ORCH_TTS_PORT` | `192.168.88.253 / 31058` |
+| `ORCH_AEC_MODE` | `browser`（浏览器原生 AEC） |
+
+IC 从初始状态放行语音 ANSWER 需要人脸在场；没有人脸状态时可能一直 HOLD，
+即使 ASR 已识别出文本、视觉描述也已发送给 Agent。启动时应看到
+“人脸预检通过（远端）”、能力清单 `face=True` 以及本地 Agent 地址。
+
+```powershell
+# 终端二：omni-llm-server 仓库根目录
+conda activate omni-llm-server
+# 已有 .env 时保留，先按上表检查配置。
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+python -m pip install -r orchestrator/requirements.txt
+python -m orchestrator.main --host 0.0.0.0 --port 8100
+```
+
+Bash 下在同一仓库根目录执行：
+
+```bash
+conda activate omni-llm-server
+[ -f .env ] || cp .env.example .env
+python -m pip install -r orchestrator/requirements.txt
+python -m orchestrator.main --host 0.0.0.0 --port 8100
+```
+
+本机浏览器打开 **http://localhost:8100/**（或 `http://127.0.0.1:8100/`），允许
+摄像头和麦克风权限后开始会话。`0.0.0.0` 仅用于服务监听，不用作浏览器访问地址。
+从另一台设备访问时，成对传入 `--ssl-cert certs/cert.pem --ssl-key certs/key.pem`
+启用 HTTPS，并使用证书包含的服务器地址访问。
+
+修改 `.env` 后重启编排服务，再重新开始网页会话。若终端保留了旧的 `ORCH_*`
+环境变量，需先修改或移除它们；生产启动脚本提前 `export` 的值同样高于 `.env`。
+脚本自身的 `ORCH_PY/ORCH_PORT/ORCH_SSL_CERT/ORCH_SSL_KEY` 仍需在调用脚本时设置。
 
 ### 参数
 
@@ -213,171 +308,64 @@ export ORCH_DUMP_AUDIO="$CODE/orchdump/s"
 
 ## 决策链路：InteractionCore + Agent（默认开）
 
-回复**不是** OmniLLM 生成的。OmniLLM 只产出音视频描述，**谁来开口、说什么**
-由这两者决定：
+每路会话持有独立的 IC `Engine` 和 Agent 双向 RPC。IC 的同步 AgentSink /
+ExpressionSink 只交付事件，宿主负责网络、TTS 和暂停/续播/停播。
 
+```text
+ASR / 人脸 / 唇动 / 视觉 / 播放态
+       │ 本地 apply_* / tick
+       ▼
+每会话 InteractionCore Engine
+       │ 两个 Sink → 宿主队列
+       ▼
+orchestrator ── AgentAction ──► AgentService/Interact
+       ▲                          │
+       └────── AgentEvent ────────┘
+       │
+       └── ActionExecutor → TTS → 浏览器 → 真实播放回执
 ```
-感知（ASR state / 人脸 state / TTS 播放态）
-        │  gRPC apply_*          10Hz~25Hz 写状态
-        ▼
-  InteractionCore（gRPC，默认 localhost:50051）
-        │  Tick() → Action       我们每 50ms 问一次
-        ▼
-  ANSWER/INSERT/YIELD/END  →  Agent Platform（HTTP）
-  GREET/UTTER              →  本地模板文案，直接播
-        │
-        ▼
-  Agent 生成回复文本 → POST /v1/speak → TTS → 扬声器
-```
 
-**职责边界**（PRD §3.2 的「谁写」）：
+AgentState 只投影到本会话 IC；FEEDBACK 在终结后整段播报，ANSWER 逐片进入 TTS。
+`done/IDLE` 是生成完成信号，`apply_playback_active` 由真实播放回执更新。
+每条消息携带 `session_id/ci/epoch`，宿主拒绝其他会话和旧轮次事件。动作语义、
+错误恢复及协议字段见 [Agent 接入指南](docs/agent-integration.md)。
 
-| 谁 | 写什么 |
-|---|---|
-| orchestrator | `apply_face/track/lip/identity`（人脸 state）、`apply_vad/asr`（ASR state）、**`apply_playback_active`**（表达层事实） |
-| Agent | `apply_agent(status, session_end_pending)` —— 它自己的投影，我们不写 |
-
-**为什么回复要绕回 orchestrator 播**：浏览器播放必须和 AEC 参考轨、播放回执
-严格对齐（回声消除靠它）。Agent 直接调 TTS 会绕过这些，回声消不掉。
-
-### 感知状态透传（IC P05：语音子集 + 视觉八键）
-
-IC 的 P05 给 `apply_asr` 加了感知字段，并新开了 `apply_vision`。编排侧现在
-把两路状态都送进去：
-
-| 来源 | 目标 | 字段 |
-|---|---|---|
-| `AsrState.to_dict()`（只在 `2pass-offline` 那一帧有值） | `apply_asr` 新增参数 | `language / language_prob / language_switch / emotion / emotion_prob / speech_event / snr_db`，另把嵌套字典拆平：`noise.burst.detected→noise_burst_detected`、`noise.burst.type→noise_burst_type`、`overlap.detected→overlap_detected`、`overlap.prob→overlap_prob` |
-| `omni.describe.parse_state()` 的 8 键快照（每份描述更新一次） | `apply_vision` | `ATTENTION/ACTION/…/POSITION` → 小写参数名；`updated_at_ms` 由 IC 自己打 |
-
-两条链路都**按 IC 版本自适应**：调用前用 `ic.supports(method, *keys)` 探
-（进程内模式探的是 `engine.state` 上的真方法，不是 `Engine` 那层
-`(*args, **kwargs)` 壳子）。旧 IC 上整组静默跳过，每会话只告警一条
-`当前 InteractionCore 版本不支持 …`；IC 升级并重开会话后自动开始透传，
-**编排不用改、两种模式（inprocess / grpc）行为一致**。
-
-取值语义：`None`（服务端没开感知 / 还没出结果）**不写** —— proto 是
-"省略 = 不改"，所以 IC 会保留上一段的感知值；VLM 解析失败（模型没按格式答）
-时同样不写，避免拿空值覆盖。`InProcessICClient` 还会按 `Engine.__init__`
-签名裁剪软打断那组参数 —— IC 的 P05 分支用 barge 状态机代替了软打断，
-原样传会让整个会话降级为 OmniLLM。
-
-#### P05 的打断探针（`ORCH_IC_DECISION_PROBE`，默认 1）
-
-P05 把打断换成了 `interaction/barge.py` 的状态机（`NONE → QUICK_CHECK →
-SOFT → HARD`）。`SOFT`/`HARD` 的判据 `barge_class` 只能由
-`DecisionProbe` 问 StartLux（`POST /v1/systemone`）得到 —— **探针不跑，
-用户开口也不会打断**。独立 IC（`grpc_server`）默认自己建；进程内模式的
-`Engine` 是编排造的，碰不到那段代码，所以 `InProcessICClient.connect()`
-按 `Engine.__init__` 签名装配：老 IC（软打断那条线）没有
-`decision_probe` 参数 → 自动跳过、不报错。
+### 配置与依赖
 
 ```bash
-export ORCH_IC_DECISION_PROBE=0   # 只在排障时关（= P05 下不打断）
-export DECISION_BASE_URL=http://192.168.89.101:8094   # 不设就用包里默认
+export ORCH_INTERACTION=1
+export ORCH_AGENT_GRPC="127.0.0.1:50051"
+python -m pip install -r orchestrator/requirements.txt
 ```
 
-### 配置
+IC 源码由 `vendor/interactioncore` 的 gitlink 固定，安装时包含 editable
+依赖；Agent 协议生成代码随 `agent_protocol/` 分发。gRPC/protobuf 运行库与生成工具
+版本由 `orchestrator/requirements.txt` 固定，TTS proto 仍在 `protos/`。
 
-```bash
-export ORCH_INTERACTION=1                    # 默认就是 1；=0 关掉
-export ORCH_IC_GRPC="localhost:50051"        # InteractionCore 地址
-export ORCH_AGENT_URL="http://192.168.89.102:8081"
-```
+IC 导入/构造失败时，宿主会告警并退回 OmniLLM 回复；描述模式下这一退路可能没有回复，
+因此必须查看日志并修复依赖。Agent 断流会停止本轮输出，不重放旧动作；
+之后新的真实 ANSWER 可建立新 RPC。主动关闭 IC 使用 `ORCH_INTERACTION=0`，
+同时关闭 `ORCH_OMNI_DESCRIBE`，以启用 OmniLLM 直接对话。
 
-⚠️ **IC 由谁启动**：本服务**不启动也不管理 IC 进程**，只要求一个可达的地址。
-离线套件 `interactioncore/scripts/run_offline_sop_suite.py` 会自己起 IC；
-真实联调时由部署方起：
+### 感知状态与打断探针
 
-```bash
-cd interactioncore && python -m interaction.grpc_server --port 50051
-```
+ASR 的语种、情绪、事件、SNR、噪声和重叠字段经能力检查后写入 `apply_asr`，
+VLM 八键快照写入 `apply_vision`。缺失值不覆盖 IC 原状态，解析失败的视觉快照也不写入。
 
-### ⚠️ IC 连不上 → 降级为 OmniLLM 回复
+P05 的 barge 状态机使用 `DecisionProbe` 获取打断判据。宿主默认构造探针，
+`DECISION_BASE_URL` 未设时使用 IC 包默认 `http://192.168.89.101:8094`。
+`ORCH_IC_DECISION_PROBE=0` 仅供排障，关闭后缺少探针判据。
+旧软打断分支的 `ORCH_IC_SOFT_INTERRUPT` 等变量不再配置当前固定版本的 Engine。
 
-IC 是默认的**唯一回复来源**，连不上会变成「能识别、但永远不回复」——
-与我们修过的 OmniLLM 断线 bug 同一病理，**极难排查**。所以有显式降级：
+### VLM 描述随 ASR 进入 Agent
 
-```
-建会话时试连 IC
-  ├─ 成功 → InteractionDownstream（IC 决策 + Agent 回复）
-  └─ 失败 → ⚠️ 告警 + 回退 PassthroughDownstream（OmniLLM 回复）
-```
+`ORCH_OMNI_DESCRIBE=1` 时，OmniLLM 用作描述器。IC 首次切入 GREET 触发
+起点 full 描述；后续每轮输出完整八键快照，ASR 断句点触发，默认 10 秒心跳兜底。
+描述异步生成，不阻塞当前 ASR 话轮；无新鲜视频帧时不触发，避免旧画面被模型编造续写。
 
-日志里会明确打：
-
-```
-[sid] InteractionCore 不可用（localhost:50051：...）—— 降级为 OmniLLM 回复
-```
-
-**降级只有一层**，已经是 OmniLLM 就不再降。想主动关掉 IC 用
-`ORCH_INTERACTION=0`，或客户端在 `session.start` 里传 `{"ic":{"enabled":false}}`。
-
-### 环境依赖
-
-`interactioncore` 要求 `grpcio>=1.84.0` / `protobuf>=7.35.1`（比 TTS 的
-gencode 新）。实测**旧 gencode + 新 runtime 兼容**，升级不影响 TTS 客户端。
-
-```bash
-cd interactioncore && pip install -e .
-```
-
-### Agent 侧要做什么
-
-**Agent 需要调我们的 `POST /v1/speak` 把回复文本送进来** ——
-完整接口说明 + curl / Python 示例见
-[`docs/agent-integration.md`](docs/agent-integration.md)。
-
-### VLM 描述随 ASR 一起给 Agent（两阶段 OmniLLM，**默认关**）
-
-IC 派给 Agent 的 `on_answer` 原本只有 ASR 转写。开起来之后会多带一份
-**OmniLLM 的画面/语音描述**，让 Agent 知道"用户说这句话时，眼前是什么样"：
-
-```jsonc
-POST {callback_ic}/interaction/on_answer
-{
-  "identity_id": "…", "display_name": "…", "session_id": "…",
-  "transcript": "你好，请介绍一下这个展厅",          // dual：原样保留
-  "content": {                                     // ← 新增
-    "ASR": "你好，请介绍一下这个展厅",
-    "VLM": "画面里有一位青年男性，穿深蓝色外套，站在白色展示桌左侧。"
-  }
-}
-```
-
-| 开关 | 默认 | 作用 |
-|---|---|---|
-| `ORCH_OMNI_DESCRIBE` | `0` | `1` = omni 换成"描述助手"人设，按两阶段刷描述 |
-| `ORCH_AGENT_TRANSCRIPT_MODE` | `legacy` | `dual` = 追加 `content` 键；`dict` = `transcript` 本身换成 `{ASR,VLM}`；`legacy` = **逐字节等于旧版** |
-| `ORCH_OMNI_DELTA_INTERVAL_S` | `2.0` | 增量描述的最小间隔（不重叠、不自激） |
-
-**两个阶段**（靠注入指令区分，不重连、不重 init）：
-
-- **全量** —— IC 判 **GREET** 时触发一次（含人物/环境/情绪/视线/指向物体等九类）。
-  判据是「**切入** GREET」而不是"动作和上次不同"：迎宾后 IC 会长时间停在
-  LISTEN/HOLD，换人后的第二次 GREET 动作元组与上次**完全一样**，用去重会漏掉。
-- **增量** —— 进入对话态后每 `ORCH_OMNI_DELTA_INTERVAL_S` 自驱动刷一次，
-  只报**相对上一轮的变化**；回「无变化」或空则**不覆盖**缓存。
-
-**主指标是"发送的那一刻不生成"**：描述是**滚动预生成**的，`AsrFinal`
-（`2pass-offline`，即断句点）到达时直接取缓存 → 断句 → Agent 这条链路上
-**没有任何等待**。所以：
-
-- 进 payload 的永远是**生成完的整段**（`response.done`），**不是 token delta**
-  （delta 任一时刻都是半句话）
-- **不做本地截断** —— 生成长度直接决定生成耗时，短只是手段、快才是目的
-- 缓存为空时**照样立刻发**（`VLM` 为空串），只记 `vlm_miss` + 打日志，
-  **不等待**。这个窗口物理上消不掉（GREET 才触发首次推理），靠观测
-  `[VLM 就绪] 年龄=…ms` 的分布来调间隔
-
-⚠️ **为什么默认关**：编排代码也是 105/106 **共用一份**的，默认值就是 106
-下次重启后的行为 —— 默认开等于替 106 决定"给 102 的 Agent 多发一个键"。
-要开就在**那一台**的启动脚本里开（做法与 IC 的 `session_envelope` 同款）。
-
-⚠️ **`ORCH_IC_MODE=grpc` 结构性拿不到 VLM**：描述是搭在
-`AgentSink._send` 上的（见 [`interaction/agent_sink.py`](interaction/agent_sink.py)
-的模块 docstring），而 gRPC 模式下 sink 在**另一个进程**里，包不到。
-回退面本来就不该有它 —— 这条是已知限制，不是待修项。
+`AgentAction.transcript` 始终为 ASR 字符串，视觉通过独立的 `vlm` 字段发送。
+视觉快照对应空 transcript 的 ANSWER，仅更新上下文。旧
+`ORCH_AGENT_TRANSCRIPT_MODE=legacy/dual/dict` 载荷开关已退役。
 
 ---
 
@@ -389,8 +377,8 @@ POST {callback_ic}/interaction/on_answer
 | `GET /healthz` | 健康检查 + 活跃会话数 |
 | `GET /stats` | 各活跃会话的原始统计 |
 | `GET /metrics` | 全局指标 + 最近会话快照（可接 Prometheus） |
-| `POST /v1/speak` | **Agent 回调**：整段播报（见下节） |
-| `POST /v1/speak/stream` | **Agent 回调**：流式播报 |
+| `POST /v1/speak` | 手工工具：整段播报 |
+| `POST /v1/speak/stream` | 手工工具：流式播报 |
 | `POST /v1/stop` | 硬打断：立刻停播并丢弃当前那轮 |
 | `POST /v1/tts/pause` | **软打断**：音量**淡出**（默认 1s）后再暂停，保留音频与精确已播位置 |
 | `POST /v1/tts/resume` | **软打断**：从暂停点接着播，音量**淡入**（默认 300ms） |
@@ -398,7 +386,8 @@ POST {callback_ic}/interaction/on_answer
 
 ### 软打断：`/v1/tts/pause` + `/v1/tts/resume`
 
-给 IC 用的两步式打断。语义与 `/v1/stop` 的区别只有一条：
+宿主执行器支持的两步式打断，也可由手工工具调用。IC 通过本地 Sink 交付表达事件，
+不再自行 POST HTTP。语义与 `/v1/stop` 的区别只有一条：
 
 | | `/v1/stop`（硬打断） | `pause` → `resume`（软打断） |
 |---|---|---|
@@ -406,14 +395,15 @@ POST {callback_ic}/interaction/on_answer
 | 参考轨 | 从缓冲里清掉未播部分 | 只留**已播**部分（等 `resumed` 后重新落位） |
 | 用途 | 用户真的抢话 | 先判"可能是误打断"，1s 后再定 |
 
-典型时序（IC 侧）：
+表达层事件的典型时序：
 
+```text
+IC ExpressionSink pause → 宿主执行暂停
+  ├─ stop → 宿主硬停，丢弃封存
+  └─ speak(prompt=true) → 宿主播提示语 → resume → 续播封存
 ```
-IC 判 YIELD → POST /v1/tts/pause
-  ├─ 宽限期（默认 1s）内用户继续说话 → POST /v1/stop        # 真抢话，丢掉封存
-  └─ 没继续说（误打断）→ POST /v1/speak {"prompt": true}     # 插一句提示语
-                        → POST /v1/tts/resume                 # 接着播原来那句
-```
+
+具体何时交付事件由固定版本 IC 的策略决定。手工 HTTP 工具可调用同名操作。
 
 **渐进式音量（不"啪一下断掉"）**：`pause` 默认不立刻静音，而是让浏览器在
 `fade_ms`（默认 1000，环境变量 `ORCH_TTS_PAUSE_FADE_MS`）里把音量线性降到 0，
@@ -436,8 +426,6 @@ IC 判 YIELD → POST /v1/tts/pause
 - 暂停期间 TTS 侧仍在合成 —— 服务端只是**不再从队列里取**，所以续播的第一声
   几乎无延迟；代价是暂停期间已合成的音频占内存（一条回复几 MB 量级）。
 - 会话关闭时封存的流会被显式丢弃（`drop_parked`），不会泄漏消费任务。
-- **默认不启用**：IC 侧要显式打开（inprocess：`ORCH_IC_SOFT_INTERRUPT=1`；
-  独立 IC：`INTERACTION_SOFT_INTERRUPT=1`）。关着时行为与旧版逐字节一致。
 - 前端必须认 `tts.pause` / `tts.resume` 两条消息（`static/orchestrator-test.html`
   已实现）。老页面会忽略它们 → 表现为「暂停没生效，声音继续」。
 
@@ -501,8 +489,7 @@ python orchestrator_replay.py assets/video/turnbased/121.mp4 --host 192.168.89.1
 | 模拟插话 | `--bargein-at 5,12`（在第 5、12 秒打断） |
 | 换个播放设备 | `--audio-device <名字或编号>` |
 | 安静输出 | `--no-verbose` |
-| **接 InteractionCore** | `--ic-grpc localhost:50051` |
-| 指定 Agent 地址 | `--ic-agent-url http://…` |
+| 指定 Agent gRPC 地址 | `--agent-grpc host:50051` |
 | 关掉 IC（走 OmniLLM） | `--no-ic` |
 | IC 事件落 JSONL | `--ic-events-out events.jsonl` |
 
@@ -772,10 +759,10 @@ farend 量纲）：
 
 ---
 
-## 下游接口（Policy / Agent 预留）
+## 下游接口
 
-`orchestrator/downstream/interface.py` 定义了完整契约。下游是**纯决策**：
-不碰传输、不持 socket、不 sleep，只返回 action 由 Orchestrator 执行。
+`orchestrator/downstream/interface.py` 定义了事件与动作契约。IC 只运行本地算法；
+`InteractionDownstream` 作为宿主适配层持有 Agent 连接，并将表达动作交给执行器。
 
 ```python
 class Downstream(Protocol):
@@ -785,9 +772,8 @@ class Downstream(Protocol):
     async def on_session_end(self, reason: str) -> None: ...
 ```
 
-**本阶段用 `PassthroughDownstream` 桩**（把 ASR 最终结果或 OmniLLM 回复
-直接作为 `Speak`），让链路可端到端验证。Policy 真实实现接入时只替换这个
-实例，其余不动。
+默认使用 `InteractionDownstream`。关闭 IC 或本地 IC 不可用时，
+`PassthroughDownstream` 可把 ASR 最终结果或 OmniLLM 回复转换为 `Speak`。
 
 **排序契约**：事件按**到达顺序**投递，不保证 `t` 单调 —— Orchestrator
 不为排序回压（实时路径上那需要无界重排窗口）。下游须容忍迟到事件，
@@ -932,7 +918,7 @@ python -m orchestrator.tests.test_face \
 
 # 单元测试（无外部依赖）
 python -m orchestrator.tests.test_clock         # 含 ctx↔会话采样 锚点映射
-python -m orchestrator.tests.test_omni_describe_stage  # VLM 描述随 ASR 发给 Agent
+python -m pytest orchestrator/tests/test_agent_integration.py -q  # IC + Agent 会话隔离
 python -m orchestrator.tests.test_ref_track     # 含 D 恢复 + 量纲回归护栏
 python -m orchestrator.tests.test_bargein_ref   # 打断 + armed 承诺落位
 python -m orchestrator.tests.check_html         # 前端结构 + 锚点协议发送端

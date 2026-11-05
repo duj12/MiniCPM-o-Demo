@@ -1,48 +1,9 @@
-"""InteractionCore + Agent 的 ``Downstream`` 实现。
-
-替换 ``PassthroughDownstream``：回复不再由 OmniLLM 生成，而是
-
-    orchestrator 事件 ──apply_*──▶ InteractionCore（决策）
-                                        │ Tick() → Action
-                                        ▼
-                                  ACTION 派发给 Agent
-                                        │ Agent 生成回复
-                                        ▼
-                        Agent POST /v1/speak ──▶ Speak ──▶ TTS
-
-**本类不产生 Speak，也不主动 Cancel** —— 播报与打断**全部**由 IC / Agent
-通过 HTTP 主动调用（见 ``main.py`` 的 ``/v1/speak`` 与 ``/v1/stop``）。
-
-> ⚠️ 这是**刻意的职责划分**，别再往这里加播报/打断：
->   · **IC**    判 GREET/UTTER → `ExpressionSink.play_template` → `/v1/speak`
->   · **IC**    判 YIELD/END   → `ExpressionSink.stop`         → `/v1/stop`
->   · **Agent** 生成完回复     → `/v1/speak`（整段或流式）
->
-> 早先本类**也**做这些（`return [Speak]` / `return [Cancel]`），结果是
-> 同一句话被播两遍、同一次打断被执行两次，靠去重和"后到的 Cancel 作用在
-> 已截断的轨上"掩盖着。**从源头去掉**才是干净的 —— 去重保留，但降级为
-> 纯粹的防御性检查（见 `executor._is_duplicate_speak`）。
-
-这里只负责：
-
-  1. 把感知事件喂给 IC（非阻塞）
-  2. 每个 Tick 向 IC 要一次决策，把 Action 翻译成「通知 Agent / 记日志 / 收尾」
-  3. ``GREET`` / ``UTTER`` 只记日志（播报由 IC 自己发起）
-
-⚠️ **IC 的 Action 有 9 种**（不只是 4 种）：
-
-    ANSWER / INSERT / YIELD / END   → 事件派给 Agent（默认关，见
-                                      `agent._AGENT_RELAY`）
-    GREET  / UTTER                  → 只记日志；播报由 IC 自己发起
-    LISTEN / WAIT / HOLD            → 不动（继续听）
-
-⚠️ IC 的状态是**服务端全局一份**（没有 session 概念），所以一个进程里
-不要同时跑多个会话接同一个 IC —— 会互相覆盖。当前部署是单会话场景。
-"""
+"""Host orchestration of local IC, independent Agent gRPC, and TTS actions."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import time
 from typing import Any, Dict, List, Optional
 
@@ -54,24 +15,11 @@ from ..downstream.interface import (
     AsrFinal, AsrPartial, AsrStateUpdate, Describe, DownstreamAction,
     DownstreamEvent, FaceIdentity, FaceLipState, FaceState, FaceWake,
     OmniDescription, PlaybackReceipt, Tick,
-    # ⚠️ `Speak` / `Cancel` **当前没有代码使用** —— 编排侧不再主动播报/打断
-    #    （见上面的类文档）。它们被注释掉的兜底分支引用着，取消注释时要用，
-    #    所以**留着 import**；`flake8` 若报 F401 属预期，别顺手删。
-    Speak, Cancel,
+    Speak, Cancel, PauseTts, ResumeTts,
 )
 from .agent import AgentClient
-from .client import InteractionClient
 
 logger = logging.getLogger(__name__)
-
-#: **模块级**记录「Agent 当前被设成了哪个 IC 地址」。
-#:
-#: ⚠️ 必须是模块级而非实例级 —— Agent 的那个设置是**进程级全局**的
-#: （见 `AgentClient.set_ic_target`），多个会话共享同一个 Agent 状态，
-#: 每个会话各自拿实例变量记会记岔。这里只做**记账**，供
-#: 「结束时该不该归还」和「有没有被别的会话覆盖」这两处判断使用。
-#: None = 本进程还没设过（Agent 用它自己的默认值）。
-_AGENT_IC_TARGET: Optional[str] = None
 
 HIGH = "HIGH"
 MEDIUM = "MEDIUM"
@@ -167,25 +115,11 @@ class InteractionDownstream:
                  session_id: str = "",
                  on_action: Optional[Any] = None,
                  report_interval_s: Optional[float] = None,
-                 restore_ic_target: str = "",
-                 ic_advertise: str = "",
-                 ic_mode: str = "grpc",
-                 ic_expression_url: str = "",
-                 ic_expression_ca: Optional[str] = None,
-                 ic_callback_ic: Optional[str] = None,
-                 agent_set_target: bool = True,
+                 ic_mode: str = "inprocess",
                  omni_describe: bool = False,
-                 agent_transcript_mode: str = "legacy") -> None:
-        #: 描述模式总开关（`ORCH_OMNI_DESCRIBE`）。**只管两件事**：
-        #:   ① 决定在 IC 判 GREET 时要不要发 `Describe("full")`
-        #:   ② 决定要不要给 IC 的 sink 装 VLM 包装（`agent_transcript_mode`
-        #:      也必须是非 legacy 才有意义）
-        #: 它**不**改 omni 的人设 —— 那是 `main.py` 按它挑 system prompt。
+                 on_output: Optional[Any] = None,
+                 agent_mcp_servers: Optional[list] = None) -> None:
         self._desc_enabled = bool(omni_describe)
-        #: Agent 载荷形态：legacy（逐字节旧版）/ dual / dict。
-        #: ⚠️ 默认值是**安全侧**，与 `config.agent_transcript_mode` 一致 ——
-        #:    编排代码 105/106 共用，默认开等于替 106 决定了对 Agent 的协议。
-        self._agent_transcript_mode = (agent_transcript_mode or "legacy").strip().lower()
         #: 最近一份**生成完**的 VLM 描述（见 `_on_vlm_description`）。
         #: 由 `agent_sink` 的 getter 在**推视觉轮的那一刻**同步读取（正常话轮
         #: 不再取它，见 `agent_sink._send`）—— 所以这里必须是一份"随时可用"
@@ -217,49 +151,25 @@ class InteractionDownstream:
         #: 这只是**日志**去重 —— 每次仍会重新探测（`ic.supports` 自己有缓存），
         #: IC 升级并重连后自动恢复推送，不用重编排。
         self._cap_warned: set = set()
-        self.ic_mode = (ic_mode or "grpc").strip().lower()
-        if self.ic_mode == "inprocess":
-            #: 每路会话**独占**一份进程内 Engine（并发由构造消解）。
-            from .inprocess import InProcessICClient
-            self.ic = InProcessICClient(
-                session_id,
-                expression_url=ic_expression_url,
-                agent_url=agent_url,
-                expression_ca=ic_expression_ca,
-                callback_ic=ic_callback_ic,
-                # VLM 只在"描述模式生效 **且** 真要改 payload"时才装包装 ——
-                # 任一条不满足都传 None，sink 走原始路径（payload 与旧版
-                # 逐字节一致）。
-                vlm_getter=(lambda: self._vlm)
-                if (self._desc_enabled
-                    and self._agent_transcript_mode != "legacy") else None,
-                agent_transcript_mode=self._agent_transcript_mode,
-            )
-            logger.info("[%s] IC 模式=进程内 Engine（本会话独占，无单例限制）",
-                        session_id or "?")
-        else:
-            # 带上会话 id —— 用于「单一驱动者」接管时的日志定位，以及
-            # 让 IC 的 tick/apply 在被别的会话接管后能被正确挂起。
-            self.ic = InteractionClient(ic_target, owner_key=session_id)
-        #: 过渡开关：Agent 尚未支持从 payload 读 callback_ic 时保留 set_target
-        self._agent_set_target = bool(agent_set_target)
-        # ⚠️ `session_id` / `callback_ic` 都必须传进去 —— 会话收尾的
-        #    `on_end` 要带上它们（Agent 端已改必填，缺了会被 422 拒；
-        #    且 session_id 缺失会**跨会话误杀**，
-        #    见 `AgentClient.engine_on_session_end` 的实测证据）。
-        self.agent = AgentClient(agent_url, session_id=session_id,
-                                 callback_ic=ic_callback_ic or "")
+        if (ic_mode or "inprocess").strip().lower() != "inprocess":
+            raise ValueError("InteractionCore is an in-process algorithm; ORCH_IC_MODE=grpc is retired")
+        self.ic_mode = "inprocess"
         self.session_id = session_id
-        #: 会话结束时把 Agent 的 IC 目标**归还**到哪 —— 传服务端配置里的
-        #: 默认 IC（**对外可回连的地址**）。空 = 不归还（调用方没给默认值）。
-        self._restore_ic = restore_ic_target or ""
-        #: **告诉 Agent 回连哪个地址**。空 = 退回 `self.ic.target`（同机部署
-        #: 时的常见情形）。跨机部署**必须**显式给 —— 见 `config.ic_advertise`
-        #: 的说明（把 `127.0.0.1` 告诉 Agent 会派错，还会污染 106）。
-        self._ic_advertise = ic_advertise or self.ic.target
-        #: 本会话是否真的设过 Agent 的目标（没设过就不该归还 —— 否则会把
-        #: 别人设的值改掉）
-        self._agent_ic_set_by_me = False
+        self._events = queue.SimpleQueue()
+        self._feedback = {}
+        self._expression_revision = 0
+        self._on_output = on_output
+        self._output_queue = asyncio.Queue()
+        self._output_worker = None
+        self._control_tasks = set()
+        self._agent_target = agent_url
+        self._agent_mcp_servers = agent_mcp_servers
+        from .inprocess import InProcessICClient
+        self.ic = InProcessICClient(
+            session_id,
+            on_agent_event=lambda event: self._events.put(("action", event)),
+            on_expression_event=lambda event: self._events.put(("expression", event)))
+        self.agent = self._make_agent()
         #: `(action_type, sop, text)` 回调 —— 给 UI/日志用（可选）
         self._on_action = on_action
         if report_interval_s is not None:
@@ -305,7 +215,6 @@ class InteractionDownstream:
             #: 日志里没有这一行就没法判"我这台到底开没开"（106 的默认值即
             #: 关 —— 见 config 的说明）。
             "omni_describe": self._desc_enabled,
-            "transcript_mode": self._agent_transcript_mode,
         }
 
     async def on_session_start(self, ctx) -> List[DownstreamAction]:
@@ -329,14 +238,6 @@ class InteractionDownstream:
         #    ⚠️ 用 `reset_session`（**不通知** agent/TTS），不是 `end_session`
         #       —— 后者是"用户主动结束"用的。
         self.ic.reset_session()
-        # P05：把**本路会话**的信封绑到 IC 的两个 sink。
-        # ⚠️ 远端 IC（`:50051`）是**进程级单例**，它的 session_id / callback_ic
-        #    只在进程启动时取一次 —— 不重绑的话，`on_*` 一直带着**上一个会话**
-        #    的信封，Agent 会把 apply_agent 写回旧会话（或 422）。进程内模式
-        #    构造时已写过，这里再写一次是为了与远端走**同一条启动序列**。
-        # `callback_ic` 为空 = 没配对外地址，IC 会整次忽略（两边都告警）。
-        # 旧 IC 没有 BindSession ⇒ 客户端内部只告警并返回 False，不阻断会话。
-        self.ic.bind_session(self.session_id, self.agent.callback_ic)
         # ⚠️ VLM 缓存与 `_prev_atype` 都必须**随新会话清掉**：
         #   · 描述属于**上一个人/上一个场景**，新会话的首个 GREET 全量描述
         #     还没到之前，留着旧的比空着更糟（Agent 会照着一个不属于眼前
@@ -355,108 +256,156 @@ class InteractionDownstream:
         self._bg_fail_logged = False
         self._ic_vision_logged = False
         self.agent.start()          # 幂等（_thread 非空直接返回）
-        self._sync_agent_ic_target()
         return []
 
     # ------------------------------------------------------------------ #
-    #  Agent 的 IC 目标同步
+    #  宿主 Agent 通信与输出任务
     # ------------------------------------------------------------------ #
 
-    def _sync_agent_ic_target(self) -> None:
-        """把**本会话的** IC 地址告诉 Agent。
+    def _make_agent(self):
+        return AgentClient(
+            self._agent_target, session_id=self.session_id,
+            on_event=lambda event: self._events.put(("agent", event)),
+            mcp_servers=self._agent_mcp_servers)
 
-        Agent 收到 IC 的 Action 后要靠这个地址回连。不同的人用不同的 IC
-        （比如别人 replay 时用自己的 IC 服务），不告诉它就会派到 Agent
-        默认的那个（106）——于是 replay 收不到自己的 Action，表现为
-        「IC 决策一直不对 / 判题全错」。
+    async def _execute_output(self, action):
+        try:
+            guard = getattr(action, "guard", None)
+            if guard is not None and not guard():
+                return
+            await self._on_output(action)
+        except Exception:
+            logger.exception("[%s] Host output failed", self.session_id)
 
-        ⚠️⚠️ **Agent 的这个设置是进程级全局的**（端点收单数
-        ``interaction_core_target``，无 session 维度）。所以并发时后设的
-        覆盖先设的。这一版**只同步 + 告警**，不去串行化 —— 详见
-        ``AgentClient.set_ic_target`` 的说明。
+    async def _run_output(self):
+        while True:
+            action = await self._output_queue.get()
+            try:
+                if action is None:
+                    return
+                await self._execute_output(action)
+            finally:
+                self._output_queue.task_done()
 
-        ⚠️ 冲突**只告警不阻断**：真实部署里 106 的 IC 是共享的，两个会话
-        用同一个 IC 完全正常，那不算冲突。只有当地址**不同**时才说明
-        「Agent 只能指向其中一个」，这时另一方的 Action 一定会派错。
-        """
-        # 过渡开关：Agent 已能读 payload 里的 callback_ic 时关掉这里
-        if not self._agent_set_target:
-            logger.info("[%s] 跳过 Agent 的 set_target（ORCH_AGENT_SET_TARGET=0）"
-                        "—— 改由 IC 在 AgentSink payload 里带 callback_ic",
-                        self.session_id)
-            return
-        # ⚠️ `global` 必须在**首次使用之前**声明（否则 SyntaxError）
-        global _AGENT_IC_TARGET
-        want = self._ic_advertise     # 注意：不是 self.ic.target（见下）
-        prev = _AGENT_IC_TARGET
-        if prev == want:
-            return                      # 已经是本会话的地址，不必重复设
-        if prev is not None and prev != want:
-            logger.warning(
-                "[%s] ⚠️ Agent(%s) 的 IC 目标正被另一个会话指向 %s，"
-                "本会话将改为 %s —— **Agent 是进程级全局单例**，"
-                "被覆盖的那一方 IC Action 会派错。并发用不同 IC 时无解，"
-                "需 Agent 侧支持每会话 target。",
-                self.session_id, self.agent.target, prev, want)
-        if self.agent.set_ic_target(want):
-            _AGENT_IC_TARGET = want
-            self._agent_ic_set_by_me = True
+    async def _deliver(self, actions):
+        if self._on_output is None:
+            return actions
+        remaining = []
+        for action in actions:
+            if isinstance(action, Speak):
+                if self._output_worker is None:
+                    self._output_worker = asyncio.create_task(self._run_output())
+                self._output_queue.put_nowait(action)
+            elif isinstance(action, (Cancel, PauseTts, ResumeTts)):
+                # Pause waits for a browser receipt; a hard stop must still run
+                # during that wait. The executor serializes pause/resume itself.
+                task = asyncio.create_task(self._execute_output(action))
+                self._control_tasks.add(task)
+                task.add_done_callback(self._control_tasks.discard)
+            else:
+                remaining.append(action)
+        return remaining
 
     async def on_session_end(self, reason: str) -> None:
-        """会话收尾（客户端断开 / 点停止）。
+        try:
+            self.ic.end_session()
+            await self._deliver(self._drain_events())
+            if self._control_tasks:
+                await asyncio.wait_for(asyncio.gather(*self._control_tasks), timeout=3)
+            if self._output_worker is not None:
+                await asyncio.wait_for(self._output_queue.join(), timeout=3)
+        finally:
+            for task in tuple(self._control_tasks):
+                task.cancel()
+            if self._output_worker is not None:
+                self._output_worker.cancel()
+                await asyncio.gather(self._output_worker, return_exceptions=True)
+                self._output_worker = None
+            await asyncio.gather(*self._control_tasks, return_exceptions=True)
+            try:
+                await asyncio.to_thread(self.agent.close)
+            finally:
+                await asyncio.to_thread(self.ic.close)
 
-        ## ⚠️ 只调 `IC.end_session()`，**编排侧不再做别的**
-
-        IC 的 ``end_session()`` 内部会一次做完三件事
-        （见 interactioncore 的 ``runtime.py``）：
-            · ``AgentSink.on_end()``      → 通知 Agent 结束
-            · ``ExpressionSink.stop()``   → `POST /v1/stop` 停播
-            · ``reset_all_state()``       → 清状态
-
-        所以编排侧**不需要**、也**不应该**再自己：
-            · 通知 Agent（`engine_on_session_end` —— 已删）
-            · 归还 Agent 的 IC 目标（`set_ic_target` —— 已删）
-        那些是跟 IC 重复的第二份，且**跨机时会互相踩**
-        （Agent 的 `interaction_core_target` 是进程级全局单例）。
-
-        编排服务的定位是「**只做编排**」：播报、打断、通知 Agent 一律
-        由 IC 与 Agent 自己发起。
-        """
-        # ⚠️ 必须在 `ic.close()` **之前**调 —— 它要发 gRPC / HTTP。
-        #
-        # ⚠️⚠️ **必须 off-loop**：进程内模式下 `end_session()` 里有**同步 HTTP**
-        #     （`ExpressionSink.stop` 打 `/v1/stop`，超时 1s），`close()` 还要
-        #     flush + join 两个 sink 的 worker 线程（各 2s）。走 gRPC 时这些都
-        #     在服务端线程上，编排侧无感；进程内会**阻塞事件循环**，把同一
-        #     loop 上其他会话的 tick / 音频路径一起卡住。
-        await asyncio.to_thread(self._end_and_close)
-
-    def _end_and_close(self) -> None:
-        """收尾的**同步**部分 —— 由 `on_session_end` 放进线程里跑。"""
-        self.ic.end_session()
-        self.agent.close()
-        self.ic.close()
-
-    # ------------------------------------------------------------------ #
-    #  Agent → IC：apply_agent（智脑薄投影）
-    # ------------------------------------------------------------------ #
+    def _drain_events(self) -> List[DownstreamAction]:
+        actions = []
+        while True:
+            try:
+                source, event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if source == "action":
+                if event.get("type") in ("answer", "yield", "end"):
+                    self._feedback.clear()
+                if self.agent._failed and event.get("type") == "answer":
+                    # A new user turn explicitly establishes a fresh RPC/context.
+                    self.agent.close(timeout=0)
+                    self.agent = self._make_agent()
+                    self.agent.start()
+                if not self.agent.submit(event):
+                    logger.warning("[%s] Agent action was not sent: %s", self.session_id, event.get("type"))
+            elif source == "expression":
+                guard = event.get("guard")
+                if guard is not None and not guard():
+                    continue
+                kind = event.get("type")
+                if kind in ("speak", "speak_stream"):
+                    revision = self._expression_revision
+                    valid = lambda revision=revision, guard=guard: (revision == self._expression_revision and (guard is None or guard()))
+                    if event.get("interrupt"):
+                        actions.append(Cancel(reason="ic_speak"))
+                    actions.append(Speak(text=event.get("text", ""),
+                                         stream_id=event.get("stream_id", ""),
+                                         is_final=event.get("is_final", True),
+                                         prompt=bool(event.get("prompt")), guard=valid))
+                elif kind == "stop":
+                    self._expression_revision += 1
+                    actions.append(Cancel(reason=event.get("reason") or "ic_stop"))
+                elif kind == "pause":
+                    actions.append(PauseTts(reason=event.get("reason", ""),
+                                            fade_ms=float(event.get("fade_ms") or 0)))
+                elif kind == "resume":
+                    actions.append(ResumeTts(reason=event.get("reason", "")))
+            else:
+                if event.get("connection_id", self.agent.connection_id) != self.agent.connection_id:
+                    continue
+                kind = event.get("type")
+                if kind == "agent.state" and self.agent.is_current(event):
+                    self.ic.apply_agent(status=event.get("status"),
+                                        session_end_pending=event.get("session_end_pending"))
+                elif kind == "agent.text" and self.agent.is_current(event, text=True):
+                    if event["kind"] == "feedback":
+                        key = (event["ci"], event["stream_id"])
+                        self._feedback[key] = self._feedback.get(key, "") + event["text"]
+                        if event["is_final"]:
+                            text = self._feedback.pop(key)
+                            if text:
+                                actions.append(Speak(text=text, guard=lambda event=event, client=self.agent: client.is_current(event, text=True)))
+                    else:
+                        actions.append(Speak(text=event["text"],
+                                             stream_id=f"agent:{event['ci']}:{event['stream_id']}",
+                                             is_final=event["is_final"],
+                                             guard=lambda event=event, client=self.agent: client.is_current(event, text=True)))
+                elif kind in ("agent.error", "agent.disconnect"):
+                    self._feedback.clear()
+                    if kind == "agent.disconnect" or self.agent.is_current(event):
+                        self.ic.apply_agent(status="IDLE", session_end_pending=False)
+                        actions.append(Cancel(reason="agent_disconnect" if kind == "agent.disconnect" else "agent_error"))
+                    logger.warning("[%s] %s: %s", self.session_id, kind, event.get("error"))
+                elif kind == "agent.ack" and not event.get("accepted"):
+                    if (event.get("act") == "ANSWER" and event.get("action_type") in (None, "answer")
+                            and self.agent.is_current(event)):
+                        self.ic.apply_agent(status="IDLE", session_end_pending=False)
+                        actions.append(Cancel(reason="agent_rejected"))
+                    logger.warning("[%s] Agent rejected action: %s", self.session_id, event.get("reason"))
+                # done is only a generation terminal, never a playback observation.
+        return actions
 
     def apply_agent(self, status: Optional[str] = None,
                     session_end_pending: Optional[bool] = None) -> None:
-        """Agent 写 `agent.status` / `session_end_pending`。
+        """把宿主接收并过滤后的 Agent 状态投影到本会话的本地 IC。
 
-        由 `main.py` 的 ``POST /v1/ic/apply_agent`` 路由过来（Agent 从 IC 的
-        payload 里拿到 `callback_ic` 后就把写入投到这里）。
-
-        ⚠️ 这一步是 `ORCH_IC_MODE=inprocess` 的**硬前置**：Engine 进了编排
-        进程之后，Agent 原来直连 IC gRPC `ApplyAgent` 的那条路就不存在了。
-        Agent 不改，`agent.status` / `session_end_pending` 永远写不进去
-        ⇒ **SOP 39 与 PENDING_ANNOUNCE 两条分支失效**。
-
-        两种模式**同名同语义**（`InProcessICClient` / `InteractionClient` 都
-        实现 `apply_agent`），所以调用方不必按模式分支。
-
-        ⚠️ **同步**（grpc 模式是一次 gRPC 往返）—— 调用方要 off-loop。
+        省略字段保持原值；播放事实由宿主真实播放回执单独回写。
         """
         self.ic.apply_agent(status=status, session_end_pending=session_end_pending)
         logger.info("[%s] Agent → IC: apply_agent(status=%s end_pending=%s)",
@@ -473,8 +422,11 @@ class InteractionDownstream:
 
     async def on_event(self, ev: DownstreamEvent) -> List[DownstreamAction]:
         # ---- 每次 Tick 向 IC 要一次决策 ----
+        pending = self._drain_events()
         if isinstance(ev, Tick):
-            return await self._on_tick()
+            pending.extend(await self._on_tick())
+            pending.extend(self._drain_events())
+            return await self._deliver(pending)
 
         # ---- 其余事件写进 IC（全部非阻塞投递）----
         self._feed(ev)
@@ -493,7 +445,8 @@ class InteractionDownstream:
             if st.get("display_name"):
                 self._display_name = st["display_name"]
 
-        return []
+        pending.extend(self._drain_events())
+        return await self._deliver(pending)
 
     def _feed(self, ev: DownstreamEvent) -> None:
         """把事件映射成 IC 的 ``apply_*``（**只投队列，立即返回**）。"""
@@ -812,41 +765,13 @@ class InteractionDownstream:
         return owns
 
     def _emit_visual_background(self, n_chars: int) -> None:
-        """把**刚生成完的**一份描述当「视觉轮」立刻投给 Agent（ASR 为空）。
-
-        Agent 收到 `content` 且 `ASR`/`transcript` 都空 ⇒ 走
-        `handle_visual_background`（**只存不答**，覆盖写
-        `scene.visual_background`，该键随 system prompt 的「会话状态」段进入
-        每一轮 LLM 调用）。所以**每份描述都推**是对的：它天然就是"当前视觉
-        状态"，覆盖即更新。
-
-        ⚠️ 这**不是** `agent.py` 里删掉的那种「转发 IC 自己也会发的事件」
-        （那次让 Agent 收到两份 `on_answer`）：IC 的 `on_answer` 只在 ANSWER
-        时发、`transcript` 必非空，**结构上产生不了**这一轮。而且它走同一个
-        sink 队列 ⇒ 与 IC 的真实 `on_answer` 端到端串行，顺序确定。
-        别把它当重复投递"修掉"。
-
-        ⚠️ **2026-10-28 起去掉了「只发第一份」的闩**。那个闩是为旧方案（每轮
-        只报变化、且靠换短人设重连）设的：换人后第二份 full 只有几十字，拿它
-        覆盖 476 字的起点背景是净损失。现在每份都是 **8 键全量快照**、语义
-        就是"此刻的完整状态" ⇒ 越新越准，覆盖是对的；再留闩反而会让 Agent
-        停在会话起点那一份、越用越旧。
-        """
-        if not self._desc_enabled:
+        # Structured snapshots already publish exactly once from Engine.apply_vision.
+        # Unparsed but useful free text still reaches the Agent through the host.
+        if self._ic_owns_vision_round() and self._vlm_state:
             return
-        # ⚠️ `_feed` 处理 OmniDescription 是在 `if not self.ic.available: return`
-        #    **之前**（故意的，见 `_feed`），所以 IC 掉线时也会走到这儿 ——
-        #    失败只告警**一次**，别每份描述刷一条。
-        if self.ic.send_visual_background():
-            self._bg_fail_logged = False
-            logger.info("[%s] 视觉轮已推给 Agent（%d 字）"
-                        "—— 覆盖 scene.visual_background，与 ASR 不同步",
-                        self.session_id, n_chars)
-        elif not self._bg_fail_logged:
-            self._bg_fail_logged = True
-            logger.warning("[%s] 视觉轮**未能交出**（无 Agent sink / gRPC 模式 / "
-                           "dict 模式 / worker 已关）—— 后续每份还会重试，"
-                           "本条只告警一次", self.session_id)
+        if self._vlm:
+            self._events.put(("action", {"type": "vision", "session_id": self.session_id,
+                                         "vlm": self._vlm}))
 
     def _note_vlm_readiness(self) -> None:
         """`AsrFinal` 到了 —— 记下**Agent 手上那份视觉状态**有多旧（纯度量）。
