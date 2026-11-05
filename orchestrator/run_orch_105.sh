@@ -21,6 +21,19 @@ if [ ! -f "$REPO/vendor/interactioncore/interaction/runtime.py" ]; then
   exit 1
 fi
 export PYTHONPATH="$REPO/vendor/interactioncore:$REPO${PYTHONPATH:+:$PYTHONPATH}"
+# ⚠️ 环境里若装着旧的 editable `interaction`（老部署常见，指向共享树），
+#    它的 `__editable__` finder 位于 sys.meta_path，**优先于**上面的
+#    PYTHONPATH —— 不卸掉会静默跑成旧 IC。这里先拦下来。
+IC_ORIGIN="$("$ORCH_PY" -c "import importlib.util as u; s=u.find_spec('interaction'); print(s.origin if s else '')" 2>/dev/null || true)"
+case "$IC_ORIGIN" in
+  "$REPO/vendor/interactioncore"/*|"") ;;
+  *)
+    echo "⚠️ 环境里有旧的 interaction 安装：$IC_ORIGIN" >&2
+    echo "   它会盖过 $REPO/vendor/interactioncore；请先执行：" >&2
+    echo "   $ORCH_PY -m pip uninstall -y interaction" >&2
+    exit 1
+    ;;
+esac
 PORT="${ORCH_PORT:-8100}"
 
 # AgentService/Interact 是唯一 Agent 通道；每路会话建立独立双向 RPC。

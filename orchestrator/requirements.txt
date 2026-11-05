@@ -1,5 +1,8 @@
 # Install from repository root: python -m pip install -r orchestrator/requirements.txt
--e ./vendor/interactioncore
+# InteractionCore 直接从 ./vendor/interactioncore 源码导入（见
+# orchestrator/interaction/__init__.py），**不需要** pip 安装。
+# ⚠️ 若环境里装过旧的 editable `interaction`（指向共享树），先
+#    `pip uninstall interaction`，否则它的 meta_path finder 会盖过源码目录。
 grpcio==1.84.0
 protobuf==7.35.1
 # 编排只用到基础数组操作，1.26 足够；106 的 py310 里 numpy 1.26.4 与
