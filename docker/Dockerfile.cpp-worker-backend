@@ -6,10 +6,11 @@
 #   - llama.cpp-omni llama-omni-server on 127.0.0.1:${BACKEND_PORT:-22500}
 #   - worker.py on 0.0.0.0:${WORKER_PORT:-22400}, forwarding to the local backend
 #
-# Model weights are mounted at runtime; they are not baked into the image.
+# Model weights can be bundled by build-image.sh or mounted at runtime.
 
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
+ARG BUNDLE_MODELS=0
 
 FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS cpp-build
 
@@ -61,7 +62,7 @@ RUN cmake -S . -B build -G Ninja \
     && mkdir -p /opt/llama.cpp-omni/bin \
     && cp -a "build/bin/${LLAMA_OMNI_SERVER_BIN}" "build/bin/${LLAMA_QWEN3OMNI_SERVER_BIN}" build/bin/*.so* /opt/llama.cpp-omni/bin/
 
-FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/opt/llama.cpp-omni/bin:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
@@ -101,18 +102,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "uvicorn>=0.40.0" \
     "websockets>=16.0"
 
-COPY --from=cpp-build /opt/llama.cpp-omni /opt/llama.cpp-omni
-COPY . .
-
 # ── 模型打包进镜像（可选）──────────────────────────────
-# BUNDLE_MODELS=1：把构建上下文的 .bundle-checkpoints/（由 build-image.sh 软链
-# 实体化生成，含 qwen3omni-gguf/fsmn-vad-onnx/TurnSense）拷进 /app/checkpoints。
-# 未打包时镜像内无模型，half_duplex 会从 /models（compose 挂载点）探测。
-ARG BUNDLE_MODELS=0
-RUN if [ "$BUNDLE_MODELS" = "1" ] && [ -d .bundle-checkpoints ]; then \
-        mkdir -p /app/checkpoints \
-        && cp -r .bundle-checkpoints/checkpoints/. /app/checkpoints/; \
-    fi
+# 不打包时跳过整个模型阶段，直接 compose build 也不要求暂存目录存在。
+FROM runtime-base AS runtime-models-0
+
+FROM runtime-base AS runtime-models-1
+# 放在代码和 C++ 产物之前，代码变化不会使约 20 GB 的模型层失效。
+COPY .bundle-checkpoints/checkpoints/ /app/checkpoints/
+
+FROM runtime-models-${BUNDLE_MODELS} AS worker
+COPY --from=cpp-build /opt/llama.cpp-omni /opt/llama.cpp-omni
+# 仅拷 worker 的运行依赖，不带入 gateway、模型暂存目录或 C++ 源码。
+COPY worker.py worker_state.py config.py ./
+COPY runtime/ ./runtime/
+COPY vad/ ./vad/
+COPY assets/ ./assets/
+COPY docker/entrypoint-cpp-worker-backend.sh ./docker/entrypoint-cpp-worker-backend.sh
 
 # ── supervisor 服务管理 ───────────────────────────────
 # 两个服务（llama server + worker）都由 supervisord 管理，autorestart + 日志落位

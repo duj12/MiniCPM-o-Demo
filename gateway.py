@@ -1442,7 +1442,8 @@ def main():
     parser = argparse.ArgumentParser(description="MiniCPMO45 Gateway")
     parser.add_argument("--port", type=int, default=None, help=f"Gateway port (default: {cfg.gateway_port})")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host")
-    parser.add_argument("--workers", type=str, default=None, help="Worker addresses, comma-separated")
+    parser.add_argument("--workers", type=str, default=None,
+                        help="Worker addresses, comma-separated (fallback: WORKER_ADDRESSES environment variable)")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of workers (auto-generate addresses)")
     parser.add_argument("--max-queue-size", type=int, default=None, help="Max queue size")
     parser.add_argument("--timeout", type=float, default=None, help="Request timeout (s)")
@@ -1464,14 +1465,17 @@ def main():
 
     port = args.port or cfg.gateway_port
 
-    # Worker 地址：优先命令行，否则根据 num_workers 自动生成
+    # Worker 地址：命令行 > WORKER_ADDRESSES 环境变量 > 默认本机 Worker
     if args.workers:
         worker_list = args.workers.split(",")
     elif args.num_workers:
         worker_list = cfg.worker_addresses(args.num_workers)
     else:
-        # 默认 1 个 Worker
-        worker_list = cfg.worker_addresses(1)
+        worker_list = [address.strip() for address in os.environ.get("WORKER_ADDRESSES", "").split(",")
+                       if address.strip()]
+        if not worker_list:
+            # 默认 1 个 Worker
+            worker_list = cfg.worker_addresses(1)
 
     if args.lang:
         GATEWAY_CONFIG["default_lang"] = args.lang
