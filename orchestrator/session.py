@@ -1914,8 +1914,14 @@ class OrchestratorSession:
                     #    不 +1，按 seq 比会丢掉带身份的那一帧。
                     seq = int(ev.state_seq)
                     self._last_face_state_seq = seq
+                    face_state = dict(ev.state)
+                    box = ev.box
+                    if box and fs and fs[0] and fs[1]:
+                        left, top, right, bottom = box
+                        face_state["box_cx"] = ((left + right) / 2) / fs[0]
+                        face_state["box_cy"] = ((top + bottom) / 2) / fs[1]
                     self.post_downstream(FaceState(
-                        t=self.clock.now(), state=dict(ev.state),
+                        t=self.clock.now(), state=face_state,
                         state_seq=seq,
                     ))
                 self._push_face_display()
