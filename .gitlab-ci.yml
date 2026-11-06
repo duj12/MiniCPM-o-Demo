@@ -16,6 +16,8 @@ variables:
   LLAMA_SRC: '/data/nas/xmov_app/omni-llm/llama.cpp-omni-dev'
   WORKER_IMAGE: 'omnillm-cpp-backend'
   GATEWAY_IMAGE: 'omnillm-gateway'
+  CD_CHART_REPOS: 'omnillm-cpp-backend omnillm-gateway'
+  IMAGE_NAMES: 'omnillm-cpp-backend omnillm-gateway'
 
 include:
   - project: 'devops1/gitlab-ci'

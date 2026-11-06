@@ -1312,7 +1312,7 @@ async def main():
                         help="限制音频提取时长(秒)，默认=完整音轨。长音频约25 tok/s，注意 KV")
     parser.add_argument("--kv-budget", type=int, default=20000,
                         help="KV 预算(tokens)，每帧≈540，超过后停止发帧保留音频。"
-                             "默认 20000 ≈ 生产每路 KV(25600) 的 78%，留余量给音频+历史")
+                             "默认 20000 ≈ 生产每路 KV(25600) 的 78%%，留余量给音频+历史")
     parser.add_argument("--replay-speed", type=float, default=1.0,
                         help="回放速度倍率，1.0=真实速度(1s音频等1s)，>1 加速发送")
     parser.add_argument("--tail-silence-s", type=float, default=2.0,
