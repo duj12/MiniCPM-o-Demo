@@ -33,6 +33,8 @@ temp/
 
 # 测试输出（可重新生成）
 tests/results/
+# 本地 SOP 录像与回放 dump
+test_data/
 
 # 模型权重与大型资源（用户自行准备）
 *.safetensors
