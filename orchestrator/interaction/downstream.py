@@ -560,6 +560,10 @@ class InteractionDownstream:
                 track_id=(str(_tid) if _tid is not None else None),  # None=清空
                 dwell_ms=int(st.get("dwell_ms") or 0),
             )
+            box_cx = st.get("box_cx")
+            box_cy = st.get("box_cy")
+            if isinstance(box_cx, (int, float)) and isinstance(box_cy, (int, float)):
+                self.ic.apply("apply_box", cx=float(box_cx), cy=float(box_cy))
             self.ic.apply(
                 "apply_lip",
                 lip_speaking_confidence=_conf(st.get("lip_speaking_confidence")),
