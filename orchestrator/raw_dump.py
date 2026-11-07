@@ -4,8 +4,21 @@
 
 ``orchestrator_replay.py`` 只吃**一个**文件（``--audio`` / ``--video``），
 再从它派生音频和两路抽帧。它**不读** ``-face.mjpeg`` / ``-omni.mjpeg`` /
-``.tsv`` 那些散装转储。所以要想离线复现，必须把「原始视频 + 麦克风音频」
+``.tsv`` 那些散装转储。所以要想离线复现，必须把「原始视频 + 音频」
 合成一个容器文件。
+
+## 音轨用哪一路（``ORCH_DUMP_MUX_AUDIO``）
+
+默认 **``aec``**：AEC 清洗后的**用户语音**。数字人播报从扬声器出来会被
+麦克风拾到（实测回声比直达晚 ~400ms、包络相关 0.6），AEC 把它压掉约
+40dB（TTS 段逐段 ERLE 中位 39.8dB），所以这一路听感上"只有用户在说话"。
+这是**录制回放**的口径（2026-11-07 用户要求）。
+
+``mic``：AEC **之前**的原始麦克风，带回声。``orchestrator_replay.py``
+重跑整条链路（含 AEC）时要用它 —— 拿 aec 轨去 replay 等于把回声消两遍。
+
+没有 ``-aec.wav`` 时（浏览器原生 AEC / 未连算法 AEC）自动退回 ``mic``，
+那一路上游已经被浏览器消过回声。
 
 ## 与「送给算法的帧」的关系（**本模块存在的核心前提**）
 
@@ -27,7 +40,8 @@
 ## 时间轴
 
 ``t_ms`` 用与 face/omni 转储**完全相同**的表达式（``clock.now()*1000//SR``），
-即「会话采样轴毫秒」—— 而 ``-mic.wav`` 的第 0 个采样**就是** t=0。
+即「会话采样轴毫秒」—— 而 ``-mic.wav`` / ``-aec.wav``（两者逐采样对齐）
+的第 0 个采样**就是** t=0。
 两者同轴，这是音视频对齐的锚点。
 """
 
@@ -61,6 +75,13 @@ _QUEUE_MAX = 64
 #: 设 `ORCH_KEEP_RAW_MJPEG=1` 可保留 —— 但只在你要拿它做逐帧取证时才有必要，
 #: 正常情况下 `-face.mjpeg` 就是同一份字节。
 _KEEP_MJPEG = os.environ.get("ORCH_KEEP_RAW_MJPEG", "0") == "1"
+
+#: 复现文件（``-raw.mkv``）的音轨来源，见模块 docstring。
+#:
+#: * ``aec``（默认）—— AEC 清洗后的用户语音，不带数字人播报的回声；
+#: * ``mic`` —— AEC 之前的原始麦克风，留给 ``orchestrator_replay.py``
+#:   重跑整条链路（含 AEC）用。
+MUX_AUDIO = (os.environ.get("ORCH_DUMP_MUX_AUDIO") or "aec").strip().lower()
 
 #: 跳过原因是否要**说出来**。
 #: 在线路径（会话收尾）静默 —— 无摄像头的会话本来就该安静跳过；
@@ -230,11 +251,16 @@ def _tick_indices(index: List[Tuple[int, int]], total_ms: int) -> List[int]:
 
 def mux_raw_video(prefix: str, sid: str, *,
                   timeout_s: float = 180.0) -> Optional[str]:
-    """把 ``-raw.mjpeg`` + ``-mic.wav`` 合成 ``-raw.mkv``。
+    """把 ``-raw.mjpeg`` + 用户语音 wav 合成 ``-raw.mkv``。
 
     **视频 ``-c:v copy``**：帧字节与服务端收到的**一模一样**，绝不重编码
     （与 ``flush_video_dump`` 的同一条理由 —— 验证要用原始字节）。
-    **音频 ``-c:a copy``**：mic.wav 原样进容器，样本逐位不变。
+    **音频 ``-c:a copy``**：音轨原样进容器，样本逐位不变。
+
+    ⚠️ 音轨默认取 ``-aec.wav``（AEC 后的用户语音，不带数字人播报的回声），
+    没有才退回 ``-mic.wav``；要让 ``orchestrator_replay.py`` 重跑 AEC 就设
+    ``ORCH_DUMP_MUX_AUDIO=mic``。两路都是 16k 单声道且**逐采样对齐**
+    （实测用户语音段 0 延迟、相关 0.993），换轨不影响音视频对齐。
 
     ⚠️ 容器必须是 **matroska(.mkv)**：mp4 **装不下 pcm_s16le**
     （``codec not currently supported in container``）。mkv 也已经在
@@ -251,7 +277,23 @@ def mux_raw_video(prefix: str, sid: str, *,
     mjpeg = Path(f"{prefix}-{sid}-raw.mjpeg")
     tsv = Path(f"{prefix}-{sid}-raw.tsv")
     mic = Path(f"{prefix}-{sid}-mic.wav")
+    aec = Path(f"{prefix}-{sid}-aec.wav")
     out = Path(f"{prefix}-{sid}-raw.mkv")
+
+    # 音轨来源见模块 docstring：默认 AEC 后的用户语音（不带播报回声）。
+    # ⚠️ 必须**逐采样对齐**才能直接换 —— 两路都从同一帧输入派生，
+    #    实测 0 延迟、相关 0.993，所以不需要任何补偿。
+    if MUX_AUDIO == "mic":
+        audio = mic
+    elif MUX_AUDIO == "aec":
+        audio = aec if aec.is_file() else mic
+        if not aec.is_file():
+            logger.info("[%s] 没有 -aec.wav（浏览器原生 AEC / 未连算法 AEC）"
+                        "—— 音轨退回 -mic.wav（该路已被上游消过回声）", sid)
+    else:
+        audio = aec if aec.is_file() else mic
+        logger.warning("[%s] 未知的 ORCH_DUMP_MUX_AUDIO=%r —— 按 aec 处理",
+                       sid, MUX_AUDIO)
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -272,8 +314,9 @@ def mux_raw_video(prefix: str, sid: str, *,
                                "若 mkv 已存在，说明这场早已合成完成，无需补做。",
                                sid, mjpeg.name)
         return None
-    if not mic.is_file():
-        logger.warning("[%s] 没有 mic.wav（未开音频转储？）—— 跳过 mux", sid)
+    if not audio.is_file():
+        logger.warning("[%s] 没有可用的音轨（mic.wav / aec.wav 均缺失，"
+                       "未开音频转储？）—— 跳过 mux", sid)
         return None
 
     # 读索引（与写线程写出的 tsv 同源，但直接用文件保证与 mjpeg 一致）
@@ -306,7 +349,7 @@ def mux_raw_video(prefix: str, sid: str, *,
                                sid, dims, d, mjpeg)
                 return None
 
-    audio_ms = _wav_duration_ms(mic)
+    audio_ms = _wav_duration_ms(audio)
     ticks = _tick_indices(index, audio_ms)
     if not ticks:
         return None
@@ -315,12 +358,12 @@ def mux_raw_video(prefix: str, sid: str, *,
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-thread_queue_size", "512",
            "-f", "image2pipe", "-framerate", (f"{fps:g}"),
            "-vcodec", "mjpeg", "-i", "pipe:0",
-           "-i", str(mic),
+           "-i", str(audio),
            "-map", "0:v", "-map", "1:a",
            "-c:v", "copy", "-c:a", "copy",
            "-f", "matroska", str(out)]
-    logger.info("[%s] 正在合成复现文件：%d 帧 / 音频 %.1fs → %s",
-                sid, len(ticks), audio_ms / 1000.0, out.name)
+    logger.info("[%s] 正在合成复现文件：%d 帧 / 音频 %.1fs（%s）→ %s",
+                sid, len(ticks), audio_ms / 1000.0, audio.name, out.name)
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err = b""
