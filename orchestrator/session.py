@@ -166,10 +166,12 @@ class OrchestratorSession:
         #: 在途的描述任务（与 `_trigger_task` 分开：对话触发与描述触发是
         #: **两种**触发，混在一个槽里会互相吞掉对方）
         self._desc_task: Optional[asyncio.Task] = None
-        #: 每轮描述的**兜底心跳**间隔（秒）—— 主路径是断句触发，见
-        #: `_on_vad_segment_end` 与 config 的说明。心跳**只在静默时**发：
-        #: 距最近一次语音活动（partial / offline）不足这个间隔就跳过。
+        #: 每轮描述的**定时触发**间隔（秒）—— 断句触发是另一条路径，见
+        #: `_on_vad_segment_end` 与 config 的说明。间隔从上一轮**完成**起算。
         self._desc_interval = float(config.get("omni_delta_interval_s", 10.0) or 10.0)
+        #: 定时触发是否**不看语音活动**（默认开）：开时用户正在说话也照常按
+        #: 间隔触发；关掉则只有静默时才发（2026-10-28 的旧口径）。
+        self._desc_always = bool(config.get("omni_delta_always", True))
         #: 断句点是否触发一次每轮描述（默认开）。关掉即回到纯定时轮询。
         self._desc_on_turn_boundary = bool(
             config.get("omni_desc_on_turn_boundary", True))
@@ -1765,17 +1767,22 @@ class OrchestratorSession:
                 self._desc_last_done_at = now
             if now - self._desc_last_done_at < self._desc_interval:
                 continue
-            # ⚠️ 心跳只服务**静默**（2026-10-28 用户口径）：ASR 出了结果之后
-            #    一直没有新的语音输入，画面仍可能在变（人走开、拿东西），
-            #    这时候才需要定时补一条。**用户正在说话时不要发** —— 主路径
-            #    （VAD 断句点）本来就会在每个语音段结束时触发一次，再叠心跳
-            #    等于对同一段话 decode 两遍。
-            #    判据用"最近一次检测到语音活动"（partial / offline 都算），
-            #    而不是"最近一次 ASR 文本"：说不出字的噪音段同样不是静默。
-            if now - self._last_speech_at < self._desc_interval:
-                continue
-            logger.info("[%s] 静默 %.0fs 无新的语音输入 ⇒ 心跳描述",
-                        self.session_id, now - self._last_speech_at)
+            # ⚠️ 定时触发默认**不看语音活动**（`omni_delta_always`，
+            #    2026-11-07 用户口径）：VAD 断句点各触发一次之外，再按固定
+            #    间隔准时触发 —— 用户一边说话一边走动、换姿态时，描述才跟得
+            #    上画面。不重叠由上面的在途判断保证，间隔从上一轮**完成**
+            #    起算 ⇒ 生成慢于间隔时只是周期变长，不会在服务端排队。
+            #    `ORCH_OMNI_DELTA_ALWAYS=0` 回到旧口径：心跳只服务**静默**
+            #    （判据用"最近一次检测到语音活动"，partial / offline 都算；
+            #    说不出字的噪音段同样不算静默）。
+            if self._desc_always:
+                logger.info("[%s] 定时描述（距上次完成 %.0fs，不看语音活动）",
+                            self.session_id, now - self._desc_last_done_at)
+            else:
+                if now - self._last_speech_at < self._desc_interval:
+                    continue
+                logger.info("[%s] 静默 %.0fs 无新的语音输入 ⇒ 心跳描述",
+                            self.session_id, now - self._last_speech_at)
             await self._do_describe("turn")
 
     def _stop_desc_loop(self) -> None:

@@ -582,6 +582,49 @@ def test_connect_publishes_client_last() -> None:
     check(triggers, "重连后 trigger_reply 送得出去（链路真的活着）")
 
 
+def test_desc_loop_fires_on_interval_while_user_is_speaking() -> None:
+    """定时触发**不看语音活动**：用户正在说话也要按间隔触发（2026-11-07 口径）。
+
+    旧口径（`omni_delta_always=0`）里心跳只服务静默，说话期间只有断句点那
+    一次；现在默认叠加一个"每 interval 一次"的定时触发。不重叠仍由在途标记
+    保证 —— 这里每 50ms 回灌一次 `take_omni_stage` 模拟 `response.done`。
+    """
+    from orchestrator.session import OrchestratorSession
+
+    print("\n[定时] 说话期间也按间隔触发；关掉开关则回到仅静默")
+
+    async def _drive(always: bool, window: float = 1.2) -> int:
+        sess = OrchestratorSession(
+            "t-always",
+            {"omni_describe": True, "omni_delta_interval_s": 0.2,
+             "omni_desc_stale_s": 0.0, "omni_delta_always": always})
+        omni = FakeOmni()
+        sess.omni = omni
+        # 手动点火：不经过 GREET / ASR，只验滚动循环的定时分支
+        sess._desc_started = True
+        sess._desc_last_done_at = 0.0
+        sess._ensure_desc_loop()
+        end = time.monotonic() + window
+        while time.monotonic() < end:
+            # 持续有语音活动 —— 旧口径下这里一条都不会发
+            sess._last_speech_at = time.monotonic()
+            await asyncio.sleep(0.05)
+            # 模拟 response.done。⚠️ 只能**在途时**回灌：`take_omni_stage`
+            # 会推进 `_desc_last_done_at`，每 50ms 无条件调一次等于把定时
+            # 间隔重置成 50ms，循环永远等不到下一次。
+            if sess._desc_inflight:
+                sess.take_omni_stage("EMOTION: 平静")
+        n = len(omni.reqs)
+        sess._stop_desc_loop()
+        sess.closed = True
+        return n
+
+    on = asyncio.run(_drive(True))
+    check(on >= 2, f"说话期间仍按间隔触发（0.2s×1.2s 期望 ≥2，实际 {on}）")
+    off = asyncio.run(_drive(False))
+    check(off == 0, f"关掉开关 ⇒ 说话期间不发（实际 {off}）")
+
+
 def test_desc_loop_rate_limits_failures() -> None:
     """触发送不出去时，滚动循环必须按**间隔**重试，不能按轮询步长空转。
 

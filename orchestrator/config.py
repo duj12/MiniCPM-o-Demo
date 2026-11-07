@@ -165,16 +165,27 @@ class Settings:
     omni_describe: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE", "0") not in ("0", "false", "False", ""))
 
-    #: 每轮描述的**心跳间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
+    #: 每轮描述的**定时触发间隔**（秒）。两次生成之间至少隔这么久，且**不重叠**
     #: （见 `session._desc_loop`）。
     #:
-    #: ⚠️ 2026-10-28 起主路径不再是定时轮询，而是**VAD 断句点触发**
-    #: （`omni_desc_on_turn_boundary`）。这个值退化成**兜底心跳** —— 没人说话、
-    #: 也没有断句时多久刷一次。10s 是用户在"事件驱动"口径下拍的值。
+    #: 2026-10-28 起主路径是**VAD 断句点触发**（`omni_desc_on_turn_boundary`），
+    #: 这个值是叠加在其上的定时触发周期。10s 是用户拍的值。
     #:
-    #: 回退到纯定时：`ORCH_OMNI_DESC_ON_TURN_BOUNDARY=0 ORCH_OMNI_DELTA_INTERVAL_S=2`。
+    #: 回退到纯定时（不要断句点）：`ORCH_OMNI_DESC_ON_TURN_BOUNDARY=0`。
     omni_delta_interval_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "10.0")))
+    #: **定时触发不受"正在说话"限制**（默认开，`ORCH_OMNI_DELTA_ALWAYS`）。
+    #:
+    #: 开 ⇒ 断句点各触发一次之外，无论 VAD/ASR 有没有活动，每
+    #: `omni_delta_interval_s` 秒再触发一次（2026-11-07 口径：用户一边说话
+    #: 一边走动、换姿态时描述也要跟上，不能等他说完）。
+    #: 关 ⇒ 回到 2026-10-28 的行为：定时心跳只服务静默，说话期间只有断句点
+    #: 那一次。
+    #:
+    #: ⚠️ 不重叠仍由 `_desc_inflight` 保证；间隔从**上一轮完成**起算，所以
+    #: 生成慢于间隔时实际周期是 `interval + 生成耗时`，不会在服务端排队。
+    omni_delta_always: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_DELTA_ALWAYS", "1") not in ("0", "false", "False", ""))
     #: **VAD 断句点触发一次增量描述**（默认开）。
     #:
     #: 断句点 = ASR 服务端 VAD 关掉一个语音段。今天唯一的证据是
