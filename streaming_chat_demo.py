@@ -8,7 +8,7 @@
     minicpm→模型自主 speak/listen。无需、也没有 --backend / --turn-decision 参数。
 
 用法：
-  # 默认走 gateway（生产路径，wss + mode=video；本机 :8006）
+  # 默认走 gateway（生产路径，wss + mode=video）
   python streaming_chat_demo.py --video xxx.mp4
 
   # 纯音频交互模式（只有 --audio，无视频）：语音对话
@@ -18,6 +18,10 @@
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
       --prompt "你是一个多模态助手，请简练回复用户的问题。" \
       --host "192.168.89.106"  --port 8006
+
+  # HTTP gateway（无 TLS，使用 ws）
+  python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
+      --host 192.168.88.253 --port 31984 --http
 
   # 并发压力测试（10 路，用完整音轨驱动真实多轮；GPU 显存/利用率监控）
   python streaming_chat_demo.py --video assets/video/turnbased/121.mp4 \
@@ -37,6 +41,7 @@
   --drain-idle-s    收尾空闲兜底(秒)，默认 5.0（正常靠 response_id 回执判定，不等超时）
   --concurrency N   并发路数，>0 进入并发测试
   --host / --port   生产服务地址（默认 gateway 8006；22500=直连后端需端口映射）
+  --http           gateway 使用 ws（默认 wss）；完整地址可通过 --gateway 指定
   --direct-backend  直连后端 WS（绕过 gateway），如 ws://127.0.0.1:22500/backend
 
 输出指标（每轮，文件回放与实时采集口径一致，见 TurnTracker）：
@@ -1277,14 +1282,15 @@ async def main():
     parser = argparse.ArgumentParser(description="流式视频对话 Demo")
     parser.add_argument("--direct-backend", default="",
                         help="直连后端 WS 地址(如 ws://127.0.0.1:22500/backend)，绕过 gateway")
-    parser.add_argument("--gateway", default="wss://127.0.0.1:8006/v1/realtime",
-                        help="gateway WS 地址")
+    parser.add_argument("--gateway", default="",
+                        help="完整 gateway WS 地址（ws:// 或 wss://），优先于 --host/--port")
     parser.add_argument("--host", default="192.168.89.106",
                         help="服务主机地址（内网机器连生产用，如 192.168.89.106）")
     parser.add_argument("--port", type=int, default=8006,
-                        help="服务端口：8006=gateway(wss，生产外网入口，默认)；"
-                             "22500=直连后端(ws，需后端端口映射到宿主机)。"
-                             "未指定时走 --direct-backend / --gateway 默认地址")
+                        help="服务端口：8006=gateway(默认 wss，--http 使用 ws)；"
+                             "22500=直连后端(ws，需后端端口映射到宿主机)")
+    parser.add_argument("--http", action="store_true",
+                        help="--host/--port 指定的 gateway 使用 ws，适用于服务端 --http 部署")
     
     parser.add_argument("--concurrency", type=int, default=1,
                         help="并发路数(默认1=单路)。>1 时进入并发测试，同时监控 GPU 显存/利用率")
@@ -1371,29 +1377,25 @@ async def main():
     CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
     # 连接目标：直连后端 或 gateway。
-    # 优先级：--host+--port 拼接（显式指定时）> --direct-backend/--gateway 显式地址 > 默认。
-    # 默认走 gateway（--gateway 默认 wss://127.0.0.1:8006），与生产外网入口一致。
+    # 完整地址优先于 --host/--port；gateway 默认使用 wss，--http 切换为 ws。
     ssl_ctx = None
     direct = bool(args.direct_backend)
-    if args.port > 0 or args.host:
+    if args.direct_backend or args.gateway:
+        url = args.direct_backend or args.gateway
+    else:
         # --host/--port 拼接生产服务地址：内网其他机器可连
         if args.port == 22500:
             # 后端直连（容器内 WS，需后端端口映射到宿主机）
             url = f"ws://{args.host or '127.0.0.1'}:{args.port}/backend"
             direct = True
         else:
-            # gateway（HTTPS/WSS）；默认端口 8006
-            url = f"wss://{args.host or '127.0.0.1'}:{args.port or 8006}/v1/realtime"
+            scheme = "ws" if args.http else "wss"
+            url = f"{scheme}://{args.host or '127.0.0.1'}:{args.port or 8006}/v1/realtime"
             direct = False
-    else:
-        url = args.direct_backend or args.gateway
-        direct = bool(args.direct_backend)
     if not direct:
-        # gateway 是 HTTPS/WSS，需要 no-verify + mode 参数
-        ssl_ctx = _ssl_ctx_noverify()
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}mode=video"
-    elif url.startswith("wss"):
+    if url.startswith("wss://"):
         ssl_ctx = _ssl_ctx_noverify()
 
     print(f"连接目标: {url} (direct={direct})")
