@@ -64,6 +64,10 @@ export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 export ORCH_AEC_DEFAULT_DELAY_MS="${ORCH_AEC_DEFAULT_DELAY_MS:-250}"
 # 两阶段描述：起点全量 + 后续断句触发/心跳兜底；经 AgentAction.vlm 发送。
 export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
+# VLM 描述刷新间隔（秒）。主路径是 VAD 断句点触发（ORCH_OMNI_DESC_ON_TURN_BOUNDARY=1），
+# 这个值管两件事：① 两次生成之间的最小间隔（不重叠，防止请求排队、延迟单调增长）
+# ② 没人说话、也没有断句时的兜底心跳。调小不会让断句触发变快。
+export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-10}"
 
 # 保留各机现有日志与音视频排障素材的默认目录。
 export ORCH_LOG_LEVEL="${ORCH_LOG_LEVEL:-info}"
@@ -92,6 +96,7 @@ echo "  python          = $ORCH_PY" >&2
 echo "  音视频转储      = $ORCH_DUMP_AUDIO" >&2
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2
 echo "  描述阶段        = 起点 full + 每轮 turn，AgentAction.vlm 单独传递" >&2
+echo "  描述刷新间隔    = ${ORCH_OMNI_DELTA_INTERVAL_S}s（断句点触发为主，此为最小间隔/静默兜底）" >&2
 echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
 echo "  打断探针        = $ORCH_IC_DECISION_PROBE" >&2
 echo "  HTTPS 证书      = $SSL_CERT" >&2
