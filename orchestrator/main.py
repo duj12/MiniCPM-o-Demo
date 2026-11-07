@@ -469,8 +469,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                     logger.info(
                         "[%s] VLM 描述已开："
                         "起点全量挂 IC 的 GREET（只发一次作背景），"
-                        "之后每轮全量、断句点触发 / %.1fs 心跳兜底",
-                        sid, cfg.omni_delta_interval_s)
+                        "之后每轮全量、断句点触发 + %.1fs 定时触发（%s）",
+                        sid, cfg.omni_delta_interval_s,
+                        "不看语音活动" if cfg.omni_delta_always else "仅静默时")
             else:
                 # 降级：IC 不可用就回退 OmniLLM 回复。
                 # ⚠️ 这条告警极其重要 —— 没有它，现象是"能识别、永远不回复"，
