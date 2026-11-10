@@ -1347,10 +1347,21 @@ def main() -> None:
 
     # 启动期能力清单 —— 让"服务起来了"与"功能真的可用"区分开
     logger.info(
-        "能力: aec=%s asr=%s omni=%s tts=%s face=%s downstream=%s",
-        cfg.enable_aec, cfg.enable_asr, cfg.enable_omni, cfg.enable_tts,
+        "能力: aec=%s asr=%s omni=%s omni_vision=%s tts=%s face=%s downstream=%s",
+        cfg.enable_aec, cfg.enable_asr, cfg.enable_omni,
+        cfg.enable_omni and cfg.omni_vision, cfg.enable_tts,
         cfg.enable_face, cfg.downstream_mode,
     )
+    if cfg.enable_omni and cfg.omni_describe and not cfg.omni_vision:
+        # 不发帧 ⇒ `last_frame_at` 永远不变 ⇒ 帧新鲜度闸会**永久**压住描述。
+        # 这是个只在功能上"静默"的冲突：会话能跑、ASR 能识别、Agent 有回复，
+        # 但 VLM 那 8 个字段一个都不会出现。必须刺眼地说出来。
+        logger.warning(
+            "⚠️ ORCH_OMNI_DESCRIBE=1 但 ORCH_OMNI_VISION=0：一个视频帧都不会"
+            "发给 Omni ⇒ 帧新鲜度闸（ORCH_OMNI_DESC_STALE_S）会永久压住描述，"
+            "VLM 状态**永远不会产出**。要么设 ORCH_OMNI_VISION=1，"
+            "要么设 ORCH_OMNI_DESCRIBE=0"
+        )
     if cfg.enable_face:
         preflight_face(cfg)
 

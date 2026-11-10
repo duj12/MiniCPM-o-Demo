@@ -158,6 +158,7 @@ python app.py
 | `ORCH_AGENT_GRPC` | `127.0.0.1:50051`（本地 Agent gRPC） |
 | `ORCH_OMNI_URL` | `wss://192.168.89.106:8006/v1/realtime?mode=video` |
 | `ORCH_OMNI_DESCRIBE` | `1`（Omni 生成视觉描述） |
+| `ORCH_OMNI_VISION` | `1`；`0` = 一个视频帧都不发给 Omni（音频照旧） |
 | `ORCH_ENABLE_FACE` | `1` |
 | `ORCH_FACE_SERVICE_URL` | `http://192.168.89.105:8767` |
 | `ORCH_ASR_URL` | `ws://192.168.88.101:31366` |

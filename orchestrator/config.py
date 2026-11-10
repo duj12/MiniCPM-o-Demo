@@ -159,6 +159,21 @@ class Settings:
     omni_turn_trigger: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_TRIGGER", "asr"))
 
+    #: **Omni 视觉开关**（默认开；`ORCH_OMNI_VISION=0` 关）。
+    #:
+    #: 关掉后**一个视频帧都不发**给 OmniLLM：`offer_frame` 直接跳过，音频
+    #: 照常推（Omni 仍可当纯语音对话方 / 听觉理解方）。前端抓帧、人脸、
+    #: 原始转储都走各自的路，**不受影响** —— 这个开关只管"往 Omni 送出什么"。
+    #:
+    #: 为什么必须单独一个开关：`ORCH_OMNI_DESCRIBE=0` 只停"要描述"这件事，
+    #: 帧仍按 1fps 持续推、到达即 prefill 进 KV（见 `listen.metrics` 的
+    #: `kv_cache_length`）。纯语音场景下那是白白多出来的上行与算力。
+    #:
+    #: ⚠️ 与 `ORCH_OMNI_DESCRIBE=1` 互斥：不发帧 ⇒ 帧新鲜度闸
+    #: （`omni_desc_stale_s`）会永久压住描述，启动时会告警。
+    omni_vision: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_OMNI_VISION", "1") not in ("0", "false", "False", ""))
+
     # ---- VLM 描述（两阶段）------------------------------------------------
     #
     # Omni description generation remains opt-in; Agent wire shape is fixed.

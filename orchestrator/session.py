@@ -143,6 +143,9 @@ class OrchestratorSession:
         self._raw_wanted = False
         #: 上一次转给 Omni 的会话时刻（毫秒）—— 见 `_maybe_feed_omni`
         self._last_omni_ms = -10 ** 9
+        #: 是否把视频帧转给 OmniLLM（`ORCH_OMNI_VISION=0` 关）。
+        #: 关掉后**一个帧都不发**，音频照旧 —— 见 config 的说明。
+        self._omni_vision = bool(config.get("omni_vision", True))
         # ASR 触发的在途任务（turn_trigger="asr"）
         self._trigger_task: Optional[asyncio.Task] = None
 
@@ -911,6 +914,10 @@ class OrchestratorSession:
         """
         if self.closed:
             return
+        if not self._omni_vision:
+            # 视觉对 Omni 关闭：这一路的意义就是"给 Omni 看"，不发就没必要
+            # 计数/落盘（否则 dump 里会出现 Omni 根本没看到的帧）。
+            return
         self.stats["video_omni_frames"] += 1
         if self._dump_on:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
@@ -927,7 +934,7 @@ class OrchestratorSession:
         抽帧节奏与音频时间轴一致，且与旧行为（每 10 个音频块一次）等价。
         ⚠️ 只在真机路径（`on_video_face`）调用；replay 走 `on_video_omni`。
         """
-        if self.omni is None:
+        if self.omni is None or not self._omni_vision:
             return
         if now_ms - self._last_omni_ms < self.OMNI_INTERVAL_MS:
             return
