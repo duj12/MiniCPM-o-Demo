@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import time
@@ -28,6 +29,27 @@ NONE = "NONE"
 
 #: IC 的档位字符串 ↔ 我们的（两边都是 HIGH/MEDIUM/LOW/NONE，直接透传）。
 _VALID_CONF = {HIGH, MEDIUM, LOW, NONE}
+
+#: 每拍都在涨的计时。拿它们当“状态变了”会把节流打回每 tick 一条。
+_REPORT_CLOCKS = {
+    "session": frozenset({
+        "greet_elapsed_ms", "absent_ms", "barge_hold_ms", "barge_paused_at_ms",
+    }),
+    "person": frozenset({"dwell_ms"}),
+}
+
+
+def _report_state_key(blocks: Optional[dict]) -> str:
+    """状态签名。计时字段除外，视觉文本、语音、打断相位的变化都会算进去。"""
+    if not blocks:
+        return ""
+    stable: Dict[str, Any] = {}
+    for group, block in blocks.items():
+        if not isinstance(block, dict):
+            continue
+        clocks = _REPORT_CLOCKS.get(str(group), frozenset())
+        stable[str(group)] = {k: v for k, v in block.items() if k not in clocks}
+    return json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _conf(v: Any, default: str = NONE) -> str:
@@ -183,8 +205,10 @@ class InteractionDownstream:
         #: 最近一次 Action（去重，避免同一个 ANSWER 重复派发）
         self._last_action_key: Optional[tuple] = None
         #: 上一次**下发**给客户端的 Action 键（(atype, sop)）。
-        #: 用来判「状态变没变」—— 变了立刻发，没变就等下一个心跳时刻。
+        #: 用来判「动作变没变」—— 变了立刻发，没变就看状态或心跳。
         self._last_reported_key: Optional[tuple] = None
+        #: 上一次下发时的状态签名（不含每拍都涨的计时字段）。
+        self._last_reported_state: Optional[str] = None
         #: 「上一次该发的动作**没送出去**」—— 下一拍重试同一条。
         #: 专门救 `GREET` 这类一瞬就过去的动作（只出现一两拍，丢了就没了）。
         self._pending_report: bool = False
@@ -799,11 +823,25 @@ class InteractionDownstream:
                            "Agent 手上没有视觉状态，但**不等待**",
                            self._vlm_miss)
 
-    def _should_report(self, atype: str, sop: Optional[str]) -> bool:
+    def _ic_snapshot_blocks(self) -> Optional[dict]:
+        """这一拍的 IC 状态块。IC 没有快照接口时返回 None。"""
+        fn = getattr(self.ic, "snapshot_blocks", None)
+        if fn is None:
+            return None
+        try:
+            blocks = fn()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] 读取 IC 状态失败：%s", self.session_id, exc)
+            return None
+        return blocks if isinstance(blocks, dict) else None
+
+    def _should_report(self, atype: str, sop: Optional[str],
+                       blocks: Optional[dict] = None) -> bool:
         """这次决策要不要下发给客户端 —— **变化时立刻发，不变时定时刷**。
 
-          · `(atype, sop)` 与上次不同 → 立即发（状态真的切了）
-          · 相同 → 距上次下发超过 `REPORT_INTERVAL_S` 才补一条心跳
+          · `(atype, sop)` 与上次不同 → 立即发（动作切了）
+          · 状态块变了（不计每拍增长的计时）→ 立即发，viz 才能跟上视觉和语音
+          · 都相同 → 距上次下发超过 `REPORT_INTERVAL_S` 才补一条心跳
 
         为什么比 `(atype, sop)` 而不是只比 `atype`：`WAIT` 带不同 `sop`
         代表**不同的等待原因**（06=嘴还在动、21=路人/脸不够清），只比
@@ -821,7 +859,8 @@ class InteractionDownstream:
         import time
         now = time.monotonic()
         key = (atype, sop)
-        if key != self._last_reported_key:
+        state_key = _report_state_key(blocks)
+        if key != self._last_reported_key or state_key != self._last_reported_state:
             return True
         # ⚠️ key 相同，但**上一次没送出去**（`_pending_report`）→ 重试。
         #    这条路径专门救 `GREET` 这类一瞬就过去的动作：它只出现一两拍，
@@ -834,10 +873,12 @@ class InteractionDownstream:
             return True
         return now - self._last_report_at >= self.REPORT_INTERVAL_S
 
-    def _mark_reported(self, atype: str, sop: Optional[str]) -> None:
+    def _mark_reported(self, atype: str, sop: Optional[str],
+                       blocks: Optional[dict] = None) -> None:
         """确认送出后记账 —— 清掉"待重试"标记。"""
         import time
         self._last_reported_key = (atype, sop)
+        self._last_reported_state = _report_state_key(blocks)
         self._last_report_at = time.monotonic()
         self._pending_report = False
 
@@ -895,10 +936,10 @@ class InteractionDownstream:
         #      （一场 6 分钟约 7000 条），而且**绝大多数是重复的**——
         #      稳态下 IC 连着几百拍返回同一个 HOLD，逐条发没有信息量。
         #
-        # 现在：**状态变了立刻发；没变则每 `REPORT_INTERVAL_S` 补一条心跳。**
-        #   · 变化 = (atype, sop) 不同 → 立即下发，零延迟（viz 看得到切换点）
-        #   · 不变 = 每 REPORT_INTERVAL_S 一条 → 证明「决策还在跑」，而非卡死
-        #   · transcript 变不算"变化"（它在稳态下每拍都在变），但**内容会带上**
+        # 现在：**动作或状态变了立刻发；都没变则每 `REPORT_INTERVAL_S` 补一条心跳。**
+        #   · 动作变化 = (atype, sop) 不同 → 立即下发
+        #   · 状态变化 = 视觉 / 语音 / 打断相位等（不含每拍增长的计时）
+        #   · 都不变 = 每 REPORT_INTERVAL_S 一条，并带上当时的完整状态块
         #
         # 心跳频率由 `REPORT_INTERVAL_S` 控制，会话建立时可用
         # `report_interval_s` 覆盖（`InteractionDownstream` 的构造参数）。
@@ -914,9 +955,11 @@ class InteractionDownstream:
         #
         # 现在：送失败就**不记 key**，下一拍会重试同一条，直到送达。
         # （IC 动作队列已改为不丢，正常情况下一次就成；这是第二道保险。）
-        if self._on_action is not None and self._should_report(atype, sop):
+        blocks = self._ic_snapshot_blocks()
+        if self._on_action is not None and self._should_report(atype, sop, blocks):
             try:
-                ok = self._on_action(atype, sop, getattr(action, "text", None))
+                ok = self._on_action(
+                    atype, sop, getattr(action, "text", None), state=blocks)
             except Exception:  # noqa: BLE001
                 ok = False
             if ok is False:
@@ -926,7 +969,7 @@ class InteractionDownstream:
                                "下一拍重试 —— 该动作若丢失，判题侧会漏记",
                                self.session_id, atype, sop)
             else:
-                self._mark_reported(atype, sop)
+                self._mark_reported(atype, sop, blocks)
 
         # 下面只处理「要不要产生动作」—— 与上报无关
         if atype in self.QUIET_TYPES:

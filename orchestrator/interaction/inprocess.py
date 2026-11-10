@@ -218,11 +218,15 @@ class InProcessICClient:
         self.last_action = action.type.value
         return action
 
-    async def snapshot(self):
-        if not self.available:
+    def snapshot_blocks(self) -> Optional[dict]:
+        """当前 IC 状态，形状与 viz JSONL 的分块一致。不可用时返回 None。"""
+        if not self.available or self._engine is None:
             return None
         from interaction.snapshot import state_to_blocks
         return state_to_blocks(self._engine.state)
+
+    async def snapshot(self):
+        return self.snapshot_blocks()
 
     def close(self) -> None:
         if self._decision_probe is not None:
