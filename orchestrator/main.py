@@ -415,8 +415,11 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
             from orchestrator.interaction import InteractionDownstream
             from orchestrator.protocol import IcDisplay
 
-            def _on_ic_action(atype: str, sop, text) -> bool:
+            def _on_ic_action(atype: str, sop, text, state=None) -> bool:
                 """IC 的决策 → UI / replay。**含 LISTEN/WAIT/HOLD 这些常见态。**
+
+                ``state`` 是这一拍的 session/person/speech/vision/agent/probes/meta。
+                replay 把它写进 ``--ic-events-out``，viz 侧栏才有内容。
 
                 **返回是否真的投递成功** —— 调用方（``_should_report``）只有在
                 成功后才记「已上报」。否则这条动作就永远丢了（见下）。
@@ -436,9 +439,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                     的另一条路）→ 现象是「喇叭响了、dump 里却没有 GREET」，
                     极难定位（实测踩过）。
                 """
+                blocks = state if isinstance(state, dict) else {}
                 return sess._send_display(IcDisplay(
                     action=atype, sop=sop, text=text,
                     t_ms=int(sess.clock.seconds() * 1000),
+                    session=blocks.get("session"),
+                    person=blocks.get("person"),
+                    speech=blocks.get("speech"),
+                    vision=blocks.get("vision"),
+                    agent=blocks.get("agent"),
+                    probes=blocks.get("probes"),
+                    meta=blocks.get("meta"),
                 ), critical=True)
 
             ic_ds = InteractionDownstream(

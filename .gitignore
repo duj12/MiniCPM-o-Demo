@@ -66,6 +66,15 @@ checkpoints/
 # llama.cpp-omni 源码构建时 git clone，不进 git
 docker/llama.cpp-omni/
 
+# AI 助手本地配置与文档（个人环境，不进 git）
+.agents/
+.cursor/
+AGENTS.md
+GLOSSARY.md
+skills-lock.json
+docs/agents/
+decisions.tsv
+
 # Orchestrator 真机诊断导出（含设备标识 / UA，属个人数据，不进 git）
 orch-diag-*.json
 calib-meta-*.json

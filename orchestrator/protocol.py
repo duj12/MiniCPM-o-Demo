@@ -287,6 +287,14 @@ class IcDisplay:
     sop: Optional[str] = None                      # SOP 编号（"07"/"15"…）
     text: Optional[str] = None                     # GREET/UTTER 的模板文案
     t_ms: int = 0
+    #: 下发这一拍时的 IC 状态。replay 原样写入 --ic-events-out，供 viz 侧栏。
+    session: Optional[dict] = None
+    person: Optional[dict] = None
+    speech: Optional[dict] = None
+    vision: Optional[dict] = None
+    agent: Optional[dict] = None
+    probes: Optional[dict] = None
+    meta: Optional[dict] = None
     type: Literal["ic"] = "ic"
 
 

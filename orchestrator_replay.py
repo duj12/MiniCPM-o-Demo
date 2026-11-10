@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import collections
 import json
 import os
 import queue
@@ -227,8 +228,162 @@ class VirtualClock:
 # 虚拟播放器（复刻 PcmPlayer 语义）
 # ============================================================================
 
+class _PcmLane:
+    """一块输出采样率上的待播 PCM。回调里取走，打断时整段丢掉。"""
+
+    def __init__(self) -> None:
+        self.chunks: "collections.deque[np.ndarray]" = collections.deque()
+        self.off = 0
+        self.n = 0
+
+    def push(self, samples: np.ndarray) -> None:
+        x = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return
+        self.chunks.append(x)
+        self.n += int(x.size)
+
+    def clear(self) -> None:
+        self.chunks.clear()
+        self.off = 0
+        self.n = 0
+
+    def take(self, out: np.ndarray, filled: int) -> int:
+        got = 0
+        need = int(out.size) - filled
+        while got < need and self.chunks:
+            chunk = self.chunks[0]
+            take = min(need - got, int(chunk.size) - self.off)
+            out[filled + got:filled + got + take] = chunk[self.off:self.off + take]
+            got += take
+            self.off += take
+            self.n -= take
+            if self.off >= int(chunk.size):
+                self.chunks.popleft()
+                self.off = 0
+        return got
+
+    def discard(self, n: int) -> None:
+        left = n
+        while left > 0 and self.chunks:
+            chunk = self.chunks[0]
+            avail = int(chunk.size) - self.off
+            drop = min(left, avail)
+            self.off += drop
+            self.n -= drop
+            left -= drop
+            if self.off >= int(chunk.size):
+                self.chunks.popleft()
+                self.off = 0
+
+
+class AudioMix:
+    """TTS 与原片共用一条输出。TTS 在播时丢掉同时长的原片，避免积压后爆音。
+
+    ``hold`` 住时不再取 TTS（缓冲留着），用来做软暂停。淡出/淡入只改音量，
+    不把设备关掉。
+    """
+
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self._lock = threading.Lock()
+        self.tts = _PcmLane()
+        self.src = _PcmLane()
+        self.gain = 1.0
+        self._fade_left = 0
+        self._fade_step = 0.0
+        self._fade_target = 1.0
+        self._hold = False
+        self.tts_played = 0
+
+    def push_tts(self, samples: np.ndarray) -> None:
+        with self._lock:
+            self.tts.push(samples)
+
+    def push_source(self, samples: np.ndarray) -> None:
+        with self._lock:
+            self.src.push(samples)
+
+    def clear_tts(self) -> None:
+        with self._lock:
+            self.tts.clear()
+            self._hold = False
+            self.gain = 1.0
+            self._fade_left = 0
+
+    def fade_to(self, target: float, n_samples: int) -> None:
+        with self._lock:
+            target = float(target)
+            n = max(0, int(n_samples))
+            self._fade_target = target
+            if n <= 0:
+                self.gain = target
+                self._fade_left = 0
+                self._fade_step = 0.0
+                return
+            self._fade_step = (target - self.gain) / n
+            self._fade_left = n
+
+    def hold(self, on: bool) -> None:
+        with self._lock:
+            self._hold = bool(on)
+
+    def pending_s(self) -> float:
+        with self._lock:
+            if self._hold:
+                return 0.0
+            n = self.tts.n
+        return n / float(self.sample_rate) if self.sample_rate else 0.0
+
+    def fill(self, out: np.ndarray) -> None:
+        """填满 ``out``。不够的尾部写 0，让声卡回调永远有数据。"""
+        with self._lock:
+            if self._hold:
+                filled = 0
+            else:
+                filled = self.tts.take(out, 0)
+                if filled:
+                    self._apply_gain(out, filled)
+                    self.tts_played += filled
+                    self.src.discard(filled)
+            if filled < int(out.size):
+                filled += self.src.take(out, filled)
+        if filled < int(out.size):
+            out[filled:] = 0.0
+
+    def _apply_gain(self, out: np.ndarray, n: int) -> None:
+        if n <= 0 or (self.gain == 1.0 and self._fade_left <= 0):
+            return
+        if self._fade_left <= 0:
+            out[:n] *= self.gain
+            return
+        ramp = min(n, self._fade_left)
+        steps = np.arange(ramp, dtype=np.float32)
+        out[:ramp] *= np.float32(self.gain) + np.float32(self._fade_step) * steps
+        self.gain = float(self.gain + self._fade_step * ramp)
+        self._fade_left -= ramp
+        if self._fade_left <= 0:
+            self.gain = self._fade_target
+        if ramp < n and self.gain != 1.0:
+            out[ramp:n] *= self.gain
+
+
+def _pcm_i16_to_float(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    x = np.ascontiguousarray(pcm, dtype=np.int16).astype(np.float32).reshape(-1) / 32768.0
+    if src_rate == dst_rate or x.size == 0:
+        return x
+    n_out = int(x.size * dst_rate / src_rate)
+    if n_out <= 0:
+        return np.zeros(0, dtype=np.float32)
+    pos = np.linspace(0, x.size - 1, n_out)
+    i0 = np.floor(pos).astype(int)
+    i1 = np.minimum(i0 + 1, x.size - 1)
+    fr = (pos - i0).astype(np.float32)
+    return (x[i0] * (1.0 - fr) + x[i1] * fr).astype(np.float32)
+
+
 class Speaker:
-    """把收到的 TTS 真正**放出来**（可选）。
+    """把 TTS 和原片从**同一条**声卡流放出来。
 
     没装 sounddevice 或没有声卡时降级为静默，不影响回放流程 —— 回放的价值
     在于协议与指标，出声只是方便人耳确认。
@@ -236,6 +391,10 @@ class Speaker:
     ⚠️ 出声之后 mic 侧**不会**自动把声音收回去：本工具不模拟声学回声
     （见模块 docstring），所以外放不会污染输入通道。这与真机不同 ——
     真机上喇叭一响，麦克风就收得到，那正是 AEC 要处理的问题。
+
+    用回调拉数据，不够就补静音。打断只清 TTS 缓冲，**不** ``abort`` 再
+    ``start`` 设备 —— 两条流抢一块声卡，或打断时重启设备，WSL 上会
+    underrun，后一句就听不见。
     """
 
     def __init__(self, device: Optional[str] = None,
@@ -245,107 +404,73 @@ class Speaker:
         self.ok = False
         self.err = ""
         self.dropped = 0
+        self.underflows = 0
         self._stream = None
-        self._sd = None
-        # 后台消费队列：`write` 阻塞（按实时速度），绝不能放在事件循环里
-        self._q: "queue.Queue" = queue.Queue(maxsize=64)
-        self._stop = threading.Event()
-        self._worker_t: Optional[threading.Thread] = None
+        self._mix = AudioMix(sample_rate)
         try:
             import sounddevice as sd
-            self._sd = sd
             self._stream = sd.OutputStream(
                 samplerate=sample_rate, channels=1, dtype="float32",
-                device=device, blocksize=0)
+                device=device, latency="high", callback=self._on_audio)
             self._stream.start()
-            self._worker_t = threading.Thread(target=self._worker, daemon=True)
-            self._worker_t.start()
             self.ok = True
         except Exception as exc:  # noqa: BLE001
             self.err = f"{type(exc).__name__}: {exc}"
 
-    def play(self, pcm24: np.ndarray) -> None:
-        """**非阻塞**投递一块 24k int16 PCM 去播放。
+    def _on_audio(self, outdata, frames, _time, status) -> None:
+        if status:
+            self.underflows += 1
+        buf = np.empty(frames, dtype=np.float32)
+        self._mix.fill(buf)
+        outdata[:, 0] = buf
 
-        ⚠️ **绝不能在事件循环里同步 `stream.write`**。它是**阻塞**的，
-        按实时速度消耗音频 —— 36s 的回复会把 asyncio 事件循环堵满 36s，
-        后果是：
-          · 时钟 / 所有异步任务被拖慢（TTS 听感"延迟非常大"）
-          · 接收循环收不到后续的 tts.* 事件，"剩余时长"卡死不动
-          · 收尾判断误判 → **没播完就关连接**
-        所以这里只入队，真正的 write 交给后台线程按自己的节奏消费。
-        """
+    def play(self, pcm: np.ndarray, *, sample_rate: Optional[int] = None) -> None:
+        """非阻塞投递一块 TTS int16 PCM。默认已经是输出采样率。"""
         if not self.ok:
             return
-        try:
-            self._q.put_nowait(np.ascontiguousarray(
-                pcm24, dtype=np.int16).astype(np.float32) / 32768.0)
-        except queue.Full:
-            self.dropped += 1
-            # 队列满 = 播放追不上，丢最旧的（新的更重要）
-            try:
-                self._q.get_nowait()
-                self._q.put_nowait(np.ascontiguousarray(
-                    pcm24, dtype=np.int16).astype(np.float32) / 32768.0)
-            except Exception:  # noqa: BLE001
-                pass
+        sr = self.sample_rate if sample_rate is None else sample_rate
+        self._mix.push_tts(_pcm_i16_to_float(pcm, sr, self.sample_rate))
 
-    def _worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                x = self._q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if x is None:
-                break
-            if self._stream is None:
-                break
-            try:
-                self._stream.write(x)
-            except Exception as exc:  # noqa: BLE001
-                self.err = f"{type(exc).__name__}: {exc}"
-                self.ok = False
-                break
+    def play_source(self, pcm: np.ndarray, *, sample_rate: int) -> None:
+        """非阻塞投递原片 PCM。采样率与输出不同时在这里重采样。"""
+        if not self.ok:
+            return
+        self._mix.push_source(_pcm_i16_to_float(pcm, sample_rate, self.sample_rate))
 
     def pending_s(self) -> float:
-        """还有多少秒的音频**没放完**（队列里排着的）。"""
-        try:
-            n = self._q.qsize()
-        except Exception:  # noqa: BLE001
+        """还有多少秒的 **TTS** 没放完。暂停挂起时不算，避免收尾干等。"""
+        if not self.ok:
             return 0.0
-        return n * 0.5            # 每块 0.5s（服务端 TTS 的分块大小）
+        return self._mix.pending_s()
+
+    def fade_tts(self, target: float, fade_s: float) -> None:
+        """把 TTS 音量在 ``fade_s`` 秒内拉到 ``target``。0 秒则立刻到位。"""
+        n = int(max(0.0, fade_s) * self.sample_rate)
+        self._mix.fade_to(target, n)
+
+    def hold_tts(self, hold: bool = True) -> None:
+        """软暂停：不再从 TTS 缓冲取数据，已经在缓冲里的留下来。"""
+        self._mix.hold(hold)
+
+    def reset_tts(self) -> None:
+        """新的一句：清掉上一句的暂停和缓冲，音量回到 1。"""
+        self._mix.clear_tts()
 
     def stop(self) -> None:
-        """打断：丢掉还没播出去的缓冲。"""
-        if not self.ok or self._stream is None:
-            return
-        # 清空待播队列 —— 打断后旧句的剩余部分不该再响
-        while True:
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                break
-        try:
-            self._stream.abort()      # abort 会丢弃缓冲（stop 是播完再停）
-            self._stream.start()
-        except Exception:  # noqa: BLE001
-            self.ok = False
+        """打断：丢掉还没播的 TTS。设备保持开着，原片缓冲留着。"""
+        self._mix.clear_tts()
 
     def close(self) -> None:
-        self._stop.set()
+        stream = self._stream
+        self._stream = None
+        self.ok = False
+        if stream is None:
+            return
         try:
-            self._q.put_nowait(None)
-        except queue.Full:
+            stream.stop()
+            stream.close()
+        except Exception:  # noqa: BLE001
             pass
-        if self._worker_t is not None:
-            self._worker_t.join(timeout=3.0)
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._stream = None
 
 
 # ============================================================================
@@ -588,7 +713,8 @@ class FaceWindow:
                  play_audio: bool = False, mux_audio: bool = True,
                  play_speed: float = 1.0,
                  status: "Optional[StatusOverlay]" = None,
-                 disp_scale: float = 0.0) -> None:
+                 disp_scale: float = 0.0,
+                 speaker: Optional["Speaker"] = None) -> None:
         self.video_path = video_path
         self.out_path = out_path
         self.fps = max(1.0, fps)
@@ -617,8 +743,9 @@ class FaceWindow:
         self._stop = threading.Event()
         self._proc = None
         self._reader = None
-        self._speaker: Optional[Speaker] = None
-        #: 主循环置位：TTS 正在播 → 暂停喂原片声（两个 Speaker 会抢设备）。
+        self._speaker: Optional[Speaker] = speaker
+        self._own_speaker = False
+        #: 主循环置位：TTS 正在播 → 暂停喂原片声。
         #: 由主循环按**播放进度**写，不是"收没收到 tts.end"。
         self.src_paused = False
         self._src_audio: Optional[np.ndarray] = None
@@ -645,14 +772,19 @@ class FaceWindow:
         if self.show and self.play_audio:
             # 原片音轨（16k 单声道 float32）—— 与回放用的是同一份音频，
             # 所以"看到的画面"和"听到的声音"天然同步。
+            # 声卡由外面传进来的那一条 Speaker 负责，这里不再另开一路。
             try:
                 self._src_audio = self._extract_audio()
-                self._speaker = Speaker(sample_rate=SR)
             except Exception as exc:  # noqa: BLE001
                 print(f"  ⚠️ 原片声音不可用：{exc}")
-                self._speaker = None
+                self._src_audio = None
+            if self._src_audio is not None and self._speaker is None:
+                self._speaker = Speaker(sample_rate=TTS_SR)
+                self._own_speaker = True
             if self._speaker is not None and not self._speaker.ok:
                 print(f"  ⚠️ 原片声音不可用：{self._speaker.err}")
+                if self._own_speaker:
+                    self._speaker.close()
                 self._speaker = None
         if self.show:
             # ⚠️ 必须是 WINDOW_NORMAL。cv2 默认的 WINDOW_AUTOSIZE **不可缩放**
@@ -806,21 +938,19 @@ class FaceWindow:
             #    一次性写会让声音跑在画面前面（缓冲区攒满就停），
             #    与"边播边对齐"的意图矛盾。
             if self._speaker is not None and self._src_audio is not None:
-                # ⚠️ **TTS 在播时必须停喂原片声**。两者是**同一个** Speaker
-                #    对象（两个会抢输出设备），同时响就是"视频原声和 TTS
-                #    一起放"。主循环按播放进度置 `src_paused` 来让路。
+                # ⚠️ TTS 在播时停喂原片。两条路进同一条声卡，同时响就是
+                #    原声和 TTS 叠在一起。主循环按播放进度置 `src_paused`。
+                #    已经进缓冲的原片，会在 TTS 被取走时按同样长度丢掉。
                 #
                 # ⚠️ 让路**只停喂**，**不能调 `_speaker.stop()`** ——
-                #    那个会把**整个队列**清空，而队列里排着的是刚到的 TTS
-                #    音频（共用一个 Speaker），等于把正主也一起丢了。
-                #    实测：排 3 块后调 stop()，qsize 直接归 0。
-                #    队列里残留的原片声最多 ~几十 ms，播完自然就没了。
+                #    stop() 清的是还没播的 TTS。
                 if not self.src_paused:
                     per = int(SR / self.fps)
                     a = (n * per) % max(1, len(self._src_audio))
                     seg = self._src_audio[a:a + per]
                     if seg.size:
-                        self._speaker.play((seg * 32767.0).astype(np.int16))
+                        self._speaker.play_source(
+                            (seg * 32767.0).astype(np.int16), sample_rate=SR)
 
             self.frames += 1
             n += 1
@@ -899,6 +1029,9 @@ class FaceWindow:
                 cv2.destroyAllWindows()
             except Exception:  # noqa: BLE001
                 pass
+        if self._own_speaker and self._speaker is not None:
+            self._speaker.close()
+            self._speaker = None
 
 
 class StatusOverlay:
@@ -1113,6 +1246,12 @@ class VirtualPlayer:
         self._first_at = 0.0
         self._lead_ms = 200
         self._cancelled = False             # 上一句是否被打断（决定下一句重排）
+        self._paused = False
+        self._pause_played = 0              # 停稳时的已播采样（16k）
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
 
     # ------------------------------ 生命周期 ------------------------------ #
 
@@ -1123,9 +1262,12 @@ class VirtualPlayer:
         self._lead_ms = lead_ms or 200
         self._armed = 0.0
         self._first_at = 0.0
-        if self._cancelled:
-            # 打断后的新一句：排程指针从**当前时刻**重新开始，不能沿用
-            # 停在旧句末尾的位置（真机踩过：新句被排到旧句之后）
+        was_paused = self._paused
+        self._paused = False
+        self._pause_played = 0
+        if self._cancelled or was_paused:
+            # 打断或软暂停之后的新一句：排程从当前时刻重来。
+            # 沿用旧句末尾会把新句排到旧句后面（真机踩过）。
             self._sources = []
             self._cancelled = False
         return self.cur
@@ -1157,6 +1299,8 @@ class VirtualPlayer:
 
         用音频时钟算，不是猜 —— 服务端 `RefTrack.resize` 要的就是这个值。
         """
+        if self._paused:
+            return self._pause_played
         now = self.clock.now()
         played = 0.0
         for s in self._sources:
@@ -1173,10 +1317,58 @@ class VirtualPlayer:
         与真机 ``PcmPlayer.stop()`` 一致：未起播的整个丢弃，正在播的只保留
         已播出的部分，然后清空调度表（下一句从零重排）。
         """
-        played = self.played_samples()
+        played = self._pause_played if self._paused else self.played_samples()
         self._sources = []
         self._cancelled = True
+        self._paused = False
         return played
+
+    def mark_paused(self) -> int:
+        """淡出结束、真正停稳。冻结已播量，调度表留着等续播。"""
+        if self._paused:
+            return self._pause_played
+        played = self.played_samples()
+        self._pause_played = played
+        self._paused = True
+        return played
+
+    def resume(self) -> float:
+        """从暂停点把剩下的音频重新排到「现在 + 提前量」。
+
+        返回承诺的起播时刻（ctx 秒）。还没停稳、或已经没有剩余时返回 0
+        —— 调用方据此决定要不要发 ``armed``。
+        """
+        if not self._paused:
+            return 0.0
+        remain = self._pause_played / float(SR)
+        tail: List[float] = []
+        for src in self._sources:
+            dur = float(src["dur"])
+            if remain >= dur - 1e-6:
+                remain -= dur
+                continue
+            if remain > 0.0:
+                dur -= remain
+                remain = 0.0
+            if dur > 1e-4:
+                tail.append(dur)
+        self._paused = False
+        at = self.clock.now() + self._lead_ms / 1000.0
+        self._sources = []
+        cursor = at
+        for dur in tail:
+            self._sources.append({"at": cursor, "dur": dur, "played_full": False})
+            cursor += dur
+        if not self._sources:
+            self._armed = 0.0
+            self._first_at = 0.0
+            return 0.0
+        self._armed = at
+        self._first_at = at
+        if self.cur is not None:
+            self.cur.armed_ctx = at
+            self.cur.first_at = at
+        return at
 
     def end_response(self) -> None:
         if self.cur is not None:
@@ -1201,9 +1393,16 @@ class VirtualPlayer:
         会**把还在播的回复掐断**（真机实测：最后一句没放完就退出了）。
         这里按调度表算真实剩余时长 —— 它是"什么时候可以收工"的唯一依据。
         """
+        if self._paused:
+            return 0.0
         now = self.clock.now()
         end = max((s["at"] + s["dur"] for s in self._sources), default=0.0)
         return max(0.0, end - now)
+
+
+def playback_reported_active(remaining_s: float, paused: bool) -> bool:
+    """软暂停时调度剩余是 0，但这句还占着，不能因此报 stopped。"""
+    return remaining_s > 0.05 or paused
 
 
 def _print_effective_params(client, asr_params: dict,
@@ -1269,6 +1468,35 @@ def _fmt_asr_state(state: dict) -> str:
     return line
 
 
+_IC_STATE_BLOCKS = (
+    "session", "person", "speech", "vision", "agent", "probes", "meta",
+)
+
+
+def _ic_event_record(msg: dict) -> dict:
+    """把一条 ``ic`` 消息收成 viz 能读的一行。
+
+    动作字段留在顶层。状态块可以在消息顶层，也可以包在 ``state`` 里。
+    缺块就省略，不拿空对象把上一拍的侧栏冲掉。
+    """
+    nested = msg.get("state") if isinstance(msg.get("state"), dict) else {}
+    rec: dict = {"type": "ic", "t_ms": int(msg.get("t_ms") or 0)}
+    action = msg.get("action")
+    if action is not None:
+        rec["action"] = action
+    for key in ("sop", "text", "action_kind"):
+        val = msg.get(key)
+        if val not in (None, ""):
+            rec[key] = val
+    for name in _IC_STATE_BLOCKS:
+        block = msg.get(name)
+        if not isinstance(block, dict):
+            block = nested.get(name)
+        if isinstance(block, dict):
+            rec[name] = block
+    return rec
+
+
 # ============================================================================
 # 编排服务客户端
 # ============================================================================
@@ -1316,6 +1544,8 @@ class OrchestratorReplayClient:
 
         self.player = VirtualPlayer(clock)
         self.epoch = int(clock.now() * 1000) % 2147483647 or 1
+        #: 软暂停的代数。新一句、打断、续播都会加一，淡出回调据此作废。
+        self._pause_token = 0
         #: 上次上报给服务端的「实际是否在出声」（None = 还没报过）。
         #: 与浏览器的 `_lastPlaybackActive` 同义，用于边沿触发 ——
         #: 只有状态翻转才发消息，不是每块都发。见主循环里的上报点。
@@ -1427,6 +1657,25 @@ class OrchestratorReplayClient:
         }, ensure_ascii=False))
         self.omni_frames_sent += 1
 
+    async def _delayed_pause(self, rid: str, token: int, fade_s: float) -> None:
+        await asyncio.sleep(fade_s)
+        await self._finish_pause(rid, token)
+
+    async def _finish_pause(self, rid: str, token: int) -> None:
+        """淡出结束才停稳，并回报已播采样。中途被打断/续播则作废。"""
+        if token != self._pause_token or self.closed:
+            return
+        if self.speaker is not None:
+            self.speaker.hold_tts(True)
+        played = self.player.mark_paused()
+        try:
+            await self.send_playback(rid, "paused", sample_offset=played,
+                                     stop_ctx=self.clock.now())
+        except Exception:  # noqa: BLE001 —— 连接已经没了
+            return
+        if self.verbose:
+            print(f"\n  [tts.pause {rid}] 停在 {played / SR:.2f}s")
+
     async def send_playback(self, rid: str, phase: str,
                             sample_offset: int = 0,
                             start_ctx: float = 0.0,
@@ -1480,6 +1729,9 @@ class OrchestratorReplayClient:
         t = m.get("type")
         if t == "tts.start":
             rid = m["response_id"]
+            self._pause_token += 1
+            if self.speaker is not None:
+                self.speaker.reset_tts()
             self.player.begin_response(rid, m.get("text", ""),
                                        int(m.get("lead_ms") or self.lead_ms))
             # ⚠️ 流式下 `tts.start` 的 text **必然是空的** —— 它是在 TTS
@@ -1547,8 +1799,51 @@ class OrchestratorReplayClient:
                 self.status.tts_playing -= 1
             await self.send_playback(rid, "ended")
 
+        elif t == "tts.pause":
+            rid = m["response_id"]
+            fade_s = max(0.0, float(m.get("fade_ms") or 0.0) / 1000.0)
+            # 淡出长于剩余时，音频会先自然播完并报 stopped，soft 会被清掉且没有
+            # resume。剩余不够就把淡出压到剩余之内（或立刻停稳）。
+            remain = float(self.player.remaining_s())
+            if fade_s > 0.0 and remain >= 0.0 and remain < fade_s:
+                fade_s = max(0.0, remain - 0.05)
+            self._pause_token += 1
+            token = self._pause_token
+            if self.speaker is not None:
+                self.speaker.fade_tts(0.0, fade_s)
+            if fade_s <= 0.0:
+                await self._finish_pause(rid, token)
+            else:
+                asyncio.create_task(self._delayed_pause(rid, token, fade_s))
+
+        elif t == "tts.resume":
+            rid = m["response_id"]
+            fade_s = max(0.0, float(m.get("fade_ms") or 0.0) / 1000.0)
+            # 淡出还没走完：取消"停稳"，音量拉回来，播放其实没断过。
+            self._pause_token += 1
+            if self.player.paused:
+                at = self.player.resume()
+                if self.speaker is not None:
+                    self.speaker.hold_tts(False)
+                    self.speaker.fade_tts(1.0, fade_s)
+                if at > 0.0:
+                    await self.send_playback(rid, "armed", start_ctx=at)
+                played = self.player._pause_played
+                await self.send_playback(rid, "resumed", sample_offset=played,
+                                         start_ctx=at)
+                if self.verbose:
+                    print(f"\n  [tts.resume {rid}] 从 {played / SR:.2f}s 接着播")
+            else:
+                if self.speaker is not None:
+                    self.speaker.fade_tts(1.0, max(0.05, fade_s))
+                played = self.player.played_samples()
+                await self.send_playback(rid, "resumed", sample_offset=played)
+                if self.verbose:
+                    print(f"\n  [tts.resume {rid}] 淡出未完成，继续播")
+
         elif t == "tts.cancel":
             rid = m["response_id"]
+            self._pause_token += 1
             played = self.player.stop()
             if self.speaker is not None:
                 self.speaker.stop()          # 丢弃还没播出去的缓冲
@@ -1593,7 +1888,8 @@ class OrchestratorReplayClient:
             atype = str(m.get("action") or "")
             if self._ic_fh is not None:
                 try:
-                    self._ic_fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+                    self._ic_fh.write(
+                        json.dumps(_ic_event_record(m), ensure_ascii=False) + "\n")
                     self._ic_fh.flush()
                 except Exception:  # noqa: BLE001
                     pass
@@ -1922,8 +2218,8 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                 #    听感就是**卡顿/断续**（实测 3.75s 丢 111 帧、队列顶到 64）。
                 #    这里喂的正好是本块 100ms，与真实时间 1:1。
                 if src_speaker is not None and not src_speaker_paused[0]:
-                    src_speaker.play(
-                        (chunk * 32767.0).astype(np.int16))
+                    src_speaker.play_source(
+                        (chunk * 32767.0).astype(np.int16), sample_rate=SR)
                 idx += 1
 
             # ── 人脸：25fps（约 40ms 一帧）──
@@ -1957,7 +2253,9 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             #    浏览器，不发这个，服务端就永远拿不到"真的在出声"的信号
             #    （IC 的 SOP 07/23/39 会一直停在默认值）。
             #    多句连播时 remaining_s 一路为正，中间不会掉到 stopped。
-            _pb = tts_left > 0.05
+            #    软暂停时 remaining_s 被故意写成 0，仍算在播，否则 IC 会清掉
+            #    soft 且不发 tts.resume。
+            _pb = playback_reported_active(tts_left, client.player.paused)
             if _pb != client._last_playback_active:
                 client._last_playback_active = _pb
                 await client.send_playback("", "playing" if _pb else "stopped")
@@ -1966,15 +2264,11 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                           f"（剩余 {tts_left:.2f}s）")
 
             # ── 输入音频：TTS 在播时让路（**串行不重叠**）──
-            # 两个 Speaker 同时开会抢输出设备（实测互相打架、谁都出不来声）。
+            # TTS 和原片进同一条声卡。同时喂会叠在一起。
             # **两条路径都要管**：
-            #   · 纯音频 → `src_speaker`，真正喂音频在下面那个 100ms 块里
+            #   · 纯音频 → `src_speaker.play_source`，在上面那个 100ms 块里
             #   · 视频   → 原片声由 `FaceWindow._run` 按帧喂，这里只置标志位
-            # ⚠️ 早先只做了纯音频那条，视频模式下主循环的 `src_speaker` 是
-            #    None、这段整个跳过 —— 原片声照喂，于是**TTS 和视频原声
-            #    一起放**（用户实测）。
-            # 只切标志位，**不 stop()** —— `stop()` 清的是整个队列，在
-            # 共用 Speaker 的场景会把刚排进去的 TTS 音频一起丢掉。
+            # 只切标志位，**不 stop()** —— `stop()` 清的是还没播的 TTS。
             if src_speaker is not None:
                 src_speaker_paused[0] = tts_left > 0.05
             if window is not None:
@@ -2054,6 +2348,11 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         #    TTS 状态一直是空闲）。
         if window is not None and window.status is not None:
             window.status.tts_remaining_s = remain
+        # 主循环退出后，软暂停和收尾尾巴仍要按同一条边沿回写 playback_active。
+        _pb = playback_reported_active(remain, client.player.paused)
+        if _pb != client._last_playback_active:
+            client._last_playback_active = _pb
+            await client.send_playback("", "playing" if _pb else "stopped")
         # ⚠️ **TTS 真正在播的就是这一段**，所以"让路"也必须在这里做 ——
         #    只在主循环里置标志位的话，主循环一退出标志就停在上次的值，
         #    收尾期间原片声又会照放（TTS + 视频原声一起响）。
@@ -2068,7 +2367,8 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
             quiet_since = now
         # 收工条件：**音频已全部送达**（tts.end 齐）**且**播放器已放完。
         # 只看剩余时长会在首批音频到达前误判（见 all_ended 的说明）。
-        if got_any and client.player.all_ended() and remain <= 0.05:
+        if (got_any and client.player.all_ended() and remain <= 0.05
+                and not client.player.paused):
             break
         # "有进展" = 剩余时长变了，或音频条数变了 —— 都说明还在推进
         n_resp = len(client.player.responses)
@@ -2247,25 +2547,28 @@ async def main_async(args) -> int:
     play_tts = args.play_all and args.play_tts
     play_src = args.play_all and args.play_audio
 
+    # ⚠️ `--show` 现在默认开，所以**必须**先确认有显示器：cv2 在无头机上
+    #    不是抛异常而是直接 abort，把整个进程带走（try/except 拦不住）。
+    want_show = args.show
+    if want_show and not _has_display():
+        print("  ⚠️ 没检测到显示器 —— 自动不开窗（继续跑，只是看不到画面）")
+        want_show = False
+    window_plays_src = bool(
+        args.video and want_show and not args.no_source_audio)
+    pure_src = bool(play_src and not args.video)
+
+    # TTS、视频原片、纯音频原片共用**一条**输出。再开第二条会抢同一块声卡。
     speaker: Optional[Speaker] = None
-    if play_tts:
+    if play_tts or window_plays_src or pure_src:
         speaker = Speaker(device=args.audio_device)
         if not speaker.ok:
-            print(f"  ⚠️ TTS 播放不可用：{speaker.err}")
+            print(f"  ⚠️ 播放不可用：{speaker.err}")
             print("     装依赖：pip install sounddevice"
                   "（Linux 还需 libportaudio2）")
+            speaker.close()
             speaker = None
 
-    # 纯音频输入**没有窗口**，原片声没地方放（原来只有 FaceWindow 会播它）。
-    # 这里补一个 16k 的 Speaker 专放输入音频。
-    # ⚠️ **只在没有 --video 时创建** —— 有视频时仍走 FaceWindow 那条老路径
-    #    （两个 Speaker 会抢输出设备，实测互相打架）。
-    src_speaker: Optional[Speaker] = None
-    if play_src and not args.video:
-        src_speaker = Speaker(device=args.audio_device, sample_rate=SR)
-        if not src_speaker.ok:
-            print(f"  ⚠️ 输入音频播放不可用：{src_speaker.err}")
-            src_speaker = None
+    src_speaker: Optional[Speaker] = speaker if pure_src else None
 
     # 只把**命令行显式给了**的 ASR 参数发出去（None = 不发，用服务端默认）
     asr_params = {}
@@ -2280,7 +2583,7 @@ async def main_async(args) -> int:
     client = OrchestratorReplayClient(
         url, clock, aec_mode=args.aec_mode,
         save_tts_dir=args.save_tts, verbose=args.verbose,
-        speaker=speaker, face_log_every=args.face_log_every,
+        speaker=speaker if play_tts else None, face_log_every=args.face_log_every,
         asr_params=asr_params, system_prompt=args.system_prompt,
         agent_grpc=args.agent_grpc,
         ic_enabled=(False if args.no_ic else None))
@@ -2301,12 +2604,6 @@ async def main_async(args) -> int:
             print(f"  ⚠️ 无法写 IC 事件文件（{exc}）")
 
     window: Optional[FaceWindow] = None
-    # ⚠️ `--show` 现在默认开，所以**必须**先确认有显示器：cv2 在无头机上
-    #    不是抛异常而是直接 abort，把整个进程带走（try/except 拦不住）。
-    want_show = args.show
-    if want_show and not _has_display():
-        print("  ⚠️ 没检测到显示器 —— 自动不开窗（继续跑，只是看不到画面）")
-        want_show = False
     if args.video and (want_show or args.save_video):
         ovl = FaceOverlay(font_path=args.overlay_font,
                           scale=args.overlay_scale,
@@ -2325,7 +2622,8 @@ async def main_async(args) -> int:
                             play_audio=not args.no_source_audio,
                             mux_audio=not args.no_source_audio,
                             play_speed=args.replay_speed, status=status,
-                            disp_scale=args.disp_scale)
+                            disp_scale=args.disp_scale,
+                            speaker=speaker if window_plays_src else None)
         window.start()
         if not window.ok:
             print(f"  ⚠️ 回放窗口/录像不可用：{window.err}")
@@ -2362,8 +2660,6 @@ async def main_async(args) -> int:
                          if window.dropped else ""))
         if speaker is not None:
             speaker.close()
-        if src_speaker is not None:
-            src_speaker.close()
         await client.close(save=True)
 
     print_summary(client, time.monotonic() - t0)

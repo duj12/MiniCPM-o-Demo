@@ -42,6 +42,7 @@ def _mk_downstream():
     d = InteractionDownstream.__new__(InteractionDownstream)
     d.session_id = "unit-test"
     d._last_reported_key = None
+    d._last_reported_state = None
     d._last_report_at = 0.0
     d._pending_report = False
     d.REPORT_INTERVAL_S = 10.0
