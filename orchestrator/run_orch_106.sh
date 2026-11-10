@@ -61,6 +61,9 @@ export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 
 # 算法 AEC 的 D 必须按设备实测；250ms 只是占位，默认仍为浏览器 AEC。
 export ORCH_AEC_DEFAULT_DELAY_MS="${ORCH_AEC_DEFAULT_DELAY_MS:-250}"
+# ASR 新语音感知（语种/情绪/事件/噪声/交叠/SNR）总开关。
+# 0 = 服务端不跑感知推理，state 回到原来的 5 个基础字段（省算力）。
+export ORCH_ASR_PERCEPTION="${ORCH_ASR_PERCEPTION:-1}"
 # 视觉对 Omni 的开关（1=按 1s 推帧，0=**一个视频帧都不发**给 Omni）。
 # 纯语音策略设 0：音频照旧推给 Omni（仍可当听觉理解方），只是不发视频。
 # ⚠️ 与 ORCH_OMNI_DESCRIBE=1 冲突：不发帧 ⇒ 帧新鲜度闸永久压住描述。
@@ -105,6 +108,7 @@ echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" 
 echo "  描述阶段        = 起点 full + 每轮 turn，AgentAction.vlm 单独传递" >&2
 if [ "$ORCH_OMNI_DELTA_ALWAYS" = "0" ]; then _ALWAYS_TXT="仅静默时"; else _ALWAYS_TXT="不看语音活动"; fi
 echo "  描述定时触发    = 每 ${ORCH_OMNI_DELTA_INTERVAL_S}s（${_ALWAYS_TXT}）+ 断句点各一次" >&2
+echo "  ASR 感知        = $ORCH_ASR_PERCEPTION（0=只出基础 5 键）" >&2
 echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
 echo "  打断探针        = $ORCH_IC_DECISION_PROBE" >&2
 echo "  HTTPS 证书      = $SSL_CERT" >&2

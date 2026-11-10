@@ -162,6 +162,7 @@ python app.py
 | `ORCH_ENABLE_FACE` | `1` |
 | `ORCH_FACE_SERVICE_URL` | `http://192.168.89.105:8767` |
 | `ORCH_ASR_URL` | `ws://192.168.88.101:31366` |
+| `ORCH_ASR_PERCEPTION` | `1`；`0` = 只出基础 5 键，服务端不跑感知推理 |
 | `ORCH_TTS_HOST / ORCH_TTS_PORT` | `192.168.88.253 / 31058` |
 | `ORCH_AEC_MODE` | `browser`（浏览器原生 AEC） |
 
