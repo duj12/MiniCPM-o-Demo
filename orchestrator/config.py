@@ -169,11 +169,11 @@ class Settings:
     #: （见 `session._desc_loop`）。
     #:
     #: 2026-10-28 起主路径是**VAD 断句点触发**（`omni_desc_on_turn_boundary`），
-    #: 这个值是叠加在其上的定时触发周期。10s 是用户拍的值。
+    #: 这个值是叠加在其上的定时触发周期。默认 1s。
     #:
     #: 回退到纯定时（不要断句点）：`ORCH_OMNI_DESC_ON_TURN_BOUNDARY=0`。
     omni_delta_interval_s: float = field(default_factory=lambda: float(
-        os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "10.0")))
+        os.environ.get("ORCH_OMNI_DELTA_INTERVAL_S", "1.0")))
     #: **定时触发不受"正在说话"限制**（默认开，`ORCH_OMNI_DELTA_ALWAYS`）。
     #:
     #: 开 ⇒ 断句点各触发一次之外，无论 VAD/ASR 有没有活动，每

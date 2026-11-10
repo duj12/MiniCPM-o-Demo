@@ -168,7 +168,7 @@ class OrchestratorSession:
         self._desc_task: Optional[asyncio.Task] = None
         #: 每轮描述的**定时触发**间隔（秒）—— 断句触发是另一条路径，见
         #: `_on_vad_segment_end` 与 config 的说明。间隔从上一轮**完成**起算。
-        self._desc_interval = float(config.get("omni_delta_interval_s", 10.0) or 10.0)
+        self._desc_interval = float(config.get("omni_delta_interval_s", 1.0) or 1.0)
         #: 定时触发是否**不看语音活动**（默认开）：开时用户正在说话也照常按
         #: 间隔触发；关掉则只有静默时才发（2026-10-28 的旧口径）。
         self._desc_always = bool(config.get("omni_delta_always", True))
