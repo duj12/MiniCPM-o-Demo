@@ -68,7 +68,7 @@ export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 # （ORCH_OMNI_DESC_ON_TURN_BOUNDARY=1），这个值管两件事：
 # ① 两次生成之间的最小间隔（不重叠，防止请求排队、延迟单调增长）
 # ② 定时触发周期 —— 从上一轮完成起算。调小不会让断句触发变快。
-export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-10}"
+export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-1}"
 # 定时触发是否**不看语音活动**（1=开，默认）：用户正在说话也按上面的间隔准时
 # 触发一次（与断句点触发叠加）。设 0 回到旧口径：只在静默时补心跳。
 export ORCH_OMNI_DELTA_ALWAYS="${ORCH_OMNI_DELTA_ALWAYS:-1}"
