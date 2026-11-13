@@ -1554,6 +1554,8 @@ class OrchestratorReplayClient:
         # 统计
         self.asr_partials = 0
         self.asr_finals: List[str] = []
+        self.last_asr_final_at = 0.0
+        self.last_tts_started_at = 0.0
         # 本轮 TTS 播报的文本累计（流式下由 `tts.delta` 逐段拼起来，
         # 收尾/打断时清空）。与 StatusOverlay.tts_text 是**两样东西** ——
         # 那个是画到视频帧上的多轮累积，这个是本轮原文。
@@ -1728,6 +1730,7 @@ class OrchestratorReplayClient:
     async def _handle(self, m: dict) -> None:
         t = m.get("type")
         if t == "tts.start":
+            self.last_tts_started_at = time.monotonic()
             rid = m["response_id"]
             self._pause_token += 1
             if self.speaker is not None:
@@ -1876,6 +1879,7 @@ class OrchestratorReplayClient:
                           end="", flush=True)
             else:
                 self.asr_finals.append(txt)
+                self.last_asr_final_at = time.monotonic()
                 if self.status is not None:
                     self.status.set_asr(txt, False, state)
                 print(f"\n  [{tms}ms ASR final] {txt} {tag}")
@@ -2136,6 +2140,24 @@ def extract_frames(path: str, fps: float, max_w: int, max_h: int,
 # 回放主流程
 # ============================================================================
 
+def agent_reply_still_pending(
+    last_asr_final_at: float,
+    last_tts_started_at: float,
+    now: float,
+    wait_s: float,
+) -> bool:
+    """最新一句 ASR final 之后还没有 TTS。Agent 可能还在生成，不能收工。
+
+    迎宾已经播完时，got_any 已是真。若这时把「播放器空了」当成整轮结束，
+    「不用了」交给 Agent 之后的结束语会被掐掉。
+    """
+    if last_asr_final_at <= 0 or wait_s <= 0:
+        return False
+    if last_tts_started_at >= last_asr_final_at:
+        return False
+    return (now - last_asr_final_at) < wait_s
+
+
 async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
                      face_frames: List[bytes], omni_frames: List[bytes],
                      args, window: Optional["FaceWindow"] = None,
@@ -2368,7 +2390,13 @@ async def run_replay(client: OrchestratorReplayClient, audio: np.ndarray,
         # 收工条件：**音频已全部送达**（tts.end 齐）**且**播放器已放完。
         # 只看剩余时长会在首批音频到达前误判（见 all_ended 的说明）。
         if (got_any and client.player.all_ended() and remain <= 0.05
-                and not client.player.paused):
+                and not client.player.paused
+                and not agent_reply_still_pending(
+                    client.last_asr_final_at,
+                    client.last_tts_started_at,
+                    now,
+                    args.wait_reply_s,
+                )):
             break
         # "有进展" = 剩余时长变了，或音频条数变了 —— 都说明还在推进
         n_resp = len(client.player.responses)
