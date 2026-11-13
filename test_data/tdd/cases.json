@@ -56,7 +56,7 @@
         }
       ],
       "source": "md#v2 / SOP01 / 1_1_1103",
-      "ic_gate": "utter ask_repeat; no ANSWER before repair"
+      "ic_gate": "UTTER 抱歉，能请您再说一遍吗？; no ANSWER before it"
     },
     {
       "id": "v2-02-1",
@@ -920,14 +920,14 @@
       "sop": "A26 SHOW_PROCESSING",
       "video": "A26.mkv",
       "status": "runnable",
-      "expect": "智脑过慢时 INSERT/我查一下",
+      "expect": "Agent 自己把垫话发给 TTS，InteractionCore 不说「我查一下」",
       "observations": [
         {
-          "kind": "has_insert_or_processing"
+          "kind": "agent_filler_to_tts"
         }
       ],
       "source": "md#v1_new / A26",
-      "ic_gate": "INSERT/processing cue"
+      "ic_gate": "agent filler on TTS; IC does not utter 我查一下"
     },
     {
       "id": "v1-A39",
@@ -935,14 +935,14 @@
       "sop": "A39 CLOSE_SESSION",
       "video": "A39.mkv",
       "status": "runnable",
-      "expect": "不用了/没事了后结束或 session_end_pending",
+      "expect": "把「不用了」交给 Agent，由 Agent 判断结束并说结束语",
       "observations": [
         {
-          "kind": "has_end_or_session_close"
+          "kind": "closing_handed_to_agent"
         }
       ],
       "source": "md#v1_new / A39",
-      "ic_gate": "END / session_end_pending"
+      "ic_gate": "ANSWER 不用了; agent speaks the closing line"
     },
     {
       "id": "v1-D15",

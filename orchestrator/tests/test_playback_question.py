@@ -22,17 +22,16 @@ def _playing(engine, text: str) -> None:
     engine.apply_asr(text, Confidence.HIGH, Confidence.LOW)
 
 
-def test_playing_long_line_asks_this_session_and_writes_yes(monkeypatch) -> None:
-    """满三个字、不是应声、不是叫停、还没有记录：编排器只问对着当前会话，并把「是」写回。"""
-    sent: list[dict] = []
-
+def _open_client(monkeypatch, sent: list[dict], choice: str | None):
     def systemone(self, questions, state, *, think_mode="never"):
         sent.append(questions)
+        if choice is None:
+            return DecisionAnswer({})
         return DecisionAnswer(
             {
                 "对着当前会话": {
                     "type": "choice",
-                    "choice": "是",
+                    "choice": choice,
                     "confidence": 0.9,
                 }
             }
@@ -46,6 +45,13 @@ def test_playing_long_line_asks_this_session_and_writes_yes(monkeypatch) -> None
     events: list[dict] = []
     client = InProcessICClient("s", on_expression_event=events.append)
     assert client.connect(), client.error
+    return client, events
+
+
+def test_playing_long_line_asks_this_session_and_writes_yes(monkeypatch) -> None:
+    """满三个字、不是应声、不是叫停、还没有记录：编排器只问对着当前会话，并把「是」写回。"""
+    sent: list[dict] = []
+    client, events = _open_client(monkeypatch, sent, "是")
     try:
         _playing(client.engine, "今天天气怎么样")
         action = asyncio.run(client.tick(0))
@@ -62,6 +68,7 @@ def test_playing_long_line_asks_this_session_and_writes_yes(monkeypatch) -> None
         assert client.engine.state.probes.addressed_to_session == "是"
         assert action.type.value != "YIELD"
         assert [event["type"] for event in events] == ["pause"]
+        assert events[0]["fade_ms"] > 0
     finally:
         client.close()
 
@@ -69,27 +76,7 @@ def test_playing_long_line_asks_this_session_and_writes_yes(monkeypatch) -> None
 def test_no_answer_resumes_on_the_next_beat(monkeypatch) -> None:
     """记录写成「不是」之后，下一拍立刻继续原来的播报，不再问。"""
     sent: list[dict] = []
-
-    def systemone(self, questions, state, *, think_mode="never"):
-        sent.append(questions)
-        return DecisionAnswer(
-            {
-                "对着当前会话": {
-                    "type": "choice",
-                    "choice": "不是",
-                    "confidence": 0.9,
-                }
-            }
-        )
-
-    monkeypatch.setattr(
-        "interaction.decision_client.DecisionClient.systemone",
-        systemone,
-    )
-    monkeypatch.setenv("ORCH_IC_DECISION_PROBE", "1")
-    events: list[dict] = []
-    client = InProcessICClient("s", on_expression_event=events.append)
-    assert client.connect(), client.error
+    client, events = _open_client(monkeypatch, sent, "不是")
     try:
         _playing(client.engine, "今天天气怎么样")
         first = asyncio.run(client.tick(0))
@@ -101,6 +88,7 @@ def test_no_answer_resumes_on_the_next_beat(monkeypatch) -> None:
         assert "barge_class" not in names
         assert second.type.value != "YIELD"
         assert [event["type"] for event in events] == ["pause", "resume"]
+        assert events[0]["fade_ms"] > 0
         assert client.engine.state.session.playback_active is True
     finally:
         client.close()
@@ -110,20 +98,8 @@ def test_backchannel_short_and_stop_do_not_ask(monkeypatch) -> None:
     """应声、不足三个字、叫停，编排器都不问三分法，也不问对着当前会话。"""
     sent: list[dict] = []
 
-    def systemone(self, questions, state, *, think_mode="never"):
-        sent.append(questions)
-        return DecisionAnswer({})
-
-    monkeypatch.setattr(
-        "interaction.decision_client.DecisionClient.systemone",
-        systemone,
-    )
-    monkeypatch.setenv("ORCH_IC_DECISION_PROBE", "1")
-
     for text in ("嗯嗯", "好的"):
-        events: list[dict] = []
-        client = InProcessICClient("s", on_expression_event=events.append)
-        assert client.connect(), client.error
+        client, events = _open_client(monkeypatch, sent, None)
         try:
             _playing(client.engine, text)
             action = asyncio.run(client.tick(0))
@@ -136,9 +112,7 @@ def test_backchannel_short_and_stop_do_not_ask(monkeypatch) -> None:
             client.close()
         sent.clear()
 
-    events = []
-    client = InProcessICClient("s", on_expression_event=events.append)
-    assert client.connect(), client.error
+    client, events = _open_client(monkeypatch, sent, None)
     try:
         _playing(client.engine, "别说了")
         action = asyncio.run(client.tick(0))

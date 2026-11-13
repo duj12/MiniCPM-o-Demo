@@ -217,11 +217,8 @@ def _is_backchannel(text: str) -> bool:
     return compact in {"对", "哦", "好的", "好"}
 
 
-def _is_true_interrupt(event: dict) -> bool:
-    return (
-        event.get("action") == "YIELD"
-        and _probes(event).get("barge_class") == "true_interrupt"
-    )
+def _is_interrupt_yield(event: dict) -> bool:
+    return event.get("action") == "YIELD"
 
 
 def _first_answer_ms(events: list[dict], pattern: re.Pattern[str] | None = None) -> int | None:
@@ -241,15 +238,42 @@ def _obs_patterns(clip: dict) -> list[str]:
     ]
 
 
+_ASK_AGAIN = "抱歉，能请您再说一遍吗？"
+_FILLER_RE = re.compile(r"我查一下|正在检索")
+_TTS_LINE_RE = re.compile(r"\[tts\.(?:start|end) [^\]]*\]\s*(.*)")
+_CLOSING_KEYS = ("不用了", "没事了")
+
+
+def _event_text(event: dict) -> str:
+    return ((event.get("text") or "") + _transcript(event)).strip()
+
+
+def _utter_matches(event: dict, sop: str) -> bool:
+    if event.get("action") != "UTTER":
+        return False
+    if sop == "01":
+        return _ASK_AGAIN in _event_text(event)
+    return str(event.get("sop") or "") == sop
+
+
+def _tts_lines(log: str) -> list[str]:
+    lines = []
+    for line in log.splitlines():
+        found = _TTS_LINE_RE.search(line)
+        if found and found.group(1).strip():
+            lines.append(found.group(1).strip())
+    return lines
+
+
 def check_utter_sop(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
     sop = str(obs.get("sop") or "")
-    hits = [
-        int(e.get("t_ms") or 0)
-        for e in events
-        if e.get("action") == "UTTER" and str(e.get("sop") or "") == sop
-    ]
+    hits = [int(e.get("t_ms") or 0) for e in events if _utter_matches(e, sop)]
     if hits:
+        if sop == "01":
+            return True, f"UTTER {_ASK_AGAIN} @ {hits[0]}"
         return True, f"UTTER sop={sop} @ {hits[0]}"
+    if sop == "01":
+        return False, f"no UTTER of {_ASK_AGAIN}"
     return False, f"no UTTER sop={sop}"
 
 
@@ -258,15 +282,10 @@ def check_no_answer_before(obs: dict, events: list[dict], log: str, clip: dict) 
     if not before.startswith("utter_sop:"):
         return False, f"unsupported before={before}"
     sop = before.split(":", 1)[1]
-    gate = next(
-        (
-            i
-            for i, e in enumerate(events)
-            if e.get("action") == "UTTER" and str(e.get("sop") or "") == sop
-        ),
-        None,
-    )
+    gate = next((i for i, e in enumerate(events) if _utter_matches(e, sop)), None)
     if gate is None:
+        if sop == "01":
+            return False, f"no UTTER of {_ASK_AGAIN} to gate"
         return False, f"no UTTER sop={sop} to gate"
     earlier = [
         _transcript(e)[:40]
@@ -346,9 +365,8 @@ def check_no_hard_yield_on_false_barge_script(obs: dict, events: list[dict], log
         if _yield_in_greet(events, index):
             continue
         text = _transcript(event)
-        barge = _probes(event).get("barge_class")
-        if FALSE_BARGE_SCRIPT_RE.search(text) or barge == "false_barge":
-            bad.append((event.get("t_ms"), text[:40], barge))
+        if FALSE_BARGE_SCRIPT_RE.search(text):
+            bad.append((event.get("t_ms"), text[:40]))
     if bad:
         return False, f"hard YIELD on false barge {bad}"
     return True, "no hard YIELD on false-barge script"
@@ -381,25 +399,13 @@ def check_false_barge_soft_resume_or_ignore(obs: dict, events: list[dict], log: 
         if t_ms < answer_ms:
             continue
         text = _transcript(event)
-        barge = _probes(event).get("barge_class")
-        if FALSE_BARGE_SCRIPT_RE.search(text) or barge == "false_barge":
-            hard.append((t_ms, text[:40], barge))
+        if FALSE_BARGE_SCRIPT_RE.search(text):
+            hard.append((t_ms, text[:40]))
     if hard:
         return False, f"hard YIELD on false barge {hard}"
 
-    soft_ms = None
-    for event in events:
-        t_ms = int(event.get("t_ms") or 0)
-        if t_ms < answer_ms:
-            continue
-        session = _session(event)
-        if session.get("barge_phase") == "soft" and session.get("barge_pause_reason") == "barge":
-            soft_ms = t_ms
-            break
-    if soft_ms is not None:
-        if resume_closes_pause_at_or_after(log, soft_ms):
-            return True, f"soft barge@{soft_ms} then tts.resume of that pause"
-        return False, f"soft barge@{soft_ms} has no later tts.resume of that pause"
+    if resume_closes_pause_at_or_after(log, answer_ms):
+        return True, "pause after the answer then tts.resume"
 
     script_seen = False
     for event in events:
@@ -420,7 +426,6 @@ def check_attention_pause_then_resume(obs: dict, events: list[dict], log: str, c
         return False, "no weather ANSWER before the attention window"
     playing_during_away = False
     away_seen = False
-    soft_ms = None
     for event in events:
         t_ms = int(event.get("t_ms") or 0)
         if t_ms < answer_ms:
@@ -433,16 +438,8 @@ def check_attention_pause_then_resume(obs: dict, events: list[dict], log: str, c
             away_seen = True
         if away and session.get("playback_active"):
             playing_during_away = True
-        if (
-            soft_ms is None
-            and session.get("barge_phase") == "soft"
-            and session.get("barge_pause_reason") == "attention"
-        ):
-            soft_ms = t_ms
-    if soft_ms is not None:
-        if resume_closes_pause_at_or_after(log, soft_ms):
-            return True, f"attention soft@{soft_ms} then tts.resume of that pause"
-        return False, f"attention soft@{soft_ms} has no later tts.resume of that pause"
+    if resume_closes_pause_at_or_after(log, answer_ms):
+        return True, "pause after the weather answer then tts.resume"
     if away_seen and not playing_during_away and not any(
         op["op"] == "pause" and op["ms"] is not None and op["ms"] >= answer_ms
         for op in tts_ops(log)
@@ -568,25 +565,26 @@ def check_has_wait_or_deferred_answer(obs: dict, events: list[dict], log: str, c
 def check_has_yield(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
     hits = [
         (e.get("t_ms"), _transcript(e)[:40])
-        for e in events
-        if _is_true_interrupt(e)
+        for index, e in enumerate(events)
+        if _is_interrupt_yield(e) and not _yield_in_greet(events, index)
     ]
     if hits:
-        return True, f"true_interrupt YIELD {hits[0]}"
+        return True, f"YIELD {hits[0]}"
     yields = [
-        (e.get("t_ms"), _transcript(e)[:20], _probes(e).get("barge_class"))
+        (e.get("t_ms"), _transcript(e)[:20])
         for e in events
         if e.get("action") == "YIELD"
     ]
-    return False, f"no true_interrupt YIELD; yields={yields}"
+    return False, f"no YIELD; yields={yields}"
 
 
 def check_has_answer_after_yield(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
-    yield_ms = [
-        int(e.get("t_ms") or 0) for e in events if _is_true_interrupt(e)
-    ]
+    yield_ms = []
+    for index, event in enumerate(events):
+        if _is_interrupt_yield(event) and not _yield_in_greet(events, index):
+            yield_ms.append(int(event.get("t_ms") or 0))
     if not yield_ms:
-        return False, "no true_interrupt YIELD before a later ANSWER"
+        return False, "no YIELD before a later ANSWER"
     later = [
         (e.get("t_ms"), _transcript(e)[:40])
         for e in _answers(events)
@@ -594,17 +592,18 @@ def check_has_answer_after_yield(obs: dict, events: list[dict], log: str, clip: 
     ]
     if later:
         return True, f"ANSWER after YIELD {later[0]}"
-    return False, "no ANSWER after true_interrupt YIELD"
+    return False, "no ANSWER after YIELD"
 
 
-def check_has_insert_or_processing(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """垫话由 Agent 发给 TTS。InteractionCore 自己说出「我查一下」不算。"""
     for event in events:
-        if event.get("action") == "INSERT":
-            return True, f"INSERT @ {event.get('t_ms')}"
-        text = (event.get("text") or "") + _transcript(event)
-        if event.get("action") == "UTTER" and ("我查一下" in text or "正在检索" in text):
-            return True, f"processing UTTER @ {event.get('t_ms')}"
-    return False, "no INSERT or processing UTTER"
+        if event.get("action") == "UTTER" and _FILLER_RE.search(_event_text(event)):
+            return False, "InteractionCore uttered the filler"
+    for line in _tts_lines(log):
+        if _FILLER_RE.search(line):
+            return True, f"agent filler on TTS: {line[:40]}"
+    return False, "agent did not send the filler to TTS"
 
 
 def _end_pending(events: list[dict]) -> int | None:
@@ -613,6 +612,29 @@ def _end_pending(events: list[dict]) -> int | None:
         if isinstance(agent, dict) and agent.get("session_end_pending"):
             return int(event.get("t_ms") or 0)
     return None
+
+
+def check_closing_handed_to_agent(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """把「不用了」或「没事了」交给 Agent，由 Agent 说结束语。光有 END 不算。"""
+    handed = [
+        event
+        for event in _answers(events)
+        if any(key in _compact(_transcript(event)) for key in _CLOSING_KEYS)
+    ]
+    if not handed:
+        return False, "did not hand 不用了 or 没事了 to Agent"
+    ic_lines = {
+        (event.get("text") or "").strip()
+        for event in events
+        if event.get("action") in {"UTTER", "GREET"} and (event.get("text") or "").strip()
+    }
+    for line in _tts_lines(log):
+        if line in ic_lines:
+            continue
+        if _compact(line) in _CLOSING_KEYS:
+            continue
+        return True, f"Agent closing line on TTS: {line[:40]}"
+    return False, "Agent did not speak the closing line"
 
 
 def check_has_end_or_session_close(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
@@ -710,13 +732,13 @@ def check_second_intro_barge_then_answer(obs: dict, events: list[dict], log: str
         (
             e.get("t_ms")
             for e in events
-            if _is_true_interrupt(e) and t0 <= int(e.get("t_ms") or 0) <= t1
+            if _is_interrupt_yield(e) and t0 <= int(e.get("t_ms") or 0) <= t1
         ),
         None,
     )
     if hit is None:
-        return False, f"no true_interrupt YIELD between intro ANSWERs {t0}..{t1}"
-    return True, f"true_interrupt YIELD @ {hit} between intros"
+        return False, f"no YIELD between intro ANSWERs {t0}..{t1}"
+    return True, f"YIELD @ {hit} between intros"
 
 
 def check_no_answer_non_subject_aside(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
@@ -753,7 +775,9 @@ CHECKS = {
     "has_wait_or_deferred_answer": check_has_wait_or_deferred_answer,
     "has_yield": check_has_yield,
     "has_answer_after_yield": check_has_answer_after_yield,
-    "has_insert_or_processing": check_has_insert_or_processing,
+    "has_insert_or_processing": check_agent_filler_to_tts,
+    "agent_filler_to_tts": check_agent_filler_to_tts,
+    "closing_handed_to_agent": check_closing_handed_to_agent,
     "has_end_or_session_close": check_has_end_or_session_close,
     "has_greet": check_has_greet,
     "has_greet_or_answer": check_has_greet_or_answer,

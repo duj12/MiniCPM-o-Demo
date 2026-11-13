@@ -115,25 +115,24 @@ def test_false_barge_ignores_greet_resume_and_false_barge_yield():
             {"kind": "false_barge_soft_resume_or_ignore"},
         ],
     }
-    events = [
-        _answer(19000, "给我介绍一下你们的展厅吧。"),
-        {
-            "t_ms": 22200,
-            "action": "LISTEN",
-            "speech": {"transcript": "嗯那。"},
-            "session": {"barge_phase": "soft", "barge_pause_reason": "barge"},
-            "probes": {},
-        },
-    ]
+    answer = _answer(19000, "给我介绍一下你们的展厅吧。")
     log = "\n".join([
         "[4000ms face]",
         "[tts.pause greet] 停在 1.00s",
         "[tts.resume greet] 从 1.00s 接着播",
     ])
-    report = score_clip(clip, events, log)
+    report = score_clip(clip, [answer], log)
     assert report["observations"][1]["ok"] is False
-    events.append(_yield(23000, "嗯那。", "false_barge"))
-    report = score_clip(clip, events, log)
+    heard = {
+        "t_ms": 22200,
+        "action": "LISTEN",
+        "speech": {"transcript": "嗯那。"},
+        "session": {},
+        "probes": {},
+    }
+    report = score_clip(clip, [answer, heard], log)
+    assert report["observations"][1]["ok"] is True
+    report = score_clip(clip, [answer, heard, _yield(23000, "嗯那。", "false_barge")], log)
     assert report["observations"][1]["ok"] is False
 
 
@@ -186,12 +185,70 @@ def test_backchannel_yield_during_greet_does_not_fail():
     assert report["observations"][0]["ok"] is False
 
 
-def test_false_barge_yield_is_not_a_true_interrupt():
+def test_yield_does_not_require_the_old_three_way():
     clip = {"id": "v1-A07", "observations": [{"kind": "has_yield"}]}
-    report = score_clip(clip, [_yield(6700, "给", "false_barge")], "")
-    assert report["verdict"] == "FAIL"
-    report = score_clip(clip, [_yield(20200, "别说了", "true_interrupt")], "")
-    assert report["verdict"] == "PASS"
+    assert score_clip(clip, [_yield(6700, "给", "false_barge")], "")["verdict"] == "PASS"
+    assert score_clip(clip, [_yield(20200, "别说了", "true_interrupt")], "")["verdict"] == "PASS"
+    assert score_clip(clip, [_answer(1000, "别说了")], "")["verdict"] == "FAIL"
+
+
+def test_ask_again_is_the_spoken_line():
+    clip = {"id": "v2-01-1", "observations": [{"kind": "utter_sop", "sop": "01"}]}
+    numbered = {
+        "t_ms": 1000,
+        "action": "UTTER",
+        "sop": "01",
+        "text": "别的话",
+        "speech": {},
+        "session": {},
+        "probes": {},
+    }
+    assert score_clip(clip, [numbered], "")["verdict"] == "FAIL"
+    spoken = {
+        "t_ms": 1000,
+        "action": "UTTER",
+        "text": "抱歉，能请您再说一遍吗？",
+        "speech": {},
+        "session": {},
+        "probes": {},
+    }
+    assert score_clip(clip, [spoken], "")["verdict"] == "PASS"
+
+
+def test_filler_is_sent_by_the_agent_not_uttered_by_ic():
+    clip = {"id": "v1-A26", "observations": [{"kind": "agent_filler_to_tts"}]}
+    uttered = {
+        "t_ms": 1000,
+        "action": "UTTER",
+        "text": "我查一下",
+        "speech": {},
+        "session": {},
+        "probes": {},
+    }
+    assert score_clip(clip, [uttered], "[tts.start a] 我查一下")["verdict"] == "FAIL"
+    inserted = {"t_ms": 1000, "action": "INSERT", "speech": {}, "session": {}, "probes": {}}
+    assert score_clip(clip, [inserted], "")["verdict"] == "FAIL"
+    held = {"t_ms": 1000, "action": "HOLD", "speech": {}, "session": {}, "probes": {}}
+    assert score_clip(clip, [held], "[tts.end b] 我查一下")["verdict"] == "PASS"
+
+
+def test_closing_line_is_handed_to_the_agent():
+    clip = {"id": "v1-A39", "observations": [{"kind": "closing_handed_to_agent"}]}
+    ended = {"t_ms": 1000, "action": "END", "speech": {}, "session": {}, "probes": {}}
+    assert score_clip(clip, [ended], "")["verdict"] == "FAIL"
+    handed = _answer(1000, "不用了")
+    assert score_clip(clip, [handed], "")["verdict"] == "FAIL"
+    log = "[tts.start c] 好的，那我先不打扰了"
+    assert score_clip(clip, [handed], log)["verdict"] == "PASS"
+    ic_line = {
+        "t_ms": 2000,
+        "action": "UTTER",
+        "text": "好的，那我先不打扰了",
+        "speech": {},
+        "session": {},
+        "probes": {},
+    }
+    assert score_clip(clip, [handed, ic_line], log)["verdict"] == "FAIL"
 
 
 def test_answer_without_wait_does_not_pass_a06():
