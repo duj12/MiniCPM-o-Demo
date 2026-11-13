@@ -10,6 +10,15 @@ from typing import Any, Callable, Optional
 from .client import _signature_accepts
 logger = logging.getLogger(__name__)
 _MAX_FAIL_METHODS = 64
+_SESSION_QUESTION = "对着当前会话"
+_SESSION_QUESTION_BODY = {
+    "type": "choice",
+    "instructions": "这句话是对着当前会话说的吗？",
+    "criteria": {
+        "是": "对着当前会话",
+        "不是": "不是对着当前会话",
+    },
+}
 
 _CONF_FIELDS: dict[str, tuple[str, ...]] = {
     "apply_face": ("face_present_confidence",),
@@ -208,6 +217,7 @@ class InProcessICClient:
             return None
         try:
             action = self._engine.tick(dt_ms)
+            self._ask_pending_question()
         except Exception as exc:
             self.bad_ticks += 1
             self.error = f"{type(exc).__name__}: {exc}"
@@ -217,6 +227,35 @@ class InProcessICClient:
         self.tick_calls += 1
         self.last_action = action.type.value
         return action
+
+    def _ask_pending_question(self) -> None:
+        """IC 决定要问时，把「对着当前会话」发出去，并把「是」或「不是」写回。"""
+        engine = self._engine
+        probe = self._decision_probe
+        if engine is None or probe is None:
+            return
+        if getattr(engine, "pending_question", None) != _SESSION_QUESTION:
+            return
+        client = getattr(probe, "client", None)
+        if client is None:
+            return
+        try:
+            answer = client.systemone(
+                {_SESSION_QUESTION: _SESSION_QUESTION_BODY},
+                {"transcript": engine.state.speech.transcript},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 对着当前会话 发问失败: %s", self.owner_key, exc)
+            return
+        if answer is None:
+            return
+        choice, _confidence = answer.choice(_SESSION_QUESTION)
+        if choice not in ("是", "不是"):
+            return
+        engine.apply_probe(
+            turn_id=engine.state.turn_id,
+            addressed_to_session=choice,
+        )
 
     def snapshot_blocks(self) -> Optional[dict]:
         """当前 IC 状态，形状与 viz JSONL 的分块一致。不可用时返回 None。"""
