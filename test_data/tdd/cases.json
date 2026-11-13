@@ -430,12 +430,12 @@
       "observations": [
         {
           "kind": "answer_target_regex",
-          "pattern": "天气|毛衣|咖啡|冷"
+          "pattern": "距离|交互"
         }
       ],
       "source": "md#v2 / SOP08 / 8_2",
-      "notes": "Demo 预期与 8_1 同句。场景列的持续远离问句不是本片闸。",
-      "ic_gate": "ANSWER on 天气+毛衣问句",
+      "notes": "源表这一条的预期句是「我用这个距离跟你交互合适吗」，不是 8_1 的天气句。",
+      "ic_gate": "ANSWER on 距离交互问句",
       "agent_gate": "VLM+weather (soft)"
     },
     {

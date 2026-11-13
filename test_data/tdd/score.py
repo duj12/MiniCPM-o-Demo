@@ -596,13 +596,22 @@ def check_has_answer_after_yield(obs: dict, events: list[dict], log: str, clip: 
 
 
 def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
-    """垫话由 Agent 发给 TTS。InteractionCore 自己说出「我查一下」不算。"""
+    """垫话由 Agent 发给 TTS。InteractionCore 自己说出「我查一下」不算。
+
+    垫话不必是「我查一下」这五个字。迎宾和固定开口是 InteractionCore 的，不算。
+    """
+    ic_lines = {
+        (event.get("text") or "").strip()
+        for event in events
+        if event.get("action") in {"UTTER", "GREET"} and (event.get("text") or "").strip()
+    }
     for event in events:
         if event.get("action") == "UTTER" and _FILLER_RE.search(_event_text(event)):
             return False, "InteractionCore uttered the filler"
     for line in _tts_lines(log):
-        if _FILLER_RE.search(line):
-            return True, f"agent filler on TTS: {line[:40]}"
+        if line in ic_lines:
+            continue
+        return True, f"agent filler on TTS: {line[:40]}"
     return False, "agent did not send the filler to TTS"
 
 
