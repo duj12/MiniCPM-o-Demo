@@ -251,6 +251,21 @@ def test_closing_line_is_handed_to_the_agent():
     assert score_clip(clip, [handed, ic_line], log)["verdict"] == "FAIL"
 
 
+def test_leave_requires_end_not_session_end_pending():
+    clip = {"id": "v1-D24", "observations": [{"kind": "has_end_or_session_close"}]}
+    pending = {
+        "t_ms": 4000,
+        "action": "HOLD",
+        "speech": {},
+        "session": {},
+        "probes": {},
+        "agent": {"session_end_pending": True},
+    }
+    assert score_clip(clip, [pending], "")["verdict"] == "FAIL"
+    ended = {"t_ms": 4000, "action": "END", "speech": {}, "session": {}, "probes": {}}
+    assert score_clip(clip, [ended], "")["verdict"] == "PASS"
+
+
 def test_answer_without_wait_does_not_pass_a06():
     clip = {"id": "v1-A06", "observations": [{"kind": "has_wait_or_deferred_answer"}]}
     assert score_clip(clip, [_answer(9000, "附近的麦当劳")], "")["verdict"] == "FAIL"

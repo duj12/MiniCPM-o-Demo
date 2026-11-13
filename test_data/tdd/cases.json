@@ -1065,7 +1065,7 @@
         }
       ],
       "source": "md#v1_new / D24",
-      "ic_gate": "END on leave"
+      "ic_gate": "END on leave; session_end_pending does not pass"
     },
     {
       "id": "v1-D25",

@@ -606,14 +606,6 @@ def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dic
     return False, "agent did not send the filler to TTS"
 
 
-def _end_pending(events: list[dict]) -> int | None:
-    for event in events:
-        agent = event.get("agent") or {}
-        if isinstance(agent, dict) and agent.get("session_end_pending"):
-            return int(event.get("t_ms") or 0)
-    return None
-
-
 def check_closing_handed_to_agent(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
     """把「不用了」或「没事了」交给 Agent，由 Agent 说结束语。光有 END 不算。"""
     handed = [
@@ -638,13 +630,11 @@ def check_closing_handed_to_agent(obs: dict, events: list[dict], log: str, clip:
 
 
 def check_has_end_or_session_close(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """离开要交出 END。session_end_pending 不算结束。"""
     ends = [e.get("t_ms") for e in events if e.get("action") == "END"]
     if ends:
         return True, f"END @ {ends[0]}"
-    pending = _end_pending(events)
-    if pending is not None:
-        return True, f"session_end_pending @ {pending}"
-    return False, "no END and no session_end_pending"
+    return False, "no END"
 
 
 def check_has_greet(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
