@@ -241,12 +241,31 @@ def test_closing_line_ends_in_interactioncore():
         "session": {},
         "probes": {},
     }
-    ended = {"t_ms": 1200, "action": "END", "speech": {"transcript": "不用了。"}, "session": {}, "probes": {}}
-    assert score_clip(clip, [said, ended], "")["verdict"] == "PASS"
+    farewell = {
+        "t_ms": 1100,
+        "action": "UTTER",
+        "sop": "39",
+        "text": "好的，再见。",
+        "speech": {"transcript": "不用了。"},
+        "session": {},
+        "probes": {},
+    }
+    ended = {
+        "t_ms": 1400,
+        "action": "END",
+        "sop": "39",
+        "speech": {},
+        "session": {},
+        "probes": {},
+    }
+    left = {"t_ms": 2000, "action": "END", "sop": "24", "speech": {}, "session": {}, "probes": {}}
+    log = "[tts.start c] 好的，再见。"
+    assert score_clip(clip, [said, farewell, ended], log)["verdict"] == "PASS"
+    assert score_clip(clip, [said, ended], log)["verdict"] == "FAIL"
+    assert score_clip(clip, [said, farewell, ended], "")["verdict"] == "FAIL"
+    assert score_clip(clip, [said, farewell, left], log)["verdict"] == "FAIL"
     handed = _answer(1000, "不用了")
-    assert score_clip(clip, [handed], "")["verdict"] == "FAIL"
-    assert score_clip(clip, [handed, ended], "")["verdict"] == "FAIL"
-    assert score_clip(clip, [said], "")["verdict"] == "FAIL"
+    assert score_clip(clip, [handed, farewell, ended], log)["verdict"] == "FAIL"
 
 
 def test_leave_requires_end_not_session_end_pending():

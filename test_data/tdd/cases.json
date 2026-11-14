@@ -935,14 +935,14 @@
       "sop": "A39 CLOSE_SESSION",
       "video": "A39.mkv",
       "status": "runnable",
-      "expect": "说完「不用了」后，StartLux 判为结束意图则 InteractionCore 出 END",
+      "expect": "说完「不用了」后，StartLux 判为结束意图则 InteractionCore 先说「好的，再见。」，播完再 END",
       "observations": [
         {
           "kind": "closing_end_by_ic"
         }
       ],
       "source": "md#v1_new / A39",
-      "ic_gate": "END after StartLux exit intent on 不用了"
+      "ic_gate": "UTTER 好的，再见。 then END sop=39; 不用了 is not ANSWER"
     },
     {
       "id": "v1-D15",

@@ -616,7 +616,10 @@ def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dic
 
 
 def check_closing_end_by_ic(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
-    """说完「不用了」或「没事了」后，InteractionCore 出 END。不要求 Agent 说结束语。"""
+    """说完「不用了」或「没事了」后：IC 说出结束语，TTS 播了，再 END sop=39。
+
+    离开画面的 END sop=24 不算。这句也不能交给 Agent。
+    """
     closing_ms = [
         int(event.get("t_ms") or 0)
         for event in events
@@ -631,14 +634,30 @@ def check_closing_end_by_ic(obs: dict, events: list[dict], log: str, clip: dict)
     ]
     if handed:
         return False, "handed 不用了 or 没事了 to Agent"
+    uttered = [
+        event
+        for event in events
+        if event.get("action") == "UTTER"
+        and str(event.get("sop") or "") == "39"
+        and int(event.get("t_ms") or 0) >= min(closing_ms)
+        and (event.get("text") or "").strip()
+    ]
+    if not uttered:
+        return False, "no IC farewell UTTER after 不用了"
+    farewell = (uttered[0].get("text") or "").strip()
+    uttered_at = int(uttered[0].get("t_ms") or 0)
+    if farewell not in _tts_lines(log):
+        return False, f"farewell {farewell} was not played on TTS"
     ends = [
         int(event.get("t_ms") or 0)
         for event in events
-        if event.get("action") == "END" and int(event.get("t_ms") or 0) >= min(closing_ms)
+        if event.get("action") == "END"
+        and str(event.get("sop") or "") == "39"
+        and int(event.get("t_ms") or 0) >= uttered_at
     ]
     if ends:
-        return True, f"END after closing @ {ends[0]}"
-    return False, "no END after 不用了 or 没事了"
+        return True, f"farewell {farewell} then END sop=39 @ {ends[0]}"
+    return False, "no END sop=39 after the farewell"
 
 
 def check_has_end_or_session_close(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
