@@ -232,23 +232,21 @@ def test_filler_is_sent_by_the_agent_not_uttered_by_ic():
     assert score_clip(clip, [held], "[tts.end b] 我查一下")["verdict"] == "PASS"
 
 
-def test_closing_line_is_handed_to_the_agent():
-    clip = {"id": "v1-A39", "observations": [{"kind": "closing_handed_to_agent"}]}
-    ended = {"t_ms": 1000, "action": "END", "speech": {}, "session": {}, "probes": {}}
-    assert score_clip(clip, [ended], "")["verdict"] == "FAIL"
-    handed = _answer(1000, "不用了")
-    assert score_clip(clip, [handed], "")["verdict"] == "FAIL"
-    log = "[tts.start c] 好的，那我先不打扰了"
-    assert score_clip(clip, [handed], log)["verdict"] == "PASS"
-    ic_line = {
-        "t_ms": 2000,
-        "action": "UTTER",
-        "text": "好的，那我先不打扰了",
-        "speech": {},
+def test_closing_line_ends_in_interactioncore():
+    clip = {"id": "v1-A39", "observations": [{"kind": "closing_end_by_ic"}]}
+    said = {
+        "t_ms": 1000,
+        "action": "HOLD",
+        "speech": {"transcript": "不用了。"},
         "session": {},
         "probes": {},
     }
-    assert score_clip(clip, [handed, ic_line], log)["verdict"] == "FAIL"
+    ended = {"t_ms": 1200, "action": "END", "speech": {"transcript": "不用了。"}, "session": {}, "probes": {}}
+    assert score_clip(clip, [said, ended], "")["verdict"] == "PASS"
+    handed = _answer(1000, "不用了")
+    assert score_clip(clip, [handed], "")["verdict"] == "FAIL"
+    assert score_clip(clip, [handed, ended], "")["verdict"] == "FAIL"
+    assert score_clip(clip, [said], "")["verdict"] == "FAIL"
 
 
 def test_leave_requires_end_not_session_end_pending():

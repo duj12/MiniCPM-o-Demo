@@ -615,27 +615,30 @@ def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dic
     return False, "agent did not send the filler to TTS"
 
 
-def check_closing_handed_to_agent(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
-    """把「不用了」或「没事了」交给 Agent，由 Agent 说结束语。光有 END 不算。"""
+def check_closing_end_by_ic(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """说完「不用了」或「没事了」后，InteractionCore 出 END。不要求 Agent 说结束语。"""
+    closing_ms = [
+        int(event.get("t_ms") or 0)
+        for event in events
+        if any(key in _compact(_transcript(event)) for key in _CLOSING_KEYS)
+    ]
+    if not closing_ms:
+        return False, "no 不用了 or 没事了 in the transcript"
     handed = [
         event
         for event in _answers(events)
         if any(key in _compact(_transcript(event)) for key in _CLOSING_KEYS)
     ]
-    if not handed:
-        return False, "did not hand 不用了 or 没事了 to Agent"
-    ic_lines = {
-        (event.get("text") or "").strip()
+    if handed:
+        return False, "handed 不用了 or 没事了 to Agent"
+    ends = [
+        int(event.get("t_ms") or 0)
         for event in events
-        if event.get("action") in {"UTTER", "GREET"} and (event.get("text") or "").strip()
-    }
-    for line in _tts_lines(log):
-        if line in ic_lines:
-            continue
-        if _compact(line) in _CLOSING_KEYS:
-            continue
-        return True, f"Agent closing line on TTS: {line[:40]}"
-    return False, "Agent did not speak the closing line"
+        if event.get("action") == "END" and int(event.get("t_ms") or 0) >= min(closing_ms)
+    ]
+    if ends:
+        return True, f"END after closing @ {ends[0]}"
+    return False, "no END after 不用了 or 没事了"
 
 
 def check_has_end_or_session_close(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
@@ -776,7 +779,7 @@ CHECKS = {
     "has_answer_after_yield": check_has_answer_after_yield,
     "has_insert_or_processing": check_agent_filler_to_tts,
     "agent_filler_to_tts": check_agent_filler_to_tts,
-    "closing_handed_to_agent": check_closing_handed_to_agent,
+    "closing_end_by_ic": check_closing_end_by_ic,
     "has_end_or_session_close": check_has_end_or_session_close,
     "has_greet": check_has_greet,
     "has_greet_or_answer": check_has_greet_or_answer,

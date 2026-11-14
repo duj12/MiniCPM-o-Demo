@@ -935,14 +935,14 @@
       "sop": "A39 CLOSE_SESSION",
       "video": "A39.mkv",
       "status": "runnable",
-      "expect": "把「不用了」交给 Agent，由 Agent 判断结束并说结束语",
+      "expect": "说完「不用了」后，StartLux 判为结束意图则 InteractionCore 出 END",
       "observations": [
         {
-          "kind": "closing_handed_to_agent"
+          "kind": "closing_end_by_ic"
         }
       ],
       "source": "md#v1_new / A39",
-      "ic_gate": "ANSWER 不用了; agent speaks the closing line"
+      "ic_gate": "END after StartLux exit intent on 不用了"
     },
     {
       "id": "v1-D15",
