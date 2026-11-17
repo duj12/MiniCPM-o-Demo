@@ -1143,6 +1143,41 @@
       ],
       "source": "md#补充测试 / s-279",
       "ic_gate": "single intro ANSWER; no bystander ANSWER"
+    },
+    {
+      "id": "supp-9554",
+      "suite": "supplement",
+      "sop": "answer gate + tts",
+      "video": "s-9554c311559e-raw.mkv",
+      "status": "runnable",
+      "expect": "四句均 IC ANSWER 交给 Agent：「给我介绍魔珐科技」、两次「跟你的交互体验是这个」、「我今天穿这个开会合适吗」；前三次的 Agent 回复和 TTS 正常播放，不能被 0.00s YIELD 掐断；最后一问接近视频结尾，Agent 回复/TTS 可能收不到，不算错",
+      "observations": [
+        {
+          "kind": "answer_count_at_least",
+          "n": 4
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "answer_target_count",
+          "pattern": "交互体验",
+          "n": 2
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "穿这个|开会|合适"
+        },
+        {
+          "kind": "tts_answers_played",
+          "n": 3
+        }
+      ],
+      "source": "manual / s-9554",
+      "notes": "2026-11-17 回归：ANSWER 必须 HIGH；第二次「跟你的交互体验是这个」是新的 HIGH 定稿，不能靠 LOW 提前答；31.0s 的误 YIELD 会在这里表现为 tts.cancel 已播 0.00s。最后一问接近视频结尾，Agent 回复/TTS 可能收不到，不算错；TTS 观察只要求前三次且没有 0.00s 取消。",
+      "ic_gate": "ANSWER x4（两次交互体验都要答）；没有 0.00s TTS 取消",
+      "agent_gate": "前三次 ANSWER 有正常回复和 TTS；最后一问的 Agent 回复/TTS 允许缺失（soft）"
     }
   ]
 }

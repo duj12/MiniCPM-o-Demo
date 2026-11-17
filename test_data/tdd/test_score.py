@@ -48,7 +48,7 @@ def test_runnable_set_keeps_a7_split_and_blocked_out():
     by_suite = {}
     for clip in runnable:
         by_suite[clip["suite"]] = by_suite.get(clip["suite"], 0) + 1
-    assert by_suite == {"v2": 32, "v1_new": 21, "supplement": 2}
+    assert by_suite == {"v2": 32, "v1_new": 21, "supplement": 3}
 
 
 def test_asr_neighbor_names_aigc():
@@ -288,6 +288,36 @@ def test_answer_without_wait_does_not_pass_a06():
     assert score_clip(clip, [_answer(9000, "附近的麦当劳")], "")["verdict"] == "FAIL"
     waited = {"t_ms": 4000, "action": "WAIT", "sop": "06", "speech": {}, "session": {}, "probes": {}}
     assert score_clip(clip, [waited, _answer(9000, "附近的麦当劳")], "")["verdict"] == "PASS"
+
+
+def test_answer_target_count_requires_both_repeats():
+    clip = {
+        "id": "supp-9554",
+        "observations": [
+            {"kind": "answer_target_count", "pattern": "交互体验", "n": 2},
+        ],
+    }
+    one = [_answer(1000, "给我介绍魔珐科技"), _answer(16000, "跟你的交互体验是这个")]
+    assert score_clip(clip, one, "")["verdict"] == "FAIL"
+    two = one + [_answer(30000, "跟你的交互体验是这个")]
+    assert score_clip(clip, two, "")["verdict"] == "PASS"
+
+
+def test_tts_answers_played_rejects_start_cancel():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 2}],
+    }
+    ok = "\n".join([
+        "[tts.start a] 你好",
+        "[tts.end a] 你好",
+        "[tts.start b] 好的",
+        "[tts.end b] 好的",
+    ])
+    assert score_clip(clip, [], ok)["verdict"] == "PASS"
+    assert score_clip(clip, [], "[tts.start a] 你好")["verdict"] == "FAIL"
+    cut = ok + "\n[tts.cancel b] 已播 0.00s"
+    assert score_clip(clip, [], cut)["verdict"] == "FAIL"
 
 
 def test_cases_roundtrip_version():

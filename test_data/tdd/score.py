@@ -24,6 +24,8 @@ FALSE_BARGE_SCRIPT_RE = re.compile(r"嗯那|小猫|金[渐线建]层|客厅|沙�
 AWAY_TOKENS = ("打电话", "背对", "侧身", "离开", "不注视", "注意力在别处")
 PAUSE_RE = re.compile(r"\[tts\.pause ([^\]]+)\]")
 RESUME_RE = re.compile(r"\[tts\.resume ([^\]]+)\]")
+TTS_START_RE = re.compile(r"\[tts\.start ([^\]]+)\]")
+TTS_CANCEL_PLAYED_RE = re.compile(r"\[tts\.cancel ([^\]]+)\]\s*已播\s*([0-9.]+)s")
 LOG_MS_RE = re.compile(r"\[(\d+)ms")
 REPAIR_SOPS = {"01", "13", "14"}
 
@@ -485,6 +487,20 @@ def check_answer_count_at_least(obs: dict, events: list[dict], log: str, clip: d
     return False, f"ANSWER x{got} < {n}"
 
 
+def check_answer_target_count(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """Count ANSWERs whose transcript matches one pattern; repeated utterances need this."""
+    pattern = str(obs.get("pattern") or "")
+    n = int(obs.get("n") or 0)
+    hits = []
+    for event in _answers(events):
+        text = _transcript(event)
+        if transcript_matches_pattern(text, pattern):
+            hits.append((event.get("t_ms"), text[:40]))
+    if len(hits) >= n:
+        return True, f"target ANSWER x{len(hits)} /{pattern}/"
+    return False, f"target ANSWER x{len(hits)} < {n} /{pattern}/ {hits}"
+
+
 def check_emotion_field_present_on_answer(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
     patterns = _obs_patterns(clip)
     targets = []
@@ -613,6 +629,34 @@ def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dic
             continue
         return True, f"agent filler on TTS: {line[:40]}"
     return False, "agent did not send the filler to TTS"
+
+
+def check_tts_answers_played(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """At least N Agent TTS segments, and none cancelled at the start.
+
+    A 0.00s ``tts.cancel`` is the spurious-YIELD signature: the segment was
+    accepted and then dropped before a single sample played.
+    """
+    n = int(obs.get("n") or 0)
+    min_played_s = float(obs.get("min_played_s") or 0.05)
+    starts = {
+        found.group(1).strip()
+        for found in (TTS_START_RE.search(line) for line in log.splitlines())
+        if found is not None
+    }
+    early_cancels = []
+    for line in log.splitlines():
+        found = TTS_CANCEL_PLAYED_RE.search(line)
+        if found is None:
+            continue
+        played = float(found.group(2))
+        if played < min_played_s:
+            early_cancels.append((found.group(1).strip(), played))
+    if len(starts) < n:
+        return False, f"TTS segments x{len(starts)} < {n}"
+    if early_cancels:
+        return False, f"TTS cancelled below {min_played_s:.2f}s: {early_cancels}"
+    return True, f"TTS segments x{len(starts)}; no start cancel"
 
 
 def check_closing_end_by_ic(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
@@ -789,6 +833,8 @@ CHECKS = {
     "no_answer_or_utter_phone_selftalk": check_no_answer_or_utter_phone_selftalk,
     "has_second_answer_or_insert": check_has_second_answer_or_insert,
     "answer_count_at_least": check_answer_count_at_least,
+    "answer_target_count": check_answer_target_count,
+    "tts_answers_played": check_tts_answers_played,
     "emotion_field_present_on_answer": check_emotion_field_present_on_answer,
     "no_answer_transcript_regex": check_no_answer_transcript_regex,
     "utter_repair": check_utter_repair,
