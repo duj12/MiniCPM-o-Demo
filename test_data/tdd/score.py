@@ -843,12 +843,12 @@ def check_no_answer_non_subject_aside(obs: dict, events: list[dict], log: str, c
         text = _transcript(event)
         if INTRO_STEM_RE.search(_compact(text)):
             continue
-        role = str(_probes(event).get("utterance_role") or "").strip().lower()
-        if role == "request":
+        reply = _probes(event).get("expects_reply")
+        if reply is True or str(reply).strip().lower() in ("true", "yes"):
             continue
-        bad.append((event.get("t_ms"), text[:40], role or "missing"))
+        bad.append((event.get("t_ms"), text[:40], "missing" if reply is None else reply))
     if bad:
-        return False, f"non-request ANSWER {bad}"
+        return False, f"ANSWER without expects_reply {bad}"
     return True, "no non-request aside ANSWER"
 
 

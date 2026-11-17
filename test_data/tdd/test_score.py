@@ -9,7 +9,7 @@ from score import load_cases, resume_closes_pause_at_or_after, runnable_cases, s
 CASES = Path(__file__).with_name("cases.json")
 
 
-def _answer(t_ms: int, text: str, emotion: str = "", role: str | None = None) -> dict:
+def _answer(t_ms: int, text: str, emotion: str = "", reply: bool | None = None) -> dict:
     event = {
         "t_ms": t_ms,
         "action": "ANSWER",
@@ -17,8 +17,8 @@ def _answer(t_ms: int, text: str, emotion: str = "", role: str | None = None) ->
         "probes": {},
         "session": {},
     }
-    if role is not None:
-        event["probes"]["utterance_role"] = role
+    if reply is not None:
+        event["probes"]["expects_reply"] = reply
     return event
 
 
@@ -45,10 +45,12 @@ def test_runnable_set_keeps_a7_split_and_blocked_out():
     assert "supp-75" not in ids
     assert "v2-05-1" in ids
     assert "v2-05-2" in ids
+    # SOP04 只保留 04_1026.mkv 这一条。
+    assert [cid for cid in ids if cid.startswith("v2-04-")] == ["v2-04-1"]
     by_suite = {}
     for clip in runnable:
         by_suite[clip["suite"]] = by_suite.get(clip["suite"], 0) + 1
-    assert by_suite == {"v2": 32, "v1_new": 21, "supplement": 3}
+    assert by_suite == {"v2": 30, "v1_new": 21, "supplement": 3}
 
 
 def test_asr_neighbor_names_aigc():

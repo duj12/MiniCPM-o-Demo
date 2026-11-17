@@ -6,6 +6,7 @@ Blocked clips stay out of the run. agent_gate does not fail a clip.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -14,7 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CASES = ROOT / "test_data" / "tdd" / "cases.json"
 PY = "/root/miniconda3/envs/orch105/bin/python"
-OUT = Path("/tmp/sop_tdd_v2")
+#: Shadow orchestrators run on another port (run_orch_105.sh ORCH_PORT).
+PORT = os.environ.get("ORCH_REPLAY_PORT", "8100")
+OUT = Path(os.environ.get("ORCH_TDD_OUT", "/tmp/sop_tdd_v2"))
 
 sys.path.insert(0, str(ROOT / "test_data" / "tdd"))
 from score import blocked_cases, load_cases, runnable_cases, score_paths  # noqa: E402
@@ -35,7 +38,7 @@ def replay(clip: dict) -> tuple[Path, Path, int]:
     cmd = [
         PY, "-u", str(ROOT / "orchestrator_replay.py"),
         "--video", str(video),
-        "--host", "127.0.0.1", "--port", "8100",
+        "--host", "127.0.0.1", "--port", PORT,
         "--ic-events-out", str(events),
         "--no-show", "--mute",
         "--face-size", "1280x720",

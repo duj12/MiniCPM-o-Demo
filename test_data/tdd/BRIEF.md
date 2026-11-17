@@ -50,7 +50,7 @@ md Demo 大量写成「ic判answer，agent结合vlm/情绪回复」。
 
 允许的证据：
 
-- IC `events.jsonl`：`action`、`speech.transcript`、`session.barge_phase` / `barge_pause_reason`、`probes.utterance_role`、`sop`
+- IC `events.jsonl`：`action`、`speech.transcript`、`session.barge_phase` / `barge_pause_reason`、`probes.barge_class` / `probes.expects_reply`、`sop`
 - replay 日志：`tts.pause` / `tts.resume`（SOP04 / SOP05）
 - replay 日志：`tts.start` / `tts.cancel 已播` —— 仅当 observation 明确要求 TTS 播放时（如 `tts_answers_played`）
 
