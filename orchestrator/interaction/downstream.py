@@ -36,6 +36,7 @@ _REPORT_CLOCKS = {
         "greet_elapsed_ms", "absent_ms", "barge_hold_ms", "barge_paused_at_ms",
     }),
     "person": frozenset({"dwell_ms"}),
+    "turn": frozenset({"pending_waited_ms"}),
 }
 
 
