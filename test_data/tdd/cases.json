@@ -1167,7 +1167,7 @@
         },
         {
           "kind": "answer_target_regex",
-          "pattern": "穿这个|开会|合适"
+          "pattern": "穿这个去开会|开会合适|我今天穿这个"
         },
         {
           "kind": "tts_answers_played",
