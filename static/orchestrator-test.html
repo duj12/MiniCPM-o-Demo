@@ -241,7 +241,7 @@
 <!-- ⚠️ 版本查询串同 worklet：iOS Safari 没有强制刷新，改了这个文件就必须
      改号，否则页面拿到新 HTML、脚本还是旧的（「能力位对、锚点却是 0 个」
      就是这么来的）。 -->
-<script src="/static/duplex/lib/orchestrator-session.js?v=5"></script>
+<script src="/static/duplex/lib/orchestrator-session.js?v=6"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const logEl = $('log'), statsEl = $('stats');
@@ -1664,6 +1664,10 @@ let alsaChans = 8, alsaRate = 16000;
 let alsaSamplesSeen = 0;          // 已下混并进入待切块缓冲的采样总数
 let alsaPending = new Float32Array(0);
 let alsaPendingRef = new Float32Array(0);  // 与 alsaPending **逐采样对齐**
+// 8PCM 门控（远端人脸 8768）要**原始交错字节**：16k/s16le/8ch，
+// 每个采样 16 字节。与 alsaPending 逐采样对齐；只在 8 声道 16k 时维护，
+// 条件不满足就置空（宁可这一段不发 pcm8，也绝不发错位的字节）。
+let alsaPendingP8 = new Uint8Array(0);
 let alsaTsMap = [];               // [{s, ts}] 最近若干帧的首采样时刻（epoch ms）
 let alsaChunksSent = 0;
 let alsaChunksWindow = 0;         // 本统计窗口发出的块数
@@ -1875,13 +1879,19 @@ function alsaCtxTimeOf(sampleIdx) {
  *  两者长度相同、逐采样对齐 —— 服务端拿到就直接当参考，**D=0**，
  *  不需要任何声学延迟估计。这是消掉"播报被识别成用户说话"的关键。
  */
-function alsaPush(mono, ref, tsMs) {
+function alsaPush(mono, ref, tsMs, pcm8) {
   if (!mono.length) return;
   // 防御：ref 必须与 mic 同长，且两路待切缓冲必须从头就同步。
   // 不满足就整段不发 ref —— 绝不把错位的 farend 送进 AEC。
   let useRef = !!(ref && ref.length === mono.length
                   && alsaPendingRef.length === alsaPending.length);
   if (!useRef && alsaPendingRef.length) alsaPendingRef = new Float32Array(0);
+  // 8PCM 同理：每采样 16 字节（8ch × int16），且字节缓冲必须与 mic 同步。
+  // 不同步就置空 —— 8768 的时间戳是「按采样数连续」的，错位一次整段废。
+  const P8_BPS = 16;
+  let useP8 = !!(pcm8 && pcm8.length === mono.length * P8_BPS
+                 && alsaPendingP8.length === alsaPending.length * P8_BPS);
+  if (!useP8 && alsaPendingP8.length) alsaPendingP8 = new Uint8Array(0);
   const startSample = alsaSamplesSeen;
   // 设备 NTP 校时会让时间戳跳变 —— 跳变时按外推值继续，别把锚点带歪
   if (alsaTsMap.length) {
@@ -1910,6 +1920,12 @@ function alsaPush(mono, ref, tsMs) {
     mergedRef.set(ref, alsaPendingRef.length);
     alsaPendingRef = mergedRef;
   }
+  if (useP8) {
+    const mergedP8 = new Uint8Array(alsaPendingP8.length + pcm8.length);
+    mergedP8.set(alsaPendingP8, 0);          // 这里就把 ws 缓冲拷走了
+    mergedP8.set(pcm8, alsaPendingP8.length);
+    alsaPendingP8 = mergedP8;
+  }
 
   const base = alsaSamplesSeen - alsaPending.length;   // pending[0] 的绝对下标
   let off = 0;
@@ -1923,6 +1939,10 @@ function alsaPush(mono, ref, tsMs) {
       // farend 与 mic 用**同一次切块边界** —— 服务端直接当参考，D=0
       if (alsaPendingRef.length >= off + ALSA_CHUNK) {
         chunk.ref = alsaPendingRef.slice(off, off + ALSA_CHUNK);
+      }
+      // 8 声道原始交错字节（**不降混**）：同一时间窗，服务端自己取 ch2-5
+      if (alsaPendingP8.length >= (off + ALSA_CHUNK) * P8_BPS) {
+        chunk.pcm8 = alsaPendingP8.slice(off * P8_BPS, (off + ALSA_CHUNK) * P8_BPS);
       }
       session.sendChunk(chunk);
       alsaChunksSent++;
@@ -1939,6 +1959,11 @@ function alsaPush(mono, ref, tsMs) {
       alsaPendingRef = alsaPendingRef.slice(off);
     } else {
       alsaPendingRef = new Float32Array(0);
+    }
+    if (alsaPendingP8.length >= off * P8_BPS) {
+      alsaPendingP8 = alsaPendingP8.slice(off * P8_BPS);
+    } else {
+      alsaPendingP8 = new Uint8Array(0);
     }
   }
 }
@@ -2003,7 +2028,13 @@ function alsaOnBinary(buf) {
   const mic = alsaDownmix(f.payload, f.channels, alsaMicUse(f.channels));
   const refUse = alsaRefUse(f.channels);
   const ref = refUse ? alsaDownmix(f.payload, f.channels, refUse) : null;
-  alsaPush(mic, ref, tsMs);
+  // 8PCM 门控：只有「8 声道 / 16k / s16le」才原样转发整帧字节。
+  // selectChannels / mono 会让 payload 变形 —— 那种情况宁可不发（8768
+  // 缺 PCM 只会不出人脸，发错字节会让它把会话粘死）。
+  const frames = Math.floor(f.payload.length / 2 / f.channels);
+  const pcm8 = (f.channels === 8 && f.sampleRate === 16000
+                && f.payload.length === frames * 16) ? f.payload : null;
+  alsaPush(mic, ref, tsMs, pcm8);
 }
 
 function alsaOnText(text) {
@@ -2044,6 +2075,7 @@ function startAlsaSource() {
   alsaSamplesSeen = 0;
   alsaPending = new Float32Array(0);
   alsaPendingRef = new Float32Array(0);
+  alsaPendingP8 = new Uint8Array(0);
   alsaTsMap = [];
   alsaChunksSent = 0;
   alsaChunksWindow = 0;
@@ -2123,6 +2155,7 @@ function stopAlsaSource() {
     try { ws.close(); } catch (e) { /* ignore */ }
   }
   alsaPending = new Float32Array(0);
+  alsaPendingP8 = new Uint8Array(0);
   setAlsaStat('已停止', '#888');
 }
 
@@ -2526,7 +2559,8 @@ log('k', `就绪。当前回声消除模式：${selectedAecMode()}`
     ['/static/duplex/lib/capture-processor.js',
      t => t.includes('t0: t0'), '采集 worklet（缺 t0 = 旧缓存）'],
     ['/static/duplex/lib/orchestrator-session.js',
-     t => t.includes("'armed'"), '会话客户端（缺 armed = 旧缓存）'],
+     t => t.includes("'armed'") && t.includes('facePcm8'),
+     '会话客户端（缺 armed/facePcm8 = 旧缓存）'],
   ];
   const stale = [];
   for (const [url, ok, name] of need) {

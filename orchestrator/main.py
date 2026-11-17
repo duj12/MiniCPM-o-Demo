@@ -41,6 +41,7 @@ from orchestrator.protocol import (  # noqa: E402
     PlaybackReceiptMsg,
     SessionReady,
     decode_audio_b64,
+    decode_pcm8_b64,
     to_json,
 )
 from orchestrator.session import OrchestratorSession  # noqa: E402
@@ -544,6 +545,12 @@ def _preflight_remote_face(cfg: Settings) -> bool:
         cfg.face_service_url, body.get("sessions"), body.get("max_sessions"),
         body.get("session_ttl_seconds"), body.get("allow_enroll"),
     )
+    if cfg.face_pcm8:
+        # 8PCM 门控只存在于 8768 那个变体上。地址指错（还指着 8767）时
+        # 服务端会**忽略** pcm8 字段，看起来「能用」，其实门控没生效 ——
+        # 这种静默降级必须在这里喊出来。
+        logger.info("人脸 8PCM 门控 = 开：每次 detect 都会带 8 声道 PCM"
+                    "（要求该地址是 8768 版本，否则该字段被忽略、退化为纯视觉）")
     return True
 
 
@@ -646,14 +653,16 @@ def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
                 session_id=sess.session_id,
                 wake_dwell_ms=cfg.face_wake_dwell_ms,
                 timeout_s=cfg.face_service_timeout_s,
+                pcm8=cfg.face_pcm8,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("远端人脸装配失败（%s: %s）—— 本会话降级为无人脸",
                          type(exc).__name__, exc)
             return
-        logger.info("人脸模块已装配（远端 %s session=%s 唤醒阈值=%dms）",
-                    cfg.face_service_url, sess.session_id,
-                    provider.wake_dwell_ms)
+        logger.info("人脸模块已装配（远端 %s session=%s 唤醒阈值=%dms "
+                    "8PCM=%s）", cfg.face_service_url, sess.session_id,
+                    provider.wake_dwell_ms,
+                    "开" if provider.pcm8_enabled else "关")
     else:
         from orchestrator.face.g1face_provider import (G1FaceProvider,
                                                        resolve_g1_root)
@@ -785,7 +794,8 @@ async def handle_client(ws, cfg: Settings) -> None:
                 k: getattr(sess.asr.config, k)
                 for k in _AsrConfig.CLIENT_OVERRIDABLE
             }
-        await send_to_client(SessionReady(session_id=sid, defaults=_defaults))
+        await send_to_client(SessionReady(session_id=sid, defaults=_defaults,
+                                          face_pcm8=bool(cfg.face_pcm8)))
 
         # ---- 后台任务 ----
         # 注意：不用 create_task(name=...)，那是 Python 3.8+ 的 API
@@ -873,12 +883,16 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
         # 不用服务端 TTS 参考轨，也不用测声学延迟。
         ref_b64 = msg.get("ref_base64") or ""
         ref = decode_audio_b64(ref_b64) if ref_b64 else None
+        # 可选 8 声道 PCM：给 8768 的 8PCM 门控用（16k / int16 LE / ch0..ch7
+        # 交错）。**原样字节**透传，不解交错 —— 多通道设备本来就有这 8 路，
+        # 以前只是没发。客户端不发时行为完全不变。
+        pcm8 = decode_pcm8_b64(msg.get("pcm8_base64") or "")
         # ctx_time/epoch 是浏览器 AudioContext 的锚点 —— 参考轨靠它做
         # 跨时钟域换算，缺了就只能退回预测落位（误差逐句变化）。
         await sess.on_audio(x, msg.get("t_ms", 0),
                             float(msg.get("ctx_time") or 0.0),
                             int(msg.get("epoch") or 0),
-                            ref=ref)
+                            ref=ref, pcm8=pcm8)
     elif t == "video_face":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))

@@ -283,7 +283,8 @@ class OrchestratorSession:
 
     async def on_audio(self, x: np.ndarray, t_ms: int = 0,
                        ctx_time: float = 0.0, epoch: int = 0,
-                       ref: Optional[np.ndarray] = None) -> None:
+                       ref: Optional[np.ndarray] = None,
+                       pcm8: Optional[bytes] = None) -> None:
         """收到一段麦克风音频（float32 (1,T)，16kHz）。
 
         mic ingest 是**唯一**推进时钟的地方。时钟因此跟踪真实音频流，
@@ -297,6 +298,10 @@ class OrchestratorSession:
         通道和 mic 一起送上来）。它与 ``x`` 是同一帧切出来的，**逐采样
         对齐** —— 直接当 AEC 参考即可，D=0，既不依赖服务端 TTS 参考轨，
         也不需要测声学延迟。``ref=None`` 时行为与改动前完全一致。
+
+        ``pcm8`` 是**可选**的原始 8 声道交错 int16 字节（16kHz，ch0..ch7），
+        给 8768 的 8PCM 门控用。它与 ``x`` 同一时间窗，这里只做一次
+        「登记」，由人脸工作线程拼块发出 —— **不阻塞音频路径**。
         """
         if self.closed:
             return
@@ -306,6 +311,11 @@ class OrchestratorSession:
         frame = self.clock.frame_of(x)
         if ctx_time > 0:
             self.clock.record_anchor(ctx_time, frame.t0, epoch)
+        # 8PCM 门控：把这一块的 8 声道原始字节交给远端人脸（8768）。
+        # 🚨 必须**非阻塞**：这里只是 append 到一个列表，真正的拼块+HTTP
+        #    在 face 工作线程里做。没开 pcm8 / 没装人脸时这一步零开销。
+        if pcm8:
+            self._feed_face_pcm8(pcm8, frame.n_samples)
         self.stats["audio_chunks_in"] += 1
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
@@ -868,6 +878,37 @@ class OrchestratorSession:
         #    负值会让 tsv 和 mux 的 tick 网格失去意义。夹到 0 即可 ——
         #    这几帧本来就早于音频起点，归到 0 是正确语义。
         return int(max(0, s) * 1000 // SR)
+
+    def _feed_face_pcm8(self, pcm8: bytes, mic_samples: int) -> None:
+        """把 8 声道 PCM 登记给远端人脸（8768 门控）。
+
+        **同步、非阻塞**：只 append 到 provider 的待发列表，真正的拼块 +
+        HTTP 在 face 工作线程里。没开 8PCM（或人脸降级）时只告警一次。
+
+        ``pcm8`` 与该 mic 块是同一时间窗切出来的，采样数理应相等；不等时
+        只告警一次 —— 远端按**自己的**采样游标记账（不依赖 mic 时钟），
+        所以不会崩，只是两条轴会慢慢错开。
+        """
+        fw = self.face_worker
+        prov = getattr(fw, "provider", None) if fw is not None else None
+        if prov is None or not getattr(prov, "pcm8_enabled", False):
+            if not getattr(self, "_pcm8_warned_noch", False):
+                self._pcm8_warned_noch = True
+                logger.warning("[%s] 收到 pcm8，但本会话人脸未启用 / 未开 "
+                               "8PCM 模式 —— 已忽略（检查 ORCH_FACE_PCM8）",
+                               self.session_id)
+            return
+        n = len(pcm8) // 16
+        if n != mic_samples and not getattr(self, "_pcm8_warned_len", False):
+            self._pcm8_warned_len = True
+            logger.warning("[%s] pcm8 与 mic 块长度不一致（%d vs %d 采样）"
+                           "—— 按 pcm8 自身长度记账",
+                           self.session_id, n, mic_samples)
+        if not getattr(self, "_pcm8_logged", False):
+            self._pcm8_logged = True
+            logger.info("[%s] 8PCM 已接入远端人脸（%d 采样/块，8 声道）",
+                        self.session_id, n)
+        prov.set_pcm8(pcm8)
 
     async def on_video_face(self, jpeg: bytes, t_ms: int = 0,
                             ctx_time: float = 0.0, epoch: int = 0) -> None:

@@ -57,6 +57,10 @@ export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
 export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.106:8767}"
 export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
+# 8PCM 门控（8768 变体）：每次 detect 必须带客户端送来的 8 声道 PCM，
+# 没有新 PCM 的帧**不发**。开的时候 ORCH_FACE_SERVICE_URL 必须指 8768。
+#   8767 = 只看图片帧（默认）；8768 = 图片 + 连续 8 声道 PCM 门控。
+export ORCH_FACE_PCM8="${ORCH_FACE_PCM8:-0}"
 export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 
 # 算法 AEC 的 D 必须按设备实测；250ms 只是占位，默认仍为浏览器 AEC。
@@ -93,7 +97,7 @@ echo "106 编排：IC = 进程内 vendor/interactioncore（每会话一份 Engin
 echo "  端口            = $PORT" >&2
 echo "  Agent gRPC      = $ORCH_AGENT_GRPC（每会话独立 Interact）" >&2
 echo "  Omni            = $ORCH_OMNI_URL" >&2
-echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（仅单会话）}" >&2
+echo "  人脸            = ${ORCH_FACE_SERVICE_URL:-本地 .so（仅单会话）}（8PCM = $ORCH_FACE_PCM8）" >&2
 echo "  python          = $PY" >&2
 echo "  音视频转储      = $ORCH_DUMP_AUDIO" >&2
 echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" >&2

@@ -275,6 +275,13 @@ class Settings:
     #: **不阻塞音频路径**（``FaceWorker.offer`` 是 put_nowait）。
     face_service_timeout_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_FACE_SERVICE_TIMEOUT_S", "2.0")))
+    #: 8PCM 门控（106:8768 的「完整 8PCM」变体）。开 ⇒ 每次 detect 必须带上
+    #: 客户端送来的 8 声道 PCM（``audio`` 消息里的 ``pcm8_base64``），并且
+    #: **没有新 PCM 的帧不发** —— 8768 缺 PCM 直接回 422，不降级成纯视觉。
+    #: 关 ⇒ 完全维持 8767 的旧行为（只发图片帧）。
+    #: 打开时必须同时把 ``ORCH_FACE_SERVICE_URL`` 指到 8768。
+    face_pcm8: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_PCM8", "") not in ("", "0", "false", "False"))
 
     # 调参
     tick_interval_s: float = 0.05
