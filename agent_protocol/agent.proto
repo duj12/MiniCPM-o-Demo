@@ -48,6 +48,11 @@ message AgentAction {
   optional bool noise_burst_detected = 15;
   optional string noise_burst_type = 16;
   optional double snr_db = 17;
+  // ASR 感知（SOP15）：语音情绪标签，如 "neutral" / "happy"。
+  // ⚠️ 与上面的 `Affect` 是两个独立信号，不许互相覆盖 —— 那是策略侧的
+  //    多模态情绪，这只是纯音频模型给的。
+  // 新字段一律往**后**加号，不要回头插空或复用已被删掉的号。
+  optional string emotion = 18;
 }
 
 message AgentState {
