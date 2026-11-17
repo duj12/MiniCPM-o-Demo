@@ -14,7 +14,7 @@
     "supplement": {
       "pass_rule": "all_runnable_must_pass",
       "description": "补充测试",
-      "notes": "supp-75 blocked until subject-voice extraction; score runnable only (09+279).",
+      "notes": "supp-75 blocked until subject-voice extraction; score runnable only (09+279+9554).",
       "shared_behavior_contract": "75 and 09 share 行为契约 when both runnable; 279 is subject-only intro"
     }
   },
@@ -27,7 +27,8 @@
   ],
   "observation_truth": [
     "IC events.jsonl (action, transcript, barge_phase, barge_pause_reason, utterance_role, sop)",
-    "replay log tts.pause / tts.resume for SOP04/05"
+    "replay log tts.pause / tts.resume for SOP04/05",
+    "replay log tts.start / tts.cancel 已播 Ns when an observation requires TTS playback"
   ],
   "answer_transcript_match": {
     "rule": "semantic_same_referent",

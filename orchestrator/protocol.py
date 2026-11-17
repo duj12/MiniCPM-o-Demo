@@ -294,6 +294,8 @@ class IcDisplay:
     vision: Optional[dict] = None
     agent: Optional[dict] = None
     probes: Optional[dict] = None
+    #: 待回答话轮 / 交接标记等去重键。replay 原样写入，供 viz 侧栏。
+    turn: Optional[dict] = None
     meta: Optional[dict] = None
     type: Literal["ic"] = "ic"
 

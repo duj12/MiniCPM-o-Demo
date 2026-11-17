@@ -449,6 +449,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                     vision=blocks.get("vision"),
                     agent=blocks.get("agent"),
                     probes=blocks.get("probes"),
+                    turn=blocks.get("turn"),
                     meta=blocks.get("meta"),
                 ), critical=True)
 

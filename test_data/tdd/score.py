@@ -631,19 +631,50 @@ def check_agent_filler_to_tts(obs: dict, events: list[dict], log: str, clip: dic
     return False, "agent did not send the filler to TTS"
 
 
-def check_tts_answers_played(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
-    """At least N Agent TTS segments, and none cancelled at the start.
+#: Agent 垫话。不是一次回答的 TTS，不能拿来凑答案段数。
+_AGENT_FILLER_PREFIXES = ("嗯", "好的，我", "让我看", "稍等", "我看看")
 
-    A 0.00s ``tts.cancel`` is the spurious-YIELD signature: the segment was
-    accepted and then dropped before a single sample played.
+
+def _is_agent_filler(text: str) -> bool:
+    return any(text.strip().startswith(prefix) for prefix in _AGENT_FILLER_PREFIXES)
+
+
+def _tts_start_segments(log: str) -> list[tuple[int | None, str]]:
+    """Each ``tts.start`` with the latest ``[Nms]`` already seen (like tts_ops)."""
+    last_ms = None
+    segments = []
+    for line in log.splitlines():
+        found = LOG_MS_RE.search(line)
+        if found:
+            last_ms = int(found.group(1))
+        started = TTS_START_RE.search(line)
+        if started:
+            with_text = _TTS_LINE_RE.search(line)
+            text = with_text.group(1).strip() if with_text else ""
+            segments.append((last_ms, text))
+    return segments
+
+
+def check_tts_answers_played(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:
+    """At least N answer-window Agent TTS segments, none cancelled at the start.
+
+    Only segments at/after the first IC ANSWER count, and Agent filler lines do
+    not count. A 0.00s ``tts.cancel`` is the spurious-YIELD signature: the
+    segment was accepted and then dropped before a single sample played.
     """
     n = int(obs.get("n") or 0)
     min_played_s = float(obs.get("min_played_s") or 0.05)
-    starts = {
-        found.group(1).strip()
-        for found in (TTS_START_RE.search(line) for line in log.splitlines())
-        if found is not None
-    }
+    first_answer_ms = _first_answer_ms(events)
+    segments = [
+        (ms, text)
+        for ms, text in _tts_start_segments(log)
+        if not _is_agent_filler(text)
+        and (
+            first_answer_ms is None
+            or ms is None
+            or ms >= first_answer_ms
+        )
+    ]
     early_cancels = []
     for line in log.splitlines():
         found = TTS_CANCEL_PLAYED_RE.search(line)
@@ -652,11 +683,11 @@ def check_tts_answers_played(obs: dict, events: list[dict], log: str, clip: dict
         played = float(found.group(2))
         if played < min_played_s:
             early_cancels.append((found.group(1).strip(), played))
-    if len(starts) < n:
-        return False, f"TTS segments x{len(starts)} < {n}"
+    if len(segments) < n:
+        return False, f"answer-window TTS segments x{len(segments)} < {n}"
     if early_cancels:
         return False, f"TTS cancelled below {min_played_s:.2f}s: {early_cancels}"
-    return True, f"TTS segments x{len(starts)}; no start cancel"
+    return True, f"answer-window TTS segments x{len(segments)}; no start cancel"
 
 
 def check_closing_end_by_ic(obs: dict, events: list[dict], log: str, clip: dict) -> tuple[bool, str]:

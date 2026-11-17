@@ -308,16 +308,87 @@ def test_tts_answers_played_rejects_start_cancel():
         "id": "supp-9554",
         "observations": [{"kind": "tts_answers_played", "n": 2}],
     }
+    events = [_answer(500, "回答")]
     ok = "\n".join([
-        "[tts.start a] 你好",
+        "[1000ms] [tts.start a] 你好",
         "[tts.end a] 你好",
-        "[tts.start b] 好的",
+        "[2000ms] [tts.start b] 好的",
         "[tts.end b] 好的",
     ])
-    assert score_clip(clip, [], ok)["verdict"] == "PASS"
-    assert score_clip(clip, [], "[tts.start a] 你好")["verdict"] == "FAIL"
-    cut = ok + "\n[tts.cancel b] 已播 0.00s"
-    assert score_clip(clip, [], cut)["verdict"] == "FAIL"
+    assert score_clip(clip, events, ok)["verdict"] == "PASS"
+    assert score_clip(
+        clip, events, "[1000ms] [tts.start a] 你好"
+    )["verdict"] == "FAIL"
+    cut = ok + "\n[3000ms] [tts.cancel b] 已播 0.00s"
+    assert score_clip(clip, events, cut)["verdict"] == "FAIL"
+
+
+def test_tts_answers_played_ignores_tts_before_the_first_answer():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 1}],
+    }
+    events = [_answer(1000, "回答")]
+    log = "\n".join([
+        "[200ms] [tts.start greeting] 您好，欢迎光临。",
+        "[1500ms] [tts.start answer] 这是回答。",
+    ])
+    assert score_clip(clip, events, log)["verdict"] == "PASS"
+
+    only_greeting = "[200ms] [tts.start greeting] 您好，欢迎光临。"
+    assert score_clip(clip, events, only_greeting)["verdict"] == "FAIL"
+
+
+def test_tts_answers_played_ignores_agent_filler_after_the_answer():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 1}],
+    }
+    events = [_answer(1000, "回答")]
+    for filler in ("嗯，让我看一下", "好的，我查一下", "让我看看", "稍等", "我看看"):
+        log = f"[1500ms] [tts.start filler] {filler}"
+        assert score_clip(clip, events, log)["verdict"] == "FAIL", filler
+
+
+def test_tts_answers_played_counts_three_answer_segments():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 3}],
+    }
+    events = [_answer(1000, "回答")]
+    log = "\n".join([
+        "[200ms] [tts.start greeting] 您好，欢迎光临。",
+        "[1500ms] [tts.start a] 第一段回答",
+        "[3000ms] [tts.start b] 第二段回答",
+        "[5000ms] [tts.start c] 第三段回答",
+    ])
+    assert score_clip(clip, events, log)["verdict"] == "PASS"
+
+
+def _orchestrator_replay():
+    """Import the replay client even when this env has no numpy installed."""
+    import importlib
+    import sys
+    import types
+
+    try:
+        return importlib.import_module("orchestrator_replay")
+    except ModuleNotFoundError:
+        if "numpy" in sys.modules:
+            raise
+        sys.modules["numpy"] = types.ModuleType("numpy")
+        return importlib.import_module("orchestrator_replay")
+
+
+def test_ic_event_record_preserves_the_turn_block():
+    replay = _orchestrator_replay()
+    turn = {"pending_target": "answer", "pending_waited_ms": 42}
+    rec = replay._ic_event_record({
+        "action": "ANSWER",
+        "t_ms": 1234,
+        "turn": turn,
+    })
+    assert rec["turn"] == turn
 
 
 def test_cases_roundtrip_version():

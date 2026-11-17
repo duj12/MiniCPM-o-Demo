@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | `v2` | `# v2-视觉版本（安卓大屏）` | 全部 `runnable` clip 必须过 |
 | `v1_new` | `# v1_new视觉版本（安卓大屏）` | 全部 `runnable` clip 必须过 |
-| `supplement` | `# 补充测试`（s-75 / s-09 / s-279） | 只对 `runnable` 计分；当前 s-75 blocked（等主人声提取），`supp-09`+`supp-279` 都须过 |
+| `supplement` | `# 补充测试`（s-75 / s-09 / s-279 / s-9554） | 只对 `runnable` 计分；当前 s-75 blocked（等主人声提取），`supp-09`+`supp-279`+`supp-9554` 都须过 |
 
 不包含：旧 `v1` Windows 表、日会记录。源 md 已不再单独列 `v2-纯语音` 验收表；TDD 仍只跑上述三块。
 
@@ -52,6 +52,7 @@ md Demo 大量写成「ic判answer，agent结合vlm/情绪回复」。
 
 - IC `events.jsonl`：`action`、`speech.transcript`、`session.barge_phase` / `barge_pause_reason`、`probes.utterance_role`、`sop`
 - replay 日志：`tts.pause` / `tts.resume`（SOP04 / SOP05）
+- replay 日志：`tts.start` / `tts.cancel 已播` —— 仅当 observation 明确要求 TTS 播放时（如 `tts_answers_played`）
 
 ### ANSWER 转写：语义一致即可
 
@@ -86,7 +87,8 @@ md 写作 `A7 YIELD`。清单 **稳定 id** 仍为 `v1-A07` … `v1-A07-8`（共
 
 - `supp-75` 与 `supp-09` 共享「行为契约」：两次介绍都答；第二次先打断再答；非主体旁白不答
 - `supp-279`：主体介绍答一次，不被旁人带走
-- **`supp-75` 暂时 `blocked`**（`waiting_subject_voice_extraction`）：md 备注「暂时先不测。等主人声提取ready」。当前只跑 `supp-09` / `supp-279`，二者都须过
+- `supp-9554`：四句均 IC ANSWER（「魔珐 / 介绍」、两次「跟你的交互体验是这个」、「穿这个 / 开会 / 合适」）；前三次必须有 Agent TTS（`tts_answers_played`），最后一次接近视频结尾，回复/TTS 可能收不到，不算错
+- **`supp-75` 暂时 `blocked`**（`waiting_subject_voice_extraction`）：md 备注「暂时先不测。等主人声提取ready」。当前只跑 `supp-09` / `supp-279` / `supp-9554`，都须过
 
 ## Blocked clips
 

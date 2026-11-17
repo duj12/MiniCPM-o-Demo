@@ -39,7 +39,9 @@
 | `utter_sop` | 出现指定 sop 的 UTTER（如 `"01"`） |
 | `no_answer_before` / `no_guess_answer_before_repeat` | 修复话术前不许猜答 |
 | `answer_target_regex` / `answer_target_contains` | 对目标话轮 ANSWER；匹配为语义/同指称（`same_referent`），非整句 exact |
+| `answer_target_count` | 对同一目标 pattern 的 ANSWER 次数下界（同一句重复出现要分别答） |
 | `answer_count_at_least` | ANSWER 次数下界 |
+| `tts_answers_played` | 首个 IC ANSWER 之后的 Agent TTS 段数下界；不计迎宾/垫话，`tts.cancel 已播 0.00s` 判红 |
 | `has_yield` / `has_answer_after_yield` | 真打断与之后交权 |
 | `no_hard_yield_on_backchannel` | 嗯啊等不应硬 YIELD |
 | `false_barge_soft_resume_or_ignore` / `no_hard_yield_on_false_barge_script` | 误打断 soft 路径 |
@@ -56,7 +58,7 @@
 
 - v2：`v2-{sop}-{variant}`，如 `v2-06-2`、`v2-01-1`
 - v1_new：`v1-{SOP}`，多视频加后缀 `v1-A07-2`
-- supplement：`supp-{短号}`，如 `supp-75`、`supp-09`、`supp-279`
+- supplement：`supp-{短号}`，如 `supp-75`、`supp-09`、`supp-279`、`supp-9554`
 
 ## 与实现 agent 的分界
 
