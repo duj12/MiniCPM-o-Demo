@@ -51,11 +51,11 @@ export ORCH_TTS_PAUSE_FADE_MS="${ORCH_TTS_PAUSE_FADE_MS:-1000}"
 export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
 
 # 人脸走按 session 隔离的远端服务，避免本地 .so 的进程级状态串扰。
-# 105/106 共用 105:8767 的服务额度；超时或额度打满会丢帧。
+# 服务已迁到 106:8767（105 那台已坏）；超时或额度打满会丢帧。
 # 必须用 "-" 保留显式空值；ORCH_FACE_SERVICE_URL= 才会回到本地 .so。
 # 本地 .so 仅适合单会话；需要时同时指定 ORCH_FACE_DB / ORCH_FACE_MODELS。
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
-export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.105:8767}"
+export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.106:8767}"
 export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
 export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 
