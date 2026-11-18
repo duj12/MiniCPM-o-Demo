@@ -36,6 +36,7 @@ _REPORT_CLOCKS = {
         "greet_elapsed_ms", "absent_ms", "barge_hold_ms", "barge_paused_at_ms",
     }),
     "person": frozenset({"dwell_ms"}),
+    "turn": frozenset({"pending_waited_ms"}),
 }
 
 
@@ -984,8 +985,9 @@ class InteractionDownstream:
             # ⚠️ **编排侧不转发给 Agent** —— IC 自己会发。
             #
             # IC 判 ANSWER 时经 `AgentSink.on_answer()` POST 到 Agent
-            # （interactioncore 的 `runtime.py._notify_sinks`），且**字段更全**
-            # （从 IC 的 state 读 identity_id / display_name / transcript）。
+            # （interactioncore 的 `runtime.py._notify_sinks`），且**字段更全**：
+            # 证据来自 Action（待回答话轮用 HIGH 那一刻的冻结值），
+            # 不再从当前 state 读 identity_id / display_name / transcript。
             # 编排侧再发一份 ⇒ Agent 收到**两份 on_answer**，行为变成
             # "取决于 Agent 内部如何处置重复"，而不是我们能保证的。
             #

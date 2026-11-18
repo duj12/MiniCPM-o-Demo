@@ -1469,7 +1469,7 @@ def _fmt_asr_state(state: dict) -> str:
 
 
 _IC_STATE_BLOCKS = (
-    "session", "person", "speech", "vision", "agent", "probes", "meta",
+    "session", "person", "speech", "vision", "agent", "probes", "turn", "meta",
 )
 
 

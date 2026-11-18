@@ -9,7 +9,7 @@ from score import load_cases, resume_closes_pause_at_or_after, runnable_cases, s
 CASES = Path(__file__).with_name("cases.json")
 
 
-def _answer(t_ms: int, text: str, emotion: str = "", role: str | None = None) -> dict:
+def _answer(t_ms: int, text: str, emotion: str = "", reply: bool | None = None) -> dict:
     event = {
         "t_ms": t_ms,
         "action": "ANSWER",
@@ -17,8 +17,8 @@ def _answer(t_ms: int, text: str, emotion: str = "", role: str | None = None) ->
         "probes": {},
         "session": {},
     }
-    if role is not None:
-        event["probes"]["utterance_role"] = role
+    if reply is not None:
+        event["probes"]["expects_reply"] = reply
     return event
 
 
@@ -45,10 +45,12 @@ def test_runnable_set_keeps_a7_split_and_blocked_out():
     assert "supp-75" not in ids
     assert "v2-05-1" in ids
     assert "v2-05-2" in ids
+    # SOP04 只保留 04_1026.mkv 这一条。
+    assert [cid for cid in ids if cid.startswith("v2-04-")] == ["v2-04-1"]
     by_suite = {}
     for clip in runnable:
         by_suite[clip["suite"]] = by_suite.get(clip["suite"], 0) + 1
-    assert by_suite == {"v2": 32, "v1_new": 21, "supplement": 2}
+    assert by_suite == {"v2": 30, "v1_new": 21, "supplement": 3}
 
 
 def test_asr_neighbor_names_aigc():
@@ -288,6 +290,107 @@ def test_answer_without_wait_does_not_pass_a06():
     assert score_clip(clip, [_answer(9000, "附近的麦当劳")], "")["verdict"] == "FAIL"
     waited = {"t_ms": 4000, "action": "WAIT", "sop": "06", "speech": {}, "session": {}, "probes": {}}
     assert score_clip(clip, [waited, _answer(9000, "附近的麦当劳")], "")["verdict"] == "PASS"
+
+
+def test_answer_target_count_requires_both_repeats():
+    clip = {
+        "id": "supp-9554",
+        "observations": [
+            {"kind": "answer_target_count", "pattern": "交互体验", "n": 2},
+        ],
+    }
+    one = [_answer(1000, "给我介绍魔珐科技"), _answer(16000, "跟你的交互体验是这个")]
+    assert score_clip(clip, one, "")["verdict"] == "FAIL"
+    two = one + [_answer(30000, "跟你的交互体验是这个")]
+    assert score_clip(clip, two, "")["verdict"] == "PASS"
+
+
+def test_tts_answers_played_rejects_start_cancel():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 2}],
+    }
+    events = [_answer(500, "回答")]
+    ok = "\n".join([
+        "[1000ms] [tts.start a] 你好",
+        "[tts.end a] 你好",
+        "[2000ms] [tts.start b] 好的",
+        "[tts.end b] 好的",
+    ])
+    assert score_clip(clip, events, ok)["verdict"] == "PASS"
+    assert score_clip(
+        clip, events, "[1000ms] [tts.start a] 你好"
+    )["verdict"] == "FAIL"
+    cut = ok + "\n[3000ms] [tts.cancel b] 已播 0.00s"
+    assert score_clip(clip, events, cut)["verdict"] == "FAIL"
+
+
+def test_tts_answers_played_ignores_tts_before_the_first_answer():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 1}],
+    }
+    events = [_answer(1000, "回答")]
+    log = "\n".join([
+        "[200ms] [tts.start greeting] 您好，欢迎光临。",
+        "[1500ms] [tts.start answer] 这是回答。",
+    ])
+    assert score_clip(clip, events, log)["verdict"] == "PASS"
+
+    only_greeting = "[200ms] [tts.start greeting] 您好，欢迎光临。"
+    assert score_clip(clip, events, only_greeting)["verdict"] == "FAIL"
+
+
+def test_tts_answers_played_ignores_agent_filler_after_the_answer():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 1}],
+    }
+    events = [_answer(1000, "回答")]
+    for filler in ("嗯，让我看一下", "好的，我查一下", "让我看看", "稍等", "我看看"):
+        log = f"[1500ms] [tts.start filler] {filler}"
+        assert score_clip(clip, events, log)["verdict"] == "FAIL", filler
+
+
+def test_tts_answers_played_counts_three_answer_segments():
+    clip = {
+        "id": "supp-9554",
+        "observations": [{"kind": "tts_answers_played", "n": 3}],
+    }
+    events = [_answer(1000, "回答")]
+    log = "\n".join([
+        "[200ms] [tts.start greeting] 您好，欢迎光临。",
+        "[1500ms] [tts.start a] 第一段回答",
+        "[3000ms] [tts.start b] 第二段回答",
+        "[5000ms] [tts.start c] 第三段回答",
+    ])
+    assert score_clip(clip, events, log)["verdict"] == "PASS"
+
+
+def _orchestrator_replay():
+    """Import the replay client even when this env has no numpy installed."""
+    import importlib
+    import sys
+    import types
+
+    try:
+        return importlib.import_module("orchestrator_replay")
+    except ModuleNotFoundError:
+        if "numpy" in sys.modules:
+            raise
+        sys.modules["numpy"] = types.ModuleType("numpy")
+        return importlib.import_module("orchestrator_replay")
+
+
+def test_ic_event_record_preserves_the_turn_block():
+    replay = _orchestrator_replay()
+    turn = {"pending_target": "answer", "pending_waited_ms": 42}
+    rec = replay._ic_event_record({
+        "action": "ANSWER",
+        "t_ms": 1234,
+        "turn": turn,
+    })
+    assert rec["turn"] == turn
 
 
 def test_cases_roundtrip_version():

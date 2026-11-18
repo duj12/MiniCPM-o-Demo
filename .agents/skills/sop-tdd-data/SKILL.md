@@ -78,7 +78,7 @@ Agent 软备注典型：VLM/情绪/多语种措辞、部分理解追问话术。
 
 允许证据：
 
-- IC `events.jsonl`：`action`、`speech.transcript`、`barge_phase` / `barge_pause_reason`、`utterance_role`、`sop`
+- IC `events.jsonl`：`action`、`speech.transcript`、`barge_phase` / `barge_pause_reason`、`probes.barge_class` / `probes.expects_reply`、`sop`
 - replay 日志：`tts.pause` / `tts.resume`（SOP04/05）
 
 **禁止单独作 PASS**：
