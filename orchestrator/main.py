@@ -795,8 +795,15 @@ async def handle_client(ws, cfg: Settings) -> None:
                 k: getattr(sess.asr.config, k)
                 for k in _AsrConfig.CLIENT_OVERRIDABLE
             }
+        # 客户端要不要在 audio 消息里带 8 声道原始 PCM：
+        #   ① 人脸是 8PCM 门控（8768）—— 算法要；
+        #   ② 本次会话要录制 —— 转储要（存 -raw8.flac）。
+        # ``recording`` 在 build_session 里由 record_raw 决定，早于这里。
+        _want_pcm8 = bool(cfg.face_pcm8
+                          or (cfg.dump_pcm8 and sess.recording))
         await send_to_client(SessionReady(session_id=sid, defaults=_defaults,
-                                          face_pcm8=bool(cfg.face_pcm8)))
+                                          face_pcm8=bool(cfg.face_pcm8),
+                                          want_pcm8=_want_pcm8))
 
         # ---- 后台任务 ----
         # 注意：不用 create_task(name=...)，那是 Python 3.8+ 的 API

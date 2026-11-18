@@ -81,10 +81,13 @@ pcm8_timestamp_us <= 音频采样时间 < timestamp_us
 - `pcm8_base64` 与 `audio_base64` 是**同一时间窗**切出来的（同一块 100ms）。
 - 格式同上文的 `pcm8_base64`：16kHz、小端 int16、8 声道交错、长度 `% 16 == 0`。
 - 不发这个字段 = 旧行为；发了但编排没开 `ORCH_FACE_PCM8` 会告警一次并忽略。
-- **什么时候发由服务端说了算**：`session.ready` 里多一个 `face_pcm8: true|false`。
+- **什么时候发由服务端说了算**：`session.ready` 里多一个 `want_pcm8: true|false`。
   客户端照着它决定要不要在 wire 上带这份字节 —— 8ch@16k 的 base64 是
-  ~341KB/s，对着 8767（不需要 PCM）纯属白烧带宽，所以默认只有 8101 这类
-  8PCM 门控实例才会是 `true`。
+  ~341KB/s，对着 8767（不需要 PCM）纯属白烧带宽。
+  `want_pcm8 = face_pcm8(8768 门控) || (本次开了录制 && ORCH_DUMP_PCM8)`：
+  8101 这类实例恒为 `true`；8100 只在客户端 `session.start` 带
+  `record_raw=true` 时为 `true`（要存 `-raw8.flac`）。`face_pcm8` 仍在，
+  语义收窄为"人脸是 8PCM 门控"，旧客户端可以继续只看它。
 - 编排会把「自上次 detect 以来收到的 PCM」拼成**一整块连续数据**发出去，
   时间戳（`pcm8_timestamp_us` / `timestamp_us`）由编排内部的采样游标推出，
   客户端**不需要**给 PCM 打时间戳，只需要保证块与块之间不丢采样。
@@ -111,6 +114,22 @@ ORCH_FACE_SERVICE_URL=http://192.168.89.106:8768 \
 ORCH_FACE_PCM8=1 \
 bash orchestrator/run_orch_106.sh
 ```
+
+## 录制产物（`record_raw=true` 才会产生）
+
+一场会话最后只留**两个**文件（都在 `ORCH_DUMP_AUDIO` 前缀下）：
+
+| 文件 | 内容 |
+|---|---|
+| `<prefix>-<sid>-raw8.flac` | 客户端送的 **8 声道原始输入**（16k / s16le / 8ch，设备固定布局 ch0,1 空 · ch2-5 阵列麦 · ch6,7 播报回采）。客户端没发 `pcm8_base64` 就**没有**这个文件。 |
+| `<prefix>-<sid>-raw.mkv` | 视频（`-c:v copy`，逐字节等于算法看到的帧）+ **AEC 后**的用户语音音轨（`-c:a copy`；没有算法 AEC 时退回单声道 mic）。`python orchestrator_replay.py --video <它>` 直接可喂。 |
+
+中间文件（`-mic.wav` / `-aec.wav` / `-raw.tsv` / `-raw.mjpeg`）合成成功后自动删除；
+`-face.mjpeg` / `-omni.mjpeg` 默认根本不写（与 mkv 里的视频逐字节相同）。
+需要取证时设 `ORCH_KEEP_WAV=1` / `ORCH_KEEP_RAW_MJPEG=1` / `ORCH_KEEP_FACE_MJPEG=1`。
+
+`orchestrator_replay.py --audio <...-raw8.flac>` 会按 `mean(ch2..5)` 下混
+（与前端 `alsaDownmix` 同一规则），不会把 ch6/7 的播报回声混进麦克风。
 
 ## 联调前检查
 

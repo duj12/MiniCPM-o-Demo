@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
@@ -26,7 +27,15 @@ from typing import Any, Deque, Dict, List, Optional
 import numpy as np
 
 from .clock import SR, AudioFrame, SampleClock
-from .protocol import MIC_CHUNK
+from .protocol import MIC_CHUNK, PCM8_CHANNELS
+
+#: 是否额外保留散装视频转储（``-face.mjpeg`` / ``-omni.mjpeg`` + tsv）。
+#:
+#: 默认 **关**：两者都与 ``-raw.mkv`` 里的视频**逐字节相同**（前端单路抓帧，
+#: ``-c:v copy`` 原样进容器），``omni`` 那路还是 ``face`` 的子集。留着只是
+#: 让视频翻倍占盘，而且 ``_dump_face`` 是整场驻留内存（133KB×20fps）。
+#: 只在要做逐帧取证、且不信任容器封装时打开（`ORCH_KEEP_FACE_MJPEG=1`）。
+_KEEP_FACE_MJPEG = os.environ.get("ORCH_KEEP_FACE_MJPEG", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +123,8 @@ class OrchestratorSession:
         #
         # ⚠️ 这两个必须分开。早先只有 `_dump_path`，于是**任何**连进来的客户端
         #    都会触发转储 —— 包括 replay 工具。实测踩过：在 105 上跑一轮
-        #    replay 验证，共享的 `orchdump/` 里就多出 `s-<sid>-mic.wav` /
-        #    `-raw.wav`（该会话只有音频、没有视频，所以是纯垃圾）。
+        #    replay 验证，共享的 `orchdump/` 里就多出 `s-<sid>-mic.wav`
+        #    （该会话只有音频、没有视频，所以是纯垃圾）。
         #    多人共用一台服务时，这些噪声文件会越积越多，还容易和真实
         #    录制产物混淆。
         #
@@ -128,9 +137,15 @@ class OrchestratorSession:
         self._dump_on = bool(_os.environ.get("ORCH_DUMP_FORCE") == "1") \
             and self._dump_path is not None
         self._dump_mic: list = []
-        self._dump_ref: list = []
-        self._dump_raw: list = []      # 未做 D 补偿的原始参考轨（测 D 用）
         self._dump_aec: list = []
+        #: 8 声道原始输入（``pcm8_base64``）直接**流式写盘**，不攒内存 ——
+        #: 16k×8ch×int16 = 256KB/s，攒 5 分钟就是 77MB。
+        #: 收尾时 ffmpeg 转 FLAC 再删 pcm 中间文件。
+        self._pcm8_fh = None
+        self._pcm8_path: Optional[str] = None
+        self._pcm8_samples = 0
+        self._pcm8_warned_len = False
+        self._pcm8_task = None
         # 视频帧转储：**原样存收到的 JPEG 字节**，不做任何转码 —— 发给
         # Omni/face 的就是这些字节，存 mp4 反而有损、且丢掉逐帧时间对应。
         # 每项 (t_ms, jpeg_bytes)，会话结束时写 .mjpeg + .tsv。
@@ -316,6 +331,8 @@ class OrchestratorSession:
         #    在 face 工作线程里做。没开 pcm8 / 没装人脸时这一步零开销。
         if pcm8:
             self._feed_face_pcm8(pcm8, frame.n_samples)
+            # 转储与人脸**解耦**：没有人脸（或人脸是 8767）时，8ch 一样要存。
+            self._dump_pcm8(pcm8, frame.n_samples)
         self.stats["audio_chunks_in"] += 1
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
@@ -372,7 +389,7 @@ class OrchestratorSession:
 
         ref_arr = (client_ref if client_ref is not None
                    else (self._ref_for(frame) if self.aec is not None else None))
-        self._dump_audio(frame.data, ref_arr, frame)
+        self._dump_audio(frame.data)
 
         if self.aec is not None:
             self._trace_ref(ref_arr, frame)
@@ -380,44 +397,25 @@ class OrchestratorSession:
         else:
             await self._fanout_direct(frame.data)
 
-    def _dump_audio(self, mic: np.ndarray, ref: np.ndarray,
-                    frame: AudioFrame) -> None:
-        """把 mic / farend 落盘（仅在开启转储时）。
+    def _dump_audio(self, mic: np.ndarray) -> None:
+        """攒 mic / AEC 输出两路（仅在开启转储时）。
 
-        「回声消不掉」这个问题的**唯一确诊手段**：拿到 mic 与 farend 的
-        原始波形，就能直接算出 mic 里到底有没有回声、以及它与 farend 差
-        多少采样。在此之前我们一直在用"互相关峰比""ERLE""mic_peak"这些
-        间接指标推断，已经推错过好几次（甚至得出过与 ASR 现象矛盾的
-        结论）—— 必须看波形。
+        两路都是**中间文件**（``-mic.wav`` / ``-aec.wav``）：AEC 输出会 mux
+        进 mkv 的音轨，mic 只在没有 AEC（浏览器原生 AEC）时当兜底音轨；
+        mux 成功后 `raw_dump.mux_raw_video` 会把它们删掉。
 
-        开启：环境变量 ``ORCH_DUMP_AUDIO=/path/prefix``（会话结束时写成
-        ``<prefix>-<sid>-mic.wav`` / ``-ref.wav`` / ``-raw.wav`` / ``-aec.wav``）。
-        默认关闭，零开销 —— 实时路径上不该有额外 I/O。
-
-        ⚠️ ``-ref.wav`` 是**已按 D 补偿过**的（它就是喂给 AEC 的那一份），
-        拿它去测 D 只能得到残差。测 D 必须用 ``-raw.wav``（未补偿的原始轨）
-        —— 见 ``tests/measure_delay.py``。
+        开启：``ORCH_DUMP_AUDIO=/path/prefix`` + 客户端 ``record_raw=true``。
+        默认关闭，零开销；8 声道那一路是单独的流式写盘（见 `_dump_pcm8`）。
         """
         if not self._dump_on:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
-        n = frame.n_samples
-        # ⚠️ **browser AEC 模式下 ref/raw 恒为全静音，直接不落盘**。
-        #
-        #    `ref is None` = 没连云端 AEC（浏览器原生模式）—— 此时
-        #    `_ref_for()` 按设计返回等长静音（"给静音是物理上诚实的"）。
-        #    这个语义**是对的**，但把它写成 wav 只是 5MB 的零。
-        #    实测：browser 模式下 `-ref.wav 峰值=0.00000`、
-        #    `-raw.wav` 也没人读（它只在**算法服务 AEC** 下测 D 时才有用，
-        #    见 tests/measure_delay.py）。
-        #
-        #    所以只在**真的连了云端 AEC**时才攒这两路。落盘时按长度判空，
-        #    长度对不上的顾虑不存在 —— 它们要么整场都有、要么整场都没有。
-        if ref is not None:
-            self._dump_ref.append(ref.reshape(-1).copy())
-        if self.ref_track is not None:
-            self._dump_raw.append(
-                self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
+        # ⚠️ `ref` / `raw` 两路**不再单独落盘**：
+        #    * ref（AEC 参考）就是 8ch 的 ch6/7，能从 `-raw8.flac` 离线还原；
+        #    * raw（服务端 TTS 参考轨未补偿版）只在旧 D 估计路径用，客户端
+        #      回采取代它之后已无用途。
+        #    转储只保留「算法真正吃进去的 mic」和「AEC 输出」两路 ——
+        #    后者进 mkv 音轨，前者只在没有 AEC 时当兜底音轨，都属中间文件。
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
         if not self._dump_on:
@@ -425,15 +423,22 @@ class OrchestratorSession:
         self._dump_aec.append(np.asarray(seg).reshape(-1).copy())
 
     def flush_audio_dump(self) -> None:
-        """会话结束时把转储写成 wav（三路：mic / farend / aec 输出）。"""
+        """会话结束时落两路 **中间** wav：``-mic.wav`` / ``-aec.wav``。
+
+        这两份都**不是最终产物**（最终只有 ``-raw8.flac`` + ``-raw.mkv``）：
+        AEC 输出会被 mux 进 mkv 音轨，mic 只在没有 AEC 时当兜底音轨 ——
+        mux 成功后 `raw_dump.mux_raw_video` 会删掉它们。
+
+        farend / 未补偿参考轨不再落盘：前者 = 8ch 的 ch6/7，后者已无用途
+        （见 `_dump_audio` 的说明）。
+        """
         if not self._dump_on or not self._dump_mic:
             return
         import wave
         from pathlib import Path
         base = Path(self._dump_path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        for name, chunks in (("mic", self._dump_mic), ("ref", self._dump_ref),
-                             ("raw", self._dump_raw), ("aec", self._dump_aec)):
+        for name, chunks in (("mic", self._dump_mic), ("aec", self._dump_aec)):
             if not chunks:
                 continue
             x = np.concatenate(chunks)
@@ -910,6 +915,79 @@ class OrchestratorSession:
                         self.session_id, n)
         prov.set_pcm8(pcm8)
 
+    # ------------------------------------------------------------------ #
+    #  8 声道原始输入转储（``-raw8.flac``）
+    # ------------------------------------------------------------------ #
+    def _dump_pcm8(self, pcm8: bytes, mic_samples: int) -> None:
+        """把 8 声道原始块**流式**写进 ``-raw8.pcm``（收尾转 FLAC）。
+
+        为什么与人脸解耦：8ch 是**原始输入音频**，算法侧（8767）要不要它
+        与"我们想不想复现"是两件事。录制一开就存，客户端没给 8ch 就什么
+        都不写（手机/浏览器麦的会话只有单声道 mic）。
+        """
+        if not self._dump_on:
+            return
+        if self._pcm8_fh is None:
+            from pathlib import Path
+            base = f"{self._dump_path}-{self.session_id}-raw8"
+            Path(base).parent.mkdir(parents=True, exist_ok=True)
+            self._pcm8_path = base + ".pcm"
+            self._pcm8_fh = open(self._pcm8_path, "wb")
+            logger.info("[%s] 8 声道原始音频转储开始：%s（16k/s16le/8ch）",
+                        self.session_id, self._pcm8_path)
+        n = len(pcm8) // (PCM8_CHANNELS * 2)
+        # 与 mic 块对齐是**硬要求**：视频/单声道音频都以 mic 采样轴为准，
+        # 8ch 一旦比它长或短，三者就错轴了。
+        if n != mic_samples:
+            if n > mic_samples:
+                pcm8 = pcm8[:mic_samples * PCM8_CHANNELS * 2]
+            else:
+                pcm8 = pcm8 + b"\x00" * (
+                    (mic_samples - n) * PCM8_CHANNELS * 2)
+            if not self._pcm8_warned_len:
+                self._pcm8_warned_len = True
+                logger.warning("[%s] 8ch 块 %d 采样 ≠ mic 块 %d —— 已按 mic "
+                               "块补零/截断，保证与视频同轴",
+                               self.session_id, n, mic_samples)
+        try:
+            self._pcm8_fh.write(pcm8)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("[%s] 8 声道写盘失败（已停止该路转储）：%s",
+                           self.session_id, exc)
+            try:
+                self._pcm8_fh.close()
+            except OSError:
+                pass
+            self._pcm8_fh = None
+            self._pcm8_path = None
+            return
+        self._pcm8_samples += mic_samples
+
+    def _finish_pcm8_dump(self) -> None:
+        """收尾：关文件 → 后台转 FLAC → 删中间 pcm。**失败不影响收尾。**"""
+        if self._pcm8_path is None:
+            return
+        if self._pcm8_fh is not None:
+            try:
+                self._pcm8_fh.close()
+            except OSError:
+                pass
+            self._pcm8_fh = None
+        pcm = self._pcm8_path
+        self._pcm8_path = None
+        if not self._pcm8_samples:
+            try:
+                import os as _os2
+                _os2.unlink(pcm)
+            except OSError:
+                pass
+            return
+        from .raw_dump import pcm8_to_flac
+        loop = asyncio.get_event_loop()
+        fut = loop.run_in_executor(None, pcm8_to_flac, pcm,
+                                   self._pcm8_samples)
+        self._pcm8_task = asyncio.ensure_future(fut)
+
     async def on_video_face(self, jpeg: bytes, t_ms: int = 0,
                             ctx_time: float = 0.0, epoch: int = 0) -> None:
         """收到人脸用视频帧（25fps，独立于音频块）。**绝不阻塞音频路径。**
@@ -922,7 +1000,10 @@ class OrchestratorSession:
             return
         self.stats["video_face_frames"] += 1
         now_ms = self._frame_time_ms(ctx_time, epoch)
-        if self._dump_on:
+        # ⚠️ 默认**不**再攒 face.mjpeg：视频最终只留 mkv 一份（`-c:v copy`
+        #    的同一份字节），再存一路只是翻倍占盘 + 整场驻留内存。
+        #    要逐帧取证时设 `ORCH_KEEP_FACE_MJPEG=1`。
+        if self._dump_on and _KEEP_FACE_MJPEG:
             # 原样存 —— 与喂给 face_worker 的是同一份字节
             self._dump_face.append((now_ms, jpeg))
         if self._raw_wanted:
@@ -953,7 +1034,7 @@ class OrchestratorSession:
         if self.closed:
             return
         self.stats["video_omni_frames"] += 1
-        if self._dump_on:
+        if self._dump_on and _KEEP_FACE_MJPEG:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
@@ -974,10 +1055,16 @@ class OrchestratorSession:
             return
         self._last_omni_ms = now_ms
         self.omni.offer_frame(jpeg)
-        # 落盘保留 omni 这一路（体积小，且是"Omni 实际看到什么"的证据）
-        if self._dump_on:
+        # 不再单独落 omni 这一路：它是 face 那一路的子集（同一份字节），
+        # mkv 里已经有了（见 `_KEEP_FACE_MJPEG` 的说明）。
+        if self._dump_on and _KEEP_FACE_MJPEG:
             self._dump_omni.append((now_ms, jpeg))
         self.stats["video_omni_frames"] += 1
+
+    @property
+    def recording(self) -> bool:
+        """本次会话是否在转储（`session.ready` 据此决定要不要 8ch）。"""
+        return bool(self._dump_on)
 
     def enable_raw_record(self, on: bool) -> None:
         """客户端在 `session.start` 里带 `record_raw=true` 时开转储。
@@ -987,7 +1074,7 @@ class OrchestratorSession:
         （尤其 replay 工具）都在共享的 `orchdump/` 里留一堆垃圾。
 
         实测踩过：105 上跑一轮 replay 验证，就在共享目录里多出
-        `s-<sid>-mic.wav` / `-raw.wav`（该会话只有音频、没有视频）。
+        `s-<sid>-mic.wav`（该会话只有音频、没有视频）。
         多人共用一台服务时这类噪声会越积越多，还容易和真实录制混淆。
         """
         if on and self._dump_path is None:
@@ -2447,6 +2534,11 @@ class OrchestratorSession:
             self.flush_video_dump()
         except Exception as exc:  # noqa: BLE001
             logger.warning("视频转储写入失败: %s", exc)
+        # 8 声道原始输入：关文件 → 后台转 FLAC（与 mux 相互独立）
+        try:
+            self._finish_pcm8_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("8 声道转储收尾失败: %s", exc)
         try:
             self._finish_raw_record()
         except Exception as exc:  # noqa: BLE001

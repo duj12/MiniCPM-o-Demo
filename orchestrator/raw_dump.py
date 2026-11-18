@@ -1,11 +1,28 @@
 """原始视频转储 —— 边收边写盘，会话结束时 mux 成**单个**文件。
 
+## 一场录制最后留下什么（2026-11-18 起）
+
+只留**两个**文件（其余全是中间文件，成功收尾后自动删）：
+
+* ``<prefix>-<sid>-raw8.flac`` —— 客户端送的 **8 声道原始输入**
+  （16k / s16le / 8ch / 设备固定布局：ch0,1 空 · ch2-5 阵列麦 · ch6,7 播报
+  回采）。客户端没送 ``pcm8_base64`` 的会话**不产生**这个文件，此时单声道
+  mic 只能从 ``-raw.mkv`` 的音轨还原。会话中流式写 ``.pcm``（不攒内存），
+  **收尾时才**转 FLAC（见 `pcm8_to_flac`）。
+* ``<prefix>-<sid>-raw.mkv`` —— 视频（``-c:v copy``，逐字节等于算法看到的帧）
+  + **AEC 后**的用户语音（``-c:a copy``）。这就是
+  ``orchestrator_replay.py --video`` 直接能吃的那一份。
+
+中间文件 ``-mic.wav`` / ``-aec.wav`` / ``-raw.tsv`` / ``-raw.mjpeg``
+在 mux 成功后删除（``ORCH_KEEP_WAV=1`` / ``ORCH_KEEP_RAW_MJPEG=1`` 可保留）。
+``-face.mjpeg`` / ``-omni.mjpeg`` 默认**根本不写**（``ORCH_KEEP_FACE_MJPEG=1``
+才写）—— 它们与 mkv 里的视频逐字节相同。
+
 ## 为什么要这个
 
 ``orchestrator_replay.py`` 只吃**一个**文件（``--audio`` / ``--video``），
-再从它派生音频和两路抽帧。它**不读** ``-face.mjpeg`` / ``-omni.mjpeg`` /
-``.tsv`` 那些散装转储。所以要想离线复现，必须把「原始视频 + 音频」
-合成一个容器文件。
+再从它派生音频和两路抽帧。散装转储**不能**直接喂它。所以要想离线复现，
+必须把「原始视频 + 音频」合成一个容器文件。
 
 ## 音轨用哪一路（``ORCH_DUMP_MUX_AUDIO``）
 
@@ -71,10 +88,18 @@ _QUEUE_MAX = 64
 
 #: mux 成功后是否保留 `-raw.mjpeg`。
 #:
-#: 默认**删**：它与 `-face.mjpeg` 逐字节相同（单路抓帧），单场就白占 740MB。
-#: 设 `ORCH_KEEP_RAW_MJPEG=1` 可保留 —— 但只在你要拿它做逐帧取证时才有必要，
-#: 正常情况下 `-face.mjpeg` 就是同一份字节。
+#: 默认**删**：它是 ``-raw.mkv`` 视频轨的**逐字节前置**（``-c:v copy``），
+#: 留着等于视频存两份、单场白占 740MB。设 `ORCH_KEEP_RAW_MJPEG=1` 可保留
+#: —— 只在要做逐帧取证、且不信任容器封装时才有必要。
 _KEEP_MJPEG = os.environ.get("ORCH_KEEP_RAW_MJPEG", "0") == "1"
+
+#: mux 成功后是否保留中间 wav（``-mic.wav`` / ``-aec.wav``）与 ``-raw.tsv``。
+#:
+#: 默认**删**：最终产物只有 ``-raw8.flac`` + ``-raw.mkv`` 两个文件。
+#: AEC 输出已经进了 mkv 音轨；单声道 mic 能从 8ch 离线还原（ch2-5 均值）。
+#: 没合成出 mkv 的会话（无摄像头 / 合成失败）会保留它们 —— 那时它们是
+#: 唯一的原始输入音频。
+_KEEP_WAV = os.environ.get("ORCH_KEEP_WAV", "0") == "1"
 
 #: 复现文件（``-raw.mkv``）的音轨来源，见模块 docstring。
 #:
@@ -249,6 +274,44 @@ def _tick_indices(index: List[Tuple[int, int]], total_ms: int) -> List[int]:
     return out
 
 
+def pcm8_to_flac(pcm_path: str, samples: int,
+                 *, timeout_s: float = 900.0) -> Optional[str]:
+    """``-raw8.pcm``（16k / s16le / 8ch 交错）→ ``-raw8.flac``，成功后删 pcm。
+
+    会话中**流式写裸 PCM**（不攒内存，进程被杀也不丢），收尾时才压成 FLAC：
+    无损、体积约 wav 的 50~70%，``soundfile``（replay 已用）直接能读。
+    没有 ffmpeg 时保留 ``.pcm`` —— 它仍是完整可用的原始数据
+    （``ffmpeg -f s16le -ar 16000 -ac 8 -i x.pcm out.wav`` 随时能转）。
+
+    返回 flac 路径；失败/跳过返回 None（**永不抛异常**给收尾流程）。
+    """
+    src = Path(pcm_path)
+    out = src.with_suffix(".flac")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.warning("未找到 ffmpeg —— 8 声道保留裸 PCM：%s", src)
+        return None
+    cmd = [ffmpeg, "-y", "-loglevel", "error",
+           "-f", "s16le", "-ar", "16000", "-ac", "8", "-i", str(src),
+           "-c:a", "flac", str(out)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("8 声道转 FLAC 失败（保留 pcm）：%s", exc)
+        return None
+    if proc.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+        logger.warning("8 声道转 FLAC 失败（保留 pcm）：%s",
+                       (proc.stderr or b"")[-300:].decode("utf-8", "replace"))
+        return None
+    try:
+        src.unlink()
+    except OSError:
+        pass
+    logger.info("✅ 8 声道原始音频：%s（%.1fMB，%d 采样 = %.1fs）",
+                out, out.stat().st_size / 1e6, samples, samples / 16000.0)
+    return str(out)
+
+
 def mux_raw_video(prefix: str, sid: str, *,
                   timeout_s: float = 180.0) -> Optional[str]:
     """把 ``-raw.mjpeg`` + 用户语音 wav 合成 ``-raw.mkv``。
@@ -310,7 +373,7 @@ def mux_raw_video(prefix: str, sid: str, *,
                            sid, "、".join(missing))
             if not mjpeg.is_file():
                 logger.warning("[%s] 注意：%s **不是**缺失，而是已被删除 —— "
-                               "合成成功后会自动删它（与 face.mjpeg 重复）。"
+                               "合成成功后会自动删它（视频已在 mkv 里）。"
                                "若 mkv 已存在，说明这场早已合成完成，无需补做。",
                                sid, mjpeg.name)
         return None
@@ -403,21 +466,26 @@ def mux_raw_video(prefix: str, sid: str, *,
         logger.warning("[%s] 合成后文件不存在或为空：%s", sid, out)
         return None
 
-    # ⚠️ **mjpeg 是 mkv 的逐字节前置**，而且与 `-face.mjpeg` **完全相同**
-    #    （前端单路抓帧，同一份字节既喂人脸又落盘 —— 见本模块 docstring）。
-    #    也就是说这 740MB 存了**两份**、且内容还能从 face.mjpeg 复原。
-    #    所以合成成功后删掉它，只留 mkv + tsv。
-    #    `-face.mjpeg` **保留**（它是"算法实际看到什么"的原始证据，
-    #    验证要用原始字节，不能拿 mkv 代替）。
+    # ⚠️ **mjpeg 是 mkv 的逐字节前置**（``-c:v copy``，见本模块 docstring）。
+    #    合成成功后它就是冗余的，删掉只留 mkv。
     if not _KEEP_MJPEG:
         try:
+            # 先取大小再删 —— 删完再 stat 会 FileNotFoundError
+            mb = mjpeg.stat().st_size / 1e6 if mjpeg.is_file() else 0.0
             mjpeg.unlink()
-            logger.info("[%s] 已删除与 face.mjpeg 重复的 -raw.mjpeg"
-                        "（省 %.0fMB；face.mjpeg 是同一份字节，仍在）",
-                        sid, mjpeg.stat().st_size / 1e6
-                        if mjpeg.exists() else 0)
+            logger.info("[%s] 已删除 -raw.mjpeg（视频已在 mkv 里，省 %.0fMB）",
+                        sid, mb)
         except OSError as exc:
             logger.warning("[%s] 删除 -raw.mjpeg 失败：%s", sid, exc)
+    # 中间文件：两路 wav 都已进容器（没有 AEC 时进的是 mic），tsv 的时间轴
+    # 也已经被 mkv 的时间戳取代 —— 默认删掉，最终只留 mkv（+ 8ch flac）。
+    if not _KEEP_WAV:
+        for p in (mic, aec, tsv):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError as exc:
+                logger.warning("[%s] 删除中间文件 %s 失败：%s", sid, p, exc)
     logger.info("[%s] ✅ 复现文件已生成：%s（%.1fMB，video=copy audio=copy，"
                 "尺寸=%s，%d 帧）。复现：python orchestrator_replay.py "
                 "--video %s --face-fps %d --omni-fps 1",

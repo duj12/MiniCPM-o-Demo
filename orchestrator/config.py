@@ -91,7 +91,7 @@ class Settings:
     #
     # 测法：开着 ORCH_DUMP_AUDIO 跑一轮真实会话，然后
     #     python -m orchestrator.tests.measure_delay \
-    #         --mic <前缀>-<sid>-mic.wav --raw <前缀>-<sid>-raw.wav \
+    #         --raw8 <前缀>-<sid>-raw8.flac \
     #         --verify-url ws://192.168.88.253:30255/ws/asr_frontend
     # 结果写进 ORCH_AEC_DEFAULT_DELAY_MS（或按设备存进 DelayStore）。
     #
@@ -282,6 +282,16 @@ class Settings:
     #: 打开时必须同时把 ``ORCH_FACE_SERVICE_URL`` 指到 8768。
     face_pcm8: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_FACE_PCM8", "") not in ("", "0", "false", "False"))
+    #: 录制时是否向客户端要 8 声道原始 PCM（存成 ``-raw8.flac``）。
+    #:
+    #: 与 ``face_pcm8`` 解耦：人脸要不要 PCM 是**算法**需求，转储要不要是
+    #: **数据**需求。两者任一为真，客户端就会在 ``session.ready`` 里看到
+    #: ``want_pcm8=true`` 并开始随音频块带 ``pcm8_base64``（8ch@16k 的
+    #: base64 ≈ 341KB/s，只在录制期间有）。
+    #:
+    #: 关 ⇒ 录制的原始输入音频退回单声道 mic（客户端送什么就存什么）。
+    dump_pcm8: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_DUMP_PCM8", "1") not in ("0", "false", "False"))
 
     # 调参
     tick_interval_s: float = 0.05

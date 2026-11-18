@@ -129,8 +129,9 @@
             self.sessionId = msg.session_id;
             self.ready = true;
             if (msg.lead_ms) self.leadMs = msg.lead_ms;
-            // 服务端要不要 8 声道原始 PCM（远端人脸的 8PCM 门控）
-            self.facePcm8 = !!msg.face_pcm8;
+            // 服务端要不要 8 声道原始 PCM —— 看 `want_pcm8`（人脸 8PCM 门控
+            // **或** 本次会话开了录制）；`face_pcm8` 是旧字段，保留兼容。
+            self.facePcm8 = !!(msg.want_pcm8 || msg.face_pcm8);
             if (!settled) {
               settled = true;
               clearTimeout(timer);

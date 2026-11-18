@@ -156,6 +156,12 @@ class SessionReady:
     #: 但只有在服务端明确要（8768 的 8PCM 门控）时才塞进消息 —— 否则
     #: 8ch@16k = 341KB/s 的 base64 全白费（8767 会直接忽略该字段）。
     face_pcm8: bool = False
+    #: 客户端**是否应该**在 ``audio`` 消息里带 ``pcm8_base64``。
+    #:
+    #: = ``face_pcm8``（8768 门控要）**或** 本次会话开了录制且
+    #: ``ORCH_DUMP_PCM8`` 为真（要存 ``-raw8.flac``）。客户端只看这一个
+    #: 字段即可；``face_pcm8`` 保留给"人脸要 PCM"的语义与旧客户端。
+    want_pcm8: bool = False
     type: Literal["session.ready"] = "session.ready"
 
 

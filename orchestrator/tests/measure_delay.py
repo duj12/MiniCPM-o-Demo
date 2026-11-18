@@ -21,15 +21,18 @@ ORCH_DUMP_AUDIO=/tmp/orchdump/s python -m orchestrator.main --port 8100
 
 # ② 用 dump 算 D
 python -m orchestrator.tests.measure_delay \
-    --mic /tmp/orchdump/s-xxxx-mic.wav \
-    --raw /tmp/orchdump/s-xxxx-raw.wav \
+    --raw8 /tmp/orchdump/s-xxxx-raw8.flac \
     --verify-url ws://192.168.88.253:30255/ws/asr_frontend
 
 # ③ 把打印出来的 ORCH_AEC_DEFAULT_DELAY_MS 写进服务端环境变量
 ```
 
-⚠️ **必须用 ``-raw.wav``（未做 D 补偿的原始参考轨）**。``-ref.wav`` 是
-喂给 AEC 的那一份（已补偿），拿它互相关只能得到**残差**，不是绝对 D。
+⚠️ **必须用未做 D 补偿的那一路参考**。``-raw8.flac`` 的 ch6/7 是设备自己的
+播报回采（物理上在扬声器旁），正是要的；旧格式的 ``-ref.wav`` 是喂给 AEC
+的那一份（已补偿），拿它互相关只能得到**残差**，不是绝对 D。
+
+（2026-11-18 起录制只留 ``-raw8.flac`` + ``-raw.mkv``，不再产出
+``-mic.wav`` / ``-raw.wav``；旧格式仍可用 ``--mic`` + ``--raw`` 读。）
 
 ⚠️ **dump 必须是本次改动之后重新采的**。改动前参考轨的落位误差是**变化**的，
 单个 D 吸收不了 —— 脚本会报出很大的散度，这本身就是有用的诊断（见输出
@@ -78,6 +81,23 @@ def load_wav(path: str) -> np.ndarray:
     if ch == 2:
         x = x.reshape(-1, 2).mean(axis=1)
     return x
+
+
+def load_raw8(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """``-raw8.flac``（16k / 8ch）→ ``(mic, farend)``。
+
+    设备布局固定：ch0,1 空 · ch2-5 阵列麦 · ch6,7 播报回采。
+    mic 取 ch2-5 均值（与前端 ``alsaDownmix`` / ``orchestrator_replay``
+    同一规则），farend 取 ch6/7 均值 —— 后者是扬声器旁的物理回采，
+    **未经 D 补偿**，正好是测绝对 D 要的那一路。
+    """
+    import soundfile as sf
+
+    x, sr = sf.read(path, dtype="float32", always_2d=True)
+    if sr != SR or x.shape[1] != 8:
+        raise SystemExit(f"{path}: 期望 16k / 8ch，实际 {sr}Hz / "
+                         f"{x.shape[1]}ch（不是 8 声道原始输入转储？）")
+    return x[:, 2:6].mean(axis=1), x[:, 6:8].mean(axis=1)
 
 
 def playback_regions(raw: np.ndarray, win: int = 320,
@@ -208,10 +228,13 @@ async def verify_with_aec(url: str, mic: np.ndarray, raw: np.ndarray,
 def main() -> None:
     p = argparse.ArgumentParser(
         description="离线测声学延迟 D（用 ORCH_DUMP_AUDIO 的 dump）")
-    p.add_argument("--mic", required=True,
-                   help="<前缀>-<sid>-mic.wav（原始麦克风，含回声）")
-    p.add_argument("--raw", required=True,
-                   help="<前缀>-<sid>-raw.wav（**未补偿**的原始参考轨）")
+    p.add_argument("--raw8",
+                   help="<前缀>-<sid>-raw8.flac（8 声道原始输入；"
+                        "mic=mean(ch2-5)，参考=mean(ch6-7)）—— 新录制格式")
+    p.add_argument("--mic",
+                   help="<前缀>-<sid>-mic.wav（原始麦克风，含回声）—— 旧格式")
+    p.add_argument("--raw",
+                   help="<前缀>-<sid>-raw.wav（**未补偿**的原始参考轨）—— 旧格式")
     p.add_argument("--window-s", type=float, default=DEFAULT_WINDOW_S)
     p.add_argument("--dmax-ms", type=float, default=DEFAULT_DMAX_MS)
     p.add_argument("--verify-url", default=None,
@@ -221,12 +244,21 @@ def main() -> None:
     p.add_argument("--client-key", default=None)
     args = p.parse_args()
 
-    mic = load_wav(args.mic)
-    raw = load_wav(args.raw)
+    if args.raw8:
+        mic, raw = load_raw8(args.raw8)
+        mic_src = f"{Path(args.raw8).name}（ch2-5 均值）"
+        raw_src = f"{Path(args.raw8).name}（ch6/7 均值）"
+    else:
+        if not args.mic or not args.raw:
+            p.error("需要 --raw8，或同时给 --mic 与 --raw（旧格式 dump）")
+        mic = load_wav(args.mic)
+        raw = load_wav(args.raw)
+        mic_src = Path(args.mic).name
+        raw_src = Path(args.raw).name
     n = min(len(mic), len(raw))
     mic, raw = mic[:n], raw[:n]
-    print(f"mic: {Path(args.mic).name}  {len(mic)/SR:.1f}s")
-    print(f"raw: {Path(args.raw).name}  {len(raw)/SR:.1f}s"
+    print(f"mic: {mic_src}  {len(mic)/SR:.1f}s")
+    print(f"raw: {raw_src}  {len(raw)/SR:.1f}s"
           f"（未补偿的原始参考轨）")
 
     res = estimate_D(mic, raw, args.window_s, args.dmax_ms)

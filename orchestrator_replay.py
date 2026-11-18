@@ -2081,7 +2081,14 @@ def load_audio(path: str, max_s: Optional[float] = None) -> np.ndarray:
     try:
         import soundfile as sf
         x, sr = sf.read(path, dtype="float32", always_2d=True)
-        x = x.mean(axis=1)                      # 多声道混合
+        if x.shape[1] == 8:
+            # 8 声道原始输入（`-raw8.flac`：16k / ch0..7 交错，设备固定布局）。
+            # 只取阵列麦 ch2..5 的均值 —— 与前端 `alsaDownmix`（mic 模式）
+            # **同一规则**；ch0/1 是静音、ch6/7 是本机回采（AEC 参考），
+            # 直接 mean(axis=1) 会把播报回声混进麦克风。
+            x = x[:, 2:6].mean(axis=1)
+        else:
+            x = x.mean(axis=1)                  # 多声道混合（其它来源）
         if sr != SR:
             x = _resample(x, sr, SR)
         return x[:int(max_s * SR)] if max_s else x.astype(np.float32)
