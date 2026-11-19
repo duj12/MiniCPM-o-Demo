@@ -211,6 +211,33 @@ class OrchestratorSession:
             config.get("omni_describe_full_instruction", "") or "")
         self._desc_delta_instruction = str(
             config.get("omni_describe_delta_instruction", "") or "")
+        # ---- state head（带置信度的 E2）----------------------------------
+        #
+        # 与描述**同一拍**、**并行**触发：两条链谁也不等谁，谁先到谁先写
+        # 状态。`on_answer` 永远不等待它们中的任何一条。
+        self._state_enabled = bool(config.get("omni_state_head", False))
+        self._state_client = None
+        self._state_tasks: set = set()
+        if self._state_enabled:
+            from .omni.state_client import StateClient
+            self._state_client = StateClient(
+                config.get("omni_state_url", "http://127.0.0.1:22520"),
+                timeout_s=float(config.get("omni_state_timeout_s", 0.8) or 0.8),
+                n_frames=int(config.get("omni_state_n_frames", 2) or 2),
+                max_px=int(config.get("omni_state_max_px", 640) or 0),
+                fail_threshold=int(config.get("omni_state_fail_threshold", 5) or 5),
+                cooldown_s=float(config.get("omni_state_cooldown_s", 30.0) or 30.0),
+            )
+            logger.info("[%s] state head 已启用（%s，超时 %.2fs，%d 帧）",
+                        self.session_id, self._state_client.url,
+                        self._state_client.timeout_s, self._state_client.n_frames)
+        #: 文本侧只出自由文本槽位（`FEATURE` / `ENV` / `POSITION` + 一行
+        #: `DESCRIPTION`），枚举槽位交给 state head。**必须两个条件都成立**：
+        #: `ORCH_TEXT_SHORT` 是"想短"，state head 是"有人补那 5 个键"。
+        #: `_desc_full_instruction` 显式给了值时优先用显式的（调 prompt 用）。
+        self._desc_text_short = (
+            self._state_enabled
+            and bool(config.get("omni_text_short", True)))
         #: 已经为哪个 VAD 段发过断句触发的描述。段关闭的证据今天只有
         #: `2pass-offline` 到达，但同一次关闭可能来多条 offline（`is_final`
         #: 之外还有收尾帧），所以要去重 —— 否则一次断句发两次 decode。
@@ -1790,16 +1817,28 @@ class OrchestratorSession:
             logger.info("[%s] 有新鲜帧了 ⇒ 补发起点全量描述", self.session_id)
         if stage == "full":
             self._desc_pending_full = False
-        from .omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
+        from .omni.describe import (FULL_INSTRUCTION, SHORT_FULL_INSTRUCTION,
+                                    SHORT_TURN_INSTRUCTION, TURN_INSTRUCTION)
         # config 覆盖（`ORCH_OMNI_DESCRIBE_*_INSTRUCTION`）—— 调 prompt 不用
         # 改代码；空则用 `omni/describe.py` 的默认。
         #
         # 两段都是**全量 8 键**，差别只在详细程度：起点那份要当 Agent 的
         # 视觉背景，允许展开；每轮那份只求快，值压到最短。
-        if stage == "full":
-            instruction = self._desc_full_instruction or FULL_INSTRUCTION
+        #
+        # `ORCH_TEXT_SHORT=1` **且** state head 开着时改用短版：枚举槽位
+        # 由 typed-question 模型作答，文本侧只留 FEATURE / ENV / POSITION
+        # 三个自由文本槽位 + 一行 DESCRIPTION。两个条件缺一不可 —— 没有
+        # state head 还砍掉 5 个键，状态就直接丢了。
+        if self._desc_text_short:
+            default_instruction = (SHORT_FULL_INSTRUCTION if stage == "full"
+                                   else SHORT_TURN_INSTRUCTION)
         else:
-            instruction = self._desc_delta_instruction or TURN_INSTRUCTION
+            default_instruction = (FULL_INSTRUCTION if stage == "full"
+                                   else TURN_INSTRUCTION)
+        if stage == "full":
+            instruction = self._desc_full_instruction or default_instruction
+        else:
+            instruction = self._desc_delta_instruction or default_instruction
         # 起点全量不设上限；每轮给上限（0 = 不限）。键值契约下截断只影响
         # 最后一行，不会污染合并后的快照。
         max_new_tokens = (None if stage == "full" or self._desc_delta_max_new_tokens <= 0
@@ -1828,6 +1867,68 @@ class OrchestratorSession:
         logger.info("[%s] 触发%s描述", self.session_id,
                     "起点全量" if stage == "full" else "每轮")
         self._desc_task = asyncio.create_task(_do())
+
+        # ---- state head：**同一拍**并行起一条，两条互不等待 ----
+        # 放这里（而不是 `_do()` 里面）是为了两者真正同时出发：`_do()` 里
+        # 第一件事就是 `trigger_reply`，把状态请求排在它后面会白等一个网络
+        # 往返。也**不要** await 它 —— 文本那轮失败与状态无关，反之亦然。
+        if self._state_client is not None:
+            task = asyncio.create_task(self._run_state(stage))
+            self._state_tasks.add(task)
+            task.add_done_callback(self._state_tasks.discard)
+
+    async def _run_state(self, stage: str) -> None:
+        """调一次 state head，成功则投 `OmniState` 给下游。
+
+        三条不变量：
+
+        * **永不抛** —— `StateClient.post_state` 已经把异常吃干净了，这里
+          只兜住"帧访问器是测试替身"这类 AttributeError；
+        * **不阻塞任何东西** —— 由 `_do_describe` 起成独立 task；
+        * **拿到的是"已进 KV 的帧"** —— 与 OmniLLM 看的是同一张画面，
+          两条链的结论才可比（见 `OmniClient.recent_frames_b64`）。
+        """
+        from .downstream.interface import OmniState
+
+        client = self._state_client
+        if client is None or self.omni is None:
+            return
+        getter = getattr(self.omni, "recent_frames_b64", None)
+        if not callable(getter):
+            # 测试替身 / 老接口不带帧访问器 ⇒ 这一轮没有状态，不是错误
+            return
+        try:
+            frames = getter(client.n_frames)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] 取帧失败（跳过本轮 state）: %s", self.session_id, exc)
+            return
+        if not frames:
+            return
+        res = await client.post_state(
+            frames, stage=stage, session_id=self.session_id,
+            transcript=self._transcript_of_state(),
+        )
+        if not res:
+            return
+        self.stats["omni_state_ok"] = self.stats.get("omni_state_ok", 0) + 1
+        self.stats["omni_state_last_ms"] = int(res.get("latency_ms") or 0)
+        self.post_downstream(OmniState(
+            t=int(self.clock.seconds() * 1000),
+            stage=stage,                      # type: ignore[arg-type]
+            state=res["state"],
+            confidence=res.get("confidence") or {},
+            latency_ms=int(res.get("latency_ms") or 0),
+            model=str(res.get("model") or ""),
+        ))
+
+    def _transcript_of_state(self) -> str:
+        """给 state head 的转写（V1 只回显、不参与推断，见其 `app.py`）。
+
+        ⚠️ 别在这里塞语音情绪：情绪的晚融合在
+        `interaction/downstream.py::_on_state` 做，只有那里知道 ASR 段末的
+        时序。把半份证据从两条路送进去会让"融合发生在哪"变得说不清。
+        """
+        return str(getattr(self, "_last_asr_text", "") or "")
 
     def _release_desc_attempt(self) -> None:
         """这一轮描述**没送出去**（连接断了/抛异常）：收尾并**照常计时**。
@@ -1921,6 +2022,17 @@ class OrchestratorSession:
         self._desc_loop_task = None
         self._desc_task = None
         self._desc_inflight = False
+        # state head 的在途请求也一起收掉；连接池随会话释放
+        for task in list(self._state_tasks):
+            if not task.done():
+                task.cancel()
+        self._state_tasks.clear()
+        if self._state_client is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._state_client.aclose())
+            except RuntimeError:
+                pass          # 没有运行中的 loop（收尾在同步上下文里）—— 无妨
+            self._state_client = None
 
     def _send_display(self, msg, *, critical: bool = False) -> bool:
         """投递 UI 消息。返回**是否入队成功**。

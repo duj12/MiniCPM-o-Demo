@@ -154,3 +154,59 @@ services:
     logging:
       driver: json-file
       options: { max-size: "50m", max-file: "3" }
+
+  # ---------------------------------------------------------------------------
+  # state head：typed-question 决策模型（OneJev/Flide），输出带置信度的 E2 状态。
+  #
+  # ⚠️ 三条运维约定：
+  #   1. **默认不启动**（profiles），要 `--profile state-head up -d state-head`；
+  #   2. `device_ids` 默认 **GPU0 = 与 cpp-worker-backend 同一张卡**（不加卡）；
+  #      因此 `depends_on` 让 omni 先加载完、KV 预分配好，state head 再进；
+  #   3. **重启 omni 前先 `docker stop omni-llm-state-head`**，否则 omni 重新
+  #      预分配 KV 可能失败（反向顺序 compose 管不到）。
+  # ---------------------------------------------------------------------------
+  state-head:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.state-head
+    image: omnillm-state-head:dev
+    container_name: omni-llm-state-head
+    profiles: [ "state-head" ]
+    environment:
+      STATE_MODEL_DIR: "${STATE_MODEL_DIR:-onejev-1.6-0.8b}"
+      STATE_REPLICAS: "${STATE_REPLICAS:-1}"
+      STATE_REPLICA_SPREAD: "${STATE_REPLICA_SPREAD:-0}"
+      STATE_BATCH_WINDOW_MS: "${STATE_BATCH_WINDOW_MS:-3}"
+      STATE_GATHER_MS: "${STATE_GATHER_MS:-2}"
+      STATE_PLANNERS: "${STATE_PLANNERS:-4}"
+      STATE_FRONTENDS: "${STATE_FRONTENDS:-2}"
+      STATE_NO_CUDA_GRAPHS: "${STATE_NO_CUDA_GRAPHS:-1}"
+      STATE_MAX_MEDIA_PX: "${STATE_MAX_MEDIA_PX:-640}"
+      STATE_TIMEOUT_S: "${STATE_TIMEOUT_S:-3.0}"
+      STATE_TIER2: "${STATE_TIER2:-0}"
+    ports:
+      - "${STATE_HEAD_HOST_PORT:-22520}:22520"
+    volumes:
+      # 镜像里没打包模型时（build 时 checkpoints/<STATE_MODEL_DIR> 缺失），
+      # 走这条挂载。两处都没有时 /health 返回 503，编排侧退回纯文本 E0。
+      - ${MODEL_HOST_PATH:-./checkpoints}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "${STATE_GPU_ID:-0}" ]
+              capabilities: [ gpu ]
+    depends_on:
+      cpp-worker-backend:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://127.0.0.1:22520/health" ]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "3" }

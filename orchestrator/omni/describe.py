@@ -18,6 +18,11 @@
   所以"描述哪些字段"必须在这里；
 * `FULL_INSTRUCTION` —— 会话起点：8 个字段，**允许展开细节**（这份要当背景）；
 * `TURN_INSTRUCTION` —— 每轮：8 个字段，**每个值压到最短**（成本在这里）。
+* `SHORT_FULL_INSTRUCTION` / `SHORT_TURN_INSTRUCTION` —— **接了 state head 之后**
+  （`ORCH_STATE_HEAD=1` 且 `ORCH_TEXT_SHORT=1`）改用的短版：只输出
+  `FEATURE` / `ENV` / `POSITION` / `DESCRIPTION` 4 行，枚举槽位全部交给
+  typed-question 模型。没开 state head 就**不要**用它 —— 8 个键里砍掉 5 个
+  而没人补，等于把状态丢了。
 
 关键约束：`system_prompt` 只在 `session.init` 时定一次（`input.append` 没有
 逐轮 prompt 字段）。所以"这一轮要什么"只能靠注入指令区分 —— 但也**只能
@@ -202,6 +207,49 @@ TURN_INSTRUCTION = (
     "ENV: 室内走廊\n"
     "POSITION: 画面中央\n"
     "不要与用户对话，不要确认，不要以“好的/收到”开头，从第一个字段名直接开始。"
+)
+
+
+#: **短文本**版起点指令 —— 仅在 `ORCH_TEXT_SHORT=1` **且** state head 开着
+#: 时使用（`ORCH_STATE_HEAD=1`，见 `session._do_describe`）。
+#:
+#: 分工：枚举槽位（ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION，
+#: 以及 ENV 的场景/光线、POSITION 的九宫格）全部交给 state head 的
+#: typed-question 模型；这里只留 **E2 表达不了的自由文本**：
+#:
+#: * `FEATURE` —— 性别/年龄/穿着/配饰（只有文字能描述）
+#: * `ENV`     —— 物品与环境要素（E2 里 `ENV.objects` 就是留给文本的）
+#: * `POSITION`—— 与物体的相对位置、被指向/拿起的物体（同上）
+#: * `DESCRIPTION` —— 一句话概括（**不是** 8 键字段，`parse_state` 会丢掉它，
+#:   它只活在原文里进 Agent 的 `content.VLM`）
+#:
+#: ⚠️ 不要把枚举槽位也一起砍掉却没有 state head —— 那就什么都不剩了，
+#: 所以选择逻辑里那两条条件是**与**关系。
+SHORT_FULL_INSTRUCTION = (
+    "直接输出对当前画面的结构化状态。"
+    "不要确认、不要回应、不要以“好的/收到/现在开始”之类的话开头。\n"
+    "本轮**只输出下面 4 行**，顺序照抄：\n"
+    "FEATURE: 性别、年龄段、穿着（上衣/下装颜色款式、配饰）\n"
+    "ENV: 画面中的物品与环境要素（不写场景类型，不写光线）\n"
+    "POSITION: 人物与画面中主要物体的相对位置；被指向或拿起的物体\n"
+    "DESCRIPTION: 一句话概括画面里正在发生什么（不超过 60 字）\n"
+    "不要输出 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION —— "
+    "那几个字段由另一个模型判定，你再写只会重复。"
+)
+
+#: **短文本**版每轮指令。与 `SHORT_FULL_INSTRUCTION` 同集，只是更短。
+#:
+#: 仍然保留「短暂动作即使已经结束也要报」这类硬要求吗？**不保留** ——
+#: 短文本这一侧已经没有 ACTION 了，那条护栏属于 state head 的问句判据
+#: （见 `state_head/questions.py` 的 `ACTION_WINDOW_HINT`）。
+SHORT_TURN_INSTRUCTION = (
+    "本轮只输出当前这些自由文本字段，4 行，顺序照抄：\n"
+    "FEATURE: 性别、年龄段、穿着（如「青年女性，灰色短袖」），不写发型细节\n"
+    "ENV: 画面中的物品（如「桌上一个白色杯子」）；不写场景类型、不写光线\n"
+    "POSITION: 与主要物体的相对位置、被指向或拿起的物体（如「站在展台右侧」）\n"
+    "DESCRIPTION: 一句话概括正在发生什么（不超过 60 字）\n"
+    "不要输出 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION，"
+    "也不要写“无变化”这类话；不确定的写“不可见”。"
 )
 
 

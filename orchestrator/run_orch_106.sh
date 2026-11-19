@@ -76,6 +76,26 @@ export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-1}"
 # 触发一次（与断句点触发叠加）。设 0 回到旧口径：只在静默时补心跳。
 export ORCH_OMNI_DELTA_ALWAYS="${ORCH_OMNI_DELTA_ALWAYS:-1}"
 
+# state head（带置信度的 E2 状态）—— **旁挂容器** omnillm-state-head:22520，
+# 与上面的文本描述**同一拍并行**请求，谁也等不着谁。
+#   0（默认）= 完全不调，行为与今天逐字节一致（纯文本 E0）。
+#   1        = 调；返回的枚举 + 概率进 8 键快照与 STATE_JSON。
+# 打开前先确认那边确实活着：curl -s http://<host>:22520/health
+export ORCH_STATE_HEAD="${ORCH_STATE_HEAD:-0}"
+export ORCH_STATE_URL="${ORCH_STATE_URL:-http://127.0.0.1:22520}"
+# 超时即丢弃本轮 state（文本那条不受影响）。0.8s ≈ 目标 P95 的 1.6 倍。
+export ORCH_STATE_TIMEOUT_S="${ORCH_STATE_TIMEOUT_S:-0.8}"
+# 送给 state head 的帧数（2 = 当前 + 1s 前，显著改善动作/运动/duration）
+export ORCH_STATE_N_FRAMES="${ORCH_STATE_N_FRAMES:-2}"
+# 发前把帧长边缩到多少像素（显存/延迟的主要旋钮之一）
+export ORCH_STATE_MAX_PX="${ORCH_STATE_MAX_PX:-640}"
+# 渲染成 `label(0.82)` 形态（0 = 只出标签）
+export ORCH_STATE_CONF_IN_TEXT="${ORCH_STATE_CONF_IN_TEXT:-1}"
+# Qwen3-Omni 只出自由文本槽位（FEATURE / ENV / POSITION + 一行 DESCRIPTION）。
+# **仅在 ORCH_STATE_HEAD=1 时生效** —— 没开 state head 还砍掉 5 个枚举键
+# 就什么都不剩了，所以代码里两个条件是"与"关系。
+export ORCH_TEXT_SHORT="${ORCH_TEXT_SHORT:-1}"
+
 # 保留各机现有日志与音视频排障素材的默认目录。
 export ORCH_LOG_LEVEL="${ORCH_LOG_LEVEL:-info}"
 export ORCH_DUMP_AUDIO="${ORCH_DUMP_AUDIO:-$SHARED/orchdump/s}"
@@ -104,6 +124,11 @@ echo "  VLM 描述        = $ORCH_OMNI_DESCRIBE（0=关，omni 当对话方）" 
 echo "  描述阶段        = 起点 full + 每轮 turn，AgentAction.vlm 单独传递" >&2
 if [ "$ORCH_OMNI_DELTA_ALWAYS" = "0" ]; then _ALWAYS_TXT="仅静默时"; else _ALWAYS_TXT="不看语音活动"; fi
 echo "  描述定时触发    = 每 ${ORCH_OMNI_DELTA_INTERVAL_S}s（${_ALWAYS_TXT}）+ 断句点各一次" >&2
+if [ "$ORCH_STATE_HEAD" = "1" ]; then
+  echo "  state head      = $ORCH_STATE_URL（超时 ${ORCH_STATE_TIMEOUT_S}s，${ORCH_STATE_N_FRAMES} 帧，文本短模式=$ORCH_TEXT_SHORT）" >&2
+else
+  echo "  state head      = 关（纯文本 E0 状态）" >&2
+fi
 echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
 echo "  打断探针        = $ORCH_IC_DECISION_PROBE" >&2
 echo "  HTTPS 证书      = $SSL_CERT" >&2

@@ -232,6 +232,45 @@ class Settings:
     omni_describe_delta_instruction: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE_DELTA_INSTRUCTION", ""))
 
+    # ---- 带置信度的 E2 状态（state head）----------------------------------
+    #
+    # 1 = 在每次"该更新视觉状态"的那一拍，**并行**调 state head（旁挂容器
+    #     :22520）拿枚举槽位 + 置信度；Qwen3-Omni 的文本描述继续跑，只负责
+    #     自由文本槽位。0 = 完全老行为（逐字节一致的 E0 路径）。
+    omni_state_head: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_HEAD", "0").strip().lower() not in ("0", "false", "off", "no", ""))
+    #: state head 地址。跨机部署时填宿主机 IP（105 编排 → 106 的 :22520）。
+    omni_state_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_URL", "http://127.0.0.1:22520"))
+    #: 超时即**丢弃本轮 state**、退回纯文本。0.8s 的依据：端到端预算
+    #: 500ms 加上网络与排队抖动；再等下去这轮状态已经比画面旧了。
+    omni_state_timeout_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_TIMEOUT_S", "0.8")))
+    #: 送给 state head 的帧数。2 = 当前帧 + 1 秒前那一帧（motion / duration
+    #: 靠对比；只有 1 帧时 state head 自动走 image 分支）。
+    omni_state_n_frames: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_N_FRAMES", "2")))
+    #: 发前把帧长边缩到多少（0 = 不缩）。与容器侧 `STATE_MAX_MEDIA_PX` 对应；
+    #: 在编排侧缩能省掉一次调度/网络带宽，两边设同一个值最省事。
+    omni_state_max_px: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_MAX_PX", "640")))
+    #: 渲染成 ``EMOTION: dissatisfied (0.82)`` 形态。关掉则只给 label。
+    omni_state_conf_in_text: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_CONF_IN_TEXT", "1").strip().lower() not in
+        ("0", "false", "off", "no"))
+    #: 连续失败多少次熔断（之后 ``omni_state_cooldown_s`` 秒内不再尝试）。
+    #: 熔断期间行为 = `omni_state_head=0`，即纯文本 E0。
+    omni_state_fail_threshold: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_FAIL_THRESHOLD", "5")))
+    omni_state_cooldown_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_COOLDOWN_S", "30.0")))
+    #: Qwen3-Omni 只出**自由文本槽位**（FEATURE / ENV.objects /
+    #: POSITION.relative_positions / 一行短描述）。仅在 `omni_state_head=1`
+    #: 时生效 —— 没有 state head 的话把枚举槽位也砍掉就什么都剩不下了。
+    omni_text_short: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_TEXT_SHORT", "1").strip().lower() not in
+        ("0", "false", "off", "no"))
+
     # 人脸（阶段 4）—— 实现走 board-face-and-cloud-infer/G1 的官方 g1face 包
     #
     # ⚠️ `face_g1_root` 与 `face_model_dir` 是**两个不同的根**，不能合并：

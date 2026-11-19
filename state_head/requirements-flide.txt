@@ -1,0 +1,12 @@
+# 推理引擎：flide（Jev 家族的统一 serving）。
+#
+# 2026-11-19 核实的约束（`pip download flide==0.1.16` 的 METADATA）：
+#   torch>=2.12,<2.15 / transformers>=5.0 / flash-linear-attention>=0.5.2,<0.7
+#   accelerate / huggingface_hub / pydantic>=2 / pillow / fastapi / uvicorn
+# 所以这个文件**必须**在独立的 /opt/venv 里装（见 docker/Dockerfile.state-head）：
+# 挂到 cpp 镜像的 runtime venv 上会把它里面的 torch 2.4 顶掉。
+#
+# `flash-linear-attention` 在部分版本上需要 nvcc 现场编译 —— Dockerfile 的
+# builder 阶段因此用 cuda devel 镜像；预编译轮子可用时它不会触发编译。
+flide==0.1.16
+torchvision

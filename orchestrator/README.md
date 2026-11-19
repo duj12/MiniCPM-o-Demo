@@ -122,6 +122,40 @@ IC 始终在宿主进程内，每会话一份 Engine；`run_ic_105.sh/run_ic_106
 `transcript` 和 `vlm` 通过 canonical gRPC 协议分别传递。
 直接运行 Python 时描述功能默认关闭，可按需要显式设置。
 
+### state head（带置信度的 E2 状态，默认关）
+
+`ORCH_STATE_HEAD=1` 时，编排会在**每次描述同一拍**再并行请求旁挂容器
+`omnillm-state-head:22520`（`POST /v1/state`）：那边用轻量 typed-question 模型
+一次性回答 ~19 个 closed-enum 问题，直接给出 `Social_State_Schema_v2_1_Lite`
+的 E2（`{label, confidence}`）。两条链**互不等待**，`on_answer` 永远不等它们。
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `ORCH_STATE_HEAD` | `0` | 总开关；0 = 与今天逐字节一致的纯文本 E0 |
+| `ORCH_STATE_URL` | `http://127.0.0.1:22520` | 105 跑编排时写 `http://192.168.89.106:22520` |
+| `ORCH_STATE_TIMEOUT_S` | `0.8` | 超时丢弃本轮 state（文本那条不受影响） |
+| `ORCH_STATE_N_FRAMES` | `2` | 送几帧（当前 + 1s 前，动作/运动槽位靠它） |
+| `ORCH_STATE_MAX_PX` | `640` | 发前缩图长边（延迟/显存旋钮） |
+| `ORCH_STATE_CONF_IN_TEXT` | `1` | 渲染成 `label(0.82)` |
+| `ORCH_TEXT_SHORT` | `1` | Omni 只出 `FEATURE`/`ENV`/`POSITION` + 一行描述 |
+
+`ORCH_TEXT_SHORT` **只在 `ORCH_STATE_HEAD=1` 时生效** —— 没开 state head 还让文本
+砍掉 5 个枚举键，状态就直接丢了（代码里是"与"关系）。
+
+服务端：
+
+```bash
+cd /data/megastore/Projects/DuJing/code/MiniCPM-o-Demo
+docker compose -f docker-compose.cpp.yml --profile state-head up -d state-head
+curl -s http://127.0.0.1:22520/health          # {"ok":true,"backend":"onejev",...}
+```
+
+⚠️ 两者**共用 omni 的 GPU0**：重启 `omni-llm-cpp-backend` 之前先
+`docker stop omni-llm-state-head`，等 omni 预分配完 KV 再起回来。
+
+连续失败 5 次后客户端熔断 30s（期间行为 = `ORCH_STATE_HEAD=0`），半开自动恢复。
+离线契约测试：`python -m orchestrator.tests.test_state_merge`。
+
 人脸默认走 `http://192.168.89.105:8767`，按会话隔离，105/106 共用服务额度。
 `ORCH_FACE_SERVICE_URL=` **显式置空**才会回到本地 provider；106 的本地 `.so`
 持有进程级状态，仅适合单会话，并需配置 `ORCH_FACE_DB/ORCH_FACE_MODELS`。

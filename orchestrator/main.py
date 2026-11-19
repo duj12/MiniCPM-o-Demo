@@ -461,7 +461,9 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 ic_mode=ic_mode,
                 on_output=sess.execute_action,
                 agent_mcp_servers=cfg.agent_mcp_servers,
-                omni_describe=cfg.omni_describe)
+                omni_describe=cfg.omni_describe,
+                omni_state=cfg.omni_state_head,
+                state_conf_in_text=cfg.omni_state_conf_in_text)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():

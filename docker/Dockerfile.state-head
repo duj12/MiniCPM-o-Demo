@@ -1,0 +1,112 @@
+# state head 镜像 —— typed-question 决策模型（OneJev/Flide）+ FastAPI 门面。
+#
+# 一个容器跑两个进程（supervisord 管理）：
+#   - flide serve  ×STATE_REPLICAS on 127.0.0.1:22521,22522…（真正推理，跨请求合批）
+#   - uvicorn      on 0.0.0.0:22520           （异步门面，转发到上面那几个）
+#
+# ⚠️ 与 cpp-worker-backend 的关键差别：**依赖不能共用**。
+#    flide 0.1.16 要求 torch>=2.12 / transformers>=5.0，而 cpp 镜像的 venv 是
+#    torch 2.4 一系（py310 同代）。装到一起会把那边的栈顶翻，所以这里自带一个
+#    独立的 /opt/venv，并且**不复用** runtime-base 里的 pip 包。
+#
+# 模型来源二选一：
+#   - 打包进镜像：build-image.sh 暂存到 .bundle-state/checkpoints/ → BUNDLE_STATE=1
+#   - 运行时挂载：compose 把 ${MODEL_HOST_PATH} 挂到 /models
+#   两者都没有时容器仍能起来，但 /health 会报错、编排侧 probe 失败退回 E0。
+
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=22.04
+ARG BUNDLE_STATE=0
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+# ── 1) 建独立 venv ─────────────────────────────────────
+# 用 devel 基镜像：flash-linear-attention 在没有对应轮子时要用 nvcc 现场编译。
+FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS venv-build
+
+ARG PIP_INDEX_URL
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=0
+RUN --mount=type=cache,target=/root/.cache/pip \
+    find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E \
+            -e 's|https?://([[:alnum:].-]+\.)?archive\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' \
+            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' {} + \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv
+
+WORKDIR /src
+# 两份 requirements 分开装：服务依赖先装（命中缓存概率高），推理引擎后装。
+COPY state_head/requirements.txt ./requirements-service.txt
+COPY state_head/requirements-flide.txt ./requirements-flide.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/venv/bin/pip install --index-url "${PIP_INDEX_URL}" \
+        -r requirements-service.txt \
+    && /opt/venv/bin/pip install --index-url "${PIP_INDEX_URL}" \
+        -r requirements-flide.txt \
+    && /opt/venv/bin/python -c "import torch, flide; \
+print('torch', torch.__version__, 'cuda', torch.version.cuda, \
+      'flide', getattr(flide, '__version__', '?'))"
+
+# ── 2) 运行期 ──────────────────────────────────────────
+FROM harbor.xmov.ai/xmov/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime-base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/venv/bin:${PATH} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    # 长跑 + 变长视觉输入，碎片是 OOM 的常见真因
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    # ⚠️ 绝不允许容器内隐式下载：模型只能来自镜像或挂载
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E \
+            -e 's|https?://([[:alnum:].-]+\.)?archive\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' \
+            -e 's|https?://security\.ubuntu\.com/ubuntu/?|http://mirrors.aliyun.com/ubuntu/|g' {} + \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        python3 \
+        supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=venv-build /opt/venv /opt/venv
+
+# ── 模型打包（可选）─────────────────────────────────────
+# 与 cpp 镜像同一套写法：暂存目录不存在时 BUNDLE_STATE=0 走空阶段，
+# 直接用 docker build 也不会因为缺模型而失败。
+FROM runtime-base AS runtime-state-0
+
+FROM runtime-base AS runtime-state-1
+# 放最前面：模型层（1.7GB）不会因为代码改动而失效。
+COPY .bundle-state/checkpoints/ /app/checkpoints/
+
+FROM runtime-state-${BUNDLE_STATE} AS state-head
+
+WORKDIR /app
+COPY state_head/ ./state_head/
+COPY docker/entrypoint-state-head.sh ./docker/entrypoint-state-head.sh
+
+RUN chmod +x docker/entrypoint-state-head.sh \
+    && mkdir -p /app/logs /var/log/supervisor
+
+EXPOSE 22520
+# flide 副本端口（STATE_REPLICAS 决定实际开几个；暴露仅为调试方便）
+EXPOSE 22521-22524
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=40 \
+    CMD curl -sf "http://127.0.0.1:22520/health" >/dev/null || exit 1
+
+ENTRYPOINT ["docker/entrypoint-state-head.sh"]

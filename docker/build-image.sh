@@ -30,6 +30,10 @@ for arg in "$@"; do
 done
 
 BUNDLE_DIR=".bundle-checkpoints"
+#: state head 的暂存根**必须**与 cpp 分开：cpp 镜像整份 COPY
+#: .bundle-checkpoints/checkpoints/，混进去会让 20G 的镜像再胖 2~4G。
+STATE_BUNDLE_DIR=".bundle-state"
+STATE_MODEL_DIR="${STATE_MODEL_DIR:-onejev-1.6-0.8b}"
 LLAMA_SRC_DIR=".llama-src"
 # 默认源码目录（宿主机 clone 的 duj12/dev，含最新代码）；可用 --llama-src 覆盖
 DEFAULT_LLAMA_SRC="../llama.cpp-omni-dev"
@@ -43,6 +47,10 @@ cleanup() {
     if [ -d "$LLAMA_SRC_DIR" ]; then
         echo "[build-image] cleaning $LLAMA_SRC_DIR"
         rm -rf "$LLAMA_SRC_DIR"
+    fi
+    if [ -d "$STATE_BUNDLE_DIR" ]; then
+        echo "[build-image] cleaning $STATE_BUNDLE_DIR"
+        rm -rf "$STATE_BUNDLE_DIR"
     fi
 }
 trap cleanup EXIT
@@ -84,17 +92,40 @@ else
     echo "[build-image] no --bundle: model NOT baked into image (mount /models at runtime)"
 fi
 
-echo "[build-image] docker build (bundle_models=${BUNDLE})..."
+# ---- state head 模型（独立暂存根）------------------------------------------
+# ⚠️ 模型缺失时**只告警不失败**：这样 CI 能在模型还没上传 SVN 的阶段先把
+#    镜像链跑通，state_head 起不来只影响它自己（/health 503 → 编排退回 E0）。
+STATE_BUNDLE=0
+if [ "$BUNDLE" = "1" ]; then
+    rm -rf "$STATE_BUNDLE_DIR"
+    if [ -d "checkpoints/${STATE_MODEL_DIR}" ]; then
+        mkdir -p "$STATE_BUNDLE_DIR/checkpoints"
+        echo "[build-image]   staging state model ${STATE_MODEL_DIR}"
+        if ! cp -Lrl "checkpoints/${STATE_MODEL_DIR}" "$STATE_BUNDLE_DIR/checkpoints/${STATE_MODEL_DIR}"; then
+            rm -rf "$STATE_BUNDLE_DIR/checkpoints/${STATE_MODEL_DIR}"
+            cp -Lr "checkpoints/${STATE_MODEL_DIR}" "$STATE_BUNDLE_DIR/checkpoints/${STATE_MODEL_DIR}"
+        fi
+        STATE_BUNDLE=1
+    else
+        echo "[build-image] WARNING: checkpoints/${STATE_MODEL_DIR} not found;" \
+             "state-head 镜像将不含模型（运行时可挂载 /models）" >&2
+    fi
+fi
+
+echo "[build-image] docker build (bundle_models=${BUNDLE}, bundle_state=${STATE_BUNDLE})..."
 docker compose -f docker-compose.cpp.yml build \
     --build-arg "BUNDLE_MODELS=${BUNDLE}" \
-    cpp-worker-backend
+    --build-arg "BUNDLE_STATE=${STATE_BUNDLE}" \
+    cpp-worker-backend state-head
 
 if [ "$PUSH" = "1" ]; then
     : "${REGISTRY:?REGISTRY required for --push}"
     : "${IMAGE_TAG:?IMAGE_TAG required for --push}"
-    echo "[build-image] pushing ${REGISTRY}/omnillm-cpp-backend:${IMAGE_TAG} ..."
-    docker tag omnillm-cpp-backend:dev "${REGISTRY}/omnillm-cpp-backend:${IMAGE_TAG}"
-    docker push "${REGISTRY}/omnillm-cpp-backend:${IMAGE_TAG}"
+    for name in omnillm-cpp-backend omnillm-state-head; do
+        echo "[build-image] pushing ${REGISTRY}/${name}:${IMAGE_TAG} ..."
+        docker tag "${name}:dev" "${REGISTRY}/${name}:${IMAGE_TAG}"
+        docker push "${REGISTRY}/${name}:${IMAGE_TAG}"
+    done
 fi
 
 echo "[build-image] done"

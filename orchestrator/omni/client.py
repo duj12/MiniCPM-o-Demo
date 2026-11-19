@@ -100,6 +100,13 @@ class OmniClient:
         #: （模型面对空画面会按 8 键格式**编造**，实测见
         #: `session._seconds_since_last_frame` 的说明）。
         self.last_frame_at: Optional[float] = None
+        #: 最近**发出去**的若干帧（base64，旧的在前）。state head 需要
+        #: "当前帧 + 1 秒前那一帧"来判断 motion / duration —— 单帧看不出位移。
+        #: 只留 4 帧：再多也没有语义增量，只是占内存。
+        #:
+        #: ⚠️ 与 `_pending_frame` 不同，这里是**已进 KV** 的帧。两条链
+        #:    （omni 文本 / state head）看同一张画面，结论才可比。
+        self._frame_history: List[str] = []
         # 音频缓冲：凑够 1s 再发（StreamingChatClient 的节奏）
         self._audio_buf: List[np.ndarray] = []
         self._audio_len = 0
@@ -249,6 +256,26 @@ class OmniClient:
         """登记一帧待发的视频（1fps）。只保留最新的一帧。"""
         self._pending_frame = base64.b64encode(jpeg).decode()
 
+    # ---- 帧访问器（给 state head 用）---------------------------------- #
+
+    def last_frame_b64(self) -> Optional[str]:
+        """最近一次**随音频发出去**的那一帧（base64）。没有则 ``None``。
+
+        没有帧时返回 ``None`` 而不是空串：调用方据此跳过整轮 state 推理，
+        而不是让模型对着一张不存在的图编状态。
+        """
+        return self._frame_history[-1] if self._frame_history else None
+
+    def recent_frames_b64(self, n: int = 2) -> List[str]:
+        """最近 ``n`` 帧，**旧的在前**（时间序）。
+
+        不足 ``n`` 时返回已有的那些 —— 首轮往往只有 1 帧，这时 state head
+        会走 image 分支（没有 motion 可言，属预期降级）。
+        """
+        if n <= 0:
+            return []
+        return list(self._frame_history[-n:])
+
     async def push_audio(self, seg: np.ndarray) -> None:
         """送一段 AEC 清洗后的音频。内部按 1s 聚合。"""
         if self.closed or self.dead or self.client is None:
@@ -275,6 +302,8 @@ class OmniClient:
         frames = None
         if self._pending_frame is not None:
             frames = [self._pending_frame]
+            self._frame_history.append(self._pending_frame)
+            del self._frame_history[:-4]
             self._pending_frame = None
             self.frames_sent += 1
             # 帧**真正发出去**的时刻（不是 offer 的时刻）—— 会话侧的
