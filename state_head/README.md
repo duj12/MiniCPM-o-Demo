@@ -5,7 +5,7 @@
 
 它替掉的是"让 Qwen3-Omni 用自然语言描述画面、再从文本里猜枚举值"那条路 ——
 那条路既不可枚举也没有置信度。这里用 **typed question**（closed enum 的问句）
-一次前向回答 19~20 个问题，直接拿到每个选项的概率。
+一次前向回答 15~16 个问题，直接拿到每个选项的概率。
 
 Qwen3-Omni **不退休**：它继续负责必须用自由文本表达的槽位
 （`FEATURE.appearance`、`ENV.objects`、`POSITION.relative_positions`、
@@ -30,8 +30,8 @@ Qwen3-Omni **不退休**：它继续负责必须用自由文本表达的槽位
 {
   "frames_b64": ["<裸 base64 或 data URL>", "<1 秒前那帧>"],  // 2 帧走 video，1 帧走 image
   "fps": 1.0,
-  "stage": "turn",          // turn=19 问 / full=20 问（多 env.scene）
-  "tier2": false,           // true 时追加 3 个长尾动作
+  "stage": "turn",          // turn=15 问 / full=16 问（多 env.scene）
+  "tier2": false,           // 已作废的空操作（动作合并成 act.type 一题）
   "session_id": "abc"       // 只用于"同会话不重复打"，跨会话完全并发
 }
 ```
@@ -47,12 +47,31 @@ Qwen3-Omni **不退休**：它继续负责必须用自由文本表达的槽位
              "BEHAVIOR": {...}, "RELATION": {...}, "ENV": {...}, "POSITION": {...} },
   "confidence": {"ATTENTION.orientation": 0.71, "ACTION.events[0]": 0.83, ...},
   "latency_ms": 312, "model": "OneJev1.6-0.8B", "backend": "onejev",
-  "stage": "turn", "n_questions": 19
+  "stage": "turn", "n_questions": 16
 }
 ```
 
 错误码：`422` 没有帧（调用方应**保留上一份 E2**）、`502` 推理失败、
 `504` 超时、`503` 后端未就绪。
+
+### 题集与 schema §3 一一对应（2026-11-19 晚改）
+
+枚举槽位**全部**在这里答，自由文本槽位留给 Qwen3-Omni：
+
+| 题 id | schema 槽位 |
+|---|---|
+| `person_visible` | 非 schema 字段：§5.1 `null` / `[]` 的门控 |
+| `attn.orientation` / `attn.gaze` | `ATTENTION` |
+| `act.type` | `ACTION.events[].type` —— **一个 10 选 1**（8 类 + `other` + `none`） |
+| `act.count` | `ACTION.events[].count` |
+| `emo.visual` | `EMOTION.visual`（`label` / `conflict` 由编排侧晚融合） |
+| `beh.posture` / `motion` / `activity` / `duration` | `BEHAVIOR` |
+| `rel.person_count` / `interaction` / `target` | `RELATION` |
+| `env.scene` / `env.lighting` | `ENV`（`objects` 是自由文本） |
+| `pos.region` | `POSITION.region`（`relative_positions` 是自由文本） |
+
+`act.type` 选 `none` ⇒ `events=[]`（观察到、确实没有）；选 `other` ⇒
+`{"type": "other"}`，具体是什么由文本描述补。**一拍最多 1 条事件**。
 
 ### 三条空值语义（schema §5.1，别混）
 
@@ -88,7 +107,8 @@ k=12 时 0.5 会被放大成 0.45→0.45 但 0.9 会放大成 0.89→0.89… 总
 | `STATE_ACTION_P` | `0.5` | 动作入 `events[]` 的阈值 |
 | `STATE_ACTION_MAX_EVENTS` | `2` | `events[]` 最多几条 |
 | `STATE_ENUM_MIN_CONF` | `0.0` | 低于此值退 `unknown`（默认不拦，按实测调） |
-| `STATE_TIER2` | `0` | 默认是否问长尾动作 |
+| `STATE_TIER2` | `0` | **已作废**（动作合并成 `act.type` 一题后不再按长尾裁剪；参数留着兼容） |
+| `STATE_SLOTS` | 空 | **槽位白名单默认值**（逗号分隔题集 id）。空/`all`/`*` = 问全套（15~16 问）；非空只问这几项，`person_visible` 永远问。编排侧每次请求都带 `slots`（来自 `ORCH_STATE_SLOTS`）**以请求为准**，这个 env 只对不带 `slots` 的调用方（curl/bench）生效 |
 | `STATE_INCLUDE_LIGHTING` | `1` | 是否问 `env.lighting` |
 | `STATE_WARMUP` | `1` | 启动后台预热（不阻塞 `/health`） |
 | `STATE_REPLICAS` | `1` | entypoint 起几个 flide（端口 22521+i） |
@@ -132,6 +152,10 @@ python -m state_head.bench_sop --clips /data/.../assets/video/sop --stage both \
 
 ## M0 实测（2026-11-19，106 GPU0 与 omni 共卡）
 
+> ⚠️ **下表是旧题集（19 问、8 个 `act.<name>` noul）的实测**，保留作对照。
+> 动作合并成 `act.type` 一题后题数是 16，单路延迟应基本不变（prefill 主导），
+> 并发侧会更好 —— 新数字需要重测后再补。
+
 环境：OneJev1.6-0.8B，19 问 `stage=turn`，单帧 640px，`--no-cuda-graphs`，
 `--batch-window-ms 3`，`STATE_SESSION_CACHE_GB=0.5`。omni 为 `-c 200000
 --parallel 10`（per-slot 20000）。
@@ -151,6 +175,28 @@ python -m state_head.bench_sop --clips /data/.../assets/video/sop --stage both \
 - `--batch-window-ms` 取 0/3/8 差别在噪声内（4 路 p95 447/455/464ms），保持 3。
 - **冷启动**：容器起来后 flide 尚未就绪的几秒里 `/v1/state` 会返回 502；
   编排侧把它当"本轮没状态"，不会影响文本链路。预热请求在 2.4s 左右。
+
+### 槽位白名单实测（2026-11-19 下午，同一台 106 GPU0）
+
+`STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction`
+⇒ turn 轮 **5 问**（`person_visible` + 上面 4 个），单帧 640px，其余参数同上：
+
+| 并发 | p50 | p95 | 吞吐 | 19 问 p95 对照 |
+|---|---|---|---|---|
+| 1 | 168ms | 172ms | 5.9 QPS | 180ms |
+| 2 | 354ms | 376ms | 5.7 QPS | 289ms |
+| 4 | 300ms | 372ms | 13.1 QPS | 455ms |
+| 8 | 411ms | **474ms** | 18.1 QPS | ~700ms（12 QPS） |
+
+（两轮独立跑批：另一轮是 176/361/389/518ms；8 路 p95 落在 474~518ms。）
+
+- **收益在并发侧**：8 路 p95 从 ~700ms 降到 ~475~520ms、吞吐 12 → 18 QPS；
+  单路几乎不变（~170ms）—— 瓶颈是**视觉 prefill 加批**，不是生成问数。
+- 2 路那一行比 19 问还差（354 vs 232ms）是**合批对不齐的抖动**：两条请求
+  落在两个 GPU 轮次时各付一次全价，重复跑会摆到 ~230~380ms 区间。
+- 单路 max 956ms 是冷启动第一条（权重/KV 刚起来）；**容器起来后前 ~2 分钟
+  会有一串 502/超长尾**，验收要在 flide 打出 `loaded ... in 3.4s` 之后跑。
+- 显存不变（模型常驻部分与题数无关）：GPU0 已用 21340 MiB、余 2785 MiB。
 
 ## 部署
 

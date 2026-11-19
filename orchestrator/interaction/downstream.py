@@ -12,7 +12,8 @@ from ..omni.describe import (
     is_no_change, looks_conversational, parse_state, render_state,
 )
 from ..omni.state_schema import (
-    fuse_emotion, merge_e2, merge_vision_text, render_e2_json,
+    filter_e2_slots, fuse_emotion, merge_e2, merge_vision_text,
+    parse_slots, partial_keys, person_missing, render_e2_json,
 )
 
 from ..downstream.interface import (
@@ -155,7 +156,8 @@ class InteractionDownstream:
                  on_output: Optional[Any] = None,
                  agent_mcp_servers: Optional[list] = None,
                  omni_state: bool = False,
-                 state_conf_in_text: bool = True) -> None:
+                 state_conf_in_text: bool = True,
+                 state_slots: str = "") -> None:
         self._desc_enabled = bool(omni_describe)
         #: state head 是否在跑（`ORCH_STATE_HEAD`）。**只影响发布节奏**：
         #: 开 ⇒ 视觉快照由 `OmniState` 那一侧统一发布，文本描述只更新
@@ -163,6 +165,11 @@ class InteractionDownstream:
         self._state_enabled = bool(omni_state)
         #: 渲染成 `label(0.82)` 形态
         self._state_conf_in_text = bool(state_conf_in_text)
+        #: E2 只出哪些槽位（`ORCH_STATE_SLOTS`）。空集合 = 全给 E2（老口径）。
+        #: 非空时：E2 只裁到这些槽位，文本那半留着，几个"两边各答一半"的键
+        #: （`ATTENTION` / `BEHAVIOR` / `RELATION`）按拼接而不是覆盖合并。
+        self._state_slots = parse_slots(state_slots)
+        self._state_concat = partial_keys(self._state_slots)
         #: 最近一份**生成完**的 VLM 描述（见 `_on_vlm_description`）。
         #: 由 `agent_sink` 的 getter 在**推视觉轮的那一刻**同步读取（正常话轮
         #: 不再取它，见 `agent_sink._send`）—— 所以这里必须是一份"随时可用"
@@ -181,6 +188,11 @@ class InteractionDownstream:
         self._state_e2: Dict[str, Any] = {}
         self._state_at = 0.0
         self._state_stage = ""
+        #: `person_visible` 的**滞回**状态：1Hz 采样下门控会在阈值附近抖
+        #: （这拍 null、下拍 []），8 键跟着跳。与当前结论不同时需要连续
+        #: 2 拍一致才翻转；`None` = 还没收到过第一份 E2。
+        self._person_missing: Optional[bool] = None
+        self._person_flip_pending = 0
         #: 最近一次 ASR 段末的情绪（`emotion` / `emotion_prob`）及其时刻。
         #: 只有 `2pass-offline` 才有，且**只在一个段末有效** —— 超过
         #: `_ASR_EMOTION_TTL_S` 就当没有，不拿旧情绪无限沿用。
@@ -313,6 +325,8 @@ class InteractionDownstream:
         self._state_e2 = {}
         self._state_at = 0.0
         self._state_stage = ""
+        self._person_missing = None
+        self._person_flip_pending = 0
         # ASR 情绪属于**上一个说话人/上一句话**，新会话必须清掉
         self._asr_emotion = None
         self._asr_emotion_prob = None
@@ -848,14 +862,52 @@ class InteractionDownstream:
     def _on_state(self, ev: OmniState) -> None:
         """收下一份 E2：合并 → 情绪晚融合 → 发布八键快照。"""
         e2 = merge_e2(self._state_e2, ev.state, ev.stage)
+        if self._state_slots:
+            # 白名单：只留实测可靠的槽位，其余由文本描述提供。裁在**合并后**
+            # 做（合并语义不变），缓存里因此也不会留下白名单外的残值。
+            e2 = filter_e2_slots(e2, self._state_slots)
+        # ---- person_visible 两拍滞回 ----
+        #
+        # 1Hz 采样下"人在不在画面"会在阈值附近抖：这一拍整份 null、下一拍
+        # 又正常。下游 8 键跟着跳，Agent 每一轮看到的"有没有人"都在变。
+        # 所以结论翻转要连续 2 拍一致；待确认的那一拍**丢弃整份读数**
+        # （不放宽成"保留一半"：null 与 [] 对策略相反的正是这个门控本身）。
+        raw_missing = person_missing(e2)
+        if self._person_missing is None:
+            self._person_missing = raw_missing
+        elif raw_missing != self._person_missing:
+            self._person_flip_pending += 1
+            if self._person_flip_pending < 2:
+                logger.info("[%s] [VLM state] 人物可见性翻转待确认"
+                            "（%s → %s，%d/2 拍）—— 本拍丢弃这份读数",
+                            self.session_id,
+                            "人不在画面" if self._person_missing else "人在画面",
+                            "人不在画面" if raw_missing else "人在画面",
+                            self._person_flip_pending)
+                return
+            logger.info("[%s] [VLM state] 人物可见性翻转已确认（%s → %s）",
+                        self.session_id,
+                        "人不在画面" if self._person_missing else "人在画面",
+                        "人不在画面" if raw_missing else "人在画面")
+            self._person_missing = raw_missing
+            self._person_flip_pending = 0
+        else:
+            self._person_flip_pending = 0
         emo = e2.get("EMOTION") or {}
         visual = emo.get("visual") or {}
-        a_label, a_prob = self._fresh_asr_emotion()
-        label, conflict = fuse_emotion(visual, a_label, a_prob)
-        e2 = dict(e2)
-        # `label` 是综合结论（视觉 + 语音），`visual` 保持纯视觉原值 ——
-        # schema §3.3 明确两者独立、可交叉校验，语音侧**永不覆盖** visual。
-        e2["EMOTION"] = {"label": label, "visual": visual, "conflict": conflict}
+        if visual:
+            a_label, a_prob = self._fresh_asr_emotion()
+            label, conflict = fuse_emotion(visual, a_label, a_prob)
+            e2 = dict(e2)
+            # `label` 是综合结论（视觉 + 语音），`visual` 保持纯视觉原值 ——
+            # schema §3.3 明确两者独立、可交叉校验，语音侧**永不覆盖** visual。
+            e2["EMOTION"] = {"label": label, "visual": visual, "conflict": conflict}
+        else:
+            # E2 没给视觉情绪（白名单回滚档没问 `emo.visual`，或模型整份
+            # 没答）⇒ **不碰 EMOTION**：文本那份是唯一来源，塞一个空结论
+            # 进去只会把文本的情绪冲成 unknown。晚融合在这一档不生效。
+            e2 = {k: v for k, v in e2.items() if k != "EMOTION"}
+            a_label = a_prob = label = conflict = None
         self._state_e2 = e2
         self._state_at = time.monotonic()
         self._state_stage = ev.stage
@@ -878,8 +930,11 @@ class InteractionDownstream:
         # 下一轮还要在上面 `update(parsed)`。写回去会让 `ENV` / `POSITION`
         # 每发布一次就多拼一段 E2 内容（`merge_vision_text` 对这两个键是
         # **拼接**而非覆盖，见 `state_schema._HALF_KEYS`）。
+        # `concat_keys`：白名单只接管半个键时（ATTENTION/BEHAVIOR/RELATION），
+        # 文本那半必须拼上而不是被 E2 覆盖 —— 见 `state_schema.partial_keys`。
         merged = (merge_vision_text(self._vlm_state, e2,
-                                    self._state_conf_in_text)
+                                    self._state_conf_in_text,
+                                    concat_keys=self._state_concat)
                   if e2 else dict(self._vlm_state))
         lines: List[str] = []
         if e2:

@@ -75,13 +75,21 @@ class StateClient:
 
     def __init__(self, url: str, timeout_s: float = 0.8, n_frames: int = 2,
                  max_px: int = 640, fail_threshold: int = 5,
-                 cooldown_s: float = 30.0) -> None:
+                 cooldown_s: float = 30.0, slots: str = "") -> None:
         self.url = (url or "").rstrip("/")
         self.timeout_s = float(timeout_s)
         self.n_frames = max(1, int(n_frames))
         self.max_px = int(max_px)
         self.fail_threshold = max(1, int(fail_threshold))
         self.cooldown_s = float(cooldown_s)
+        #: 槽位白名单（`ORCH_STATE_SLOTS`）—— **每次请求都带给服务端**，
+        #: 这样"文本省哪几项"与"E2 答哪几项"只有一个写者，不会因为容器
+        #: 的 `STATE_SLOTS` 没跟着改而出现"没人回答的槽位"。
+        #: 空列表 = 问全套（显式发 `[]`，与服务端 env 默认值区分开）。
+        self.slots: List[str] = [s.strip() for s in str(slots or "").split(",")
+                                 if s.strip()]
+        if set(self.slots) & {"all", "*"}:
+            self.slots = []
         self._client: Optional[httpx.AsyncClient] = None
         self._fails = 0
         self._open_until = 0.0
@@ -132,6 +140,9 @@ class StateClient:
             "transcript": transcript or "",
             "asr_emotion": asr_emotion,
             "asr_emotion_prob": asr_emotion_prob,
+            # **总是**发（哪怕是空列表）：服务端据此区分"调用方要求全套"
+            # 与"调用方没意见，用我的 STATE_SLOTS 默认值"。
+            "slots": list(self.slots),
         }
         if tier2 is not None:
             body["tier2"] = bool(tier2)

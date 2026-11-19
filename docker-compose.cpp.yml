@@ -185,6 +185,10 @@ services:
       STATE_MAX_MEDIA_PX: "${STATE_MAX_MEDIA_PX:-640}"
       STATE_TIMEOUT_S: "${STATE_TIMEOUT_S:-3.0}"
       STATE_TIER2: "${STATE_TIER2:-0}"
+      # 槽位白名单**默认值**：空 = 问全套。编排侧每次请求都带
+      # `ORCH_STATE_SLOTS`，以请求为准；这个 env 只在不带 `slots` 的
+      # 调用方（手工 curl / bench）下生效。
+      STATE_SLOTS: "${STATE_SLOTS:-}"
     ports:
       - "${STATE_HEAD_HOST_PORT:-22520}:22520"
     volumes:

@@ -13,8 +13,9 @@
       "frames_b64": ["<最新帧>", "<1 秒前的帧>"],   # 裸 base64 或 data URL
       "fps": 1.0,                                  # 帧间隔（给 video 打时间戳）
       "stage": "turn",                             # turn | full
-      "tier2": false,                              # 是否加长尾动作题
+      "tier2": false,                              # 已作废（动作是一题 act.type）
       "session_id": "abc",                         # 只用于同会话互斥
+      "slots": ["attn.gaze", "beh.activity"],      # 白名单；[]=问全套，缺省=用 STATE_SLOTS
       "transcript": "",                            # 预留：V1 不参与推断
       "asr_emotion": null,                         # 预留：融合在编排侧做
       "asr_emotion_prob": null
@@ -27,7 +28,7 @@
       "state": { ...E2 §4.3... },
       "confidence": {"ATTENTION.orientation": 0.71, ...},
       "latency_ms": 312, "model": "OneJev1.6-0.8B",
-      "backend": "onejev", "stage": "turn", "n_questions": 19
+      "backend": "onejev", "stage": "turn", "n_questions": 15
     }
 
 ## 为什么 ``transcript`` / ``asr_emotion`` 收下却不用
@@ -53,7 +54,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .assemble import assemble, flatten_confidence
+from .assemble import assemble, flatten_confidence, project_slots
 from .backends import BackendError, SystemOneBackend, build_media, warmup
 from .questions import build_questions
 from .scheduler import Capacity, SessionGate, parse_urls
@@ -85,6 +86,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_slots(raw: Optional[str]) -> frozenset:
+    """``STATE_SLOTS`` → 题集 id 集合。空 / ``all`` / ``*`` ⇒ 空集合（问全套）。
+
+    与编排侧 ``orchestrator/omni/state_schema.parse_slots`` **同一口径**；
+    两边都为空时就是老行为（E2 出全部枚举槽位、文本侧走短文本）。
+    """
+    items = {s.strip() for s in (raw or "").split(",") if s.strip()}
+    if not items or items & {"all", "*"}:
+        return frozenset()
+    return frozenset(items)
+
+
 class Settings:
     """启动期读一次的环境（全部在 compose / .env 里可调）。"""
 
@@ -108,6 +121,11 @@ class Settings:
         self.model_dir = os.environ.get("STATE_MODEL_DIR", "onejev-1.6-0.8b")
         #: 场景/任务提示（模型卡 ``state.task``）。空 = 不发，行为不变。
         self.context = os.environ.get("STATE_CONTEXT", "")
+        #: 槽位白名单（``STATE_SLOTS``）：非空则**只问这些**，题数与延迟同步
+        #: 下降。空 / ``all`` / ``*`` = 问全套。默认那 4 个零样本实测可靠的
+        #: 槽位由编排侧的 ``ORCH_STATE_SLOTS`` 决定，这里两处必须一致 ——
+        #: 不一致的症状是「文本以为 E2 会答某一项，E2 却没问」，那一项就空了。
+        self.slots = _parse_slots(os.environ.get("STATE_SLOTS", ""))
 
 
 SETTINGS = Settings()
@@ -150,6 +168,9 @@ class StateRequest(BaseModel):
     session_id: str = ""
     #: 场景/任务提示（对应模型卡里的 ``state.task``）。空则用 ``STATE_CONTEXT``。
     context: str = ""
+    #: 槽位白名单（题集 id）。编排侧 `StateClient` **每次都发**：``[]`` =
+    #: 明确要求问全套；``None`` = 没意见，用服务端 ``STATE_SLOTS``。
+    slots: Optional[List[str]] = None
     # 预留字段（见模块文档）：V1 不参与推断，只回显
     transcript: str = ""
     asr_emotion: Optional[str] = None
@@ -171,9 +192,10 @@ class StateResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BACKEND
-    logger.info("[state_head] backend=%s urls=%s max_px=%d tier2=%s",
+    logger.info("[state_head] backend=%s urls=%s max_px=%d tier2=%s slots=%s",
                 SETTINGS.backend_name, SETTINGS.urls, SETTINGS.max_px,
-                SETTINGS.default_tier2)
+                SETTINGS.default_tier2,
+                ",".join(sorted(SETTINGS.slots)) or "all")
     BACKEND = SystemOneBackend(SETTINGS.urls, timeout_s=SETTINGS.timeout_s,
                                debias=SETTINGS.debias,
                                max_connections=SETTINGS.max_concurrency)
@@ -217,6 +239,9 @@ async def health() -> JSONResponse:
         "backend": SETTINGS.backend_name,
         "endpoints": SETTINGS.urls,
         "max_px": SETTINGS.max_px,
+        # 白名单为空表示"问全套"。部署时它应与编排侧的 `ORCH_STATE_SLOTS`
+        # 一致，否则会出现"文本以为 E2 会答某一项、E2 却没问"的空洞。
+        "slots": sorted(SETTINGS.slots),
         "inflight": CAPACITY.inflight,
         "peak": CAPACITY.peak,
         "stats": dict(BACKEND.stats, **GATE.stats),
@@ -229,8 +254,10 @@ async def questions(stage: str = "turn", tier2: bool = None) -> Dict[str, Any]:
     """当前生效的题集（排错用：延迟超预算时先看这里数了几题）。"""
     q = build_questions(stage=stage,
                         tier2=SETTINGS.default_tier2 if tier2 is None else tier2,
-                        include_lighting=SETTINGS.lighting)
-    return {"stage": stage, "count": len(q), "questions": q}
+                        include_lighting=SETTINGS.lighting,
+                        slots=SETTINGS.slots)
+    return {"stage": stage, "count": len(q),
+            "slots": sorted(SETTINGS.slots), "questions": q}
 
 
 @app.post("/v1/state", response_model=StateResponse)
@@ -244,8 +271,15 @@ async def state(req: StateRequest) -> StateResponse:
 
     stage = "full" if str(req.stage).lower() == "full" else "turn"
     tier2 = SETTINGS.default_tier2 if req.tier2 is None else bool(req.tier2)
+    # 请求给了就听请求（`[]` = 问全套），没给才用服务端默认 —— 编排侧是
+    # 唯一的白名单写者，两边的 `STATE_SLOTS` 因此不会漂。
+    slots = SETTINGS.slots if req.slots is None else frozenset(
+        s.strip() for s in req.slots if s and s.strip())
+    if slots & {"all", "*"}:
+        slots = frozenset()
     questions = build_questions(stage=stage, tier2=tier2,
-                                include_lighting=SETTINGS.lighting)
+                                include_lighting=SETTINGS.lighting,
+                                slots=slots)
     frames = [_downscale(f, SETTINGS.max_px, SETTINGS.jpeg_quality)
               for f in req.frames_b64]
     media_state, media = build_media(
@@ -271,6 +305,9 @@ async def state(req: StateRequest) -> StateResponse:
         person_p=SETTINGS.person_p, action_p=SETTINGS.action_p,
         enum_min_conf=SETTINGS.enum_min_conf, max_events=SETTINGS.max_events,
     )
+    if slots:
+        # 只返回**真的问过**的槽位（"人不在画面"那种整份 null 不裁）。
+        e2 = project_slots(e2, questions)
     latency_ms = int((time.monotonic() - started) * 1000)
     conf = flatten_confidence(e2)
     logger.info("[VLM state] stage=%s latency=%dms slots=%d conf=%d 键",

@@ -16,7 +16,10 @@
 5. `merge_vision_text`：`ENV` / `POSITION` 是**两半拼起来**的，不能整键覆盖；
    文本侧那份 `_vlm_state` **不能被合成结果污染**（否则每发布一次就长一截）；
 6. `StateClient` 拿不到服务时**返回 None 而不是抛异常**，并在连续失败后熔断
-   （缺 httpx 时这一段跳过 —— 本地开发机常常没装，105/镜像里才有）。
+   （缺 httpx 时这一段跳过 —— 本地开发机常常没装，105/镜像里才有）；
+7. **槽位白名单**（`ORCH_STATE_SLOTS`）：E2 只留白名单槽位、"人不在画面"
+   的整份 null 不裁、半份键（ATTENTION/BEHAVIOR/RELATION）由文本拼接、
+   E2 没产视觉情绪时**不冲掉**文本那份；外加与 `state_head` 的表一致性。
 
     python -m orchestrator.tests.test_state_merge
 """
@@ -29,7 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from orchestrator.omni.state_schema import (  # noqa: E402
-    merge_e2, fuse_emotion, to_vision_strings, merge_vision_text,
+    DEFAULT_STATE_SLOTS, KEY_SLOTS, filter_e2_slots, merge_e2, fuse_emotion,
+    to_vision_strings, merge_vision_text, parse_slots, partial_keys,
     render_e2_json, flatten_confidence,
 )
 
@@ -199,13 +203,19 @@ def t_merge_text() -> None:
 
 
 #: 下游 `_publish_vision` 的最小替身 —— 只装它真正读写的那几个字段。
-def _mk_pub(state_enabled: bool = True, conf: bool = True):
+def _mk_pub(state_enabled: bool = True, conf: bool = True,
+            slots: str = ""):
     from orchestrator.interaction.downstream import InteractionDownstream
 
     d = InteractionDownstream.__new__(InteractionDownstream)
     d.session_id = "t-state-merge"
     d._state_enabled = state_enabled
     d._state_conf_in_text = conf
+    d._state_slots = parse_slots(slots)
+    d._state_concat = partial_keys(d._state_slots)
+    d._asr_emotion = None
+    d._asr_emotion_prob = None
+    d._asr_emotion_at = 0.0
     d._vlm = ""
     d._vlm_state = {}
     d._vlm_text = ""
@@ -213,6 +223,9 @@ def _mk_pub(state_enabled: bool = True, conf: bool = True):
     d._state_at = 0.0
     d._state_stage = ""
     d._vlm_stage = ""
+    # person_visible 两拍滞回的游标（`_on_state` 里的新字段）
+    d._person_missing = None
+    d._person_flip_pending = 0
     d.ic_calls = []
     d.rounds = []
 
@@ -296,6 +309,267 @@ def t_state_client() -> None:
           "熔断期间直接跳过，不再发请求")
     check(asyncio.run(c.post_state([])) is None, "没有帧 ⇒ None")
 
+    # 白名单**每次都发**：空列表也是显式的"问全套"，与服务端 env 默认值区分开
+    class _Cap:
+        def __init__(self) -> None:
+            self.body = None
+
+        async def post(self, url, json=None, **kw):
+            self.body = json
+
+            class _R:
+                status_code = 200
+                text = ""
+
+                def json(self):
+                    return {"state": {"ATTENTION": {"gaze": _node("at_screen")}},
+                            "latency_ms": 5, "model": "onejev",
+                            "n_questions": 1}
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    for raw, want in (("attn.gaze, beh.activity", ["attn.gaze", "beh.activity"]),
+                      ("", []), ("all", [])):
+        cc = StateClient("http://127.0.0.1:1", slots=raw)
+        cap = _Cap()
+        cc._client = cap
+        out = asyncio.run(cc.post_state(["AAAA"], stage="turn"))
+        check(out is not None and cap.body.get("slots") == want,
+              f"slots={raw!r} ⇒ 请求体 slots={cap.body.get('slots')}（期望 {want}）")
+
+
+def t_slots() -> None:
+    print("\n[8] 槽位白名单：裁剪 / 半份键拼接 / 情绪不被空值冲掉")
+    slots = parse_slots(",".join(DEFAULT_STATE_SLOTS))
+    check(set(slots) == set(DEFAULT_STATE_SLOTS), "默认白名单解析正确")
+    _known = {i for ids in KEY_SLOTS.values() for i in ids}
+    check(set(DEFAULT_STATE_SLOTS) <= _known,
+          "默认白名单的每一项都属于某个 8 键（防拼写错误静默失效）")
+    check(parse_slots("") == frozenset(), "空 ⇒ 空集合（E2 全出）")
+    check(parse_slots("all") == frozenset() and parse_slots("*") == frozenset(),
+          "all / * ⇒ 空集合（退老口径）")
+
+    cut = filter_e2_slots(E2_FULL, slots)
+    check(cut["ATTENTION"] == {"gaze": E2_FULL["ATTENTION"]["gaze"]},
+          "ATTENTION 只剩 gaze（orientation 交回文本）")
+    check("ACTION" not in cut, "ACTION 不在白名单 ⇒ 整键裁掉")
+    check("EMOTION" not in cut, "EMOTION 不在白名单 ⇒ 整键裁掉")
+    check(set(cut["BEHAVIOR"]) == {"activity"}, f"BEHAVIOR 只剩 activity：{cut['BEHAVIOR']}")
+    check(set(cut["RELATION"]) == {"person_count", "interaction"},
+          f"RELATION 只剩人数与互动：{cut['RELATION']}")
+    check("ENV" not in cut and "POSITION" not in cut, "ENV/POSITION 也裁掉")
+
+    half = partial_keys(slots)
+    check(half == frozenset({"ATTENTION", "BEHAVIOR", "RELATION"}),
+          f"半份键 = ATTENTION/BEHAVIOR/RELATION（ACTION 是整键）：{sorted(half)}")
+
+    # 「人不在画面」是读数，**整份保留**（门控语义不能因为裁剪丢掉）
+    gone = {"ACTION": {"events": None},
+            "ATTENTION": {"orientation": {"label": None}, "gaze": {"label": "unknown"}},
+            "BEHAVIOR": {"posture": {"label": "standing"}},
+            "ENV": {"scene": {"label": "office"}}}
+    check(filter_e2_slots(gone, slots) is gone,
+          "人不见（events=null 且 orientation=null）⇒ 不裁，整份 null 读数保留")
+
+    # 半份键：文本那半必须拼上，不能整键覆盖
+    text = {"ATTENTION": "面向屏幕", "BEHAVIOR": "站立 6 秒",
+            "RELATION": "单人，同伴"}
+    merged = merge_vision_text(text, cut, concat_keys=half)
+    check("gaze=at_screen" in merged["ATTENTION"]
+          and merged["ATTENTION"].startswith("面向屏幕"),
+          f"ATTENTION = 文本(朝向) + E2(视线)：{merged['ATTENTION']}")
+    check("activity=working" in merged["BEHAVIOR"]
+          and merged["BEHAVIOR"].startswith("站立 6 秒"),
+          f"BEHAVIOR = 文本(姿态/时长) + E2(活动)：{merged['BEHAVIOR']}")
+    # 不给 concat_keys 时是**整键覆盖**（老口径），确保两种口径真的不同
+    overwritten = merge_vision_text(text, cut)
+    check(not overwritten["ATTENTION"].startswith("面向屏幕"),
+          "不传 concat_keys ⇒ 整键覆盖（对照组，证明上面那条真的靠 concat）")
+
+    # 下游 `_on_state`：EMOTION 不在白名单时**不碰**文本那份情绪
+    d = _mk_pub(slots=",".join(DEFAULT_STATE_SLOTS))
+    d._vlm_state = {"EMOTION": "label=平静", "ATTENTION": "面向屏幕",
+                    "BEHAVIOR": "站立 6 秒", "RELATION": "单人"}
+    d._vlm_text = "EMOTION: label=平静"
+    from orchestrator.downstream.interface import OmniState
+    d._on_state(OmniState(t=0, stage="turn",
+                          state=dict(E2_FULL, EMOTION={"visual": _node("neutral", 0.9)}),
+                          latency_ms=1, model="onebit"))
+    check("EMOTION" not in d._state_e2,
+          "E2 没产视觉情绪（白名单不含 emo.visual）⇒ 不往缓存里塞空 EMOTION")
+    check("label=平静" in d._vlm, f"文本那份情绪原样留着：{d._vlm.splitlines()}")
+    check("gaze=at_screen" in d._vlm, "E2 的 gaze 进了快照")
+    check(d._vlm_state.get("ATTENTION") == "面向屏幕",
+          "文本侧 ATTENTION 未被污染（拼接结果不写回 _vlm_state）")
+
+    # 契约：state_head 那份 `_SLOT_PATHS` 与编排侧逐条一致
+    try:
+        from state_head.assemble import _SLOT_PATHS as SH_PATHS
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [SKIP] 本机 import 不到 state_head（{exc}）")
+    else:
+        from orchestrator.omni.state_schema import _SLOT_PATHS as ORCH_PATHS
+        check(SH_PATHS == ORCH_PATHS,
+              "state_head 与编排侧的槽位→E2 路径表逐条一致")
+
+
+#: 人不在画面时的一份完整 full 读数（`state_head.assemble` 的形态）。
+E2_GONE = {
+    "ATTENTION": {"orientation": {"label": None, "confidence": None},
+                  "gaze": {"label": None, "confidence": None}},
+    "ACTION": {"events": None},
+    "EMOTION": {"visual": {"label": "unknown", "confidence": 0.0}},
+    "BEHAVIOR": {"posture": {"label": None, "confidence": None},
+                 "motion": {"label": None, "confidence": None},
+                 "activity": {"label": None, "confidence": None},
+                 "duration_s": None},
+    "RELATION": {"person_count": None,
+                 "interaction": {"label": None, "confidence": None},
+                 "target": {"label": None, "confidence": None}},
+    "ENV": {"scene": {"label": "office", "confidence": 0.8},
+            "lighting": {"label": "bright", "confidence": 0.7}},
+    "POSITION": {"region": {"label": None, "confidence": None}},
+}
+
+
+def t_hysteresis() -> None:
+    print("\n[9] person_visible 两拍滞回（1Hz 采样不抖）")
+    from orchestrator.downstream.interface import OmniState
+
+    def push(d, state: dict) -> None:
+        d._on_state(OmniState(t=time.monotonic(), stage="full",
+                              state=state, latency_ms=1, model="onebit"))
+
+    d = _mk_pub()
+    push(d, E2_FULL)
+    check(d._person_missing is False, "首拍定基线：人在画面")
+    baseline = d._state_e2
+    n_pub = len(d.ic_calls)
+
+    push(d, E2_GONE)
+    check(d._state_e2 is baseline, "第 1 拍『人不见了』整份丢弃（缓存不动）")
+    check(len(d.ic_calls) == n_pub, "待确认的那一拍不发布")
+    check(d._person_flip_pending == 1, "翻转计数 1/2")
+
+    push(d, E2_FULL)
+    check(d._person_flip_pending == 0 and d._person_missing is False,
+          "下一拍又见人 ⇒ 计数清零，不翻转")
+
+    push(d, E2_GONE)
+    check(d._person_flip_pending == 1, "重新计数 1/2")
+    push(d, E2_GONE)
+    check(d._person_missing is True, "连续 2 拍一致 ⇒ 翻转生效")
+    check(d._state_e2.get("ACTION", {}).get("events") is None,
+          "翻转后缓存的是 null 读数（看不到人）")
+
+    # 反向同样要两拍：单拍"又看到人"不翻回
+    push(d, E2_FULL)
+    check(d._person_missing is True and d._person_flip_pending == 1,
+          "从 null 翻回也要两拍（单拍不翻回）")
+
+
+def t_desc_only_parse() -> None:
+    print("\n[11] desc-only 三行解析（FEATURE / ENV / POSITION）")
+    from orchestrator.omni.describe import parse_state, render_state
+
+    three = ("FEATURE: 青年女性，灰色短袖，戴眼镜\n"
+             "ENV: 白杯、绿植、木质展台\n"
+             "POSITION: 站在展台右侧，偏画面中央")
+    got = parse_state(three)
+    check(set(got) == {"FEATURE", "ENV", "POSITION"} and len(got) == 3,
+          f"三行 ⇒ 三个键：{sorted(got)}")
+    check(got["FEATURE"].startswith("青年女性"), "FEATURE 值完整")
+
+    wrapped = ("FEATURE: 青年女性，灰色短袖，戴眼镜\n"
+               "ENV: 白杯、绿植\n"
+               "木质展台\n"          # 模型换行续写，没有 KEY:
+               "POSITION: 展台右侧")
+    got2 = parse_state(wrapped)
+    check(set(got2) == {"FEATURE", "ENV", "POSITION"},
+          "多行（续行无 KEY:）⇒ 仍只出三个键，续行被忽略")
+    check("木质展台" not in "".join(got2.values()),
+          "续行不污染相邻字段（解析不到就丢）")
+
+    eight = "\n".join(f"{k}: 值{k}" for k in
+                      ("ATTENTION", "ACTION", "EMOTION", "FEATURE",
+                       "BEHAVIOR", "RELATION", "ENV", "POSITION"))
+    got3 = parse_state(eight)
+    check(len(got3) == 8, "8 键形态仍可解析（ORCH_TEXT_DESC_ONLY=0 的回滚路径）")
+
+    check(parse_state("好的，我看到了一个用户。") == {},
+          "对话式回复 ⇒ 空 dict（调用方回退原文）")
+    check(render_state(got) ==
+          "FEATURE: " + got["FEATURE"] + "\nENV: " + got["ENV"] +
+          "\nPOSITION: " + got["POSITION"], "按 STATE_KEYS 顺序渲染三行")
+
+
+def t_state_head_contract() -> None:
+    print("\n[12] state_head 题集 / assemble：schema §3 对齐 + 动作单题")
+    try:
+        from state_head.questions import build_questions
+        from state_head.assemble import assemble
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [SKIP] 本机 import 不到 state_head（{exc}）")
+        return
+
+    full = build_questions(stage="full")
+    turn = build_questions(stage="turn")
+    check(len(full) == 16, f"full = 16 问（§3 全枚举槽位）：{len(full)}")
+    check(len(turn) == 15 and "env.scene" not in turn,
+          f"turn = 15 问、不含 env.scene：{len(turn)}")
+    check("act.type" in full and "env.scene" in full, "act.type / env.scene 都在 full 里")
+    check(not any(q.split(".")[0] == "act" and q not in ("act.type", "act.count")
+                  for q in full),
+          "不再按动作类别拆 noul（没有 act.nod / act.wave …）")
+    check(set(full["act.type"]["criteria"]) == {
+        "nod", "shake_head", "wave", "point", "thumbs_up", "raise_hand",
+        "clap", "hand_over_object", "other", "none"},
+        "act.type 是 10 选 1（8 类 + other + none）")
+    check(list(full["act.type"]["criteria"])[-2:] == ["other", "none"],
+          "none 放最后（不让『没动作』占 argmax 先手）")
+
+    base = {"person_visible": {"type": "noul", "noul": 0.92}}
+
+    def _act(choice: str, p: float = 0.8, count: float = 0.0) -> dict:
+        return {**base,
+                "act.type": {"type": "choice", "choice": choice,
+                             "probabilities": {choice: p}},
+                "act.count": {"type": "score", "score": count}}
+
+    out = assemble(_act("none", 0.9), stage="full", has_scene=True)
+    check(out["ACTION"]["events"] == [],
+          "act.type=none ⇒ events=[]（看到人、确实没动作）")
+
+    out = assemble(_act("nod", 0.8), stage="full", has_scene=True)
+    check(out["ACTION"]["events"] == [
+        {"type": "nod", "count": 1, "confidence": 0.8}],
+        f"nod p=0.8 ⇒ 单条事件：{out['ACTION']['events']}")
+    check(len(out["ACTION"]["events"]) == 1, "一拍最多 1 条事件")
+
+    out = assemble(_act("nod", 0.4), stage="full", has_scene=True, action_p=0.5)
+    check(out["ACTION"]["events"] == [], "选中项低于 action_p ⇒ []（不让噪声动作入状态）")
+
+    out = assemble({**base, "act.type": {"type": "choice", "choice": "other",
+                                         "probabilities": {"other": 0.7}}},
+                   stage="full", has_scene=True)
+    check(out["ACTION"]["events"][0]["type"] == "other",
+          "other 是 schema 枚举值，原样出（细节由文本描述补）")
+
+    out = assemble({"person_visible": {"type": "noul", "noul": 0.1},
+                    "act.type": {"type": "choice", "choice": "nod",
+                                 "probabilities": {"nod": 0.9}}},
+                   stage="full", has_scene=True)
+    check(out["ACTION"]["events"] is None, "人不在画面 ⇒ events=null（不是 []）")
+
+    # 白名单裁剪：人不见的整份 null 不裁（§5.1 门控读数要原样回编排侧）
+    from state_head.assemble import project_slots
+    cut = project_slots(out, {"act.type", "act.count"})
+    check((cut.get("ACTION") or {}).get("events", "missing") is None,
+          "人不见 ⇒ project_slots 不裁，ACTION.events=null 原样保留")
+
 
 def main() -> int:
     t_merge_e2()
@@ -305,6 +579,10 @@ def main() -> int:
     t_merge_text()
     t_publish_vision()
     t_state_client()
+    t_slots()
+    t_hysteresis()
+    t_desc_only_parse()
+    t_state_head_contract()
     print()
     if _failures:
         print(f"❌ {len(_failures)} 项失败：")

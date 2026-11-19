@@ -19,10 +19,14 @@
 * `FULL_INSTRUCTION` —— 会话起点：8 个字段，**允许展开细节**（这份要当背景）；
 * `TURN_INSTRUCTION` —— 每轮：8 个字段，**每个值压到最短**（成本在这里）。
 * `SHORT_FULL_INSTRUCTION` / `SHORT_TURN_INSTRUCTION` —— **接了 state head 之后**
-  （`ORCH_STATE_HEAD=1` 且 `ORCH_TEXT_SHORT=1`）改用的短版：只输出
-  `FEATURE` / `ENV` / `POSITION` / `DESCRIPTION` 4 行，枚举槽位全部交给
-  typed-question 模型。没开 state head 就**不要**用它 —— 8 个键里砍掉 5 个
+  （`ORCH_STATE_HEAD=1` 且 `ORCH_TEXT_SHORT=1`，且 `ORCH_STATE_SLOTS` 为空
+  = E2 出全部枚举槽位）改用的短版：只输出 `FEATURE` / `ENV` / `POSITION` /
+  `DESCRIPTION` 4 行。没开 state head 就**不要**用它 —— 8 个键里砍掉 5 个
   而没人补，等于把状态丢了。
+* `partial_instruction(stage, slots)` —— **槽位白名单**模式
+  （`ORCH_STATE_SLOTS` 非空，默认 `attn.gaze,beh.activity,rel.person_count,
+  rel.interaction`）：保留 8 行形状，只把 E2 已经答了的项交代成"别写"。
+  为什么不直接砍成 4 行：见 `partial_instruction` 的 docstring。
 
 关键约束：`system_prompt` 只在 `session.init` 时定一次（`input.append` 没有
 逐轮 prompt 字段）。所以"这一轮要什么"只能靠注入指令区分 —— 但也**只能
@@ -251,6 +255,88 @@ SHORT_TURN_INSTRUCTION = (
     "不要输出 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION，"
     "也不要写“无变化”这类话；不确定的写“不可见”。"
 )
+
+
+#: **desc-only** 模式的 system prompt —— schema §3 对齐后的默认形态。
+#:
+#: 分工是**互斥且完备**的：
+#:
+#: * state head（OneJev）答 schema 里**所有枚举槽位**：
+#:   ATTENTION.orientation/gaze、ACTION.events[].type/count、
+#:   EMOTION.visual、BEHAVIOR.posture/motion/activity/duration_s、
+#:   RELATION.person_count/interaction/target、ENV.scene/lighting、
+#:   POSITION.region；
+#: * Qwen3-Omni 只答**自由文本槽位**：FEATURE.appearance/accessories、
+#:   ENV.objects、POSITION.relative_positions —— 再加一句 description。
+#:
+#: ⚠️ 为什么必须换 **system prompt** 而不是逐轮注入：2026-10-28 实测，
+#: 注入指令带不动"输出哪些类别"（151 字普通段落），也带不动详细程度
+#: （147→151 字，两版都失败）。见本模块顶部那两张表。
+#:
+#: ⚠️ `ENV` 行只说物品，**不说场景类型与光线** —— 那两个枚举由 state head
+#: 给，两边都写只会出现两份对不上的结论。
+DESC_ONLY_SYSTEM_PROMPT = """你是一个视频监控/行为分析助手。每轮只用三行描述当前画面：
+FEATURE: 画面中的用户 —— 性别、年龄段、穿着、配饰、正在做什么
+ENV: 环境 —— 画面里有哪些主要物品与环境要素（不写场景类型、不写光线）
+POSITION: 主要人物相对画面与其它物品的位置关系
+三行合计不超过 50 字，只写关键短语，不写完整句子；只描述实际可见的信息，
+不确定就省略该项；不要输出其它字段，不要与用户对话。
+不要写 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION —— 那几个字段由另一个模型判定。"""
+
+#: `main.py` 装配用（`ORCH_TEXT_DESC_ONLY=1` 且没有显式覆盖时选它）。
+DESC_ONLY_DESCRIBE_SYSTEM_PROMPT = DESC_ONLY_SYSTEM_PROMPT
+
+#: desc-only 的注入指令。**每轮与起点同一套** —— 起点那份也不需要更长。
+DESC_ONLY_INSTRUCTION = (
+    "本轮直接输出三行，格式照抄，合计不超过 50 字：\n"
+    "FEATURE: 用户（性别、年龄段、穿着、配饰、正在做什么）\n"
+    "ENV: 环境（画面里的主要物品与环境要素，不写场景类型与光线）\n"
+    "POSITION: 人物相对物品与画面的位置\n"
+    "不要确认、不要回应、不要以“好的/收到”开头，从 FEATURE: 开始。"
+)
+
+
+#: 每个 typed-question 槽位，在文本侧该**省掉**的那半句。
+#:
+#: 白名单模式下（`ORCH_STATE_SLOTS` 非空，默认就是那 4 个可靠槽位）
+#: Qwen3-Omni 仍然输出全量 8 行 —— 2026-10-28 实测「注入指令带不动
+#: 输出哪些类别」，所以只能保留 8 行形状，再逐项交代"这一项别写"。
+#: 被省掉的项由 state head 给，编排侧按 `partial_keys()` 拼起来。
+_SLOT_OMIT = {
+    "attn.orientation": "ATTENTION 里的镜头朝向（面向/侧身/背对）",
+    "attn.gaze": "ATTENTION 里的视线去向（看镜头/看屏幕/看别处）",
+    "act.*": "ACTION 整行（动作由另一个模型判定，不要输出这一行）",
+    "emo.visual": "EMOTION 整行（表情情绪由另一个模型判定，不要输出这一行）",
+    "beh.posture": "BEHAVIOR 里的姿态（站立/坐）",
+    "beh.motion": "BEHAVIOR 里的移动（行走/靠近/远离/转身）",
+    "beh.activity": "BEHAVIOR 里正在做的事（用手机/阅读/工作）",
+    "beh.duration": "BEHAVIOR 里的持续秒数",
+    "rel.person_count": "RELATION 里的人数",
+    "rel.interaction": "RELATION 里的互动方式（交谈/面对面/协作）",
+    "rel.target": "RELATION 里的主要交互对象",
+    "env.scene": "ENV 里的场景类型",
+    "env.lighting": "ENV 里的光线",
+    "pos.region": "POSITION 里的九宫格位置（画面中央/左侧…）",
+}
+
+
+def partial_instruction(stage: str, slots) -> str:
+    """**白名单模式**的指令：全量 8 行，但省掉 E2 已经答了的项。
+
+    与 `SHORT_TURN_INSTRUCTION` 的区别：短文本版要求"只输出 4 行"，而实测
+    证明逐轮注入砍不掉类别（模型会照着自己前几轮的风格继续输出 8 行）。
+    所以这里**保留 8 行形状**，只在细节上划清边界 —— 即使模型多写了，
+    编排侧拼接时也只是重复一遍同样的结论，不会丢信息。
+
+    ``slots`` 为空（E2 全出）时退回普通指令，等价于老行为。
+    """
+    base = FULL_INSTRUCTION if stage == "full" else TURN_INSTRUCTION
+    omit = [_SLOT_OMIT[s] for s in (slots or ()) if s in _SLOT_OMIT]
+    if not omit:
+        return base
+    return (base
+            + "\n下面这些项**由另一个模型判定，不要输出**（同一行里其余部分照常输出）："
+            + "；".join(omit) + "。")
 
 
 #: 「无变化」的判据 —— 命中的**不下发**（保住上一份有效描述，见

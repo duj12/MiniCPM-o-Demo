@@ -124,23 +124,48 @@ IC 始终在宿主进程内，每会话一份 Engine；`run_ic_105.sh/run_ic_106
 
 ### state head（带置信度的 E2 状态，默认关）
 
-`ORCH_STATE_HEAD=1` 时，编排会在**每次描述同一拍**再并行请求旁挂容器
+`ORCH_STATE_HEAD=1` 时，编排**按独立定时器**（默认 1s）请求旁挂容器
 `omnillm-state-head:22520`（`POST /v1/state`）：那边用轻量 typed-question 模型
-一次性回答 ~19 个 closed-enum 问题，直接给出 `Social_State_Schema_v2_1_Lite`
-的 E2（`{label, confidence}`）。两条链**互不等待**，`on_answer` 永远不等它们。
+一次回答 **16 个 closed-enum 问题**（`stage=full`，schema §3 的枚举槽位全部
+在内），直接给出 `Social_State_Schema_v2_1_Lite` 的 E2（`{label, confidence}`）。
+
+两条链**各自独立、互不等待**：
+
+* **Jev（state head）** —— 定时器触发，1Hz（帧率上限），每拍都是完整读数；
+* **Qwen3-Omni** —— 每话轮只出**三行描述**（`FEATURE` / `ENV` / `POSITION`，
+  ≤50 字），枚举槽位一概不答（`ORCH_TEXT_DESC_ONLY=1`）。
+
+每次发布都把两边合成完整 8 键：E2 覆盖枚举槽位，文本补自由文本槽位
+（`ENV` / `POSITION` 是两半拼接）。`on_answer` 永远不等它们。
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `ORCH_STATE_HEAD` | `0` | 总开关；0 = 与今天逐字节一致的纯文本 E0 |
 | `ORCH_STATE_URL` | `http://127.0.0.1:22520` | 105 跑编排时写 `http://192.168.89.106:22520` |
+| `ORCH_STATE_INTERVAL_S` | `1.0` | **Jev 独立节拍**（秒）；`0` = 关，退回跟随文本触发 |
+| `ORCH_STATE_STAGE` | `full` | 每拍请求的 stage；`full` 才含 `env.scene` |
 | `ORCH_STATE_TIMEOUT_S` | `0.8` | 超时丢弃本轮 state（文本那条不受影响） |
 | `ORCH_STATE_N_FRAMES` | `2` | 送几帧（当前 + 1s 前，动作/运动槽位靠它） |
 | `ORCH_STATE_MAX_PX` | `640` | 发前缩图长边（延迟/显存旋钮） |
 | `ORCH_STATE_CONF_IN_TEXT` | `1` | 渲染成 `label(0.82)` |
-| `ORCH_TEXT_SHORT` | `1` | Omni 只出 `FEATURE`/`ENV`/`POSITION` + 一行描述 |
+| `ORCH_STATE_SLOTS` | 空 | **槽位白名单**：空/`all`/`*` = 问全套（16 题）。非空只作**回滚**用 |
+| `ORCH_TEXT_DESC_ONLY` | `1` | Omni 只出三行描述（要求 state head 开且白名单为空） |
+| `ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS` | `128` | 三行的硬截断 |
+| `ORCH_OMNI_DELTA_INTERVAL_S` | `10` | 文本心跳间隔（主路径仍是 VAD 断句点触发） |
+| `ORCH_OMNI_DELTA_ALWAYS` | `0` | `0` = 心跳只在静默时补（文本不再负责动作） |
 
-`ORCH_TEXT_SHORT` **只在 `ORCH_STATE_HEAD=1` 时生效** —— 没开 state head 还让文本
-砍掉 5 个枚举键，状态就直接丢了（代码里是"与"关系）。
+`ORCH_TEXT_DESC_ONLY=1` 与 `ORCH_STATE_SLOTS` 非空**互斥**：文本已经不答枚举，
+白名单留着会出现"E2 没问、文本也没答"的空洞 —— 代码里有护栏（告警 + 按全量问）。
+
+**`ACTION` 语义**：动作是一个 10 选 1 的 `act.type`（8 类 + `other`
++ `none`），一拍最多 1 条事件；`none` ⇒ `events=[]`（人在、确实没动作），人不在
+画面 ⇒ `null`。`person_visible` 在编排侧做**两拍滞回**，1Hz 采样不会让 8 键
+来回跳。
+
+**回滚**：`ORCH_STATE_INTERVAL_S=0` + `ORCH_TEXT_DESC_ONLY=0` +
+`ORCH_STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction`
+（需同时用回旧 state-head 镜像，题集已变）。服务端的 `STATE_SLOTS` 必须与
+请求一致 —— 编排侧每次都带，以请求为准。
 
 服务端：
 

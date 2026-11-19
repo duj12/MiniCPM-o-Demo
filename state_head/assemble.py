@@ -4,7 +4,7 @@
 
     {"attn.gaze": {"type": "choice", "choice": "at_screen",
                    "probabilities": {...}, "confidence": 0.71},
-     "act.nod":   {"type": "noul", "noul": 0.83},
+     "act.type":  {"type": "choice", "choice": "nod", "probabilities": {...}},
      "act.count": {"type": "score", "score": 1.4, "probabilities": {...}}}
 
 输出是 ``docs/Social_State_Schema_v2_1_Lite.md`` §4.3 的 E2 ``state`` 块。
@@ -38,12 +38,34 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 
-from .questions import ACTION_EVENTS, ACTION_EVENTS_TIER2
 
 #: ``beh.duration`` 档位 → 代表秒数。取每档的**中位偏小**值而不是上限：
 #: 引擎上线前这个数只是"本观测窗口内"的估计，报大了一旦和引擎数字对不上
 #: 会显得像 bug；报小了最坏是保守。
 DURATION_SECONDS: tuple = (1, 3, 8, 15)
+
+#: 题集 id → E2 落点 ``(键, 子键)``（子键 ``None`` = 整键）。``act.type``
+#: 落整键 ``ACTION``（``events[]`` 没有"半份"）。
+#:
+#: 与编排侧 ``orchestrator/omni/state_schema._SLOT_PATHS`` 逐条对应 ——
+#: 两边各存一份是**故意**的（state head 不 import 编排代码），由
+#: ``orchestrator/tests/test_state_merge.py`` 的契约段对齐。
+_SLOT_PATHS: Dict[str, tuple] = {
+    "act.type": ("ACTION", None),
+    "attn.orientation": ("ATTENTION", "orientation"),
+    "attn.gaze": ("ATTENTION", "gaze"),
+    "emo.visual": ("EMOTION", None),
+    "beh.posture": ("BEHAVIOR", "posture"),
+    "beh.motion": ("BEHAVIOR", "motion"),
+    "beh.activity": ("BEHAVIOR", "activity"),
+    "beh.duration": ("BEHAVIOR", "duration_s"),
+    "rel.person_count": ("RELATION", "person_count"),
+    "rel.interaction": ("RELATION", "interaction"),
+    "rel.target": ("RELATION", "target"),
+    "env.scene": ("ENV", "scene"),
+    "env.lighting": ("ENV", "lighting"),
+    "pos.region": ("POSITION", "region"),
+}
 
 
 def _f(v: Any) -> Optional[float]:
@@ -143,31 +165,25 @@ def _duration_from_score(expected: Optional[float]) -> Optional[int]:
 def _collect_events(answers: Dict[str, Any], person_visible: bool,
                     action_p: float, max_events: int,
                     tier2: bool) -> Optional[List[Dict[str, Any]]]:
-    """逐个 ``act.<name>`` 的 ``noul`` → ``ACTION.events``。
+    """``act.type`` 一个多选一 → ``ACTION.events``。
 
     ``None`` = 看不到人；``[]`` = 人可见但没动作。**互斥**，别混。
+
+    ``none`` 是"观察到了，确实没有"；选中项概率低于 ``action_p`` 时按
+    "证据不足"处理，同样落 ``[]`` —— 宁可漏报一次瞬时动作，也不让噪声
+    动作污染下游策略。``other`` 是 schema 的枚举值，原样出。
+
+    ``max_events`` / ``tier2`` 保留在签名里只为兼容（动作合并成一题后
+    一拍最多一条事件，也不再按长尾裁剪）。
     """
     if not person_visible:
         return None
-    scored: List[tuple] = []
-    for name in ACTION_EVENTS:
-        if not tier2 and name in ACTION_EVENTS_TIER2:
-            continue
-        p = _noul(answers.get(f"act.{name}"))
-        if p is not None and p >= action_p:
-            scored.append((p, name))
-    if not scored:
+    node = _enum(answers.get("act.type", {}), 0.0)
+    label, p = node.get("label"), node.get("confidence")
+    if label in (None, "none", "unknown") or (p is not None and p < action_p):
         return []
-    # 概率高的先占位；同分时按 ACTION_EVENTS 的顺序（nod/shake_head 在前的
-    # 语义互斥对因此总能先入选）。
-    order = {n: i for i, n in enumerate(ACTION_EVENTS)}
-    scored.sort(key=lambda t: (-t[0], order[t[1]]))
-    picked = scored[:max_events]
     count = _count_from_score(_score(answers.get("act.count")))
-    return [
-        {"type": name, "count": count, "confidence": _clip01(p)}
-        for p, name in picked
-    ]
+    return [{"type": str(label), "count": count, "confidence": _clip01(p)}]
 
 
 def assemble(answers: Dict[str, Any], *, stage: str = "turn",
@@ -260,6 +276,39 @@ def assemble(answers: Dict[str, Any], *, stage: str = "turn",
         },
         "POSITION": {"region": region, "relative_positions": []},
     }
+
+
+def project_slots(state: Dict[str, Any], asked) -> Dict[str, Any]:
+    """把 E2 裁到**本轮实际问过的**槽位（``STATE_SLOTS`` 白名单）。
+
+    ``asked`` 是题集 id 集合（``build_questions(...).keys()``）。白名单模式
+    下题集本来就是裁过的，``assemble`` 却仍会给没问的槽位填一个
+    ``{"label": None}``（那是"本轮未观测"的表示）—— 返回给编排侧的 E2 里
+    留着这些空键没有信息量，还会让 ``conf`` 计数和 ``STATE_JSON`` 变长。
+
+    ⚠️ 两种情况**不裁**：
+
+    * ``asked`` 为空 —— 非白名单模式，老行为；
+    * **人不在画面**（``ACTION.events is None``）—— 那是整份 ``null`` 读数，
+      裁掉就等于把 §5.1 的 ``null`` / ``[]`` 门控丢了，而那正是 E2 最值钱
+      的部分（编排侧的 ``filter_e2_slots`` 也是同一条规则）。
+    """
+    if not asked or not isinstance(state, dict) or not state:
+        return state
+    if (state.get("ACTION") or {}).get("events", "missing") is None:
+        return state
+    asked = frozenset(asked)
+    out: Dict[str, Any] = {}
+    for qid, (key, sub) in _SLOT_PATHS.items():
+        if qid not in asked or key not in state:
+            continue
+        if sub is None:
+            out[key] = state[key]
+            continue
+        node = state.get(key)
+        if isinstance(node, dict) and sub in node:
+            out.setdefault(key, {})[sub] = node[sub]
+    return out
 
 
 def flatten_confidence(state: Dict[str, Any]) -> Dict[str, float]:

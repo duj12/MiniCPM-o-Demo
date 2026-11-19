@@ -218,6 +218,36 @@ class OrchestratorSession:
         self._state_enabled = bool(config.get("omni_state_head", False))
         self._state_client = None
         self._state_tasks: set = set()
+        #: 文本侧**只出三行描述**（FEATURE / ENV / POSITION），schema 的枚举
+        #: 槽位全部交给 state head。没有 state head 时强制关闭 —— 否则枚举
+        #: 槽位就没人答了（与 `_desc_text_short` 同一条护栏）。
+        self._desc_only = (self._state_enabled
+                           and bool(config.get("omni_text_desc_only", True)))
+        #: desc-only 的硬截断（0 = 不限）。
+        self._desc_only_max_new_tokens = int(
+            config.get("omni_desc_only_max_new_tokens", 128) or 0)
+        #: state head 的**独立定时器**（秒；0 = 关，退回"跟随文本触发"）。
+        self._state_interval = float(
+            config.get("omni_state_interval_s", 1.0) or 0.0)
+        #: 每拍用哪个 stage —— `full` 才含 `env.scene`。
+        self._state_stage = str(config.get("omni_state_stage", "full") or "full")
+        self._state_loop_task: Optional[asyncio.Task] = None
+        #: 独立于文本的**在途**标记：state 链不再被 `_desc_inflight` 挡住。
+        self._state_inflight = False
+        self._state_inflight_at = 0.0
+        self._state_last_done_at = 0.0
+        #: 上一次请求时 `omni.last_frame_at` 的值 —— 帧没更新就跳过（1s
+        #: 内重跑同一对帧只是白烧 GPU）。
+        self._state_last_frame_at: Any = _NO_FRAME_CLOCK
+        from .omni.state_schema import parse_slots
+        _slots_raw = str(config.get("omni_state_slots", "") or "")
+        if self._desc_only and parse_slots(_slots_raw):
+            # 文本已经不答枚举了，白名单留着就会出现"E2 没问、文本也没答"
+            # 的空洞。以全量为准并告警（配置错了要看得见）。
+            logger.warning("[%s] ORCH_TEXT_DESC_ONLY=1 时 ORCH_STATE_SLOTS 必须为空 "
+                           "—— 已忽略 %r，按全量问", self.session_id, _slots_raw)
+            _slots_raw = ""
+        self._state_slots = parse_slots(_slots_raw)
         if self._state_enabled:
             from .omni.state_client import StateClient
             self._state_client = StateClient(
@@ -227,10 +257,18 @@ class OrchestratorSession:
                 max_px=int(config.get("omni_state_max_px", 640) or 0),
                 fail_threshold=int(config.get("omni_state_fail_threshold", 5) or 5),
                 cooldown_s=float(config.get("omni_state_cooldown_s", 30.0) or 30.0),
+                # 白名单**每次请求都带给服务端**（见 `StateClient.slots`）：
+                # 只有编排侧知道"文本省掉了哪几项"，服务端照它问即可。
+                slots=_slots_raw,
             )
-            logger.info("[%s] state head 已启用（%s，超时 %.2fs，%d 帧）",
+            logger.info("[%s] state head 已启用（%s，超时 %.2fs，%d 帧，"
+                        "节拍 %s，stage=%s，槽位=%s）",
                         self.session_id, self._state_client.url,
-                        self._state_client.timeout_s, self._state_client.n_frames)
+                        self._state_client.timeout_s, self._state_client.n_frames,
+                        ("%.2fs" % self._state_interval
+                         if self._state_interval > 0 else "跟随文本"),
+                        self._state_stage,
+                        ",".join(sorted(self._state_slots)) or "全量")
         #: 文本侧只出自由文本槽位（`FEATURE` / `ENV` / `POSITION` + 一行
         #: `DESCRIPTION`），枚举槽位交给 state head。**必须两个条件都成立**：
         #: `ORCH_TEXT_SHORT` 是"想短"，state head 是"有人补那 5 个键"。
@@ -1817,8 +1855,10 @@ class OrchestratorSession:
             logger.info("[%s] 有新鲜帧了 ⇒ 补发起点全量描述", self.session_id)
         if stage == "full":
             self._desc_pending_full = False
-        from .omni.describe import (FULL_INSTRUCTION, SHORT_FULL_INSTRUCTION,
-                                    SHORT_TURN_INSTRUCTION, TURN_INSTRUCTION)
+        from .omni.describe import (DESC_ONLY_INSTRUCTION, FULL_INSTRUCTION,
+                                    SHORT_FULL_INSTRUCTION,
+                                    SHORT_TURN_INSTRUCTION, TURN_INSTRUCTION,
+                                    partial_instruction)
         # config 覆盖（`ORCH_OMNI_DESCRIBE_*_INSTRUCTION`）—— 调 prompt 不用
         # 改代码；空则用 `omni/describe.py` 的默认。
         #
@@ -1829,9 +1869,20 @@ class OrchestratorSession:
         # 由 typed-question 模型作答，文本侧只留 FEATURE / ENV / POSITION
         # 三个自由文本槽位 + 一行 DESCRIPTION。两个条件缺一不可 —— 没有
         # state head 还砍掉 5 个键，状态就直接丢了。
-        if self._desc_text_short:
-            default_instruction = (SHORT_FULL_INSTRUCTION if stage == "full"
-                                   else SHORT_TURN_INSTRUCTION)
+        if self._desc_only:
+            # 三行描述（FEATURE / ENV / POSITION）：枚举槽位全归 state head，
+            # 文本只说"人什么样、环境有什么、站在哪儿"。full / turn 同一套
+            # —— 起点那份也不需要更长的版本。
+            default_instruction = DESC_ONLY_INSTRUCTION
+        elif self._desc_text_short:
+            if self._state_slots:
+                # 白名单：E2 只答 4 个槽位 ⇒ 文本保留全量 8 行、只省掉这 4 项。
+                # 不能走短文本版（那样 ATTENTION/ACTION/EMOTION/BEHAVIOR/
+                # RELATION 的其余部分就没人答了）。
+                default_instruction = partial_instruction(stage, self._state_slots)
+            else:
+                default_instruction = (SHORT_FULL_INSTRUCTION if stage == "full"
+                                       else SHORT_TURN_INSTRUCTION)
         else:
             default_instruction = (FULL_INSTRUCTION if stage == "full"
                                    else TURN_INSTRUCTION)
@@ -1841,8 +1892,14 @@ class OrchestratorSession:
             instruction = self._desc_delta_instruction or default_instruction
         # 起点全量不设上限；每轮给上限（0 = 不限）。键值契约下截断只影响
         # 最后一行，不会污染合并后的快照。
-        max_new_tokens = (None if stage == "full" or self._desc_delta_max_new_tokens <= 0
-                          else self._desc_delta_max_new_tokens)
+        if self._desc_only:
+            # 三行 ≤50 汉字 ≈ 60~80 token；128 留一倍余量。截断只可能砍到
+            # 最后一行（POSITION），FEATURE 先出。
+            max_new_tokens = self._desc_only_max_new_tokens or None
+        elif stage == "full" or self._desc_delta_max_new_tokens <= 0:
+            max_new_tokens = None
+        else:
+            max_new_tokens = self._desc_delta_max_new_tokens
         self.stats["omni_desc_triggers"] = self.stats.get("omni_desc_triggers", 0) + 1
         # 标记在途**必须在 create_task 之前** —— 循环下一次轮询要看它
         self._desc_inflight = True
@@ -1872,7 +1929,10 @@ class OrchestratorSession:
         # 放这里（而不是 `_do()` 里面）是为了两者真正同时出发：`_do()` 里
         # 第一件事就是 `trigger_reply`，把状态请求排在它后面会白等一个网络
         # 往返。也**不要** await 它 —— 文本那轮失败与状态无关，反之亦然。
-        if self._state_client is not None:
+        # ⚠️ 只在 `ORCH_STATE_INTERVAL_S=0`（关掉独立定时器）时才在文本触发点
+        #    跟调一次 —— 那是 2026-11-19 的老行为，用于回滚。默认（>0）由
+        #    `_state_loop` 自己按节拍跑，不跟文本同步。
+        if self._state_client is not None and self._state_interval <= 0:
             task = asyncio.create_task(self._run_state(stage))
             self._state_tasks.add(task)
             task.add_done_callback(self._state_tasks.discard)
@@ -1951,10 +2011,70 @@ class OrchestratorSession:
         self._desc_last_done_at = time.monotonic()
 
     def _ensure_desc_loop(self) -> None:
-        """起滚动循环（幂等）。"""
-        if self._desc_loop_task is not None and not self._desc_loop_task.done():
-            return
-        self._desc_loop_task = asyncio.create_task(self._desc_loop())
+        """起滚动循环与 state 定时循环（各自幂等）。"""
+        if self._desc_loop_task is None or self._desc_loop_task.done():
+            self._desc_loop_task = asyncio.create_task(self._desc_loop())
+        self._ensure_state_loop()
+
+    def _ensure_state_loop(self) -> None:
+        """起 state head 的独立定时循环（幂等）。
+
+        与描述链路**解耦**：``ORCH_OMNI_DESCRIBE=0`` 时 `_arm_desc_loop`
+        永不触发，但 Jev 的节拍仍要按帧跑 —— 否则状态链会静默地一直不启动。
+        """
+        if (self._state_client is not None and self._state_interval > 0
+                and (self._state_loop_task is None
+                     or self._state_loop_task.done())):
+            self._state_loop_task = asyncio.create_task(self._state_loop())
+
+    async def _state_loop(self) -> None:
+        """state head 的**独立定时器** —— 目标刷新周期就是 `interval`。
+
+        ## 为什么要独立
+
+        `_desc_inflight` 只在文本 `response.done` 时放掉，而文本一轮 ~1s；
+        与 state 共用这个闸，实际周期会变成 `文本耗时 + interval`（实测
+        ~1.05s + 1s ≈ 2.05s），Jev 的 185ms 优势全被吃掉。
+
+        ## 判据
+
+        依次是：没启用 / 关了 → 跳过；在途未超时 → 跳过；距上一拍结束不够
+        `interval` → 跳过；**`omni.last_frame_at` 没变** → 跳过（帧是跟着
+        1s 音频块发的，1s 内重跑同一对帧只是白烧 GPU）；否则跑一次。
+        最后一拍失败不会让循环停 —— `_run_state` 永不抛。
+        """
+        stale_s = max(5.0, self._state_interval * 3)
+        while not self.closed:
+            await asyncio.sleep(self._DESC_POLL_S)
+            client = self._state_client
+            if client is None or self._state_interval <= 0 or self.omni is None:
+                continue
+            now = time.monotonic()
+            if self._state_inflight:
+                if now - self._state_inflight_at <= stale_s:
+                    continue
+                # 超时 = 请求挂住了（网络/服务端卡死）。显式告警并放掉，
+                # 下一拍自己接回来 —— 与 `_desc_loop` 同一套自愈思路。
+                logger.warning("[%s] state 请求在途超过 %.0fs —— "
+                               "放掉在途标记，恢复定时刷新",
+                               self.session_id, stale_s)
+                self._state_inflight = False
+                self._state_last_done_at = now
+            if now - self._state_last_done_at < self._state_interval:
+                continue
+            frame_at = getattr(self.omni, "last_frame_at", _NO_FRAME_CLOCK)
+            if frame_at is not _NO_FRAME_CLOCK:
+                if frame_at is not None and frame_at == self._state_last_frame_at:
+                    # 没有新帧：重跑同一对帧既不会变好，还占着共享 GPU0
+                    continue
+                self._state_last_frame_at = frame_at
+            self._state_inflight = True
+            self._state_inflight_at = now
+            try:
+                await self._run_state(self._state_stage)
+            finally:
+                self._state_inflight = False
+                self._state_last_done_at = time.monotonic()
 
     async def _desc_loop(self) -> None:
         """滚动刷新每轮描述 —— 目标是 `AsrFinal` 一到就有非空缓存可发。
@@ -2016,11 +2136,13 @@ class OrchestratorSession:
 
     def _stop_desc_loop(self) -> None:
         """停掉滚动循环与在途描述任务（会话收尾用）。"""
-        for task in (self._desc_loop_task, self._desc_task):
+        for task in (self._desc_loop_task, self._desc_task,
+                     self._state_loop_task):
             if task is not None and not task.done():
                 task.cancel()
         self._desc_loop_task = None
         self._desc_task = None
+        self._state_loop_task = None
         self._desc_inflight = False
         # state head 的在途请求也一起收掉；连接池随会话释放
         for task in list(self._state_tasks):
@@ -2542,6 +2664,9 @@ class OrchestratorSession:
             )
         if self.face_worker is not None:
             self.face_worker.start()
+        # state head 的节拍**不等 GREET**：会话一起来就按帧跑（描述链路
+        # 关掉时 `_arm_desc_loop` 不点火，但 Jev 仍要出状态）。
+        self._ensure_state_loop()
 
     async def drain(self, reason: str = "client_stop",
                     asr_timeout: float = 15.0,

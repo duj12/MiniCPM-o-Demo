@@ -13,8 +13,10 @@
 刻意**不发**的槽位（留给 Qwen3-Omni 的自由文本，或由编排侧的空值语义表达）：
 
 * ``FEATURE.appearance`` / ``FEATURE.accessories`` —— 自由文本；
-* ``ENV.objects`` / ``POSITION.relative_positions`` / ``description`` —— 自由文本；
-* ``ACTION.events[].type`` 里 ``other`` 的描述 —— schema 要求写进 description。
+* ``ENV.objects`` / ``POSITION.relative_positions`` / ``description`` —— 自由文本。
+
+``ACTION.events[].type`` 用**一个多选一的 choice**（``act.type``）回答，
+不是每类一个 ``noul``：schema 里它是单值枚举，一次只需判断是哪一个。
 
 ``score`` 型问题返回的是**期望档位**（0..n-1 的浮点），不是概率向量，
 所以 ``count`` / ``duration_s`` 这类数值槽位用它；``choice`` 才有逐选项概率。
@@ -44,24 +46,29 @@ ATTENTION_GAZE: Dict[str, str] = {
     "unknown": "无法判断",
 }
 
-#: 短时动作（``noul``，每题一个概率）。
+#: 短时动作 —— **一个多选一的 ``choice``**，对应 schema §3 的
+#: ``ACTION.events[].type``（10 选 1，`assemble` 只取选中项那一条）。
 #:
-#: ⚠️ 顺序即优先级：多个动作同时过阈值时，按这里的顺序取前 ``ACTION_MAX_EVENTS``
-#: 个。``nod`` / ``shake_head`` 语义互斥，放最前面保证它们先占位。
-ACTION_EVENTS: Dict[str, str] = {
+#: ⚠️ 末尾两项不是"额外动作"，别混：
+#:
+#: * ``none`` 不是 schema 的枚举值，它是"观察到了、确实没有"的表达
+#:   （§5.1 的 ``events=[]``）—— 没有它模型只能强行挑一个动作；
+#: * ``other`` 是 schema 的枚举值之一，具体是什么由 Qwen3-Omni 的
+#:   描述文本补充（schema §3 对 ``other`` 的要求）。
+#:
+#: 顺序照 schema §3，``none`` 放最后 —— 不让"没动作"占 argmax 的先手。
+ACTION_TYPES: Dict[str, str] = {
     "nod": "点头",
     "shake_head": "摇头",
     "wave": "挥手",
-    "thumbs_up": "竖大拇指",
     "point": "指向",
+    "thumbs_up": "竖大拇指",
     "raise_hand": "举手",
     "clap": "鼓掌",
     "hand_over_object": "递交物品",
+    "other": "有其他明显动作，但不属于上述类别",
+    "none": "最近 1 到 2 秒内没有明显动作",
 }
-
-#: ``STATE_TIER2=1`` 时才问的动作（9 类里的长尾）—— 每题都是一次前向增量，
-#: 默认关掉是为了省延迟，不是因为语义不同。
-ACTION_EVENTS_TIER2: tuple = ("raise_hand", "clap", "hand_over_object")
 
 #: 短时动作的观测窗口。写进 instructions：没有这个锚，模型会把"上一分钟
 #: 做过的手势"当成当前动作（SOP07 的失败模式）。
@@ -200,16 +207,23 @@ def _score(instructions: str, levels: List[str]) -> Dict[str, Any]:
 
 def build_questions(stage: str = "turn", tier2: bool = False,
                     include_lighting: bool = True,
-                    include_scene: bool = None) -> Dict[str, Dict[str, Any]]:
+                    include_scene: bool = None,
+                    slots=None) -> Dict[str, Dict[str, Any]]:
     """组装本轮题集。
 
-    ``stage="turn"`` = 19 问（不含 ``env.scene``），``"full"`` = 20 问。
+    ``stage="turn"`` = 15 问（不含 ``env.scene``），``"full"`` = 16 问。
     题数是延迟的主旋钮，全部由 env 控制、不改代码：
 
     * ``include_scene`` —— 默认 ``stage == "full"``（场景类型是静态的，
       起点问一次足够；schema §5.2 也允许稳定槽位在 E2 里省略）；
     * ``include_lighting`` —— 默认开；
-    * ``tier2`` —— 追加 3 个长尾动作。
+    * ``tier2`` —— **已作废的空操作**（只保留参数以兼容老调用方：
+      动作合并成 ``act.type`` 一题后，长尾动作天然在选项里）；
+    * ``slots`` —— **槽位白名单**（``STATE_SLOTS``）：非空时只问这些 id。
+      ``person_visible`` **永远问**（它是 ``null`` / ``[]`` 的门控，裁掉就把
+      空值语义丢了）。``act.*`` 是通配写法，命中即保留 ``act.type`` 与
+      ``act.count``。白名单越短延迟越低；**部署默认是空**（问全套，
+      schema §3 的枚举槽位全由 Jev 答），非空只作回滚用。
 
     返回**有序** dict（``dict`` 自 3.7 起保序），组装侧按同一顺序遍历。
     """
@@ -230,13 +244,12 @@ def build_questions(stage: str = "turn", tier2: bool = False,
         "主要人物的视线落在哪里？朝向正对镜头不代表在注视镜头。",
         ATTENTION_GAZE)
 
-    # ---- 2. ACTION（每类一个 noul，次数用一个 score）------------------ #
-    active_events = {k: v for k, v in ACTION_EVENTS.items()
-                     if tier2 or k not in ACTION_EVENTS_TIER2}
-    for name, zh in active_events.items():
-        q[f"act.{name}"] = _noul(
-            f"{ACTION_WINDOW_HINT}，画面里的人物做了「{zh}」这个动作"
-            f"（即使动作在生成时已经结束，只要落在观测窗口内就算）")
+    # ---- 2. ACTION（一个 10 选 1，次数用一个 score）------------------- #
+    q["act.type"] = _choice(
+        f"{ACTION_WINDOW_HINT}，画面里的人物做了下面哪一个动作？"
+        "只选一个最明显的；动作在生成时已经结束、但落在观测窗口内也算。"
+        "这段时间没有明显动作就选 none；有明显动作但不属于前八类才选 other。",
+        ACTION_TYPES)
     q["act.count"] = _score(
         "刚才出现的主要动作一共重复了几次？",
         ACTION_COUNT_LEVELS)
@@ -286,13 +299,27 @@ def build_questions(stage: str = "turn", tier2: bool = False,
         "主要人物位于画面的哪个区域（把画面按 3×3 九宫格划分）？",
         POSITION_REGION)
 
+    # ---- 8. 白名单裁剪（`STATE_SLOTS`）--------------------------------- #
+    if slots:
+        allowed = frozenset(slots)
+        all_act = "act.*" in allowed
+        keep = set()
+        for qid in q:
+            if qid == "person_visible":
+                keep.add(qid)          # 门控，永远保留
+            elif qid.startswith("act."):
+                if all_act or qid in allowed:
+                    keep.add(qid)
+            elif qid in allowed:
+                keep.add(qid)
+        q = {k: v for k, v in q.items() if k in keep}
+
     return q
 
 
-#: 动作 id → 动作名（组装侧按 ``act.<name>`` 取）。
-ACTION_QUESTION_IDS: Dict[str, str] = {
-    f"act.{name}": name for name in ACTION_EVENTS
-}
+#: 动作题的题 id（组装侧整键取 ``ACTION``）。保留这个名字是因为老的
+#: 调用方/测试还在按它判断"这轮问没问动作"。
+ACTION_QUESTION_IDS: Dict[str, str] = {"act.type": "type"}
 
 
 def question_ids(stage: str = "turn", tier2: bool = False) -> List[str]:

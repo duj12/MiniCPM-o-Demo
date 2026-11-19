@@ -334,9 +334,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         #    "回话"会被当作画面描述发给 Agent。web 前端传的永远是对话型
         #    prompt ⇒ 必须挡住并说出来，不能静默照用。
         if cfg.omni_describe and cfg.downstream_mode == "omni":
-            from orchestrator.omni.describe import DESCRIBE_SYSTEM_PROMPT
-            omni_prompt = (cfg.omni_describe_system_prompt
-                           or DESCRIBE_SYSTEM_PROMPT)
+            from orchestrator.omni.describe import (
+                DESC_ONLY_DESCRIBE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT)
+            # 优先级：显式覆盖 > desc-only（文本只说三行）> 8 键契约。
+            # desc-only 要与 state head 同时开才成立（枚举槽位得有人答），
+            # `session._desc_only` 里有同一条与门。
+            if cfg.omni_describe_system_prompt:
+                omni_prompt = cfg.omni_describe_system_prompt
+            elif cfg.omni_text_desc_only and cfg.omni_state_head:
+                omni_prompt = DESC_ONLY_DESCRIBE_SYSTEM_PROMPT
+            else:
+                omni_prompt = DESCRIBE_SYSTEM_PROMPT
             if hello and (hello.get("system_prompt") or "").strip():
                 logger.warning(
                     "[%s] 描述模式生效（ORCH_OMNI_DESCRIBE=1）—— **忽略**客户端"
@@ -463,7 +471,8 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 agent_mcp_servers=cfg.agent_mcp_servers,
                 omni_describe=cfg.omni_describe,
                 omni_state=cfg.omni_state_head,
-                state_conf_in_text=cfg.omni_state_conf_in_text)
+                state_conf_in_text=cfg.omni_state_conf_in_text,
+                state_slots=cfg.omni_state_slots)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():

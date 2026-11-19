@@ -40,11 +40,14 @@ _NO_EVIDENCE = frozenset({"", "unknown", "none"})
 #  合并
 # --------------------------------------------------------------------------- #
 
-def _person_missing(e2: Dict[str, Any]) -> bool:
+def person_missing(e2: Dict[str, Any]) -> bool:
     """``null`` 三件套同时成立才算"人不在画面"。
 
     只判 ``ACTION.events is None`` 不够：模型偶发把 events 置空但其余槽位
     有值（那是 ``[]`` 的误写），这时按"人不见"整份清空会**丢一份好状态**。
+
+    公开名字给下游做**滞回**用（1Hz 采样下这个门控会在阈值附近抖）——
+    `_person_missing` 保留为内部别名，老的调用点不用改。
     """
     if not isinstance(e2, dict):
         return False
@@ -52,6 +55,10 @@ def _person_missing(e2: Dict[str, Any]) -> bool:
     attn = e2.get("ATTENTION") or {}
     orient = (attn.get("orientation") or {}).get("label") if isinstance(attn, dict) else None
     return act.get("events", "missing") is None and orient is None
+
+
+#: 内部别名（历史调用点用下划线名；新代码用 `person_missing`）。
+_person_missing = person_missing
 
 
 def _merge_node(base: Any, patch: Any, skip_none: bool) -> Any:
@@ -321,8 +328,130 @@ def render_e2_json(e2: Dict[str, Any]) -> str:
 _HALF_KEYS = frozenset({"ENV", "POSITION"})
 
 
+# --------------------------------------------------------------------------- #
+#  槽位白名单（state head 只出实测可靠的槽位，其余留给 Qwen3-Omni 文本）
+# --------------------------------------------------------------------------- #
+#
+# 2026-11-19 在 SOP 06–11 上的零样本实测（分窗采样、双帧、19 问）：
+#   * 稳：``attn.gaze`` / ``beh.activity`` / ``rel.person_count`` /
+#     ``rel.interaction``；
+#   * 不稳：``attn.orientation``（背对镜头判不出）、全部手势与次数、
+#     ``emo.visual``（一律判 neutral）、``beh.motion``、``rel.target``。
+#
+# 所以默认**只让 E2 出那 4 个槽位**，其余交回 Qwen3-Omni 的文本描述。
+# ``ORCH_STATE_SLOTS`` 为空 / ``all`` / ``*`` 时退回"E2 全出、文本只出自由
+# 文本槽位"的老行为（``ORCH_TEXT_SHORT=1`` 的短文本模式）。
+
+#: 8 键 → 组成它的题集 id（与 ``state_head/questions.py`` 逐字对应）。
+KEY_SLOTS: Dict[str, tuple] = {
+    "ATTENTION": ("attn.orientation", "attn.gaze"),
+    "ACTION": ("act.*",),
+    "EMOTION": ("emo.visual",),
+    "BEHAVIOR": ("beh.posture", "beh.motion", "beh.activity", "beh.duration"),
+    "RELATION": ("rel.person_count", "rel.interaction", "rel.target"),
+    "ENV": ("env.scene", "env.lighting"),
+    "POSITION": ("pos.region",),
+}
+
+#: 题集 id → E2 里的落点 ``(键, 子键)``；子键 ``None`` 表示整键。
+#: 动作是整键 ``events[]``（没有"半份"），``act.*`` 通配与显式的
+#: ``act.type`` 都指向 ``ACTION`` —— 显式那条是为了与
+#: ``state_head/assemble._SLOT_PATHS`` 逐条一致（有测试锁着）。
+_SLOT_PATHS: Dict[str, tuple] = {
+    "act.type": ("ACTION", None),
+    "attn.orientation": ("ATTENTION", "orientation"),
+    "attn.gaze": ("ATTENTION", "gaze"),
+    "emo.visual": ("EMOTION", None),
+    "beh.posture": ("BEHAVIOR", "posture"),
+    "beh.motion": ("BEHAVIOR", "motion"),
+    "beh.activity": ("BEHAVIOR", "activity"),
+    "beh.duration": ("BEHAVIOR", "duration_s"),
+    "rel.person_count": ("RELATION", "person_count"),
+    "rel.interaction": ("RELATION", "interaction"),
+    "rel.target": ("RELATION", "target"),
+    "env.scene": ("ENV", "scene"),
+    "env.lighting": ("ENV", "lighting"),
+    "pos.region": ("POSITION", "region"),
+}
+
+#: 零样本实测可靠、默认交给 state head 的槽位。
+DEFAULT_STATE_SLOTS: tuple = ("attn.gaze", "beh.activity",
+                              "rel.person_count", "rel.interaction")
+
+
+def parse_slots(raw: Any) -> frozenset:
+    """``ORCH_STATE_SLOTS`` → 槽位集合。空 / ``all`` / ``*`` ⇒ 空集合（全给 E2）。"""
+    if raw is None:
+        return frozenset()
+    items = {s.strip() for s in str(raw).split(",") if s.strip()}
+    if not items or items & {"all", "*"}:
+        return frozenset()
+    return frozenset(items)
+
+
+def filter_e2_slots(e2: Dict[str, Any], slots) -> Dict[str, Any]:
+    """把 E2 裁到白名单槽位。
+
+    白名单为空 ⇒ 原样返回（老行为）。**"人不在画面"的读数整份保留** ——
+    那是门控（``person_visible``）的结果，裁掉就等于把 null / ``[]`` 的
+    区分丢了，而那正是 E2 最值钱的部分。
+    """
+    allowed = frozenset(slots or ())
+    if not allowed or not isinstance(e2, dict) or not e2:
+        return e2
+    if _person_missing(e2):
+        return e2
+    whole = set()
+    keep: Dict[str, set] = {}
+    for qid in allowed:
+        if qid.startswith("act."):
+            whole.add("ACTION")
+            continue
+        path = _SLOT_PATHS.get(qid)
+        if not path:
+            continue
+        key, sub = path
+        if sub is None:
+            whole.add(key)
+        else:
+            keep.setdefault(key, set()).add(sub)
+    out: Dict[str, Any] = {}
+    for key, val in e2.items():
+        if key in whole:
+            out[key] = val
+            continue
+        subs = keep.get(key)
+        if not subs or not isinstance(val, dict):
+            continue
+        part = {k: v for k, v in val.items() if k in subs}
+        if part:
+            out[key] = part
+    return out
+
+
+def partial_keys(slots) -> frozenset:
+    """E2 **只答了某个键的一部分**的那些键（⇒ 文本那半要留着、两半拼接）。
+
+    例：白名单里有 ``attn.gaze`` 没有 ``attn.orientation`` ⇒ ``ATTENTION``
+    两边各有半份，合并时不能整键覆盖。``ACTION`` 是整键（``events[]``），
+    只有全有或全无，不算半份。
+    """
+    allowed = frozenset(slots or ())
+    if not allowed:
+        return frozenset()
+    out = set()
+    for key, ids in KEY_SLOTS.items():
+        if key == "ACTION":
+            continue
+        hit = [i for i in ids if i in allowed]
+        if hit and len(hit) < len(ids):
+            out.add(key)
+    return frozenset(out)
+
+
 def merge_vision_text(text_state: Dict[str, str],
-                      e2: Dict[str, Any], with_conf: bool = True) -> Dict[str, str]:
+                      e2: Dict[str, Any], with_conf: bool = True,
+                      concat_keys=None) -> Dict[str, str]:
     """文本描述的 8 键与 E2 的 8 键合成一份。
 
     E2 覆盖**它能回答的槽位**；``FEATURE`` 这类自由文本槽位 E2 不给（返回
@@ -331,11 +460,15 @@ def merge_vision_text(text_state: Dict[str, str],
     ⚠️ ``ENV`` / ``POSITION`` 两个键是**两半拼起来的**（见 ``_HALF_KEYS``），
     所以这里做拼接而不是覆盖；拼接顺序是「文本在前、E2 在后」，免得
     E2 那半段把文本里的物品清单挤到看不见的位置。
+    ``concat_keys`` 用来把"白名单只让 E2 答半份"的那几个键也加进拼接集合
+    （见 ``partial_keys``）：``ATTENTION`` / ``BEHAVIOR`` / ``RELATION``
+    在默认白名单下都是两边各答一半，整键覆盖会丢掉文本那半。
     """
+    keys = _HALF_KEYS if concat_keys is None else (_HALF_KEYS | frozenset(concat_keys))
     merged = dict(text_state or {})
     for key, e2_part in to_vision_strings(e2, with_conf=with_conf).items():
         old = merged.get(key)
-        if key in _HALF_KEYS and old and old != e2_part:
+        if key in keys and old and old != e2_part:
             merged[key] = f"{old}；{e2_part}"
         else:
             merged[key] = e2_part
@@ -366,5 +499,6 @@ def flatten_confidence(e2: Dict[str, Any]) -> Dict[str, float]:
 __all__ = [
     "SCHEMA_VERSION", "STATE_KEYS", "merge_e2", "fuse_emotion",
     "to_vision_strings", "render_e2_json", "merge_vision_text",
-    "flatten_confidence",
+    "flatten_confidence", "KEY_SLOTS", "DEFAULT_STATE_SLOTS",
+    "parse_slots", "filter_e2_slots", "partial_keys", "person_missing",
 ]

@@ -264,12 +264,46 @@ class Settings:
         os.environ.get("ORCH_STATE_FAIL_THRESHOLD", "5")))
     omni_state_cooldown_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_STATE_COOLDOWN_S", "30.0")))
+    #: E2 **只出这些槽位**（逗号分隔的题集 id）。空 / ``all`` / ``*`` = 问全套。
+    #:
+    #: 默认**空**：schema 对齐后枚举槽位全部归 state head，文本不再答枚举，
+    #: 白名单只会造成"两头都不答"的空洞。
+    #: 回滚到 2026-11-19 的白名单形态时显式给
+    #: ``ORCH_STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction``
+    #: （见 `state_schema.DEFAULT_STATE_SLOTS`）。
+    omni_state_slots: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_SLOTS", ""))
     #: Qwen3-Omni 只出**自由文本槽位**（FEATURE / ENV.objects /
     #: POSITION.relative_positions / 一行短描述）。仅在 `omni_state_head=1`
     #: 时生效 —— 没有 state head 的话把枚举槽位也砍掉就什么都剩不下了。
     omni_text_short: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_TEXT_SHORT", "1").strip().lower() not in
         ("0", "false", "off", "no"))
+    #: 文本侧**只出三行描述**（``FEATURE`` / ``ENV`` / ``POSITION``），schema
+    #: §3 的枚举槽位**全部**交给 state head（``ORCH_TEXT_DESC_ONLY``）。
+    #:
+    #: 与 `omni_text_short` 的区别：短文本仍是"8 键契约、值压短"，这里干脆
+    #: 换 system prompt、只写关键短语。同样要求 `omni_state_head=1`，且
+    #: `omni_state_slots` 必须为空（文本不再答枚举，白名单留着会出现
+    #: "两头都不答"的空洞 —— session 里会告警并强制按全量处理）。
+    omni_text_desc_only: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_TEXT_DESC_ONLY", "1").strip().lower() not in
+        ("0", "false", "off", "no", ""))
+    #: desc-only 的 token 上限（硬截断）。三行 ≤50 汉字约 60~80 token，
+    #: 128 留一倍余量；截断只可能砍到最后一行 POSITION。
+    omni_desc_only_max_new_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS", "128")))
+    #: state head 的**独立定时器**（秒，0 = 关）。开时 state head 不再等
+    #: 文本轮结束，按固定节拍自己跑（帧历史本身就是 1Hz，1s 是上限）。
+    #:
+    #: 关掉（0）⇒ 回到 2026-11-19 的老行为：跟着文本触发、被
+    #: `_desc_inflight` 挡，实际周期 = 文本耗时 + interval。
+    omni_state_interval_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_INTERVAL_S", "1.0")))
+    #: 每拍请求的 stage：``full`` 才含 ``env.scene``（schema §3 的
+    #: ``ENV.scene`` 只有这一条路能拿到）；``turn`` 仅作回滚值。
+    omni_state_stage: str = field(default_factory=lambda: (
+        os.environ.get("ORCH_STATE_STAGE", "full").strip().lower() or "full"))
 
     # 人脸（阶段 4）—— 实现走 board-face-and-cloud-infer/G1 的官方 g1face 包
     #
