@@ -41,6 +41,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
+#: 发给 `/v1/state` 的场景/任务提示（`--context` 或 ``STATE_CONTEXT``）。
+#: 空 = 不发，与旧行为一致。
+CONTEXT = ""
+
 #: SOP 片段 → 期望（只写"必须满足"的槽位，见计划 §六.2）。
 #: 键是片段文件名去扩展名后的**前缀**匹配（``06_1`` 命中 ``06_1_xxx.mkv``）。
 SOP_EXPECT: Dict[str, Dict[str, Any]] = {
@@ -101,9 +105,11 @@ def clip_key(name: str) -> Optional[str]:
 
 async def post_state(client: httpx.AsyncClient, base: str, frames: List[str],
                      stage: str, session_id: str = "") -> Dict[str, Any]:
-    resp = await client.post(
-        f"{base}/v1/state",
-        json={"frames_b64": frames, "stage": stage, "session_id": session_id})
+    body: Dict[str, Any] = {"frames_b64": frames, "stage": stage,
+                            "session_id": session_id}
+    if CONTEXT:
+        body["context"] = CONTEXT
+    resp = await client.post(f"{base}/v1/state", json=body)
     resp.raise_for_status()
     return resp.json()
 
@@ -214,8 +220,25 @@ def check_expected(state: Dict[str, Any], expect: Dict[str, Any]) -> List[Tuple[
     return out
 
 
+def sample_windows(frames: List[str], n: int) -> List[List[str]]:
+    """把整段按 1fps 抽到的帧切成 n 个双帧窗口（均匀铺开）。
+
+    只看**最后两帧**会系统性漏掉动作 —— 手势/转身往往在片段中段，末尾已经
+    恢复原状。2026-11-19 实测：只看尾部时 07_1 判成 `ACTION.events=[]`
+    （0.0），改分窗后才看得到。
+    """
+    if len(frames) <= 2:
+        return [frames]
+    n = max(1, min(n, len(frames) - 1))
+    out: List[List[str]] = []
+    for k in range(n):
+        i = round(k * (len(frames) - 2) / max(1, n - 1))
+        out.append(frames[i:i + 2])
+    return out
+
+
 async def bench_sop(clips: Path, base: str, stage_mode: str,
-                    out_path: Optional[Path]) -> int:
+                    out_path: Optional[Path], windows: int = 3) -> int:
     files = sorted([p for p in clips.rglob("*")
                     if p.suffix.lower() in (".mkv", ".mp4", ".mov")])
     if not files:
@@ -236,24 +259,49 @@ async def bench_sop(clips: Path, base: str, stage_mode: str,
             if not frames:
                 continue
             for stage in stages:
-                t0 = time.monotonic()
-                try:
-                    r = await post_state(client, base, frames[-2:], stage,
-                                         session_id=f"sop-{clip.stem}-{stage}")
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  ! {clip.name} {stage}: {exc}", file=sys.stderr)
+                lat: List[float] = []
+                per_win: List[List[Tuple[str, bool]]] = []
+                states: List[Dict[str, Any]] = []
+                n_q = None
+                for w_i, win in enumerate(sample_windows(frames, windows)):
+                    t0 = time.monotonic()
+                    try:
+                        r = await post_state(client, base, win, stage,
+                                             session_id=f"sop-{clip.stem}-{stage}-{w_i}")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  ! {clip.name} {stage} w{w_i}: {exc}", file=sys.stderr)
+                        continue
+                    lat.append((time.monotonic() - t0) * 1000.0)
+                    n_q = r.get("n_questions") or n_q
+                    states.append(r.get("state") or {})
+                    per_win.append(check_expected(r.get("state", {}), expect)
+                                   if expect else [])
+                if not states:
                     continue
-                dt = (time.monotonic() - t0) * 1000.0
-                checks = check_expected(r.get("state", {}), expect) if expect else []
+                dt = sum(lat) / len(lat)
+                if per_win:
+                    # 槽位级「任一窗口命中」：真实部署是连续 1fps 流，
+                    # 按最差窗口算会把"晚一拍"误判成"不会"。
+                    names = [nm for nm, _ in per_win[0]]
+                    checks = [(nm, any(w[i][1] for w in per_win))
+                              for i, nm in enumerate(names)]
+                else:
+                    checks = []
+                best = max(range(len(states)),
+                           key=lambda i: sum(1 for _, ok in checks if ok)) \
+                    if checks else 0
                 results.append({
                     "clip": clip.name, "key": key, "stage": stage,
-                    "latency_ms": round(dt, 1), "n_questions": r.get("n_questions"),
-                    "state": r.get("state"), "checks": checks,
+                    "latency_ms": round(dt, 1), "n_questions": n_q,
+                    "state": states[best], "checks": checks,
                     "passed": sum(1 for _, ok in checks if ok),
                     "total": len(checks),
+                    "windows": len(states),
+                    "states_all": states if out_path else None,
                 })
                 mark = "—" if not checks else f"{sum(1 for _, ok in checks if ok)}/{len(checks)}"
-                print(f"{clip.name:<28} {stage:<5} {dt:7.1f}ms  {mark}")
+                print(f"{clip.name:<28} {stage:<5} {dt:7.1f}ms  "
+                      f"{mark:<7} w={len(states)}")
                 for name, ok in checks:
                     if not ok:
                         print(f"    ✗ {name}")
@@ -295,10 +343,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--clips", type=Path, help="SOP 片段目录（.mkv/.mp4）")
     ap.add_argument("--stage-mode", default="both", choices=("turn", "full", "both"))
     ap.add_argument("--out", type=Path, help="SOP 明细 JSON 输出路径")
+    ap.add_argument("--windows", type=int, default=3,
+        help="每段均匀采样几个双帧窗口（默认 3；只看尾部会漏掉中段动作）")
+    ap.add_argument("--context", default=os.environ.get("STATE_CONTEXT", ""),
+        help="发给 /v1/state 的场景提示（对应模型卡里的 state.task）")
     args = ap.parse_args(argv)
 
+    global CONTEXT
+    CONTEXT = args.context or ""
+
     if args.clips:
-        return asyncio.run(bench_sop(args.clips, args.url, args.stage_mode, args.out))
+        return asyncio.run(bench_sop(args.clips, args.url, args.stage_mode,
+                                     args.out, args.windows))
 
     if not args.still:
         ap.error("需要 --still <图片> 或 --clips <目录>")

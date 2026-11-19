@@ -58,7 +58,8 @@ def normalize_frames(frames_b64: List[str]) -> List[str]:
     return out
 
 
-def build_media(frames_b64: List[str], fps: float = 1.0) -> tuple:
+def build_media(frames_b64: List[str], fps: float = 1.0,
+                context: str = "") -> tuple:
     """帧列表 → ``(state 片段, media 列表)``。
 
     两帧及以上用 **video**（Flide 会按 ``fps`` 给每帧打时间戳，motion /
@@ -71,10 +72,13 @@ def build_media(frames_b64: List[str], fps: float = 1.0) -> tuple:
     frames = normalize_frames(frames_b64)
     if not frames:
         raise BackendError("no frames")
+    # ``context`` 是给模型的场景/任务提示（模型卡示例里的 ``state.task``）。
+    # 不写就只是一段没头没尾的画面，零样本下动作与情绪类问句更容易判成 neutral。
+    extra = {"context": context} if context else {}
     if len(frames) >= 2:
-        return ({"clip": "<video:1>"},
+        return ({"clip": "<video:1>", **extra},
                 [{"type": "video", "fps": float(fps or 1.0), "frames": frames}])
-    return ({"frame": "<image:1>"},
+    return ({"frame": "<image:1>", **extra},
             [{"type": "image", "data": frames[0]}])
 
 

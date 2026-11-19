@@ -106,6 +106,8 @@ class Settings:
         self.lighting = _env_bool("STATE_INCLUDE_LIGHTING", True)
         self.warmup = _env_bool("STATE_WARMUP", True)
         self.model_dir = os.environ.get("STATE_MODEL_DIR", "onejev-1.6-0.8b")
+        #: 场景/任务提示（模型卡 ``state.task``）。空 = 不发，行为不变。
+        self.context = os.environ.get("STATE_CONTEXT", "")
 
 
 SETTINGS = Settings()
@@ -146,6 +148,8 @@ class StateRequest(BaseModel):
     stage: str = "turn"
     tier2: Optional[bool] = None
     session_id: str = ""
+    #: 场景/任务提示（对应模型卡里的 ``state.task``）。空则用 ``STATE_CONTEXT``。
+    context: str = ""
     # 预留字段（见模块文档）：V1 不参与推断，只回显
     transcript: str = ""
     asr_emotion: Optional[str] = None
@@ -244,7 +248,8 @@ async def state(req: StateRequest) -> StateResponse:
                                 include_lighting=SETTINGS.lighting)
     frames = [_downscale(f, SETTINGS.max_px, SETTINGS.jpeg_quality)
               for f in req.frames_b64]
-    media_state, media = build_media(frames, fps=req.fps)
+    media_state, media = build_media(
+        frames, fps=req.fps, context=req.context or SETTINGS.context)
 
     started = time.monotonic()
 
