@@ -92,6 +92,7 @@ k=12 时 0.5 会被放大成 0.45→0.45 但 0.9 会放大成 0.89→0.89… 总
 | `STATE_INCLUDE_LIGHTING` | `1` | 是否问 `env.lighting` |
 | `STATE_WARMUP` | `1` | 启动后台预热（不阻塞 `/health`） |
 | `STATE_REPLICAS` | `1` | entypoint 起几个 flide（端口 22521+i） |
+| `STATE_SESSION_CACHE_GB` | `0.5` | flide 前缀缓存上限。**不设就是"模型起来后剩下的全用"**——与 omni 共卡时会把 GPU0 吃到只剩 1.9GB；0 = 不传参 |
 
 `flide serve` 的合批参数在 `docker/entrypoint-state-head.sh` 里：
 `STATE_BATCH_WINDOW_MS`（默认 3）、`--frontends 2`、`--planners 4`、
@@ -128,6 +129,28 @@ python -m state_head.bench_sop --clips /data/.../assets/video/sop --stage both \
 
 验收线：**8 路并发 p95 ≤ 500ms**，显存增量 ≤ 与 omni 共卡的空闲量，
 且不把 omni 的首字延迟拖到超时。
+
+## M0 实测（2026-11-19，106 GPU0 与 omni 共卡）
+
+环境：OneJev1.6-0.8B，19 问 `stage=turn`，单帧 640px，`--no-cuda-graphs`，
+`--batch-window-ms 3`，`STATE_SESSION_CACHE_GB=0.5`。omni 为 `-c 200000
+--parallel 10`（per-slot 20000）。
+
+| 并发 | p50 | p95 | 吞吐 |
+|---|---|---|---|
+| 1 | 176ms | 180ms | 5.7 QPS |
+| 2 | 232ms | 289ms | 8.1 QPS |
+| 4 | 379ms | **455ms** | 10.6 QPS |
+| 8 | ~650ms | ~700ms | 12 QPS |
+| 16 | ~920ms | ~1250ms | 16 QPS |
+
+- **显存**：GPU0 已用 18879 → 21520 MiB（state head 常驻 **2.6GB**），
+  余量 2605 MiB。不设 `STATE_SESSION_CACHE_GB` 时是 22220 MiB、余量只剩 1.9GB。
+- **对 omni 的影响**：无会话时首字 8002/8017/8020ms（基线 7970/8003/8038ms，无差异）；
+  4 路 state 满负荷时 8175–8230ms（+2~3%），未出现超时；稳态 0 个 502。
+- `--batch-window-ms` 取 0/3/8 差别在噪声内（4 路 p95 447/455/464ms），保持 3。
+- **冷启动**：容器起来后 flide 尚未就绪的几秒里 `/v1/state` 会返回 502；
+  编排侧把它当"本轮没状态"，不会影响文本链路。预热请求在 2.4s 左右。
 
 ## 部署
 

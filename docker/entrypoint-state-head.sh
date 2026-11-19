@@ -13,6 +13,11 @@ STATE_REPLICAS="${STATE_REPLICAS:-1}"
 STATE_HEAD_PORT="${STATE_HEAD_PORT:-22520}"
 STATE_FLIDE_BASE_PORT="${STATE_FLIDE_BASE_PORT:-22521}"
 STATE_BATCH_WINDOW_MS="${STATE_BATCH_WINDOW_MS:-3}"
+# flide 的 session cache 默认是 "模型起来后剩下多少就用多少" —— 与 omni 共卡时
+# 这会把 GPU0 吃到只剩 1.9GB（实测）。给个上限，把余量留给 omni；
+# 我们的每个请求都是新帧、命中不了前缀缓存，所以小值几乎不损失延迟。
+# 0 / 空 = 不传参（flide 自动），非 0 = GB 数。
+STATE_SESSION_CACHE_GB="${STATE_SESSION_CACHE_GB:-0}"
 STATE_GATHER_MS="${STATE_GATHER_MS:-2}"
 STATE_PLANNERS="${STATE_PLANNERS:-4}"
 STATE_FRONTENDS="${STATE_FRONTENDS:-2}"
@@ -58,8 +63,15 @@ if [ ! -e "$MODEL_PATH" ]; then
 fi
 
 # ---- 生成 flide 副本命令 + 汇聚 STATE_BACKEND_URLS -------------------------
-GRAPH_FLAG="on"
-[ "$STATE_NO_CUDA_GRAPHS" = "1" ] && GRAPH_FLAG="off"
+# ⚠️ supervisord 的 `command=` **不支持反斜杠续行**：行尾的 `\` 会原样留进
+#    参数里，换行也会进参数值 ⇒ flide/uvicorn 收到一堆 "unrecognized
+#    arguments"。这里一律拼成单行；开关类参数（`--no-cuda-graphs`）只能是
+#   有/无，不能带 on|off 的值。
+GRAPH_ARGS=""
+[ "$STATE_NO_CUDA_GRAPHS" = "1" ] && GRAPH_ARGS="--no-cuda-graphs"
+CACHE_ARGS=""
+[ -n "$STATE_SESSION_CACHE_GB" ] && [ "$STATE_SESSION_CACHE_GB" != "0" ] \
+    && CACHE_ARGS="--session-cache-gb ${STATE_SESSION_CACHE_GB}"
 
 flide_programs=""
 backend_urls=""
@@ -76,13 +88,7 @@ for ((i = 0; i < STATE_REPLICAS; i++)); do
     fi
     flide_programs+="
 [program:flide-${i}]
-command=/opt/venv/bin/flide serve --model ${MODEL_PATH} --device ${STATE_DEVICE} \\
-    --host 127.0.0.1 --port ${port} \\
-    --batch-window-ms ${STATE_BATCH_WINDOW_MS} --gather-ms ${STATE_GATHER_MS} \\
-    --planners ${STATE_PLANNERS} --frontends ${STATE_FRONTENDS} \\
-    --no-cuda-graphs ${GRAPH_FLAG} \\
-    --max-media-mb ${STATE_MAX_MEDIA_MB} \\
-    --max-request-tokens ${STATE_MAX_REQUEST_TOKENS}
+command=/opt/venv/bin/flide serve --model ${MODEL_PATH} --device ${STATE_DEVICE} --host 127.0.0.1 --port ${port} --batch-window-ms ${STATE_BATCH_WINDOW_MS} --gather-ms ${STATE_GATHER_MS} --planners ${STATE_PLANNERS} --frontends ${STATE_FRONTENDS} ${GRAPH_ARGS} ${CACHE_ARGS} --max-media-mb ${STATE_MAX_MEDIA_MB} --max-request-tokens ${STATE_MAX_REQUEST_TOKENS}
 ${replica_env}
 autostart=true
 autorestart=true
@@ -121,8 +127,7 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 serverurl=unix:///var/run/supervisor.sock
 ${flide_programs}
 [program:state-head]
-command=/opt/venv/bin/python -m uvicorn state_head.app:app \\
-    --host 0.0.0.0 --port ${STATE_HEAD_PORT} --log-level info
+command=/opt/venv/bin/python -m uvicorn state_head.app:app --host 0.0.0.0 --port ${STATE_HEAD_PORT} --log-level info
 environment=STATE_BACKEND_URLS="${STATE_BACKEND_URLS}",STATE_MODEL_DIR="${STATE_MODEL_DIR}",HF_HUB_OFFLINE="1",TRANSFORMERS_OFFLINE="1"
 autostart=true
 autorestart=true
