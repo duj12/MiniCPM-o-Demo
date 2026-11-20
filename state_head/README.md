@@ -147,6 +147,10 @@ python -m state_head.bench_sop --clips /data/.../assets/video/sop --stage both \
     --out /app/logs/sop_state.json
 ```
 
+> 想看"Jev 与 Omni 文本同帧对比"用
+> `python -m orchestrator.tools.bench_compare <video.mkv>`（在 `orchestrator/`
+> 一侧，因为它 import 了 `OmniClient` 和线上提示词）。
+
 验收线：**8 路并发 p95 ≤ 500ms**，显存增量 ≤ 与 omni 共卡的空闲量，
 且不把 omni 的首字延迟拖到超时。
 

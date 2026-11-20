@@ -63,6 +63,8 @@ benchmark.json
 .run-logs/
 *.log
 tools/
+# 但编排自己的工具目录要进 git（延迟/对比台架、探针脚本）
+!orchestrator/tools/
 
 # 模型权重目录（CI 构建时由 svn export 生成，不进 git）
 checkpoints/

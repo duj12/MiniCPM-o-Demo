@@ -997,6 +997,14 @@ python -m orchestrator.tests.test_duplex_sim --scenario turn --anchor armed \
 # 离线测 D（用 ORCH_DUMP_AUDIO 的 dump；--verify-url 会用真实 AEC 复核）
 python -m orchestrator.tests.measure_delay --mic <-mic.wav> --raw <-raw.wav>
 
+# 视觉两条链同帧对比：Jev（/v1/state 16 问）vs Qwen3-Omni 描述文本
+# 默认用**线上**的 desc-only 两行提示词（直接 import 本包 describe.py，
+# 改了提示词这里跟着变，不会出现两份不一致的模板）
+python -m orchestrator.tools.bench_compare /data/.../s-xxx-raw.mkv --ticks 20 \
+  --out /tmp/cmp.jsonl
+python -m orchestrator.tools.bench_compare clip.mkv --variant full   # 老 8 键对照
+python -m orchestrator.tools.bench_compare clip.mkv --variant none   # 只跑 Jev
+
 # 主动校准通道（**已从验证页移除**，服务端端点保留给离线工具/诊断用）
 python -m orchestrator.tests.test_calibrate        # 算法：已知延迟的合成回声
 python -m orchestrator.tests.test_calibrate_e2e    # 端点：模拟浏览器走全流程
