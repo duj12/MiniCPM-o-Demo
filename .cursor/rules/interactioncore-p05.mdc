@@ -1,0 +1,12 @@
+---
+description: vendor/interactioncore 的开发固定在 P05 分支
+alwaysApply: true
+---
+
+# InteractionCore 用 P05
+
+`vendor/interactioncore` 的功能开发、提交和推送都在 `P05` 上。
+
+- 改这个子模块前先确认当前分支是 `P05`，并且跟踪 `origin/P05`。
+- 不要为 InteractionCore 再开 `feat/*` 分支，也不要停在游离提交上提交。
+- 主仓库只记录子模块提交号。子模块先在 `P05` 上提交并推送，再更新主仓库里的指针。

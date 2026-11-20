@@ -145,6 +145,29 @@ class OmniDescription:
 
 
 @dataclass(frozen=True)
+class OmniState:
+    """state head 产出的一份 **E2 状态**（带置信度）。
+
+    与 `OmniDescription` **并列而不是替代**：后者是 Qwen3-Omni 的自由文本
+    （``FEATURE`` 这类槽位只有文本能表达），本事件是 typed-question 模型
+    给出的枚举 + 概率。两者在 `InteractionDownstream` 里合成同一份八键快照。
+
+    ``state`` 就是 schema §4.3 的 E2 ``state`` 块；``confidence`` 是拍平的
+    ``{E2 路径: 概率}``（只用于日志，不参与合成）。
+
+    ⚠️ ``stage="turn"`` 时**``None`` 值是"本轮未观测"**（``env.scene``
+    不在 turn 轮的问集里），合并时必须保旧值 —— 见 ``state_schema.merge_e2``。
+    """
+    t: int
+    stage: Literal["full", "turn"]
+    state: dict
+    confidence: dict = field(default_factory=dict)
+    latency_ms: int = 0
+    model: str = ""
+    kind: Literal["omni.state"] = "omni.state"
+
+
+@dataclass(frozen=True)
 class FaceWake:
     """人脸唤醒（G1 库的 ``interacting``）。"""
     t: int
@@ -240,7 +263,7 @@ class Tick:
 
 DownstreamEvent = Union[
     AsrPartial, AsrFinal, AsrTurnSense, AsrStateUpdate,
-    OmniTurnSense, OmniDelta, OmniResponseDone, OmniDescription,
+    OmniTurnSense, OmniDelta, OmniResponseDone, OmniDescription, OmniState,
     FaceWake, FaceIdentity, FaceLipState, FaceState,
     PlaybackReceipt, Tick,
 ]

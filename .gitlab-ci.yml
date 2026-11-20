@@ -1,10 +1,13 @@
 # Omni-LLM-Server 镜像构建 CI
 #
-# 构建两个镜像（SVN 下载模型到 checkpoints/，由 build-image.sh 打包进镜像）：
+# 构建三个镜像（SVN 下载模型到 checkpoints/，由 build-image.sh 打包进镜像）：
 #   - omnillm-cpp-backend : worker+后端 镜像（C++ llama 服务 + worker.py + VAD/TurnSense）
 #   - omnillm-gateway     : gateway 镜像（网页入口 :8006，不加载模型）
+#   - omnillm-state-head  : typed-question 状态模型（OneJev/Flide，:22520）
 # 模型仓库：svn://svn-local.xmov.ai/repository/AlgModels/OmniLLM
 #   - latest 分支（默认）：checkpoints/{qwen3omni-gguf,fsmn-vad-onnx,TurnSense}/
+#   - state head 的模型是同目录下的 onejev-1.6-0.8b/；缺失时 build-image.sh
+#     只告警，state-head 镜像照出不误（运行时可挂 /models）
 # 分支映射（同 Fun-ASR-deploy）：master/pre 各对应 SVN 子目录，其他分支用 latest。
 
 variables:
@@ -16,8 +19,12 @@ variables:
   LLAMA_SRC: '/data/nas/xmov_app/omni-llm/llama.cpp-omni-dev'
   WORKER_IMAGE: 'omnillm-cpp-backend'
   GATEWAY_IMAGE: 'omnillm-gateway'
+  STATE_HEAD_IMAGE: 'omnillm-state-head'
+  # ⚠️ CD_CHART_REPOS 保持两项：外部 devops 仓里还没有 state-head 的 chart，
+  #    加名字会让 deploy 阶段找不到 chart。等 chart 建好再补；在此之前目标机用
+  #    `docker compose -f docker-compose.cpp.yml --profile state-head up -d` 起。
   CD_CHART_REPOS: 'omnillm-cpp-backend omnillm-gateway'
-  IMAGE_NAMES: 'omnillm-cpp-backend omnillm-gateway'
+  IMAGE_NAMES: 'omnillm-cpp-backend omnillm-gateway omnillm-state-head'
 
 include:
   - project: 'devops1/gitlab-ci'
@@ -69,13 +76,14 @@ build_image:
     - rsync -aL --delete --delete-excluded --exclude='.svn/' --stats "$SVN_LOCAL_PATH/checkpoints/" ./checkpoints/
     - ls -la ./checkpoints/
     - echo "Building images with tag $CI_COMMIT_SHORT_SHA"
-    # worker+backend 镜像：使用 Runner 上预置的源码并打包模型
+    # worker+backend 与 state-head 两个镜像：使用 Runner 上预置的源码并打包模型
+    # （state head 的模型走独立的 .bundle-state/ 暂存根，不污染 cpp 镜像）
     - bash docker/build-image.sh
     # 单独构建 gateway，避免 Compose 再次构建已完成的 worker 依赖。
     - docker build -f docker/Dockerfile.gateway -t "$GATEWAY_IMAGE:dev" .
     - |
-      # 打 tag 并推送两个镜像（worker + gateway）
-      for IMAGE_NAME in "$WORKER_IMAGE" "$GATEWAY_IMAGE"; do
+      # 打 tag 并推送三个镜像（worker + gateway + state-head）
+      for IMAGE_NAME in "$WORKER_IMAGE" "$GATEWAY_IMAGE" "$STATE_HEAD_IMAGE"; do
         SRC_TAG=$IMAGE_NAME:dev
         docker tag $SRC_TAG $DEV_REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
         docker push $DEV_REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA

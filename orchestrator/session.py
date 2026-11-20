@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
@@ -26,7 +27,15 @@ from typing import Any, Deque, Dict, List, Optional
 import numpy as np
 
 from .clock import SR, AudioFrame, SampleClock
-from .protocol import MIC_CHUNK
+from .protocol import MIC_CHUNK, PCM8_CHANNELS
+
+#: 是否额外保留散装视频转储（``-face.mjpeg`` / ``-omni.mjpeg`` + tsv）。
+#:
+#: 默认 **关**：两者都与 ``-raw.mkv`` 里的视频**逐字节相同**（前端单路抓帧，
+#: ``-c:v copy`` 原样进容器），``omni`` 那路还是 ``face`` 的子集。留着只是
+#: 让视频翻倍占盘，而且 ``_dump_face`` 是整场驻留内存（133KB×20fps）。
+#: 只在要做逐帧取证、且不信任容器封装时打开（`ORCH_KEEP_FACE_MJPEG=1`）。
+_KEEP_FACE_MJPEG = os.environ.get("ORCH_KEEP_FACE_MJPEG", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +123,8 @@ class OrchestratorSession:
         #
         # ⚠️ 这两个必须分开。早先只有 `_dump_path`，于是**任何**连进来的客户端
         #    都会触发转储 —— 包括 replay 工具。实测踩过：在 105 上跑一轮
-        #    replay 验证，共享的 `orchdump/` 里就多出 `s-<sid>-mic.wav` /
-        #    `-raw.wav`（该会话只有音频、没有视频，所以是纯垃圾）。
+        #    replay 验证，共享的 `orchdump/` 里就多出 `s-<sid>-mic.wav`
+        #    （该会话只有音频、没有视频，所以是纯垃圾）。
         #    多人共用一台服务时，这些噪声文件会越积越多，还容易和真实
         #    录制产物混淆。
         #
@@ -128,9 +137,15 @@ class OrchestratorSession:
         self._dump_on = bool(_os.environ.get("ORCH_DUMP_FORCE") == "1") \
             and self._dump_path is not None
         self._dump_mic: list = []
-        self._dump_ref: list = []
-        self._dump_raw: list = []      # 未做 D 补偿的原始参考轨（测 D 用）
         self._dump_aec: list = []
+        #: 8 声道原始输入（``pcm8_base64``）直接**流式写盘**，不攒内存 ——
+        #: 16k×8ch×int16 = 256KB/s，攒 5 分钟就是 77MB。
+        #: 收尾时 ffmpeg 转 FLAC 再删 pcm 中间文件。
+        self._pcm8_fh = None
+        self._pcm8_path: Optional[str] = None
+        self._pcm8_samples = 0
+        self._pcm8_warned_len = False
+        self._pcm8_task = None
         # 视频帧转储：**原样存收到的 JPEG 字节**，不做任何转码 —— 发给
         # Omni/face 的就是这些字节，存 mp4 反而有损、且丢掉逐帧时间对应。
         # 每项 (t_ms, jpeg_bytes)，会话结束时写 .mjpeg + .tsv。
@@ -199,6 +214,71 @@ class OrchestratorSession:
             config.get("omni_describe_full_instruction", "") or "")
         self._desc_delta_instruction = str(
             config.get("omni_describe_delta_instruction", "") or "")
+        # ---- state head（带置信度的 E2）----------------------------------
+        #
+        # 与描述**同一拍**、**并行**触发：两条链谁也不等谁，谁先到谁先写
+        # 状态。`on_answer` 永远不等待它们中的任何一条。
+        self._state_enabled = bool(config.get("omni_state_head", False))
+        self._state_client = None
+        self._state_tasks: set = set()
+        #: 文本侧**只出两行描述**（FEATURE / ENV），schema 的枚举
+        #: 槽位全部交给 state head。没有 state head 时强制关闭 —— 否则枚举
+        #: 槽位就没人答了（与 `_desc_text_short` 同一条护栏）。
+        self._desc_only = (self._state_enabled
+                           and bool(config.get("omni_text_desc_only", True)))
+        #: desc-only 的硬截断（0 = 不限）。
+        self._desc_only_max_new_tokens = int(
+            config.get("omni_desc_only_max_new_tokens", 32) or 0)
+        #: state head 的**独立定时器**（秒；0 = 关，退回"跟随文本触发"）。
+        self._state_interval = float(
+            config.get("omni_state_interval_s", 1.0) or 0.0)
+        #: 每拍用哪个 stage —— `full` 才含 `env.scene`。
+        self._state_stage = str(config.get("omni_state_stage", "full") or "full")
+        self._state_loop_task: Optional[asyncio.Task] = None
+        #: 独立于文本的**在途**标记：state 链不再被 `_desc_inflight` 挡住。
+        self._state_inflight = False
+        self._state_inflight_at = 0.0
+        self._state_last_done_at = 0.0
+        #: 上一次请求时 `omni.last_frame_at` 的值 —— 帧没更新就跳过（1s
+        #: 内重跑同一对帧只是白烧 GPU）。
+        self._state_last_frame_at: Any = _NO_FRAME_CLOCK
+        from .omni.state_schema import parse_slots
+        _slots_raw = str(config.get("omni_state_slots", "") or "")
+        if self._desc_only and parse_slots(_slots_raw):
+            # 文本已经不答枚举了，白名单留着就会出现"E2 没问、文本也没答"
+            # 的空洞。以全量为准并告警（配置错了要看得见）。
+            logger.warning("[%s] ORCH_TEXT_DESC_ONLY=1 时 ORCH_STATE_SLOTS 必须为空 "
+                           "—— 已忽略 %r，按全量问", self.session_id, _slots_raw)
+            _slots_raw = ""
+        self._state_slots = parse_slots(_slots_raw)
+        if self._state_enabled:
+            from .omni.state_client import StateClient
+            self._state_client = StateClient(
+                config.get("omni_state_url", "http://127.0.0.1:22520"),
+                timeout_s=float(config.get("omni_state_timeout_s", 0.8) or 0.8),
+                n_frames=int(config.get("omni_state_n_frames", 2) or 2),
+                max_px=int(config.get("omni_state_max_px", 640) or 0),
+                fail_threshold=int(config.get("omni_state_fail_threshold", 5) or 5),
+                cooldown_s=float(config.get("omni_state_cooldown_s", 30.0) or 30.0),
+                # 白名单**每次请求都带给服务端**（见 `StateClient.slots`）：
+                # 只有编排侧知道"文本省掉了哪几项"，服务端照它问即可。
+                slots=_slots_raw,
+            )
+            logger.info("[%s] state head 已启用（%s，超时 %.2fs，%d 帧，"
+                        "节拍 %s，stage=%s，槽位=%s）",
+                        self.session_id, self._state_client.url,
+                        self._state_client.timeout_s, self._state_client.n_frames,
+                        ("%.2fs" % self._state_interval
+                         if self._state_interval > 0 else "跟随文本"),
+                        self._state_stage,
+                        ",".join(sorted(self._state_slots)) or "全量")
+        #: 文本侧只出自由文本槽位（`FEATURE` / `ENV` / `POSITION` + 一行
+        #: `DESCRIPTION`），枚举槽位交给 state head。**必须两个条件都成立**：
+        #: `ORCH_TEXT_SHORT` 是"想短"，state head 是"有人补那 5 个键"。
+        #: `_desc_full_instruction` 显式给了值时优先用显式的（调 prompt 用）。
+        self._desc_text_short = (
+            self._state_enabled
+            and bool(config.get("omni_text_short", True)))
         #: 已经为哪个 VAD 段发过断句触发的描述。段关闭的证据今天只有
         #: `2pass-offline` 到达，但同一次关闭可能来多条 offline（`is_final`
         #: 之外还有收尾帧），所以要去重 —— 否则一次断句发两次 decode。
@@ -286,7 +366,8 @@ class OrchestratorSession:
 
     async def on_audio(self, x: np.ndarray, t_ms: int = 0,
                        ctx_time: float = 0.0, epoch: int = 0,
-                       ref: Optional[np.ndarray] = None) -> None:
+                       ref: Optional[np.ndarray] = None,
+                       pcm8: Optional[bytes] = None) -> None:
         """收到一段麦克风音频（float32 (1,T)，16kHz）。
 
         mic ingest 是**唯一**推进时钟的地方。时钟因此跟踪真实音频流，
@@ -300,6 +381,10 @@ class OrchestratorSession:
         通道和 mic 一起送上来）。它与 ``x`` 是同一帧切出来的，**逐采样
         对齐** —— 直接当 AEC 参考即可，D=0，既不依赖服务端 TTS 参考轨，
         也不需要测声学延迟。``ref=None`` 时行为与改动前完全一致。
+
+        ``pcm8`` 是**可选**的原始 8 声道交错 int16 字节（16kHz，ch0..ch7），
+        给 8768 的 8PCM 门控用。它与 ``x`` 同一时间窗，这里只做一次
+        「登记」，由人脸工作线程拼块发出 —— **不阻塞音频路径**。
         """
         if self.closed:
             return
@@ -309,6 +394,13 @@ class OrchestratorSession:
         frame = self.clock.frame_of(x)
         if ctx_time > 0:
             self.clock.record_anchor(ctx_time, frame.t0, epoch)
+        # 8PCM 门控：把这一块的 8 声道原始字节交给远端人脸（8768）。
+        # 🚨 必须**非阻塞**：这里只是 append 到一个列表，真正的拼块+HTTP
+        #    在 face 工作线程里做。没开 pcm8 / 没装人脸时这一步零开销。
+        if pcm8:
+            self._feed_face_pcm8(pcm8, frame.n_samples)
+            # 转储与人脸**解耦**：没有人脸（或人脸是 8767）时，8ch 一样要存。
+            self._dump_pcm8(pcm8, frame.n_samples)
         self.stats["audio_chunks_in"] += 1
         self.stats["audio_samples_in"] += frame.n_samples
         self.metrics.inc("audio_chunks")
@@ -365,7 +457,7 @@ class OrchestratorSession:
 
         ref_arr = (client_ref if client_ref is not None
                    else (self._ref_for(frame) if self.aec is not None else None))
-        self._dump_audio(frame.data, ref_arr, frame)
+        self._dump_audio(frame.data)
 
         if self.aec is not None:
             self._trace_ref(ref_arr, frame)
@@ -373,44 +465,25 @@ class OrchestratorSession:
         else:
             await self._fanout_direct(frame.data)
 
-    def _dump_audio(self, mic: np.ndarray, ref: np.ndarray,
-                    frame: AudioFrame) -> None:
-        """把 mic / farend 落盘（仅在开启转储时）。
+    def _dump_audio(self, mic: np.ndarray) -> None:
+        """攒 mic / AEC 输出两路（仅在开启转储时）。
 
-        「回声消不掉」这个问题的**唯一确诊手段**：拿到 mic 与 farend 的
-        原始波形，就能直接算出 mic 里到底有没有回声、以及它与 farend 差
-        多少采样。在此之前我们一直在用"互相关峰比""ERLE""mic_peak"这些
-        间接指标推断，已经推错过好几次（甚至得出过与 ASR 现象矛盾的
-        结论）—— 必须看波形。
+        两路都是**中间文件**（``-mic.wav`` / ``-aec.wav``）：AEC 输出会 mux
+        进 mkv 的音轨，mic 只在没有 AEC（浏览器原生 AEC）时当兜底音轨；
+        mux 成功后 `raw_dump.mux_raw_video` 会把它们删掉。
 
-        开启：环境变量 ``ORCH_DUMP_AUDIO=/path/prefix``（会话结束时写成
-        ``<prefix>-<sid>-mic.wav`` / ``-ref.wav`` / ``-raw.wav`` / ``-aec.wav``）。
-        默认关闭，零开销 —— 实时路径上不该有额外 I/O。
-
-        ⚠️ ``-ref.wav`` 是**已按 D 补偿过**的（它就是喂给 AEC 的那一份），
-        拿它去测 D 只能得到残差。测 D 必须用 ``-raw.wav``（未补偿的原始轨）
-        —— 见 ``tests/measure_delay.py``。
+        开启：``ORCH_DUMP_AUDIO=/path/prefix`` + 客户端 ``record_raw=true``。
+        默认关闭，零开销；8 声道那一路是单独的流式写盘（见 `_dump_pcm8`）。
         """
         if not self._dump_on:
             return
         self._dump_mic.append(mic.reshape(-1).copy())
-        n = frame.n_samples
-        # ⚠️ **browser AEC 模式下 ref/raw 恒为全静音，直接不落盘**。
-        #
-        #    `ref is None` = 没连云端 AEC（浏览器原生模式）—— 此时
-        #    `_ref_for()` 按设计返回等长静音（"给静音是物理上诚实的"）。
-        #    这个语义**是对的**，但把它写成 wav 只是 5MB 的零。
-        #    实测：browser 模式下 `-ref.wav 峰值=0.00000`、
-        #    `-raw.wav` 也没人读（它只在**算法服务 AEC** 下测 D 时才有用，
-        #    见 tests/measure_delay.py）。
-        #
-        #    所以只在**真的连了云端 AEC**时才攒这两路。落盘时按长度判空，
-        #    长度对不上的顾虑不存在 —— 它们要么整场都有、要么整场都没有。
-        if ref is not None:
-            self._dump_ref.append(ref.reshape(-1).copy())
-        if self.ref_track is not None:
-            self._dump_raw.append(
-                self.ref_track.read_raw(frame.t0, frame.n_samples).copy())
+        # ⚠️ `ref` / `raw` 两路**不再单独落盘**：
+        #    * ref（AEC 参考）就是 8ch 的 ch6/7，能从 `-raw8.flac` 离线还原；
+        #    * raw（服务端 TTS 参考轨未补偿版）只在旧 D 估计路径用，客户端
+        #      回采取代它之后已无用途。
+        #    转储只保留「算法真正吃进去的 mic」和「AEC 输出」两路 ——
+        #    后者进 mkv 音轨，前者只在没有 AEC 时当兜底音轨，都属中间文件。
 
     def _dump_aec_out(self, seg: np.ndarray) -> None:
         if not self._dump_on:
@@ -418,15 +491,22 @@ class OrchestratorSession:
         self._dump_aec.append(np.asarray(seg).reshape(-1).copy())
 
     def flush_audio_dump(self) -> None:
-        """会话结束时把转储写成 wav（三路：mic / farend / aec 输出）。"""
+        """会话结束时落两路 **中间** wav：``-mic.wav`` / ``-aec.wav``。
+
+        这两份都**不是最终产物**（最终只有 ``-raw8.flac`` + ``-raw.mkv``）：
+        AEC 输出会被 mux 进 mkv 音轨，mic 只在没有 AEC 时当兜底音轨 ——
+        mux 成功后 `raw_dump.mux_raw_video` 会删掉它们。
+
+        farend / 未补偿参考轨不再落盘：前者 = 8ch 的 ch6/7，后者已无用途
+        （见 `_dump_audio` 的说明）。
+        """
         if not self._dump_on or not self._dump_mic:
             return
         import wave
         from pathlib import Path
         base = Path(self._dump_path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        for name, chunks in (("mic", self._dump_mic), ("ref", self._dump_ref),
-                             ("raw", self._dump_raw), ("aec", self._dump_aec)):
+        for name, chunks in (("mic", self._dump_mic), ("aec", self._dump_aec)):
             if not chunks:
                 continue
             x = np.concatenate(chunks)
@@ -872,6 +952,110 @@ class OrchestratorSession:
         #    这几帧本来就早于音频起点，归到 0 是正确语义。
         return int(max(0, s) * 1000 // SR)
 
+    def _feed_face_pcm8(self, pcm8: bytes, mic_samples: int) -> None:
+        """把 8 声道 PCM 登记给远端人脸（8768 门控）。
+
+        **同步、非阻塞**：只 append 到 provider 的待发列表，真正的拼块 +
+        HTTP 在 face 工作线程里。没开 8PCM（或人脸降级）时只告警一次。
+
+        ``pcm8`` 与该 mic 块是同一时间窗切出来的，采样数理应相等；不等时
+        只告警一次 —— 远端按**自己的**采样游标记账（不依赖 mic 时钟），
+        所以不会崩，只是两条轴会慢慢错开。
+        """
+        fw = self.face_worker
+        prov = getattr(fw, "provider", None) if fw is not None else None
+        if prov is None or not getattr(prov, "pcm8_enabled", False):
+            if not getattr(self, "_pcm8_warned_noch", False):
+                self._pcm8_warned_noch = True
+                logger.warning("[%s] 收到 pcm8，但本会话人脸未启用 / 未开 "
+                               "8PCM 模式 —— 已忽略（检查 ORCH_FACE_PCM8）",
+                               self.session_id)
+            return
+        n = len(pcm8) // 16
+        if n != mic_samples and not getattr(self, "_pcm8_warned_len", False):
+            self._pcm8_warned_len = True
+            logger.warning("[%s] pcm8 与 mic 块长度不一致（%d vs %d 采样）"
+                           "—— 按 pcm8 自身长度记账",
+                           self.session_id, n, mic_samples)
+        if not getattr(self, "_pcm8_logged", False):
+            self._pcm8_logged = True
+            logger.info("[%s] 8PCM 已接入远端人脸（%d 采样/块，8 声道）",
+                        self.session_id, n)
+        prov.set_pcm8(pcm8)
+
+    # ------------------------------------------------------------------ #
+    #  8 声道原始输入转储（``-raw8.flac``）
+    # ------------------------------------------------------------------ #
+    def _dump_pcm8(self, pcm8: bytes, mic_samples: int) -> None:
+        """把 8 声道原始块**流式**写进 ``-raw8.pcm``（收尾转 FLAC）。
+
+        为什么与人脸解耦：8ch 是**原始输入音频**，算法侧（8767）要不要它
+        与"我们想不想复现"是两件事。录制一开就存，客户端没给 8ch 就什么
+        都不写（手机/浏览器麦的会话只有单声道 mic）。
+        """
+        if not self._dump_on:
+            return
+        if self._pcm8_fh is None:
+            from pathlib import Path
+            base = f"{self._dump_path}-{self.session_id}-raw8"
+            Path(base).parent.mkdir(parents=True, exist_ok=True)
+            self._pcm8_path = base + ".pcm"
+            self._pcm8_fh = open(self._pcm8_path, "wb")
+            logger.info("[%s] 8 声道原始音频转储开始：%s（16k/s16le/8ch）",
+                        self.session_id, self._pcm8_path)
+        n = len(pcm8) // (PCM8_CHANNELS * 2)
+        # 与 mic 块对齐是**硬要求**：视频/单声道音频都以 mic 采样轴为准，
+        # 8ch 一旦比它长或短，三者就错轴了。
+        if n != mic_samples:
+            if n > mic_samples:
+                pcm8 = pcm8[:mic_samples * PCM8_CHANNELS * 2]
+            else:
+                pcm8 = pcm8 + b"\x00" * (
+                    (mic_samples - n) * PCM8_CHANNELS * 2)
+            if not self._pcm8_warned_len:
+                self._pcm8_warned_len = True
+                logger.warning("[%s] 8ch 块 %d 采样 ≠ mic 块 %d —— 已按 mic "
+                               "块补零/截断，保证与视频同轴",
+                               self.session_id, n, mic_samples)
+        try:
+            self._pcm8_fh.write(pcm8)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("[%s] 8 声道写盘失败（已停止该路转储）：%s",
+                           self.session_id, exc)
+            try:
+                self._pcm8_fh.close()
+            except OSError:
+                pass
+            self._pcm8_fh = None
+            self._pcm8_path = None
+            return
+        self._pcm8_samples += mic_samples
+
+    def _finish_pcm8_dump(self) -> None:
+        """收尾：关文件 → 后台转 FLAC → 删中间 pcm。**失败不影响收尾。**"""
+        if self._pcm8_path is None:
+            return
+        if self._pcm8_fh is not None:
+            try:
+                self._pcm8_fh.close()
+            except OSError:
+                pass
+            self._pcm8_fh = None
+        pcm = self._pcm8_path
+        self._pcm8_path = None
+        if not self._pcm8_samples:
+            try:
+                import os as _os2
+                _os2.unlink(pcm)
+            except OSError:
+                pass
+            return
+        from .raw_dump import pcm8_to_flac
+        loop = asyncio.get_event_loop()
+        fut = loop.run_in_executor(None, pcm8_to_flac, pcm,
+                                   self._pcm8_samples)
+        self._pcm8_task = asyncio.ensure_future(fut)
+
     async def on_video_face(self, jpeg: bytes, t_ms: int = 0,
                             ctx_time: float = 0.0, epoch: int = 0) -> None:
         """收到人脸用视频帧（25fps，独立于音频块）。**绝不阻塞音频路径。**
@@ -884,7 +1068,10 @@ class OrchestratorSession:
             return
         self.stats["video_face_frames"] += 1
         now_ms = self._frame_time_ms(ctx_time, epoch)
-        if self._dump_on:
+        # ⚠️ 默认**不**再攒 face.mjpeg：视频最终只留 mkv 一份（`-c:v copy`
+        #    的同一份字节），再存一路只是翻倍占盘 + 整场驻留内存。
+        #    要逐帧取证时设 `ORCH_KEEP_FACE_MJPEG=1`。
+        if self._dump_on and _KEEP_FACE_MJPEG:
             # 原样存 —— 与喂给 face_worker 的是同一份字节
             self._dump_face.append((now_ms, jpeg))
         if self._raw_wanted:
@@ -919,7 +1106,7 @@ class OrchestratorSession:
             # 计数/落盘（否则 dump 里会出现 Omni 根本没看到的帧）。
             return
         self.stats["video_omni_frames"] += 1
-        if self._dump_on:
+        if self._dump_on and _KEEP_FACE_MJPEG:
             self._dump_omni.append((int(self.clock.now() * 1000 // SR), jpeg))
         if self.omni is not None:
             self.omni.offer_frame(jpeg)
@@ -940,10 +1127,16 @@ class OrchestratorSession:
             return
         self._last_omni_ms = now_ms
         self.omni.offer_frame(jpeg)
-        # 落盘保留 omni 这一路（体积小，且是"Omni 实际看到什么"的证据）
-        if self._dump_on:
+        # 不再单独落 omni 这一路：它是 face 那一路的子集（同一份字节），
+        # mkv 里已经有了（见 `_KEEP_FACE_MJPEG` 的说明）。
+        if self._dump_on and _KEEP_FACE_MJPEG:
             self._dump_omni.append((now_ms, jpeg))
         self.stats["video_omni_frames"] += 1
+
+    @property
+    def recording(self) -> bool:
+        """本次会话是否在转储（`session.ready` 据此决定要不要 8ch）。"""
+        return bool(self._dump_on)
 
     def enable_raw_record(self, on: bool) -> None:
         """客户端在 `session.start` 里带 `record_raw=true` 时开转储。
@@ -953,7 +1146,7 @@ class OrchestratorSession:
         （尤其 replay 工具）都在共享的 `orchdump/` 里留一堆垃圾。
 
         实测踩过：105 上跑一轮 replay 验证，就在共享目录里多出
-        `s-<sid>-mic.wav` / `-raw.wav`（该会话只有音频、没有视频）。
+        `s-<sid>-mic.wav`（该会话只有音频、没有视频）。
         多人共用一台服务时这类噪声会越积越多，还容易和真实录制混淆。
         """
         if on and self._dump_path is None:
@@ -1669,20 +1862,51 @@ class OrchestratorSession:
             logger.info("[%s] 有新鲜帧了 ⇒ 补发起点全量描述", self.session_id)
         if stage == "full":
             self._desc_pending_full = False
-        from .omni.describe import FULL_INSTRUCTION, TURN_INSTRUCTION
+        from .omni.describe import (DESC_ONLY_INSTRUCTION, FULL_INSTRUCTION,
+                                    SHORT_FULL_INSTRUCTION,
+                                    SHORT_TURN_INSTRUCTION, TURN_INSTRUCTION,
+                                    partial_instruction)
         # config 覆盖（`ORCH_OMNI_DESCRIBE_*_INSTRUCTION`）—— 调 prompt 不用
         # 改代码；空则用 `omni/describe.py` 的默认。
         #
         # 两段都是**全量 8 键**，差别只在详细程度：起点那份要当 Agent 的
         # 视觉背景，允许展开；每轮那份只求快，值压到最短。
-        if stage == "full":
-            instruction = self._desc_full_instruction or FULL_INSTRUCTION
+        #
+        # `ORCH_TEXT_SHORT=1` **且** state head 开着时改用短版：枚举槽位
+        # 由 typed-question 模型作答，文本侧只留 FEATURE / ENV / POSITION
+        # 三个自由文本槽位 + 一行 DESCRIPTION。两个条件缺一不可 —— 没有
+        # state head 还砍掉 5 个键，状态就直接丢了。
+        if self._desc_only:
+            # 两行描述（FEATURE / ENV）：枚举槽位全归 state head，
+            # 文本只说"人什么样、环境有什么、站在哪儿"。full / turn 同一套
+            # —— 起点那份也不需要更长的版本。
+            default_instruction = DESC_ONLY_INSTRUCTION
+        elif self._desc_text_short:
+            if self._state_slots:
+                # 白名单：E2 只答 4 个槽位 ⇒ 文本保留全量 8 行、只省掉这 4 项。
+                # 不能走短文本版（那样 ATTENTION/ACTION/EMOTION/BEHAVIOR/
+                # RELATION 的其余部分就没人答了）。
+                default_instruction = partial_instruction(stage, self._state_slots)
+            else:
+                default_instruction = (SHORT_FULL_INSTRUCTION if stage == "full"
+                                       else SHORT_TURN_INSTRUCTION)
         else:
-            instruction = self._desc_delta_instruction or TURN_INSTRUCTION
+            default_instruction = (FULL_INSTRUCTION if stage == "full"
+                                   else TURN_INSTRUCTION)
+        if stage == "full":
+            instruction = self._desc_full_instruction or default_instruction
+        else:
+            instruction = self._desc_delta_instruction or default_instruction
         # 起点全量不设上限；每轮给上限（0 = 不限）。键值契约下截断只影响
         # 最后一行，不会污染合并后的快照。
-        max_new_tokens = (None if stage == "full" or self._desc_delta_max_new_tokens <= 0
-                          else self._desc_delta_max_new_tokens)
+        if self._desc_only:
+            # 两行关键词 ≈ 20~30 token；32 留余量。截断只可能砍到最后一行
+            # （ENV），FEATURE 先出。
+            max_new_tokens = self._desc_only_max_new_tokens or None
+        elif stage == "full" or self._desc_delta_max_new_tokens <= 0:
+            max_new_tokens = None
+        else:
+            max_new_tokens = self._desc_delta_max_new_tokens
         self.stats["omni_desc_triggers"] = self.stats.get("omni_desc_triggers", 0) + 1
         # 标记在途**必须在 create_task 之前** —— 循环下一次轮询要看它
         self._desc_inflight = True
@@ -1708,6 +1932,71 @@ class OrchestratorSession:
                     "起点全量" if stage == "full" else "每轮")
         self._desc_task = asyncio.create_task(_do())
 
+        # ---- state head：**同一拍**并行起一条，两条互不等待 ----
+        # 放这里（而不是 `_do()` 里面）是为了两者真正同时出发：`_do()` 里
+        # 第一件事就是 `trigger_reply`，把状态请求排在它后面会白等一个网络
+        # 往返。也**不要** await 它 —— 文本那轮失败与状态无关，反之亦然。
+        # ⚠️ 只在 `ORCH_STATE_INTERVAL_S=0`（关掉独立定时器）时才在文本触发点
+        #    跟调一次 —— 那是 2026-11-19 的老行为，用于回滚。默认（>0）由
+        #    `_state_loop` 自己按节拍跑，不跟文本同步。
+        if self._state_client is not None and self._state_interval <= 0:
+            task = asyncio.create_task(self._run_state(stage))
+            self._state_tasks.add(task)
+            task.add_done_callback(self._state_tasks.discard)
+
+    async def _run_state(self, stage: str) -> None:
+        """调一次 state head，成功则投 `OmniState` 给下游。
+
+        三条不变量：
+
+        * **永不抛** —— `StateClient.post_state` 已经把异常吃干净了，这里
+          只兜住"帧访问器是测试替身"这类 AttributeError；
+        * **不阻塞任何东西** —— 由 `_do_describe` 起成独立 task；
+        * **拿到的是"已进 KV 的帧"** —— 与 OmniLLM 看的是同一张画面，
+          两条链的结论才可比（见 `OmniClient.recent_frames_b64`）。
+        """
+        from .downstream.interface import OmniState
+
+        client = self._state_client
+        if client is None or self.omni is None:
+            return
+        getter = getattr(self.omni, "recent_frames_b64", None)
+        if not callable(getter):
+            # 测试替身 / 老接口不带帧访问器 ⇒ 这一轮没有状态，不是错误
+            return
+        try:
+            frames = getter(client.n_frames)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] 取帧失败（跳过本轮 state）: %s", self.session_id, exc)
+            return
+        if not frames:
+            return
+        res = await client.post_state(
+            frames, stage=stage, session_id=self.session_id,
+            transcript=self._transcript_of_state(),
+        )
+        if not res:
+            return
+        self.stats["omni_state_ok"] = self.stats.get("omni_state_ok", 0) + 1
+        self.stats["omni_state_last_ms"] = int(res.get("latency_ms") or 0)
+        self.post_downstream(OmniState(
+            t=int(self.clock.seconds() * 1000),
+            stage=stage,                      # type: ignore[arg-type]
+            state=res["state"],
+            confidence=res.get("confidence") or {},
+            latency_ms=int(res.get("latency_ms") or 0),
+            model=str(res.get("model") or ""),
+        ))
+
+    def _transcript_of_state(self) -> str:
+        """给 state head 的转写（V1 只回显、不参与推断，见其 `app.py`）。
+
+        ⚠️ 别在这里塞语音情绪：情绪的晚融合在
+        `interaction/downstream.py::_on_state` 做，只有那里知道 ASR 段末的
+        时序。把半份证据从两条路送进去会让"融合发生在哪"变得说不清。
+        """
+        return str(getattr(self, "_last_asr_text", "") or "")
+
     def _release_desc_attempt(self) -> None:
         """这一轮描述**没送出去**（连接断了/抛异常）：收尾并**照常计时**。
 
@@ -1729,10 +2018,70 @@ class OrchestratorSession:
         self._desc_last_done_at = time.monotonic()
 
     def _ensure_desc_loop(self) -> None:
-        """起滚动循环（幂等）。"""
-        if self._desc_loop_task is not None and not self._desc_loop_task.done():
-            return
-        self._desc_loop_task = asyncio.create_task(self._desc_loop())
+        """起滚动循环与 state 定时循环（各自幂等）。"""
+        if self._desc_loop_task is None or self._desc_loop_task.done():
+            self._desc_loop_task = asyncio.create_task(self._desc_loop())
+        self._ensure_state_loop()
+
+    def _ensure_state_loop(self) -> None:
+        """起 state head 的独立定时循环（幂等）。
+
+        与描述链路**解耦**：``ORCH_OMNI_DESCRIBE=0`` 时 `_arm_desc_loop`
+        永不触发，但 Jev 的节拍仍要按帧跑 —— 否则状态链会静默地一直不启动。
+        """
+        if (self._state_client is not None and self._state_interval > 0
+                and (self._state_loop_task is None
+                     or self._state_loop_task.done())):
+            self._state_loop_task = asyncio.create_task(self._state_loop())
+
+    async def _state_loop(self) -> None:
+        """state head 的**独立定时器** —— 目标刷新周期就是 `interval`。
+
+        ## 为什么要独立
+
+        `_desc_inflight` 只在文本 `response.done` 时放掉，而文本一轮 ~1s；
+        与 state 共用这个闸，实际周期会变成 `文本耗时 + interval`（实测
+        ~1.05s + 1s ≈ 2.05s），Jev 的 185ms 优势全被吃掉。
+
+        ## 判据
+
+        依次是：没启用 / 关了 → 跳过；在途未超时 → 跳过；距上一拍结束不够
+        `interval` → 跳过；**`omni.last_frame_at` 没变** → 跳过（帧是跟着
+        1s 音频块发的，1s 内重跑同一对帧只是白烧 GPU）；否则跑一次。
+        最后一拍失败不会让循环停 —— `_run_state` 永不抛。
+        """
+        stale_s = max(5.0, self._state_interval * 3)
+        while not self.closed:
+            await asyncio.sleep(self._DESC_POLL_S)
+            client = self._state_client
+            if client is None or self._state_interval <= 0 or self.omni is None:
+                continue
+            now = time.monotonic()
+            if self._state_inflight:
+                if now - self._state_inflight_at <= stale_s:
+                    continue
+                # 超时 = 请求挂住了（网络/服务端卡死）。显式告警并放掉，
+                # 下一拍自己接回来 —— 与 `_desc_loop` 同一套自愈思路。
+                logger.warning("[%s] state 请求在途超过 %.0fs —— "
+                               "放掉在途标记，恢复定时刷新",
+                               self.session_id, stale_s)
+                self._state_inflight = False
+                self._state_last_done_at = now
+            if now - self._state_last_done_at < self._state_interval:
+                continue
+            frame_at = getattr(self.omni, "last_frame_at", _NO_FRAME_CLOCK)
+            if frame_at is not _NO_FRAME_CLOCK:
+                if frame_at is not None and frame_at == self._state_last_frame_at:
+                    # 没有新帧：重跑同一对帧既不会变好，还占着共享 GPU0
+                    continue
+                self._state_last_frame_at = frame_at
+            self._state_inflight = True
+            self._state_inflight_at = now
+            try:
+                await self._run_state(self._state_stage)
+            finally:
+                self._state_inflight = False
+                self._state_last_done_at = time.monotonic()
 
     async def _desc_loop(self) -> None:
         """滚动刷新每轮描述 —— 目标是 `AsrFinal` 一到就有非空缓存可发。
@@ -1794,12 +2143,25 @@ class OrchestratorSession:
 
     def _stop_desc_loop(self) -> None:
         """停掉滚动循环与在途描述任务（会话收尾用）。"""
-        for task in (self._desc_loop_task, self._desc_task):
+        for task in (self._desc_loop_task, self._desc_task,
+                     self._state_loop_task):
             if task is not None and not task.done():
                 task.cancel()
         self._desc_loop_task = None
         self._desc_task = None
+        self._state_loop_task = None
         self._desc_inflight = False
+        # state head 的在途请求也一起收掉；连接池随会话释放
+        for task in list(self._state_tasks):
+            if not task.done():
+                task.cancel()
+        self._state_tasks.clear()
+        if self._state_client is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._state_client.aclose())
+            except RuntimeError:
+                pass          # 没有运行中的 loop（收尾在同步上下文里）—— 无妨
+            self._state_client = None
 
     def _send_display(self, msg, *, critical: bool = False) -> bool:
         """投递 UI 消息。返回**是否入队成功**。
@@ -2309,6 +2671,9 @@ class OrchestratorSession:
             )
         if self.face_worker is not None:
             self.face_worker.start()
+        # state head 的节拍**不等 GREET**：会话一起来就按帧跑（描述链路
+        # 关掉时 `_arm_desc_loop` 不点火，但 Jev 仍要出状态）。
+        self._ensure_state_loop()
 
     async def drain(self, reason: str = "client_stop",
                     asr_timeout: float = 15.0,
@@ -2413,6 +2778,11 @@ class OrchestratorSession:
             self.flush_video_dump()
         except Exception as exc:  # noqa: BLE001
             logger.warning("视频转储写入失败: %s", exc)
+        # 8 声道原始输入：关文件 → 后台转 FLAC（与 mux 相互独立）
+        try:
+            self._finish_pcm8_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("8 声道转储收尾失败: %s", exc)
         try:
             self._finish_raw_record()
         except Exception as exc:  # noqa: BLE001

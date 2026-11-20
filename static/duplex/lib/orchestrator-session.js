@@ -33,6 +33,8 @@
       this.sessionId = null;
       this.ready = false;
       this.closed = false;
+      /** 服务端在 session.ready 里告诉你它要不要 8 声道原始 PCM */
+      this.facePcm8 = false;
 
       /** TTS 播放器（由外部注入，需实现 playChunk/stop） */
       this.player = opts.player || null;
@@ -127,6 +129,9 @@
             self.sessionId = msg.session_id;
             self.ready = true;
             if (msg.lead_ms) self.leadMs = msg.lead_ms;
+            // 服务端要不要 8 声道原始 PCM —— 看 `want_pcm8`（人脸 8PCM 门控
+            // **或** 本次会话开了录制）；`face_pcm8` 是旧字段，保留兼容。
+            self.facePcm8 = !!(msg.want_pcm8 || msg.face_pcm8);
             if (!settled) {
               settled = true;
               clearTimeout(timer);
@@ -312,6 +317,17 @@
         new Float32Array(rbuf).set(chunk.ref);
         msg.ref_base64 = arrayBufferToBase64(rbuf);
         this.stats.refChunksSent = (this.stats.refChunksSent || 0) + 1;
+      }
+      // ⚠️ **可选 8 声道原始 PCM**（只给「8PCM 门控」的人脸服务用）：
+      //    AlsaServer 的帧体本来就是 16k / s16le / 8 声道交错，客户端要
+      //    **原样转发**（不降混）—— 服务端要自己用 ch2-5 做声源方向。
+      //    必须是新的 Uint8Array（不能是接收缓冲的 subarray 视图）。
+      //    不带这个字段时，消息形状与改动前**逐字节一致**。
+      if (chunk.pcm8 && chunk.pcm8.length && this.facePcm8) {
+        const p8 = chunk.pcm8;
+        const ab = p8.buffer.slice(p8.byteOffset, p8.byteOffset + p8.length);
+        msg.pcm8_base64 = arrayBufferToBase64(ab);
+        this.stats.pcm8ChunksSent = (this.stats.pcm8ChunksSent || 0) + 1;
       }
       this._send(msg);
       this.stats.audioSent += 1;

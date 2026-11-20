@@ -51,12 +51,12 @@ export ORCH_TTS_PAUSE_FADE_MS="${ORCH_TTS_PAUSE_FADE_MS:-1000}"
 export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
 
 # 人脸走按 session 隔离的远端服务，避免本地 .so 的进程级状态串扰。
-# 105/106 共用 105:8767 的服务额度；超时或额度打满会丢帧。
+# 105/106 共用 106:8767 的服务额度；超时或额度打满会丢帧。
 # 必须用 "-" 保留显式空值；ORCH_FACE_SERVICE_URL= 才会回到本地 .so。
 # 105 当前没有可用本地 .so；置空前还需 ORCH_ENABLE_FACE=0，避免误以为能回退。
 # 106 的本地 .so 退路仅适合单会话，见 run_orch_106.sh。
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
-export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.105:8767}"
+export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.106:8767}"
 export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
 export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
 
@@ -71,14 +71,60 @@ export ORCH_ASR_PERCEPTION="${ORCH_ASR_PERCEPTION:-1}"
 export ORCH_OMNI_VISION="${ORCH_OMNI_VISION:-1}"
 # 两阶段描述：起点全量 + 后续断句触发 / 定时触发；经 AgentAction.vlm 发送。
 export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
+# state head（带置信度的 E2 状态）—— **旁挂容器** omnillm-state-head:22520。
+#   0（默认）= 完全不调，行为与今天逐字节一致（纯文本 E0）。
+#   1        = 调；schema §3 的枚举槽位全部由它答（独立 1s 节拍），
+#              文本只出两行描述。见下方 ORCH_TEXT_DESC_ONLY。
+# 打开前先确认那边确实活着：curl -s http://<host>:22520/health
+# ⚠️ 105 上跑编排时 state head 在 106 ⇒ 必须写宿主机地址
+#    ORCH_STATE_URL=http://192.168.89.106:22520（不是 localhost）。
+export ORCH_STATE_HEAD="${ORCH_STATE_HEAD:-0}"
+# desc-only 模式下文本只是"人 / 环境"两行，10s 心跳足够；没开
+# state head 时保持 1s（老行为：文本自己答全量 8 键）。
+if [ "$ORCH_STATE_HEAD" = "1" ]; then
+  _DEF_DELTA_INTERVAL=10; _DEF_DELTA_ALWAYS=0
+else
+  _DEF_DELTA_INTERVAL=1;  _DEF_DELTA_ALWAYS=1
+fi
 # VLM 描述定时触发间隔（秒）。主路径是 VAD 断句点触发
 # （ORCH_OMNI_DESC_ON_TURN_BOUNDARY=1），这个值管两件事：
 # ① 两次生成之间的最小间隔（不重叠，防止请求排队、延迟单调增长）
 # ② 定时触发周期 —— 从上一轮完成起算。调小不会让断句触发变快。
-export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-1}"
-# 定时触发是否**不看语音活动**（1=开，默认）：用户正在说话也按上面的间隔准时
-# 触发一次（与断句点触发叠加）。设 0 回到旧口径：只在静默时补心跳。
-export ORCH_OMNI_DELTA_ALWAYS="${ORCH_OMNI_DELTA_ALWAYS:-1}"
+export ORCH_OMNI_DELTA_INTERVAL_S="${ORCH_OMNI_DELTA_INTERVAL_S:-$_DEF_DELTA_INTERVAL}"
+# 定时触发是否**不看语音活动**（1=开）：用户正在说话也按上面的间隔准时
+# 触发一次（与断句点触发叠加）。设 0 只在静默时补心跳 —— desc-only 模式的
+# 默认（文本不再负责动作/姿态，说话期间不需要额外 decode）。
+export ORCH_OMNI_DELTA_ALWAYS="${ORCH_OMNI_DELTA_ALWAYS:-$_DEF_DELTA_ALWAYS}"
+
+export ORCH_STATE_URL="${ORCH_STATE_URL:-http://127.0.0.1:22520}"
+# Jev 的**独立定时器**（秒；0 = 关，退回"跟随文本触发"的老行为）。
+# 帧历史本身就是 1Hz（帧跟着 1s 音频块发），1s 已是上限。
+export ORCH_STATE_INTERVAL_S="${ORCH_STATE_INTERVAL_S:-1}"
+# 每拍请求的 stage：full 才含 env.scene（schema §3 的 ENV.scene 唯一入口）。
+export ORCH_STATE_STAGE="${ORCH_STATE_STAGE:-full}"
+# 超时即丢弃本轮 state（文本那条不受影响）。0.8s ≈ 目标 P95 的 1.6 倍。
+export ORCH_STATE_TIMEOUT_S="${ORCH_STATE_TIMEOUT_S:-0.8}"
+# 送给 state head 的帧数（2 = 当前 + 1s 前，显著改善动作/运动/duration）
+export ORCH_STATE_N_FRAMES="${ORCH_STATE_N_FRAMES:-2}"
+# 发前把帧长边缩到多少像素（显存/延迟的主要旋钮之一）
+export ORCH_STATE_MAX_PX="${ORCH_STATE_MAX_PX:-640}"
+# 渲染成 `label(0.82)` 形态（0 = 只出标签）
+export ORCH_STATE_CONF_IN_TEXT="${ORCH_STATE_CONF_IN_TEXT:-1}"
+# Qwen3-Omni 只出自由文本槽位（FEATURE / ENV / POSITION + 一行 DESCRIPTION）。
+# **仅在 ORCH_STATE_HEAD=1 时生效** —— 没开 state head 还砍掉 5 个枚举键
+# 就什么都不剩了，所以代码里两个条件是"与"关系。
+export ORCH_TEXT_SHORT="${ORCH_TEXT_SHORT:-1}"
+# **文本只出两行描述**（FEATURE / ENV，每行 ≤10 字）：schema §3 的
+# 枚举槽位**全部**交给 state head。同样要求 ORCH_STATE_HEAD=1，且
+# ORCH_STATE_SLOTS 必须为空（代码里有护栏，配错会告警并按全量处理）。
+export ORCH_TEXT_DESC_ONLY="${ORCH_TEXT_DESC_ONLY:-1}"
+# desc-only 的硬截断（两行关键词约 20~30 token）。
+export ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS="${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS:-32}"
+# 槽位白名单：**默认空 = 问全套 16 题**（schema 对齐后的形态）。
+# 空 / all / * = 全量；非空只作回滚用，例如
+#   ORCH_STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction
+# ⚠️ 必须与 state head 容器一致（不一致 = 有槽位没人答）。
+export ORCH_STATE_SLOTS="${ORCH_STATE_SLOTS:-}"
 
 # 保留各机现有日志与音视频排障素材的默认目录。
 export ORCH_LOG_LEVEL="${ORCH_LOG_LEVEL:-info}"
@@ -111,6 +157,13 @@ echo "  描述阶段        = 起点 full + 每轮 turn，AgentAction.vlm 单独
 if [ "$ORCH_OMNI_DELTA_ALWAYS" = "0" ]; then _ALWAYS_TXT="仅静默时"; else _ALWAYS_TXT="不看语音活动"; fi
 echo "  描述定时触发    = 每 ${ORCH_OMNI_DELTA_INTERVAL_S}s（${_ALWAYS_TXT}）+ 断句点各一次" >&2
 echo "  ASR 感知        = $ORCH_ASR_PERCEPTION（0=只出基础 5 键）" >&2
+if [ "$ORCH_STATE_HEAD" = "1" ]; then
+  echo "  state head      = $ORCH_STATE_URL（超时 ${ORCH_STATE_TIMEOUT_S}s，${ORCH_STATE_N_FRAMES} 帧，节拍 ${ORCH_STATE_INTERVAL_S}s，stage=$ORCH_STATE_STAGE）" >&2
+  echo "  E2 槽位白名单   = ${ORCH_STATE_SLOTS:-（空 = 全量 16 题）}" >&2
+  echo "  文本侧          = desc-only=$ORCH_TEXT_DESC_ONLY（两行描述，上限 ${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS} token）" >&2
+else
+  echo "  state head      = 关（纯文本 E0 状态）" >&2
+fi
 echo "  暂停/续播渐变   = 淡出 ${ORCH_TTS_PAUSE_FADE_MS}ms / 淡入 ${ORCH_TTS_RESUME_FADE_MS}ms" >&2
 echo "  打断探针        = $ORCH_IC_DECISION_PROBE" >&2
 echo "  HTTPS 证书      = $SSL_CERT" >&2

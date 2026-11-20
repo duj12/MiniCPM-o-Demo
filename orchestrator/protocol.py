@@ -151,6 +151,17 @@ class SessionReady:
     #: 客户端还是旧的，用户看到的"默认"就不是真的默认了。
     #: `defaults.asr` 同理，让用户能看到当前 ASR 调参的实际数值。
     defaults: Optional[Dict[str, Any]] = None
+    #: 服务端是否要 8 声道原始 PCM（``pcm8_base64``）。客户端据此决定
+    #: **要不要在 wire 上带这份字节**：AlsaServer 页面的缓冲一直维护，
+    #: 但只有在服务端明确要（8768 的 8PCM 门控）时才塞进消息 —— 否则
+    #: 8ch@16k = 341KB/s 的 base64 全白费（8767 会直接忽略该字段）。
+    face_pcm8: bool = False
+    #: 客户端**是否应该**在 ``audio`` 消息里带 ``pcm8_base64``。
+    #:
+    #: = ``face_pcm8``（8768 门控要）**或** 本次会话开了录制且
+    #: ``ORCH_DUMP_PCM8`` 为真（要存 ``-raw8.flac``）。客户端只看这一个
+    #: 字段即可；``face_pcm8`` 保留给"人脸要 PCM"的语义与旧客户端。
+    want_pcm8: bool = False
     type: Literal["session.ready"] = "session.ready"
 
 
@@ -294,6 +305,8 @@ class IcDisplay:
     vision: Optional[dict] = None
     agent: Optional[dict] = None
     probes: Optional[dict] = None
+    #: 待回答话轮 / 交接标记等去重键。replay 原样写入，供 viz 侧栏。
+    turn: Optional[dict] = None
     meta: Optional[dict] = None
     type: Literal["ic"] = "ic"
 
@@ -370,6 +383,34 @@ def decode_audio_b64(s: str) -> np.ndarray:
     raw = base64.b64decode(s)
     x = np.frombuffer(raw, dtype=np.float32)
     return x.reshape(1, -1).copy()
+
+
+#: 8PCM 门控的声道数（8768 契约：16k / 小端 int16 / 8 声道交错）
+PCM8_CHANNELS = 8
+PCM8_SR = 16000
+
+
+def decode_pcm8_b64(s: str) -> Optional[bytes]:
+    """解 8 声道交错 PCM（int16 LE），返回**原始字节**（不解交错）。
+
+    ⚠️ 不解交错、也不转 numpy：上层只需要把它原样 base64 转发给人脸服务，
+    多一次解包/重打包纯属浪费，且交错顺序必须逐字节保持不变（ch0..ch7）。
+    长度不是 ``8*2`` 的整数倍时返回 ``None`` —— 那是客户端切块切错了。
+    """
+    if not s:
+        return None
+    try:
+        raw = base64.b64decode(s)
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw or len(raw) % (PCM8_CHANNELS * 2) != 0:
+        return None
+    return raw
+
+
+def pcm8_samples(raw: bytes) -> int:
+    """8 声道交错字节数 → 每声道采样数。"""
+    return len(raw) // (PCM8_CHANNELS * 2)
 
 
 def encode_audio_b64(x: np.ndarray) -> str:

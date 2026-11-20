@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from orchestrator_replay import (  # noqa: E402
     SR, TTS_SR, AudioMix, VirtualPlayer, _pcm_i16_to_float,
-    playback_reported_active,
+    agent_reply_still_pending, playback_reported_active,
 )
 
 
@@ -97,6 +97,19 @@ def test_empty_fill_is_silence() -> None:
     assert np.all(out == 0.0)
 
 
+def test_greeting_already_played_does_not_drop_a_later_reply() -> None:
+    # 迎宾 TTS 已经起播；之后的 ASR final 还没有新的 TTS。
+    assert agent_reply_still_pending(10.0, 3.0, now=12.0, wait_s=20.0) is True
+
+
+def test_reply_wait_ends_once_the_new_tts_starts() -> None:
+    assert agent_reply_still_pending(10.0, 14.0, now=15.0, wait_s=20.0) is False
+
+
+def test_reply_wait_expires() -> None:
+    assert agent_reply_still_pending(10.0, 3.0, now=31.0, wait_s=20.0) is False
+
+
 def test_resample_16k_to_24k() -> None:
     pcm = np.arange(160, dtype=np.int16)
     out = _pcm_i16_to_float(pcm, 16000, 24000)
@@ -111,5 +124,8 @@ if __name__ == "__main__":
     test_player_pause_freezes_then_resume_keeps_the_tail()
     test_paused_player_still_counts_as_playback()
     test_empty_fill_is_silence()
+    test_greeting_already_played_does_not_drop_a_later_reply()
+    test_reply_wait_ends_once_the_new_tts_starts()
+    test_reply_wait_expires()
     test_resample_16k_to_24k()
     print("ok")

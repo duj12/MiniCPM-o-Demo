@@ -11,11 +11,15 @@ from typing import Any, Dict, List, Optional
 from ..omni.describe import (
     is_no_change, looks_conversational, parse_state, render_state,
 )
+from ..omni.state_schema import (
+    filter_e2_slots, fuse_emotion, merge_e2, merge_vision_text,
+    parse_slots, partial_keys, person_missing, render_e2_json,
+)
 
 from ..downstream.interface import (
     AsrFinal, AsrPartial, AsrStateUpdate, Describe, DownstreamAction,
     DownstreamEvent, FaceIdentity, FaceLipState, FaceState, FaceWake,
-    OmniDescription, PlaybackReceipt, Tick,
+    OmniDescription, OmniState, PlaybackReceipt, Tick,
     Speak, Cancel, PauseTts, ResumeTts,
 )
 from .agent import AgentClient
@@ -36,6 +40,7 @@ _REPORT_CLOCKS = {
         "greet_elapsed_ms", "absent_ms", "barge_hold_ms", "barge_paused_at_ms",
     }),
     "person": frozenset({"dwell_ms"}),
+    "turn": frozenset({"pending_waited_ms"}),
 }
 
 
@@ -80,6 +85,15 @@ _VISION_KEYS: tuple = (
 #: `supports("apply_asr", …)` 的探测键 —— 认 `language` 就说明是 P05 及以后
 #: （P05 之前 `apply_asr` 只有 transcript / asr_confidence / turn_complete）。
 _ASR_CAP_PROBE: tuple = ("language", "noise_burst_detected", "overlap_prob")
+
+#: ASR 情绪的**有效期**（秒）。`emotion` 只在 `2pass-offline`（段末）有值，
+#: 心跳轮拿不到；沿用太久会把"上一句的语气"贴到这一句上。8s 约等于
+#: "一句话 + 一次心跳"的量级。
+_ASR_EMOTION_TTL_S = 8.0
+
+#: state head 停摆的判定窗口（秒）。超过这么久没有新的 E2，视觉快照退回
+#: 由文本描述发布 —— 否则 state 服务挂了会导致 Agent 一份画面都收不到。
+_STATE_FALLBACK_S = 2.5
 
 
 def _asr_perception_kwargs(st: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,8 +154,22 @@ class InteractionDownstream:
                  ic_mode: str = "inprocess",
                  omni_describe: bool = False,
                  on_output: Optional[Any] = None,
-                 agent_mcp_servers: Optional[list] = None) -> None:
+                 agent_mcp_servers: Optional[list] = None,
+                 omni_state: bool = False,
+                 state_conf_in_text: bool = True,
+                 state_slots: str = "") -> None:
         self._desc_enabled = bool(omni_describe)
+        #: state head 是否在跑（`ORCH_STATE_HEAD`）。**只影响发布节奏**：
+        #: 开 ⇒ 视觉快照由 `OmniState` 那一侧统一发布，文本描述只更新
+        #: 自由文本槽位；关 ⇒ 完全回到老路径（每份描述发一轮）。
+        self._state_enabled = bool(omni_state)
+        #: 渲染成 `label(0.82)` 形态
+        self._state_conf_in_text = bool(state_conf_in_text)
+        #: E2 只出哪些槽位（`ORCH_STATE_SLOTS`）。空集合 = 全给 E2（老口径）。
+        #: 非空时：E2 只裁到这些槽位，文本那半留着，几个"两边各答一半"的键
+        #: （`ATTENTION` / `BEHAVIOR` / `RELATION`）按拼接而不是覆盖合并。
+        self._state_slots = parse_slots(state_slots)
+        self._state_concat = partial_keys(self._state_slots)
         #: 最近一份**生成完**的 VLM 描述（见 `_on_vlm_description`）。
         #: 由 `agent_sink` 的 getter 在**推视觉轮的那一刻**同步读取（正常话轮
         #: 不再取它，见 `agent_sink._send`）—— 所以这里必须是一份"随时可用"
@@ -153,6 +181,24 @@ class InteractionDownstream:
         #: ⚠️ 解析失败（模型没按格式答）时保持为空，`self._vlm` 退回原文 ——
         #:    绝不能因为"格式不对"就把一份有效描述丢掉。
         self._vlm_state: Dict[str, str] = {}
+        #: 最近一份自由文本描述原文（state head 开着时，它是 `_vlm` 的
+        #: 文本尾巴 —— 枚举槽位由 E2 提供）。
+        self._vlm_text = ""
+        #: state head 的 E2 缓存（`state_schema.merge_e2` 合并后的结果）。
+        self._state_e2: Dict[str, Any] = {}
+        self._state_at = 0.0
+        self._state_stage = ""
+        #: `person_visible` 的**滞回**状态：1Hz 采样下门控会在阈值附近抖
+        #: （这拍 null、下拍 []），8 键跟着跳。与当前结论不同时需要连续
+        #: 2 拍一致才翻转；`None` = 还没收到过第一份 E2。
+        self._person_missing: Optional[bool] = None
+        self._person_flip_pending = 0
+        #: 最近一次 ASR 段末的情绪（`emotion` / `emotion_prob`）及其时刻。
+        #: 只有 `2pass-offline` 才有，且**只在一个段末有效** —— 超过
+        #: `_ASR_EMOTION_TTL_S` 就当没有，不拿旧情绪无限沿用。
+        self._asr_emotion: Optional[str] = None
+        self._asr_emotion_prob: Optional[float] = None
+        self._asr_emotion_at = 0.0
         #: 该描述**生成完成**的单调时刻（算年龄用）
         self._vlm_at = 0.0
         #: 该描述属于哪个阶段（full / delta）
@@ -234,11 +280,13 @@ class InteractionDownstream:
                 # 只有真开了才声明 —— 这行是"本路会话会不会产 Describe"
                 # 的唯一可观测点（105 靠它判影子实例起对了没）
                 *(["omni.describe"] if self._desc_enabled else []),
+                *(["omni.state"] if self._state_enabled else []),
             ],
             #: 描述模式 / Agent 载荷形态的生效值。**同一份代码 105/106 共用**，
             #: 日志里没有这一行就没法判"我这台到底开没开"（106 的默认值即
             #: 关 —— 见 config 的说明）。
             "omni_describe": self._desc_enabled,
+            "omni_state": self._state_enabled,
         }
 
     async def on_session_start(self, ctx) -> List[DownstreamAction]:
@@ -273,6 +321,16 @@ class InteractionDownstream:
                         self.session_id, len(self._vlm))
         self._vlm = ""
         self._vlm_state = {}
+        self._vlm_text = ""
+        self._state_e2 = {}
+        self._state_at = 0.0
+        self._state_stage = ""
+        self._person_missing = None
+        self._person_flip_pending = 0
+        # ASR 情绪属于**上一个说话人/上一句话**，新会话必须清掉
+        self._asr_emotion = None
+        self._asr_emotion_prob = None
+        self._asr_emotion_at = 0.0
         self._vlm_at = 0.0
         self._vlm_stage = ""
         self._prev_atype = ""
@@ -482,6 +540,12 @@ class InteractionDownstream:
             self._on_vlm_description(ev)
             return
 
+        # 同一条理由：`_on_state` 只写本对象的缓存（+ 复用 `_push_vision_to_ic`
+        # 里的可用性判据），不能因为 IC 掉线就把 E2 丢掉。
+        if isinstance(ev, OmniState):
+            self._on_state(ev)
+            return
+
         if not self.ic.available:
             return
 
@@ -505,6 +569,7 @@ class InteractionDownstream:
             )
             asr_kwargs.update(self._asr_perception_kwargs(st))
             self.ic.apply("apply_asr", **asr_kwargs)
+            self._note_asr_emotion(st)
 
         elif isinstance(ev, AsrPartial):
             # 流式帧只更新"用户在说话"的证据；转写等 final 更准
@@ -649,8 +714,11 @@ class InteractionDownstream:
             return {}
         return kw
 
-    def _push_vision_to_ic(self) -> None:
-        """把刚更新的 VLM 八键快照推给 IC 的 `apply_vision`（P05）。
+    def _push_vision_to_ic(self, state: Dict[str, str]) -> None:
+        """把一份**合成好的**八键快照推给 IC 的 `apply_vision`（P05）。
+
+        ``state`` 是 ``_publish_vision`` 里 E2 + 文本合成出来的那份
+        （不是 ``self._vlm_state`` 本身 —— 那个只是文本侧的一半）。
 
         ⚠️ **`updated_at_ms` 不传** —— 由 IC 在自己收到时打时间戳
         （`state.apply_vision` 里有值变化就 `now_ms()`）。编排与 IC 的墙钟
@@ -660,7 +728,7 @@ class InteractionDownstream:
         跳过：那种情况下 `_vlm` 已退回原文给 Agent，但 IC 的八个字段是
         结构化的，没有可写的东西，**不要**拿空串去覆盖上一份。
         """
-        if not self._vlm_state:
+        if not state:
             return
         if not self.ic.available:
             return
@@ -668,7 +736,7 @@ class InteractionDownstream:
             self._warn_capability_once(
                 "vision", "apply_vision（VLM 八键：注意力/动作/情绪/…）")
             return
-        kwargs = {k.lower(): v for k, v in self._vlm_state.items() if v}
+        kwargs = {k.lower(): v for k, v in state.items() if v}
         if not kwargs:
             return
         logger.debug("[%s] → IC: apply_vision %d 键（stage=%s）",
@@ -702,6 +770,8 @@ class InteractionDownstream:
         非空描述**正是主指标的立足点。
         """
         text = (ev.text or "").strip()
+        #: 这份文本到达的时刻 —— 下面要和「E2 是**先发布还是后发布**」比较
+        t_arrived = time.monotonic()
         if not text:
             logger.info("[%s] VLM 描述为空（stage=%s）—— 保持上一轮",
                         self.session_id, ev.stage)
@@ -716,6 +786,7 @@ class InteractionDownstream:
             logger.warning("[%s] ⚠️ VLM 描述像是**对话**而非描述（prompt 没镇住？）"
                            "：%r", self.session_id, text[:60])
         self._vlm = text
+        self._vlm_text = text
         # ---- 结构化合并 ----
         #
         # 解析不到任何键 ⇒ **保持原文**（模型没按格式答时不丢数据，只是回到
@@ -729,7 +800,6 @@ class InteractionDownstream:
                 # 每轮（`turn`）也是全量 8 键，合并 == 替换；用 `update` 是为了
                 # 兜住"某一行被截断/没答"的情形 —— 缺的键保旧值，而不是丢掉。
                 self._vlm_state.update(parsed)
-            self._vlm = render_state(self._vlm_state)
         else:
             # 解析失败 ⇒ 快照与原文脱节，**清掉快照**，免得下一份增量合并到
             # 一个过时的底座上（旧键会以"没变化"的名义永远留着）。
@@ -739,36 +809,168 @@ class InteractionDownstream:
         logger.info("[%s] VLM 描述已更新（stage=%s）%d 字，快照 %d 键：%r",
                     self.session_id, ev.stage, len(self._vlm),
                     len(self._vlm_state), self._vlm[:400])
+        # ---- state head 在跑时，发布权优先交给 E2 那一拍 ----
+        # 两条链是同一拍触发的：文本到了、E2 也到了，各发一轮会让 Agent
+        # 每 tick 收到两条视觉轮，且后到的覆盖先到的。
+        #
+        # 分三种情形：
+        # * **E2 还没到**（本 session 首次，或 `_STATE_FALLBACK_S` 内没有新
+        #   E2）⇒ 照旧由本函数发布，否则 state 服务一挂 Agent 就再也收不到
+        #   画面了；
+        # * **E2 已经先发布过**（`_state_at < t_arrived`）⇒ 那份快照里缺
+        #   自由文本槽位，补发一轮才对 —— 否则短文本模式下 `FEATURE` 要等到
+        #   下一个 tick 才到 Agent 手上；
+        # * **E2 还没发布**（同拍的 E2 通常晚于文本，或者只是上一拍留下的
+        #   新鲜值）⇒ 只更新槽位，等 `_on_state` 统一发布。
+        if self._state_enabled and self._state_fresh():
+            if self._state_at < t_arrived:
+                logger.debug("[%s] E2 已先发布，补一轮带文本槽位的视觉背景",
+                             self.session_id)
+                self._publish_vision(parsed=bool(parsed))
+            else:
+                logger.debug("[%s] 文本槽位已更新，等 E2 那一拍统一发布",
+                             self.session_id)
+            return
+        self._publish_vision(parsed=bool(parsed))
+
+    # ------------------------------------------------------------------ #
+    #  E2 状态（`state head` → E2 → 八键快照）
+    # ------------------------------------------------------------------ #
+
+    def _state_fresh(self) -> bool:
+        return bool(self._state_e2) and (
+            time.monotonic() - self._state_at) < _STATE_FALLBACK_S
+
+    def _note_asr_emotion(self, st: Dict[str, Any]) -> None:
+        """记下段末的 ASR 情绪（只有 `2pass-offline` 有值）。"""
+        emo = st.get("emotion")
+        if not emo:
+            return
+        self._asr_emotion = str(emo)
+        p = st.get("emotion_prob")
+        self._asr_emotion_prob = float(p) if isinstance(p, (int, float)) else None
+        self._asr_emotion_at = time.monotonic()
+
+    def _fresh_asr_emotion(self):
+        """取 ASR 情绪；超过 ``_ASR_EMOTION_TTL_S`` 就当没有。"""
+        if not self._asr_emotion:
+            return None, None
+        if time.monotonic() - self._asr_emotion_at > _ASR_EMOTION_TTL_S:
+            return None, None
+        return self._asr_emotion, self._asr_emotion_prob
+
+    def _on_state(self, ev: OmniState) -> None:
+        """收下一份 E2：合并 → 情绪晚融合 → 发布八键快照。"""
+        e2 = merge_e2(self._state_e2, ev.state, ev.stage)
+        if self._state_slots:
+            # 白名单：只留实测可靠的槽位，其余由文本描述提供。裁在**合并后**
+            # 做（合并语义不变），缓存里因此也不会留下白名单外的残值。
+            e2 = filter_e2_slots(e2, self._state_slots)
+        # ---- person_visible 两拍滞回 ----
+        #
+        # 1Hz 采样下"人在不在画面"会在阈值附近抖：这一拍整份 null、下一拍
+        # 又正常。下游 8 键跟着跳，Agent 每一轮看到的"有没有人"都在变。
+        # 所以结论翻转要连续 2 拍一致；待确认的那一拍**丢弃整份读数**
+        # （不放宽成"保留一半"：null 与 [] 对策略相反的正是这个门控本身）。
+        raw_missing = person_missing(e2)
+        if self._person_missing is None:
+            self._person_missing = raw_missing
+        elif raw_missing != self._person_missing:
+            self._person_flip_pending += 1
+            if self._person_flip_pending < 2:
+                logger.info("[%s] [VLM state] 人物可见性翻转待确认"
+                            "（%s → %s，%d/2 拍）—— 本拍丢弃这份读数",
+                            self.session_id,
+                            "人不在画面" if self._person_missing else "人在画面",
+                            "人不在画面" if raw_missing else "人在画面",
+                            self._person_flip_pending)
+                return
+            logger.info("[%s] [VLM state] 人物可见性翻转已确认（%s → %s）",
+                        self.session_id,
+                        "人不在画面" if self._person_missing else "人在画面",
+                        "人不在画面" if raw_missing else "人在画面")
+            self._person_missing = raw_missing
+            self._person_flip_pending = 0
+        else:
+            self._person_flip_pending = 0
+        emo = e2.get("EMOTION") or {}
+        visual = emo.get("visual") or {}
+        if visual:
+            a_label, a_prob = self._fresh_asr_emotion()
+            label, conflict = fuse_emotion(visual, a_label, a_prob)
+            e2 = dict(e2)
+            # `label` 是综合结论（视觉 + 语音），`visual` 保持纯视觉原值 ——
+            # schema §3.3 明确两者独立、可交叉校验，语音侧**永不覆盖** visual。
+            e2["EMOTION"] = {"label": label, "visual": visual, "conflict": conflict}
+        else:
+            # E2 没给视觉情绪（白名单回滚档没问 `emo.visual`，或模型整份
+            # 没答）⇒ **不碰 EMOTION**：文本那份是唯一来源，塞一个空结论
+            # 进去只会把文本的情绪冲成 unknown。晚融合在这一档不生效。
+            e2 = {k: v for k, v in e2.items() if k != "EMOTION"}
+            a_label = a_prob = label = conflict = None
+        self._state_e2 = e2
+        self._state_at = time.monotonic()
+        self._state_stage = ev.stage
+        logger.info("[%s] [VLM state] stage=%s %dms 模型=%s 槽位=%d "
+                    "情绪=%s(视觉=%s, 语音=%s, conflict=%s)",
+                    self.session_id, ev.stage, ev.latency_ms, ev.model or "-",
+                    len(ev.state or {}), (label or {}).get("label"),
+                    (visual or {}).get("label"), a_label, conflict)
+        self._publish_vision(parsed=True)
+
+    def _publish_vision(self, parsed: bool = True) -> None:
+        """把当前快照推给 IC（`apply_vision`）与 Agent（视觉轮）。
+
+        快照的组成：**E2 覆盖它能回答的槽位**，文本描述补自由文本槽位
+        （`FEATURE` 这类 E2 不产出的）。E2 缺席时退回纯文本那份，与
+        `ORCH_STATE_HEAD=0` 的老行为逐字节一致。
+        """
+        e2 = self._state_e2 if self._state_fresh() else {}
+        # ⚠️ **不要把合成结果写回 `_vlm_state`** —— 那个字段是"文本侧那份"，
+        # 下一轮还要在上面 `update(parsed)`。写回去会让 `ENV` / `POSITION`
+        # 每发布一次就多拼一段 E2 内容（`merge_vision_text` 对这两个键是
+        # **拼接**而非覆盖，见 `state_schema._HALF_KEYS`）。
+        # `concat_keys`：白名单只接管半个键时（ATTENTION/BEHAVIOR/RELATION），
+        # 文本那半必须拼上而不是被 E2 覆盖 —— 见 `state_schema.partial_keys`。
+        merged = (merge_vision_text(self._vlm_state, e2,
+                                    self._state_conf_in_text,
+                                    concat_keys=self._state_concat)
+                  if e2 else dict(self._vlm_state))
+        lines: List[str] = []
+        if e2:
+            # 机器可读的那份放最前面：Agent 想解析就解析，想读自然语言
+            # 就看后面两段（八键快照 + 自由文本）。
+            lines.append(render_e2_json(e2))
+        if merged:
+            lines.append(render_state(merged))
+        if self._vlm_text:
+            lines.append(self._vlm_text)
+        if lines:
+            self._vlm = "\n".join(lines)
+        if e2:
+            self._vlm_stage = self._state_stage or self._vlm_stage
         # ---- IC 的视觉状态（P05 `apply_vision`）----
-        # 与下面推给 Agent 的「视觉轮」**各走各的出口**：这里进 IC 的状态机
-        # （以后 policy 能用上画面），下面那条进 Agent 的 `scene` 背景。
-        # 两者都只读快照，谁先谁后不影响正确性 —— 但放在这里（而不是
-        # `_emit_visual_background` 里）是为了"IC 掉线时也更新"，
-        # 与 `_vlm` 缓存的取向保持一致。
-        self._push_vision_to_ic()
+        # 与下面推给 Agent 的「视觉轮」**各走各的出口**：这里进 IC 的状态机，
+        # 下面那条进 Agent 的 `scene` 背景。放在这里（而不是
+        # `_emit_visual_background` 里）是为了"IC 掉线时也更新"。
+        self._push_vision_to_ic(merged)
         # ---- 有了就推：VLM **不与 ASR 强行同步**（2026-10-28 用户口径）----
         #
-        # 每份描述（full 与 turn 一样）一生成完就**立刻**作为「ASR 空的视觉轮」
-        # 推给 Agent（只存不答），而不是塞进缓存等下一次 `on_answer` 捎带。
-        # 两条理由：
-        #  · 断句触发的描述本来就晚于本句的 `on_answer`（窗口几十毫秒 vs
-        #    decode 秒级）⇒ 缓存只会让 Agent 永远看到「上一句那时候」的画面；
-        #  · 用户不说话、画面却变了的时候，也该及时更新 —— 缓存模式下没有
-        #    `on_answer` 就永远发不出去。
-        # 每份都是 8 键全量快照 ⇒ 直接覆盖，不存在"旧值残留"。
-        # **必须在 `self._vlm = text` 之后同步调**（sink 的 getter 读的就是它）。
-        # 传**缓存里那份**（已渲染成快照），不是模型原文 —— 日志里的字数要能
-        # 对上 Agent 实际收到的东西。
+        # 每份快照一生成完就**立刻**作为「ASR 空的视觉轮」推给 Agent
+        # （只存不答），而不是塞进缓存等下一次 `on_answer` 捎带：断句触发的
+        # 描述本来就晚于本句的 `on_answer`（窗口几十毫秒 vs decode 秒级），
+        # 缓存只会让 Agent 永远看到「上一句那时候」的画面；用户不说话、
+        # 画面却变了的时候也该及时更新。
         #
         # ⚠️ 新版 IC 自己会发：ea4ea22 起 `Engine.apply_vision` 写完状态就调
         #    `agent_sink.on_vision(...)`（ASR 空的 ANSWER）。IC 的 ADR 0001
         #    要求编排侧**同一会话不要再投** `emit_visual_background`，否则每份
         #    描述变成两轮、后一轮覆盖前一轮。
-        #    只在 `parsed` 时让路：解析失败时 `_push_vision_to_ic` 什么也没写
+        #    只在真有快照时让路：解析失败时 `_push_vision_to_ic` 什么也没写
         #    ⇒ IC 不会发；此时原文仍要走编排侧那一轮（保底不丢数据）。
-        if parsed and self._ic_owns_vision_round():
+        if merged and self._ic_owns_vision_round():
             return
-        self._emit_visual_background(len(self._vlm))
+        self._emit_visual_background(len(self._vlm), have_state=bool(merged))
 
     def _ic_owns_vision_round(self) -> bool:
         """IC 自己会不会把这份快照当 Vision 通知发给 Agent（见上）。
@@ -792,10 +994,13 @@ class InteractionDownstream:
                         "—— 编排侧不再补视觉背景轮", self.session_id)
         return owns
 
-    def _emit_visual_background(self, n_chars: int) -> None:
+    def _emit_visual_background(self, n_chars: int, have_state: bool = False) -> None:
         # Structured snapshots already publish exactly once from Engine.apply_vision.
         # Unparsed but useful free text still reaches the Agent through the host.
-        if self._ic_owns_vision_round() and self._vlm_state:
+        # ``have_state`` 由调用方给**合成后**的快照是否有内容 —— 不能再用
+        # ``self._vlm_state``：短文本模式下它只剩自由文本槽位，而 E2 单独
+        # 到齐时那份快照照样是结构化的（IC 会发），拿它判会多发一轮。
+        if self._ic_owns_vision_round() and have_state:
             return
         if self._vlm:
             self._events.put(("action", {"type": "vision", "session_id": self.session_id,
@@ -984,8 +1189,9 @@ class InteractionDownstream:
             # ⚠️ **编排侧不转发给 Agent** —— IC 自己会发。
             #
             # IC 判 ANSWER 时经 `AgentSink.on_answer()` POST 到 Agent
-            # （interactioncore 的 `runtime.py._notify_sinks`），且**字段更全**
-            # （从 IC 的 state 读 identity_id / display_name / transcript）。
+            # （interactioncore 的 `runtime.py._notify_sinks`），且**字段更全**：
+            # 证据来自 Action（待回答话轮用 HIGH 那一刻的冻结值），
+            # 不再从当前 state 读 identity_id / display_name / transcript。
             # 编排侧再发一份 ⇒ Agent 收到**两份 on_answer**，行为变成
             # "取决于 Agent 内部如何处置重复"，而不是我们能保证的。
             #

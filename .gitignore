@@ -33,8 +33,11 @@ temp/
 
 # 测试输出（可重新生成）
 tests/results/
-# 本地 SOP 录像与回放 dump
-test_data/
+# 本地 SOP 录像与回放 dump。tdd 文本进仓库，缓存不进。
+test_data/*
+!test_data/tdd/
+test_data/tdd/__pycache__/
+test_data/tdd/.pytest_cache/
 
 # 模型权重与大型资源（用户自行准备）
 *.safetensors
@@ -63,16 +66,14 @@ tools/
 
 # 模型权重目录（CI 构建时由 svn export 生成，不进 git）
 checkpoints/
+# 构建期的模型暂存根（build-image.sh 生成、trap 清理；构建中断时不进 git）
+.bundle-checkpoints/
+.bundle-state/
 # llama.cpp-omni 源码构建时 git clone，不进 git
 docker/llama.cpp-omni/
 
-# AI 助手本地配置与文档（个人环境，不进 git）
-.agents/
-.cursor/
-AGENTS.md
-GLOSSARY.md
+# 仍留在本机、不进 git
 skills-lock.json
-docs/agents/
 decisions.tsv
 
 # Orchestrator 真机诊断导出（含设备标识 / UA，属个人数据，不进 git）

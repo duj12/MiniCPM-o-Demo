@@ -118,7 +118,7 @@ docker compose -f docker-compose.cpp.yml down
 | `GGUF_MODEL_HOST_PATH` | **必填** 模型权重目录的宿主机**父目录**（含 `MiniCPM-o-4_5-gguf/` 和 `qwen3omni-gguf/`） | — |
 | `CPP_GPU_ID` | 使用的 GPU 编号 | `0` |
 | `GATEWAY_HOST_PORT` | 网关对外端口（HTTPS） | `8006` |
-| `LLAMA_SERVER_EXTRA_ARGS` | 后端额外启动参数 | `-c 16384 --parallel 4` |
+| `LLAMA_SERVER_EXTRA_ARGS` | 后端额外启动参数 | `-c 200000 --parallel 10` |
 
 > **`-c` 建议**：
 > - MiniCPM（含 TTS）：`-c 32768 --parallel 4`（每路分配 8192 tokens）

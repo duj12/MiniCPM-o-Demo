@@ -1,0 +1,1134 @@
+{
+  "version": 2,
+  "source_md": "test_data/交互策略SOP视频测试用例.md",
+  "synced_at": "2026-11-10T14:28:00+08:00",
+  "suites": {
+    "v2": {
+      "pass_rule": "all_runnable_must_pass",
+      "description": "v2视觉版本（安卓大屏）。SOP05 的 v2-05-1 / v2-05-2 在绿线内。"
+    },
+    "v1_new": {
+      "pass_rule": "all_runnable_must_pass",
+      "description": "v1_new视觉版本（安卓大屏）；A7=8 videos"
+    },
+    "supplement": {
+      "pass_rule": "all_runnable_must_pass",
+      "description": "补充测试",
+      "notes": "supp-75 blocked until subject-voice extraction; score runnable only (09+279+9554).",
+      "shared_behavior_contract": "75 and 09 share 行为契约 when both runnable; 279 is subject-only intro"
+    }
+  },
+  "forbidden_sole_gates": [
+    "any ANSWER exists",
+    "any historical tts.resume in log unrelated to this soft pause",
+    "greet-window YIELD counted as false-barge recovery",
+    "ANSWER on non-target transcript (e.g. 哼哼) for schedule/emotion SOPs",
+    "fail solely because ANSWER transcript ≠ md/expect wording when same referent"
+  ],
+  "observation_truth": [
+    "IC events.jsonl (action, transcript, barge_phase, barge_pause_reason, probes.barge_class, probes.expects_reply, sop)",
+    "replay log tts.pause / tts.resume for SOP04/05",
+    "replay log tts.start / tts.cancel 已播 Ns when an observation requires TTS playback"
+  ],
+  "answer_transcript_match": {
+    "rule": "semantic_same_referent",
+    "detail": "IC ANSWER transcript to Agent need not equal md/expect/needle text verbatim; same referent / semantic match is enough (score.same_referent). Unrelated transcripts still fail."
+  },
+  "ic_vs_agent": {
+    "ic_hard": "ANSWER/YIELD/WAIT/UTTER/GREET/END/INSERT, pause/resume, no aside ANSWER — scored by observations",
+    "agent_soft": "VLM/emotion/language wording and partial-understanding phrasing — notes only unless observation says otherwise"
+  },
+  "cases": [
+    {
+      "id": "v2-01-1",
+      "suite": "v2",
+      "sop": "01 ASK_TO_REPEAT",
+      "video": "1_1_1103.mkv",
+      "status": "runnable",
+      "expect": "噪声只盖关键词时 IC 请再说（sop01），不猜答",
+      "observations": [
+        {
+          "kind": "utter_sop",
+          "sop": "01"
+        },
+        {
+          "kind": "no_answer_before",
+          "before": "utter_sop:01"
+        }
+      ],
+      "source": "md#v2 / SOP01 / 1_1_1103",
+      "ic_gate": "UTTER 抱歉，能请您再说一遍吗？; no ANSWER before it"
+    },
+    {
+      "id": "v2-02-1",
+      "suite": "v2",
+      "sop": "02 CONFIRM_PARTIAL",
+      "video": "02_1_1103.mkv",
+      "status": "runnable",
+      "expect": "IC 对订会议室整句 ANSWER 交给 Agent；Agent 部分理解追问（非 IC 硬闸）",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "会议室"
+        }
+      ],
+      "source": "md#v2 / SOP02 / 02_1",
+      "ic_gate": "ANSWER on 订会议室句",
+      "agent_gate": "partial-understanding follow-up (soft)"
+    },
+    {
+      "id": "v2-02-2",
+      "suite": "v2",
+      "sop": "02 CONFIRM_PARTIAL",
+      "video": "02_2_1103.mkv",
+      "status": "runnable",
+      "expect": "IC 对订会议室句 ANSWER 交给 Agent；Agent 部分理解追问（非 IC 硬闸）",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "会议室"
+        }
+      ],
+      "source": "md#v2 / SOP02 / 02_2",
+      "ic_gate": "ANSWER on 订会议室句",
+      "agent_gate": "partial-understanding follow-up (soft)"
+    },
+    {
+      "id": "v2-03-1",
+      "suite": "v2",
+      "sop": "03 BACKCHANNEL",
+      "video": "03_1026.mkv",
+      "status": "runnable",
+      "expect": "只答「你好，AIGC是什么？」；其他处不 YIELD（greet 过程中的除外）；附和处没判成真打断也算通过",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "AIGC",
+            "aigc"
+          ]
+        },
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v2 / SOP03 / 03_1026.mkv",
+      "ic_gate": "ANSWER AIGC 问句；附和处不 YIELD（greet 过程中的除外）"
+    },
+    {
+      "id": "v2-03-2",
+      "suite": "v2",
+      "sop": "03 BACKCHANNEL",
+      "video": "03_2_1104.mkv",
+      "status": "runnable",
+      "expect": "只答「你好，AIGC是什么？」；其他处不 YIELD（greet 过程中的除外）；附和处没判成真打断也算通过",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "AIGC",
+            "aigc"
+          ]
+        },
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v2 / SOP03 / 03_2_1104.mkv",
+      "ic_gate": "ANSWER AIGC 问句；附和处不 YIELD（greet 过程中的除外）"
+    },
+    {
+      "id": "v2-03-3",
+      "suite": "v2",
+      "sop": "03 BACKCHANNEL",
+      "video": "03_3_1104.mkv",
+      "status": "runnable",
+      "expect": "只答「你好，AIGC是什么？」；其他处不 YIELD（greet 过程中的除外）；附和处没判成真打断也算通过",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "AIGC",
+            "aigc"
+          ]
+        },
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v2 / SOP03 / 03_3_1104.mkv",
+      "ic_gate": "ANSWER AIGC 问句；附和处不 YIELD（greet 过程中的除外）"
+    },
+    {
+      "id": "v2-03-4",
+      "suite": "v2",
+      "sop": "03 BACKCHANNEL",
+      "video": "03_4_1104.mkv",
+      "status": "runnable",
+      "expect": "只答「你好，AIGC是什么？」；其他处不 YIELD（greet 过程中的除外）；附和处没判成真打断也算通过",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "AIGC",
+            "aigc"
+          ]
+        },
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v2 / SOP03 / 03_4_1104.mkv",
+      "ic_gate": "ANSWER AIGC 问句；附和处不 YIELD（greet 过程中的除外）"
+    },
+    {
+      "id": "v2-03-5",
+      "suite": "v2",
+      "sop": "03 BACKCHANNEL",
+      "video": "03_5_1105.mkv",
+      "status": "runnable",
+      "expect": "只答「你好，AIGC是什么？」；其他处不 YIELD（greet 过程中的除外）；附和处没判成真打断也算通过",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "AIGC",
+            "aigc"
+          ]
+        },
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v2 / SOP03 / 03_5_1105.mkv",
+      "ic_gate": "ANSWER AIGC 问句；附和处不 YIELD（greet 过程中的除外）"
+    },
+    {
+      "id": "v2-04-1",
+      "suite": "v2",
+      "sop": "04 FALSE_BARGE",
+      "video": "04_1026.mkv",
+      "status": "runnable",
+      "expect": "只答展厅介绍；其他处不 YIELD（greet 过程中的除外）；误打断 soft→resume 或当附和忽略",
+      "observations": [
+        {
+          "kind": "answer_target_contains",
+          "any_of": [
+            "展厅",
+            "介绍"
+          ]
+        },
+        {
+          "kind": "false_barge_soft_resume_or_ignore"
+        },
+        {
+          "kind": "no_hard_yield_on_false_barge_script"
+        }
+      ],
+      "source": "md#v2 / SOP04 / 04_1026.mkv",
+      "ic_gate": "ANSWER 展厅句; no YIELD on false-barge script; pause/resume or ignore"
+    },
+    {
+      "id": "v2-05-1",
+      "suite": "v2",
+      "sop": "05 ATTENTION",
+      "video": "05_1_1026.mkv",
+      "status": "runnable",
+      "expect": "答天气。开始打电话或不面向屏幕时 pause；结束电话并面向屏幕时 resume。电话里正在说的内容不作为回复。",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "天气"
+        },
+        {
+          "kind": "attention_pause_then_resume"
+        },
+        {
+          "kind": "no_answer_or_utter_phone_selftalk"
+        }
+      ],
+      "source": "md#v2 / SOP05 / 05_1_1026.mkv",
+      "ic_gate": "weather ANSWER; attention pause/resume; no phone ANSWER/UTTER",
+      "agent_gate": "agent need not stop (not IC-scored)"
+    },
+    {
+      "id": "v2-05-2",
+      "suite": "v2",
+      "sop": "05 ATTENTION",
+      "video": "05_2_1026.mkv",
+      "status": "runnable",
+      "expect": "答天气。开始打电话或不面向屏幕时 pause；结束电话并面向屏幕时 resume。电话里正在说的内容不作为回复。",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "天气"
+        },
+        {
+          "kind": "attention_pause_then_resume"
+        },
+        {
+          "kind": "no_answer_or_utter_phone_selftalk"
+        }
+      ],
+      "source": "md#v2 / SOP05 / 05_2_1026.mkv",
+      "ic_gate": "weather ANSWER; attention pause/resume; no phone ANSWER/UTTER",
+      "agent_gate": "agent need not stop (not IC-scored)"
+    },
+    {
+      "id": "v2-06-1",
+      "suite": "v2",
+      "sop": "06 GESTURE",
+      "video": "06_1_1026.mkv",
+      "status": "runnable",
+      "expect": "「介绍星云」ANSWER；竖大拇指句再 ANSWER 交给 Agent 结合 VLM",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "星云|介绍"
+        },
+        {
+          "kind": "has_second_answer_or_insert"
+        }
+      ],
+      "source": "md#v2 / SOP06 / 06_1",
+      "ic_gate": "ANSWER on intro and thumbs-up turn",
+      "agent_gate": "VLM-aware praise reply (soft)"
+    },
+    {
+      "id": "v2-06-2",
+      "suite": "v2",
+      "sop": "06 GESTURE",
+      "video": "06_2_1109.mkv",
+      "status": "runnable",
+      "expect": "介绍魔珐 ANSWER；边说边摇头「嗯…AIGC??」再 ANSWER 交 Agent+VLM",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "AIGC|aigc"
+        }
+      ],
+      "source": "md#v2 / SOP06 / 06_2",
+      "ic_gate": "ANSWER on intro and shake+AIGC turn",
+      "agent_gate": "VLM-aware (soft)"
+    },
+    {
+      "id": "v2-06-3",
+      "suite": "v2",
+      "sop": "06 GESTURE",
+      "video": "06_3_1109.mkv",
+      "status": "runnable",
+      "expect": "介绍魔珐 ANSWER；先摇头再说「aigc是什么呀」再 ANSWER 交 Agent+VLM",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "aigc|AIGC"
+        }
+      ],
+      "source": "md#v2 / SOP06 / 06_3",
+      "ic_gate": "ANSWER on intro and later aigc question",
+      "agent_gate": "VLM-aware (soft)"
+    },
+    {
+      "id": "v2-07",
+      "suite": "v2",
+      "sop": "07 APPEARANCE",
+      "video": "08_1026.mkv",
+      "status": "runnable",
+      "expect": "对职业装问句 IC ANSWER，Agent 结合 VLM 回复（文件名 08_1026）",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "开会|职业|毛衣|外套"
+        }
+      ],
+      "source": "md#v2 / SOP07 / 08_1026",
+      "notes": "video filename 08_1026 maps to SOP07",
+      "ic_gate": "ANSWER on appearance question",
+      "agent_gate": "VLM clothing advice (soft)"
+    },
+    {
+      "id": "v2-08-1",
+      "suite": "v2",
+      "sop": "08 CONTINUOUS_BEHAVIOR",
+      "video": "8_1_1026.mkv",
+      "status": "runnable",
+      "expect": "天气+毛衣问句 IC ANSWER，Agent 结合 VLM",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "天气|毛衣|咖啡|冷"
+        }
+      ],
+      "source": "md#v2 / SOP08 / 8_1",
+      "ic_gate": "ANSWER",
+      "agent_gate": "VLM+weather (soft)"
+    },
+    {
+      "id": "v2-08-2",
+      "suite": "v2",
+      "sop": "08 CONTINUOUS_BEHAVIOR",
+      "video": "8_2_1026.mkv",
+      "status": "runnable",
+      "expect": "天气+毛衣问句 IC ANSWER，Agent 结合 VLM",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "距离|交互"
+        }
+      ],
+      "source": "md#v2 / SOP08 / 8_2",
+      "notes": "源表这一条的预期句是「我用这个距离跟你交互合适吗」，不是 8_1 的天气句。",
+      "ic_gate": "ANSWER on 距离交互问句",
+      "agent_gate": "VLM+weather (soft)"
+    },
+    {
+      "id": "v2-09",
+      "suite": "v2",
+      "sop": "09 RELATION",
+      "video": "09_1026.mkv",
+      "status": "runnable",
+      "expect": "介绍宋总句 IC ANSWER；Agent 结合人物关系（称谓）",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "宋总|魔珐"
+        }
+      ],
+      "source": "md#v2 / SOP09",
+      "ic_gate": "ANSWER on 宋总介绍句",
+      "agent_gate": "relation-aware wording (soft)"
+    },
+    {
+      "id": "v2-10-1",
+      "suite": "v2",
+      "sop": "10 VISUAL_AFFECT",
+      "video": "10_1_1026.mkv",
+      "status": "runnable",
+      "expect": "产品介绍 ANSWER；「听不懂」再 ANSWER，Agent 结合情绪",
+      "observations": [
+        {
+          "kind": "answer_count_at_least",
+          "n": 2
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "听不懂|星云|产品"
+        }
+      ],
+      "source": "md#v2 / SOP10 / 10_1",
+      "ic_gate": "ANSWER both turns",
+      "agent_gate": "affect-aware (soft)"
+    },
+    {
+      "id": "v2-10-2",
+      "suite": "v2",
+      "sop": "10 VISUAL_AFFECT",
+      "video": "10_2_1026.mkv",
+      "status": "runnable",
+      "expect": "介绍星云 ANSWER；「比较满意」再 ANSWER，Agent 结合情绪",
+      "observations": [
+        {
+          "kind": "answer_count_at_least",
+          "n": 2
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "满意|星云"
+        }
+      ],
+      "source": "md#v2 / SOP10 / 10_2",
+      "ic_gate": "ANSWER both turns",
+      "agent_gate": "affect-aware (soft)"
+    },
+    {
+      "id": "v2-11-1",
+      "suite": "v2",
+      "sop": "11 VOICE_AFFECT",
+      "video": "11_1_1103.mkv",
+      "status": "runnable",
+      "expect": "IC 把下班日程句 ANSWER 交给 Agent 并结合情绪；不答非日程短句",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "下班|日程"
+        },
+        {
+          "kind": "emotion_field_present_on_answer"
+        }
+      ],
+      "source": "md#v2 / SOP11 / 11_1",
+      "ic_gate": "ANSWER schedule + emotion field",
+      "agent_gate": "schedule content (soft)"
+    },
+    {
+      "id": "v2-11-2",
+      "suite": "v2",
+      "sop": "11 VOICE_AFFECT",
+      "video": "11_2_1103.mkv",
+      "status": "runnable",
+      "expect": "IC 把下班日程句 ANSWER 交给 Agent；禁止哼哼当目标句",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "下班|日程"
+        },
+        {
+          "kind": "no_answer_transcript_regex",
+          "pattern": "^哼+"
+        }
+      ],
+      "source": "md#v2 / SOP11 / 11_2",
+      "ic_gate": "ANSWER schedule only",
+      "agent_gate": "schedule content (soft)"
+    },
+    {
+      "id": "v2-12-1",
+      "suite": "v2",
+      "sop": "12 TEXT_AFFECT",
+      "video": "12_1_1103.mkv",
+      "status": "runnable",
+      "expect": "「第一天上班挺开心」IC ANSWER，Agent 结合情绪",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "上班|开心"
+        }
+      ],
+      "source": "md#v2 / SOP12 / 12_1",
+      "ic_gate": "ANSWER",
+      "agent_gate": "text-affect (soft)"
+    },
+    {
+      "id": "v2-12-2",
+      "suite": "v2",
+      "sop": "12 TEXT_AFFECT",
+      "video": "12_2_1103.mkv",
+      "status": "runnable",
+      "expect": "「访客多焦虑」IC ANSWER，Agent 结合情绪",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "焦虑|访客"
+        }
+      ],
+      "source": "md#v2 / SOP12 / 12_2",
+      "ic_gate": "ANSWER",
+      "agent_gate": "text-affect (soft)"
+    },
+    {
+      "id": "v2-13-1",
+      "suite": "v2",
+      "sop": "13 SNR",
+      "video": "13_1_1026.mkv",
+      "status": "runnable",
+      "expect": "安静环境介绍句 IC ANSWER，Agent 正常回复",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        }
+      ],
+      "source": "md#v2 / SOP13 / 13_1",
+      "ic_gate": "ANSWER"
+    },
+    {
+      "id": "v2-13-2",
+      "suite": "v2",
+      "sop": "13 SNR",
+      "video": "13_2_1026.mkv",
+      "status": "runnable",
+      "expect": "嘈杂时 IC 提示靠近（嘈杂/sop13），不硬猜答",
+      "observations": [
+        {
+          "kind": "utter_repair",
+          "sops": [
+            "13",
+            "01"
+          ]
+        },
+        {
+          "kind": "no_answer_before_repair"
+        }
+      ],
+      "source": "md#v2 / SOP13 / 13_2",
+      "ic_gate": "noisy/ask_repeat utter"
+    },
+    {
+      "id": "v2-13-3",
+      "suite": "v2",
+      "sop": "13 SNR",
+      "video": "1_2_1103.mkv",
+      "status": "runnable",
+      "expect": "噪声盖住全部声音时 IC 提示嘈杂，不猜答（挂在 SOP13，非 SOP01）",
+      "observations": [
+        {
+          "kind": "utter_repair",
+          "sops": [
+            "13",
+            "01"
+          ]
+        },
+        {
+          "kind": "no_answer_before_repair"
+        }
+      ],
+      "source": "md#v2 / SOP13 / 1_2_1103",
+      "notes": "listed under SOP13 in source md",
+      "ic_gate": "noisy/ask_repeat utter"
+    },
+    {
+      "id": "v2-14",
+      "suite": "v2",
+      "sop": "14 OVERLAP",
+      "video": "14_1026.mkv",
+      "status": "runnable",
+      "expect": "重叠语音时 IC 提示人多靠近（sop14）",
+      "observations": [
+        {
+          "kind": "utter_sop",
+          "sop": "14"
+        }
+      ],
+      "source": "md#v2 / SOP14",
+      "ic_gate": "utter sop14"
+    },
+    {
+      "id": "v2-15",
+      "suite": "v2",
+      "sop": "15 NOISE_BURST",
+      "video": "15_1_1026.mkv",
+      "status": "runnable",
+      "expect": "残缺行程句上 IC 判 ANSWER 交给 Agent；由 Agent 追问地点（非 IC sop01 硬闸）",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "想去|行程|介绍"
+        }
+      ],
+      "source": "md#v2 / SOP15 / 15_1",
+      "notes": "md Demo: ic判answer，agent主动询问没听清去哪",
+      "ic_gate": "ANSWER on noisy/partial trip request",
+      "agent_gate": "ask which place (soft, not IC utter)"
+    },
+    {
+      "id": "v2-16",
+      "suite": "v2",
+      "sop": "16 LANGUAGE_SWITCH",
+      "video": "16_1026.mkv",
+      "status": "runnable",
+      "expect": "中/英/粤三句均 IC ANSWER；Agent 用语种应答（语种内容非 IC 硬闸）",
+      "observations": [
+        {
+          "kind": "answer_count_at_least",
+          "n": 3
+        }
+      ],
+      "source": "md#v2 / SOP16",
+      "ic_gate": "ANSWER on each language turn",
+      "agent_gate": "language-matched reply (soft)"
+    },
+    {
+      "id": "v1-A01",
+      "suite": "v1_new",
+      "sop": "A01 ASK_TO_REPEAT",
+      "video": null,
+      "status": "blocked",
+      "expect": "第一次没听清请再说，不猜",
+      "observations": [
+        {
+          "kind": "utter_sop",
+          "sop": "01"
+        },
+        {
+          "kind": "no_guess_answer_before_repeat"
+        }
+      ],
+      "source": "md#v1_new / A01",
+      "blocked_reason": "never_recorded",
+      "notes": "v1 A01 未录制；保留契约，不进可跑套件",
+      "ic_gate": "ask_repeat"
+    },
+    {
+      "id": "v1-A02",
+      "suite": "v1_new",
+      "sop": "A02 CHANGE_INPUT",
+      "video": null,
+      "status": "blocked",
+      "expect": "连续两次没听清换输入方式",
+      "observations": [
+        {
+          "kind": "utter_sop",
+          "sop": "02"
+        }
+      ],
+      "source": "md#v1_new / A02",
+      "blocked_reason": "never_recorded",
+      "notes": "v1 A02 未录制；保留契约，不进可跑套件",
+      "ic_gate": "change_input utter"
+    },
+    {
+      "id": "v1-A06",
+      "suite": "v1_new",
+      "sop": "A06 WAIT",
+      "video": "A06.mkv",
+      "status": "runnable",
+      "expect": "停顿未说完不抢答（WAIT）",
+      "observations": [
+        {
+          "kind": "has_wait_or_deferred_answer"
+        }
+      ],
+      "source": "md#v1_new / A06",
+      "ic_gate": "WAIT / deferred ANSWER"
+    },
+    {
+      "id": "v1-A07",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07.mkv",
+      "status": "runnable",
+      "expect": "「别说了」处真打断立即停播",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "has_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07.mkv",
+      "notes": "direct barge phrase 别说了",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-2",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_2_1109.mkv",
+      "status": "runnable",
+      "expect": "「我不想听了」处真打断立即停播",
+      "observations": [
+        {
+          "kind": "has_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_2_1109.mkv",
+      "notes": "direct 我不想听了",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-3",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_3_1109.mkv",
+      "status": "runnable",
+      "expect": "「你别再说了」处真打断立即停播",
+      "observations": [
+        {
+          "kind": "has_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_3_1109.mkv",
+      "notes": "direct 你别再说了",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-4",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_4_1109.mkv",
+      "status": "runnable",
+      "expect": "「打住」处真打断立即停播",
+      "observations": [
+        {
+          "kind": "has_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_4_1109.mkv",
+      "notes": "direct 打住",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-5",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_5_1109.mkv",
+      "status": "runnable",
+      "expect": "「停，我不想讨论这个」处真打断立即停播",
+      "observations": [
+        {
+          "kind": "has_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_5_1109.mkv",
+      "notes": "direct 停",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-6",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_6_1109.mkv",
+      "status": "runnable",
+      "expect": "先对介绍魔珐 ANSWER；「其实我想听的是星云」处真打断(YIELD)，再交 Agent ANSWER",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "has_yield"
+        },
+        {
+          "kind": "has_answer_after_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_6_1109.mkv",
+      "notes": "question barge 星云",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-7",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_7_1109.mkv",
+      "status": "runnable",
+      "expect": "先对介绍魔珐 ANSWER；「什么是生成式AI」处 YIELD，再交 Agent ANSWER",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "has_yield"
+        },
+        {
+          "kind": "has_answer_after_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_7_1109.mkv",
+      "notes": "question barge 生成式AI",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A07-8",
+      "suite": "v1_new",
+      "sop": "A7 YIELD",
+      "video": "A07_8_1109.mkv",
+      "status": "runnable",
+      "expect": "先对介绍魔珐 ANSWER；「再介绍魔珐有言」处 YIELD，再交 Agent ANSWER",
+      "observations": [
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "has_yield"
+        },
+        {
+          "kind": "has_answer_after_yield"
+        }
+      ],
+      "source": "md#v1_new / A7 / A07_8_1109.mkv",
+      "notes": "question barge 魔珐有言",
+      "ic_gate": "YIELD on barge; ANSWER on intro where applicable",
+      "agent_gate": "post-yield answer for question barges (soft)"
+    },
+    {
+      "id": "v1-A08",
+      "suite": "v1_new",
+      "sop": "A08 BACKCHANNEL",
+      "video": "A08.mkv",
+      "status": "runnable",
+      "expect": "附和不停播、不 YIELD",
+      "observations": [
+        {
+          "kind": "no_hard_yield_on_backchannel"
+        }
+      ],
+      "source": "md#v1_new / A08",
+      "ic_gate": "no backchannel YIELD"
+    },
+    {
+      "id": "v1-A26",
+      "suite": "v1_new",
+      "sop": "A26 SHOW_PROCESSING",
+      "video": "A26.mkv",
+      "status": "runnable",
+      "expect": "Agent 自己把垫话发给 TTS，InteractionCore 不说「我查一下」",
+      "observations": [
+        {
+          "kind": "agent_filler_to_tts"
+        }
+      ],
+      "source": "md#v1_new / A26",
+      "ic_gate": "agent filler on TTS; IC does not utter 我查一下"
+    },
+    {
+      "id": "v1-A39",
+      "suite": "v1_new",
+      "sop": "A39 CLOSE_SESSION",
+      "video": "A39.mkv",
+      "status": "runnable",
+      "expect": "说完「不用了」后，StartLux 判为结束意图则 InteractionCore 先说「好的，再见。」，播完再 END",
+      "observations": [
+        {
+          "kind": "closing_end_by_ic"
+        }
+      ],
+      "source": "md#v1_new / A39",
+      "ic_gate": "UTTER 好的，再见。 then END sop=39; 不用了 is not ANSWER"
+    },
+    {
+      "id": "v1-D15",
+      "suite": "v1_new",
+      "sop": "D15 GENERIC_GREETING",
+      "video": "D15.mkv",
+      "status": "runnable",
+      "expect": "陌生人通用欢迎 GREET",
+      "observations": [
+        {
+          "kind": "has_greet"
+        }
+      ],
+      "source": "md#v1_new / D15",
+      "ic_gate": "GREET"
+    },
+    {
+      "id": "v1-D16",
+      "suite": "v1_new",
+      "sop": "D16 PERSONALIZED_GREETING",
+      "video": "D16.mkv",
+      "status": "runnable",
+      "expect": "已知用户个性化欢迎（prefer sop16）",
+      "observations": [
+        {
+          "kind": "has_greet",
+          "prefer_sop": "16"
+        }
+      ],
+      "source": "md#v1_new / D16",
+      "ic_gate": "personalized GREET"
+    },
+    {
+      "id": "v1-D17",
+      "suite": "v1_new",
+      "sop": "D17 SAFE_IDENTITY",
+      "video": "D17.mkv",
+      "status": "runnable",
+      "expect": "中置信欢迎不喊名（prefer sop17）",
+      "observations": [
+        {
+          "kind": "has_greet",
+          "prefer_sop": "17"
+        }
+      ],
+      "source": "md#v1_new / D17",
+      "ic_gate": "safe GREET"
+    },
+    {
+      "id": "v1-D18",
+      "suite": "v1_new",
+      "sop": "D18 UNKNOWN_USER",
+      "video": "D18.mkv",
+      "status": "runnable",
+      "expect": "身份失败按陌生人服务",
+      "observations": [
+        {
+          "kind": "has_greet_or_answer"
+        }
+      ],
+      "source": "md#v1_new / D18",
+      "ic_gate": "GREET/ANSWER as stranger"
+    },
+    {
+      "id": "v1-D21",
+      "suite": "v1_new",
+      "sop": "D21 NO_ENGAGEMENT",
+      "video": "D21.mkv",
+      "status": "runnable",
+      "expect": "路人不 GREET",
+      "observations": [
+        {
+          "kind": "no_greet"
+        }
+      ],
+      "source": "md#v1_new / D21",
+      "ic_gate": "no GREET"
+    },
+    {
+      "id": "v1-D22",
+      "suite": "v1_new",
+      "sop": "D22 PROACTIVE_GREETING",
+      "video": "D15.mkv",
+      "status": "runnable",
+      "expect": "稳定停留主动欢迎（与 D15 同片）",
+      "observations": [
+        {
+          "kind": "has_greet"
+        }
+      ],
+      "source": "md#v1_new / D22 shares D15",
+      "notes": "same video as D15",
+      "ic_gate": "GREET"
+    },
+    {
+      "id": "v1-D23",
+      "suite": "v1_new",
+      "sop": "D23 SOFT_EXIT",
+      "video": "D23.mkv",
+      "status": "runnable",
+      "expect": "欢迎后无人接话软退出",
+      "observations": [
+        {
+          "kind": "has_end_or_soft_exit"
+        }
+      ],
+      "source": "md#v1_new / D23",
+      "ic_gate": "soft exit / END"
+    },
+    {
+      "id": "v1-D24",
+      "suite": "v1_new",
+      "sop": "D24 END_SESSION",
+      "video": "D24.mkv",
+      "status": "runnable",
+      "expect": "交互中人离开则停播结束",
+      "observations": [
+        {
+          "kind": "has_end_or_session_close"
+        }
+      ],
+      "source": "md#v1_new / D24",
+      "ic_gate": "END on leave; session_end_pending does not pass"
+    },
+    {
+      "id": "v1-D25",
+      "suite": "v1_new",
+      "sop": "D25 multi-user greet",
+      "video": "D25.mkv",
+      "status": "runnable",
+      "expect": "A 无反馈后不再持续 greet；B 进场应对 B greet",
+      "observations": [
+        {
+          "kind": "second_subject_gets_greet"
+        }
+      ],
+      "source": "md#v1_new / D25",
+      "ic_gate": "greet B after A soft-exit"
+    },
+    {
+      "id": "supp-75",
+      "suite": "supplement",
+      "sop": "repair dual-intro",
+      "video": "s-75fd10971e33-raw.mkv",
+      "status": "blocked",
+      "expect": "两次介绍魔法有言都答；第二次先打断再答；不被杂音/旁白带走",
+      "observations": [
+        {
+          "kind": "answer_intro_magic_twice"
+        },
+        {
+          "kind": "second_intro_barge_then_answer"
+        },
+        {
+          "kind": "no_answer_non_subject_aside"
+        }
+      ],
+      "source": "md#补充测试 / s-75",
+      "blocked_reason": "waiting_subject_voice_extraction",
+      "notes": "暂时先不测。等主人声提取ready",
+      "ic_gate": "dual intro ANSWER + barge + no aside ANSWER"
+    },
+    {
+      "id": "supp-09",
+      "suite": "supplement",
+      "sop": "repair dual-intro",
+      "video": "s-09d58ed9014e-raw.mkv",
+      "status": "runnable",
+      "expect": "同 supp-75 行为契约（两次介绍；二次先打断再答；非主体不答）",
+      "observations": [
+        {
+          "kind": "answer_intro_magic_twice"
+        },
+        {
+          "kind": "second_intro_barge_then_answer"
+        },
+        {
+          "kind": "no_answer_non_subject_aside"
+        }
+      ],
+      "source": "md#补充测试 / s-09",
+      "ic_gate": "dual intro contract"
+    },
+    {
+      "id": "supp-279",
+      "suite": "supplement",
+      "sop": "repair subject-only",
+      "video": "s-279dc9bd087b-raw.mkv",
+      "status": "runnable",
+      "expect": "正常答介绍魔法有言，不被旁人杂音打断",
+      "observations": [
+        {
+          "kind": "answer_intro_magic_once"
+        },
+        {
+          "kind": "no_answer_non_subject_aside"
+        }
+      ],
+      "source": "md#补充测试 / s-279",
+      "ic_gate": "single intro ANSWER; no bystander ANSWER"
+    },
+    {
+      "id": "supp-9554",
+      "suite": "supplement",
+      "sop": "answer gate + tts",
+      "video": "s-9554c311559e-raw.mkv",
+      "status": "runnable",
+      "expect": "四句均 IC ANSWER 交给 Agent：「给我介绍魔珐科技」、两次「跟你的交互体验是这个」、「我今天穿这个开会合适吗」；前三次的 Agent 回复和 TTS 正常播放，不能被 0.00s YIELD 掐断；最后一问接近视频结尾，Agent 回复/TTS 可能收不到，不算错",
+      "observations": [
+        {
+          "kind": "answer_count_at_least",
+          "n": 4
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "魔珐|介绍"
+        },
+        {
+          "kind": "answer_target_count",
+          "pattern": "交互体验",
+          "n": 2
+        },
+        {
+          "kind": "answer_target_regex",
+          "pattern": "穿这个去开会|开会合适|我今天穿这个"
+        },
+        {
+          "kind": "tts_answers_played",
+          "n": 3
+        }
+      ],
+      "source": "manual / s-9554",
+      "notes": "2026-11-17 回归：ANSWER 必须 HIGH；第二次「跟你的交互体验是这个」是新的 HIGH 定稿，不能靠 LOW 提前答；31.0s 的误 YIELD 会在这里表现为 tts.cancel 已播 0.00s。最后一问接近视频结尾，Agent 回复/TTS 可能收不到，不算错；TTS 观察只要求前三次且没有 0.00s 取消。",
+      "ic_gate": "ANSWER x4（两次交互体验都要答）；没有 0.00s TTS 取消",
+      "agent_gate": "前三次 ANSWER 有正常回复和 TTS；最后一问的 Agent 回复/TTS 允许缺失（soft）"
+    }
+  ]
+}

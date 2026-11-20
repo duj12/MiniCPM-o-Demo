@@ -37,7 +37,7 @@ import json
 import logging
 import socket
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .signals import FaceObservation, IdentityEvent
@@ -53,6 +53,24 @@ _IN_GALLERY = ("recognized", "enrolled")
 
 #: 初始的「无身份」键 —— 避免第一帧就发一条空身份事件（照抄本地实现）。
 _NO_IDENT = (None, "NONE", None, None)
+
+#: 待发 8PCM 的块数上限（100ms/块 ⇒ 300 块 = 30s）。正常只有 1~2 块。
+_PCM8_MAX_PENDING = 300
+
+#: 服务端单请求 PCM8 上限 —— **实测 1 秒音频**（16k×1s×8ch×2B = 256000B）。
+#: 1000ms → 200，1008ms → `413 PCM8 exceeds service limit`。超过的部分
+#: 留在队里下一次发（切在整帧边界，所以仍是连续的）。
+_PCM8_MAX_SAMPLES = 16000
+_PCM8_MAX_BYTES = _PCM8_MAX_SAMPLES * 8 * 2
+
+
+def _samples_to_us(n: int, sr: int = 16000) -> int:
+    """采样数 → 微秒（**整数**运算，服务端要 int）。
+
+    62.5µs/采样不能写成浮点：pydantic 的 int 字段拿到 ``100000.0``
+    可能被拒或截断，而这两个时间戳一旦错位就是 422。
+    """
+    return (int(n) * 1_000_000) // int(sr)
 
 
 class RemoteFaceError(RuntimeError):
@@ -75,7 +93,8 @@ class RemoteFaceProvider:
                  wake_dwell_ms: int = 2000,
                  timeout_s: float = 2.0,
                  max_jpeg_bytes: int = _DEFAULT_MAX_JPEG_BYTES,
-                 close_timeout_s: float = 1.0) -> None:
+                 close_timeout_s: float = 1.0,
+                 pcm8: bool = False) -> None:
         parts = urlsplit(base_url if "://" in base_url else f"http://{base_url}")
         if not parts.hostname:
             raise ValueError(f"远端人脸服务地址非法: {base_url!r}")
@@ -89,6 +108,17 @@ class RemoteFaceProvider:
         self._timeout_s = float(timeout_s)
         self._close_timeout_s = float(close_timeout_s)
         self._max_jpeg_bytes = int(max_jpeg_bytes)
+
+        #: 8PCM 门控（8768）。开 ⇒ 每次 detect 都必须带 PCM，且时间戳
+        #: 走**音频采样轴**而不是墙钟（见 ``set_pcm8`` / ``_send_pcm8``）。
+        self.pcm8_enabled = bool(pcm8)
+        #: 待发的 8 声道交错 int16 块（原始字节，**不解交错**）
+        self._pcm8_pending: List[bytes] = []
+        #: 已交给服务端的 PCM 累计采样数 —— 下一块的起点就是它，
+        #: 「块间连续」由这个游标保证（不能拿墙钟/帧率去凑）。
+        self._pcm8_cursor = 0
+        self._pcm8_warned_empty = False
+        self.pcm8_blocks = 0
 
         self._conn: Optional[http.client.HTTPConnection] = None
         self._frame_size: Optional[Tuple[int, int]] = None
@@ -238,6 +268,10 @@ class RemoteFaceProvider:
                                len(jpeg), self._max_jpeg_bytes)
             return None
 
+        if self.pcm8_enabled:
+            # 8768 门控：时间戳走音频采样轴，且必须有新 PCM 才能发
+            return self._send_pcm8(jpeg, t)
+
         ts_us = self._next_timestamp_us()
         payload = {
             "session_id": self.session_id,
@@ -256,16 +290,112 @@ class RemoteFaceProvider:
         self.frames_sent += 1
         self._healthy = True
 
-        # 帧尺寸（UI 要把框坐标映射到显示区）—— 复用本地那份纯 Python SOF 解析，
-        # 不引 cv2（远端的 OpenCV 在服务端，调用方不该依赖它）
-        if self._frame_size is None:
-            from .g1face_provider import jpeg_size
-            sz = jpeg_size(jpeg)
-            if sz is not None:
-                self._frame_size = sz
-                logger.info("远端人脸输入帧尺寸: %dx%d", sz[0], sz[1])
-
+        self._probe_frame_size(jpeg)
         return self._to_observation(resp, t)
+
+    # ------------------------------------------------------------------ #
+    #  8PCM（8768 门控）
+    # ------------------------------------------------------------------ #
+
+    def set_pcm8(self, raw: bytes) -> None:
+        """登记一块客户端送来的 8 声道交错 int16 PCM（**非阻塞、不拷贝**）。
+
+        由 mic ingest 路径调用（``session.on_audio``），工作线程消费、
+        拼进下一次 ``/face/detect``。块与块在**音频采样轴**上连续，
+        时间戳一律由本类的游标推出，不看墙钟 —— 8768 要求
+        ``pcm8_timestamp_us <= 每个采样时刻 < timestamp_us``，且相邻请求的
+        PCM 必须首尾相接，游标是唯一能保证这件事的东西。
+        """
+        if not self.pcm8_enabled:
+            return
+        if not raw or len(raw) % 16:
+            if not self._pcm8_warned_empty:
+                self._pcm8_warned_empty = True
+                logger.warning("8PCM 块非法（%d 字节，需 8 声道 int16 对齐）"
+                               "—— 已丢弃，后续同类不再提示", len(raw))
+            return
+        self._pcm8_pending.append(raw)
+        # 兜底：视频停了但音频还在送（或人脸线程被拖住）时别无限攒。
+        # 丢掉最旧的块会破坏块间连续 —— 之后服务端会以 422 拒绝，
+        # 由 ``_resync_pcm8`` 重建会话兜底。
+        if len(self._pcm8_pending) > _PCM8_MAX_PENDING:
+            self._pcm8_pending.pop(0)
+            self._warn_limited("8PCM 积压超过 %d 块（%.0fs）—— 丢弃最旧块",
+                               _PCM8_MAX_PENDING, _PCM8_MAX_PENDING * 0.1)
+
+    def _send_pcm8(self, jpeg: bytes, t: int) -> Optional[FaceObservation]:
+        """带 PCM 的 detect：把待发块拼成一整块连续 PCM。"""
+        if not self._pcm8_pending:
+            # **没有新 PCM 就不发** —— 8768 缺 PCM 回 422，重复上一块又
+            # 违反「块间连续」。跳过这帧，下一块音频到了再发。
+            return None
+        pending, self._pcm8_pending = self._pcm8_pending, []
+        buf = b"".join(pending)
+        if len(buf) > _PCM8_MAX_BYTES:
+            # 服务端单请求上限 1s（实测 1008ms 就 413）。超出部分留到下次，
+            # 切点是整帧边界（16 字节）⇒ 仍是首尾相接的连续块。
+            buf, rest = buf[:_PCM8_MAX_BYTES], buf[_PCM8_MAX_BYTES:]
+            self._pcm8_pending.insert(0, rest)
+        n = len(buf) // 16                       # 每声道采样数
+        start_us = _samples_to_us(self._pcm8_cursor)
+        end_us = _samples_to_us(self._pcm8_cursor + n)
+        payload = {
+            "session_id": self.session_id,
+            # 帧时间戳取 PCM 末端的音频时刻：窗口 [start, end) 恰好覆盖本块
+            # 全部采样，且严格递增（游标只增），不会越界。
+            "timestamp_us": end_us,
+            "frame_jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
+            "pcm8_base64": base64.b64encode(buf).decode("ascii"),
+            "pcm8_timestamp_us": start_us,
+        }
+        try:
+            resp = self._post("/face/detect", payload)
+        except (RemoteFaceError, socket.timeout, TimeoutError, OSError,
+                http.client.HTTPException) as exc:
+            # 失败：把**这一段**放回队首（不是原始块列表 —— 可能已按上限
+            # 切过），和后面的部分一起发，仍然是连续的。
+            self._pcm8_pending.insert(0, buf)
+            self._on_frame_error(exc)
+            return None
+
+        self._pcm8_cursor += n
+        self._last_ts_us = end_us
+        self.frames_sent += 1
+        self.pcm8_blocks += len(pending)
+        self._healthy = True
+        self._probe_frame_size(jpeg)
+        return self._to_observation(resp, t)
+
+    def _resync_pcm8(self) -> None:
+        """PCM 轴被服务端拒了（422）——重开会话，从 0 重新计时。
+
+        8768 是按 ``session_id`` 记账的，块一旦不连续（积压丢弃、客户端
+        换块）、或者采样与帧时间对不上，就会一直 422。``/face/close``
+        让服务端回收该会话，下一次 detect 重新建一个，游标归零即可自愈。
+        代价是 dwell 清零 —— 比「人脸永久失效」便宜得多。
+        """
+        self._pcm8_pending.clear()
+        self._pcm8_cursor = 0
+        self._last_ts_us = 0
+        try:
+            self._post("/face/close", {"session_id": self.session_id},
+                       timeout=self._close_timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("8PCM 重同步：会话释放失败（可忽略）：%s", exc)
+        logger.warning("8PCM 时间轴不连续 —— 已重建人脸会话（dwell 清零）")
+
+    def _probe_frame_size(self, jpeg: bytes) -> None:
+        """首帧解析输入尺寸（UI 要把框坐标映射到显示区）。
+
+        复用本地那份纯 Python SOF 解析，不引 cv2（OpenCV 在服务端）。
+        """
+        if self._frame_size is not None:
+            return
+        from .g1face_provider import jpeg_size
+        sz = jpeg_size(jpeg)
+        if sz is not None:
+            self._frame_size = sz
+            logger.info("远端人脸输入帧尺寸: %dx%d", sz[0], sz[1])
 
     # ------------------------------------------------------------------ #
 
@@ -370,6 +500,14 @@ class RemoteFaceProvider:
         self.last_error = f"{type(exc).__name__}: {exc}"
         status = getattr(exc, "status", None)
 
+        if status in (409, 422) and self.pcm8_enabled:
+            # 8PCM 门控下这两种都是**粘住**的（服务端记住期望值，之后每帧都拒）：
+            #   422 = PCM 缺失 / 未对齐 / 不连续 / 含未来采样；
+            #   409 = `PCM8 timestamp discontinuity: got X expected Y`
+            #         —— 典型是「上一块服务端处理了但响应超时丢了」，重发同一块。
+            # 唯一出路是 `/face/close` 重开会话（dwell 清零），否则人脸永久失效。
+            self._resync_pcm8()
+            return
         if status == 409:
             # 时间戳倒退 / 会话已被关闭。**不要**去调 /face/reset ——
             # 那会把 dwell 清零，代价比丢这一帧大得多。

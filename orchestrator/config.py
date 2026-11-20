@@ -91,7 +91,7 @@ class Settings:
     #
     # 测法：开着 ORCH_DUMP_AUDIO 跑一轮真实会话，然后
     #     python -m orchestrator.tests.measure_delay \
-    #         --mic <前缀>-<sid>-mic.wav --raw <前缀>-<sid>-raw.wav \
+    #         --raw8 <前缀>-<sid>-raw8.flac \
     #         --verify-url ws://192.168.88.253:30255/ws/asr_frontend
     # 结果写进 ORCH_AEC_DEFAULT_DELAY_MS（或按设备存进 DelayStore）。
     #
@@ -247,6 +247,80 @@ class Settings:
     omni_describe_delta_instruction: str = field(default_factory=lambda: os.environ.get(
         "ORCH_OMNI_DESCRIBE_DELTA_INSTRUCTION", ""))
 
+    # ---- 带置信度的 E2 状态（state head）----------------------------------
+    #
+    # 1 = 在每次"该更新视觉状态"的那一拍，**并行**调 state head（旁挂容器
+    #     :22520）拿枚举槽位 + 置信度；Qwen3-Omni 的文本描述继续跑，只负责
+    #     自由文本槽位。0 = 完全老行为（逐字节一致的 E0 路径）。
+    omni_state_head: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_HEAD", "0").strip().lower() not in ("0", "false", "off", "no", ""))
+    #: state head 地址。跨机部署时填宿主机 IP（105 编排 → 106 的 :22520）。
+    omni_state_url: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_URL", "http://127.0.0.1:22520"))
+    #: 超时即**丢弃本轮 state**、退回纯文本。0.8s 的依据：端到端预算
+    #: 500ms 加上网络与排队抖动；再等下去这轮状态已经比画面旧了。
+    omni_state_timeout_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_TIMEOUT_S", "0.8")))
+    #: 送给 state head 的帧数。2 = 当前帧 + 1 秒前那一帧（motion / duration
+    #: 靠对比；只有 1 帧时 state head 自动走 image 分支）。
+    omni_state_n_frames: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_N_FRAMES", "2")))
+    #: 发前把帧长边缩到多少（0 = 不缩）。与容器侧 `STATE_MAX_MEDIA_PX` 对应；
+    #: 在编排侧缩能省掉一次调度/网络带宽，两边设同一个值最省事。
+    omni_state_max_px: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_MAX_PX", "640")))
+    #: 渲染成 ``EMOTION: dissatisfied (0.82)`` 形态。关掉则只给 label。
+    omni_state_conf_in_text: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_CONF_IN_TEXT", "1").strip().lower() not in
+        ("0", "false", "off", "no"))
+    #: 连续失败多少次熔断（之后 ``omni_state_cooldown_s`` 秒内不再尝试）。
+    #: 熔断期间行为 = `omni_state_head=0`，即纯文本 E0。
+    omni_state_fail_threshold: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_STATE_FAIL_THRESHOLD", "5")))
+    omni_state_cooldown_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_COOLDOWN_S", "30.0")))
+    #: E2 **只出这些槽位**（逗号分隔的题集 id）。空 / ``all`` / ``*`` = 问全套。
+    #:
+    #: 默认**空**：schema 对齐后枚举槽位全部归 state head，文本不再答枚举，
+    #: 白名单只会造成"两头都不答"的空洞。
+    #: 回滚到 2026-11-19 的白名单形态时显式给
+    #: ``ORCH_STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction``
+    #: （见 `state_schema.DEFAULT_STATE_SLOTS`）。
+    omni_state_slots: str = field(default_factory=lambda: os.environ.get(
+        "ORCH_STATE_SLOTS", ""))
+    #: Qwen3-Omni 只出**自由文本槽位**（FEATURE / ENV.objects /
+    #: POSITION.relative_positions / 一行短描述）。仅在 `omni_state_head=1`
+    #: 时生效 —— 没有 state head 的话把枚举槽位也砍掉就什么都剩不下了。
+    omni_text_short: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_TEXT_SHORT", "1").strip().lower() not in
+        ("0", "false", "off", "no"))
+    #: 文本侧**只出两行描述**（``FEATURE`` / ``ENV``），schema
+    #: §3 的枚举槽位**全部**交给 state head（``ORCH_TEXT_DESC_ONLY``）。
+    #:
+    #: 与 `omni_text_short` 的区别：短文本仍是"8 键契约、值压短"，这里干脆
+    #: 换 system prompt、只写关键短语。同样要求 `omni_state_head=1`，且
+    #: `omni_state_slots` 必须为空（文本不再答枚举，白名单留着会出现
+    #: "两头都不答"的空洞 —— session 里会告警并强制按全量处理）。
+    omni_text_desc_only: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_TEXT_DESC_ONLY", "1").strip().lower() not in
+        ("0", "false", "off", "no", ""))
+    #: desc-only 的 token 上限（硬截断）。两行关键词 ≈ 20~30 token，32 留余量；
+    #: 截断只可能砍到最后一行 ENV。注意服务端在某些路径上不一定执行这个值
+    #: （2026-11-20 实测 16 也没截断），所以提示词本身必须限定字数。
+    omni_desc_only_max_new_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS", "32")))
+    #: state head 的**独立定时器**（秒，0 = 关）。开时 state head 不再等
+    #: 文本轮结束，按固定节拍自己跑（帧历史本身就是 1Hz，1s 是上限）。
+    #:
+    #: 关掉（0）⇒ 回到 2026-11-19 的老行为：跟着文本触发、被
+    #: `_desc_inflight` 挡，实际周期 = 文本耗时 + interval。
+    omni_state_interval_s: float = field(default_factory=lambda: float(
+        os.environ.get("ORCH_STATE_INTERVAL_S", "1.0")))
+    #: 每拍请求的 stage：``full`` 才含 ``env.scene``（schema §3 的
+    #: ``ENV.scene`` 只有这一条路能拿到）；``turn`` 仅作回滚值。
+    omni_state_stage: str = field(default_factory=lambda: (
+        os.environ.get("ORCH_STATE_STAGE", "full").strip().lower() or "full"))
+
     # 人脸（阶段 4）—— 实现走 board-face-and-cloud-infer/G1 的官方 g1face 包
     #
     # ⚠️ `face_g1_root` 与 `face_model_dir` 是**两个不同的根**，不能合并：
@@ -290,6 +364,23 @@ class Settings:
     #: **不阻塞音频路径**（``FaceWorker.offer`` 是 put_nowait）。
     face_service_timeout_s: float = field(default_factory=lambda: float(
         os.environ.get("ORCH_FACE_SERVICE_TIMEOUT_S", "2.0")))
+    #: 8PCM 门控（106:8768 的「完整 8PCM」变体）。开 ⇒ 每次 detect 必须带上
+    #: 客户端送来的 8 声道 PCM（``audio`` 消息里的 ``pcm8_base64``），并且
+    #: **没有新 PCM 的帧不发** —— 8768 缺 PCM 直接回 422，不降级成纯视觉。
+    #: 关 ⇒ 完全维持 8767 的旧行为（只发图片帧）。
+    #: 打开时必须同时把 ``ORCH_FACE_SERVICE_URL`` 指到 8768。
+    face_pcm8: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_FACE_PCM8", "") not in ("", "0", "false", "False"))
+    #: 录制时是否向客户端要 8 声道原始 PCM（存成 ``-raw8.flac``）。
+    #:
+    #: 与 ``face_pcm8`` 解耦：人脸要不要 PCM 是**算法**需求，转储要不要是
+    #: **数据**需求。两者任一为真，客户端就会在 ``session.ready`` 里看到
+    #: ``want_pcm8=true`` 并开始随音频块带 ``pcm8_base64``（8ch@16k 的
+    #: base64 ≈ 341KB/s，只在录制期间有）。
+    #:
+    #: 关 ⇒ 录制的原始输入音频退回单声道 mic（客户端送什么就存什么）。
+    dump_pcm8: bool = field(default_factory=lambda: os.environ.get(
+        "ORCH_DUMP_PCM8", "1") not in ("0", "false", "False"))
 
     # 调参
     tick_interval_s: float = 0.05

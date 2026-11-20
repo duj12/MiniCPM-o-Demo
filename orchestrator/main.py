@@ -41,6 +41,7 @@ from orchestrator.protocol import (  # noqa: E402
     PlaybackReceiptMsg,
     SessionReady,
     decode_audio_b64,
+    decode_pcm8_b64,
     to_json,
 )
 from orchestrator.session import OrchestratorSession  # noqa: E402
@@ -333,9 +334,17 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         #    "回话"会被当作画面描述发给 Agent。web 前端传的永远是对话型
         #    prompt ⇒ 必须挡住并说出来，不能静默照用。
         if cfg.omni_describe and cfg.downstream_mode == "omni":
-            from orchestrator.omni.describe import DESCRIBE_SYSTEM_PROMPT
-            omni_prompt = (cfg.omni_describe_system_prompt
-                           or DESCRIBE_SYSTEM_PROMPT)
+            from orchestrator.omni.describe import (
+                DESC_ONLY_DESCRIBE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT)
+            # 优先级：显式覆盖 > desc-only（文本只说两行）> 8 键契约。
+            # desc-only 要与 state head 同时开才成立（枚举槽位得有人答），
+            # `session._desc_only` 里有同一条与门。
+            if cfg.omni_describe_system_prompt:
+                omni_prompt = cfg.omni_describe_system_prompt
+            elif cfg.omni_text_desc_only and cfg.omni_state_head:
+                omni_prompt = DESC_ONLY_DESCRIBE_SYSTEM_PROMPT
+            else:
+                omni_prompt = DESCRIBE_SYSTEM_PROMPT
             if hello and (hello.get("system_prompt") or "").strip():
                 logger.warning(
                     "[%s] 描述模式生效（ORCH_OMNI_DESCRIBE=1）—— **忽略**客户端"
@@ -449,6 +458,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                     vision=blocks.get("vision"),
                     agent=blocks.get("agent"),
                     probes=blocks.get("probes"),
+                    turn=blocks.get("turn"),
                     meta=blocks.get("meta"),
                 ), critical=True)
 
@@ -459,7 +469,10 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
                 ic_mode=ic_mode,
                 on_output=sess.execute_action,
                 agent_mcp_servers=cfg.agent_mcp_servers,
-                omni_describe=cfg.omni_describe)
+                omni_describe=cfg.omni_describe,
+                omni_state=cfg.omni_state_head,
+                state_conf_in_text=cfg.omni_state_conf_in_text,
+                state_slots=cfg.omni_state_slots)
             # ⚠️ 建连接**必须在这里**（不是 on_session_start）—— 连不上要
             #    立刻决定降级，而不是等会话跑起来才发现没有回复来源。
             if ic_ds.ic.connect():
@@ -544,6 +557,12 @@ def _preflight_remote_face(cfg: Settings) -> bool:
         cfg.face_service_url, body.get("sessions"), body.get("max_sessions"),
         body.get("session_ttl_seconds"), body.get("allow_enroll"),
     )
+    if cfg.face_pcm8:
+        # 8PCM 门控只存在于 8768 那个变体上。地址指错（还指着 8767）时
+        # 服务端会**忽略** pcm8 字段，看起来「能用」，其实门控没生效 ——
+        # 这种静默降级必须在这里喊出来。
+        logger.info("人脸 8PCM 门控 = 开：每次 detect 都会带 8 声道 PCM"
+                    "（要求该地址是 8768 版本，否则该字段被忽略、退化为纯视觉）")
     return True
 
 
@@ -646,14 +665,16 @@ def build_face(sess: OrchestratorSession, cfg: Settings) -> None:
                 session_id=sess.session_id,
                 wake_dwell_ms=cfg.face_wake_dwell_ms,
                 timeout_s=cfg.face_service_timeout_s,
+                pcm8=cfg.face_pcm8,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("远端人脸装配失败（%s: %s）—— 本会话降级为无人脸",
                          type(exc).__name__, exc)
             return
-        logger.info("人脸模块已装配（远端 %s session=%s 唤醒阈值=%dms）",
-                    cfg.face_service_url, sess.session_id,
-                    provider.wake_dwell_ms)
+        logger.info("人脸模块已装配（远端 %s session=%s 唤醒阈值=%dms "
+                    "8PCM=%s）", cfg.face_service_url, sess.session_id,
+                    provider.wake_dwell_ms,
+                    "开" if provider.pcm8_enabled else "关")
     else:
         from orchestrator.face.g1face_provider import (G1FaceProvider,
                                                        resolve_g1_root)
@@ -785,7 +806,15 @@ async def handle_client(ws, cfg: Settings) -> None:
                 k: getattr(sess.asr.config, k)
                 for k in _AsrConfig.CLIENT_OVERRIDABLE
             }
-        await send_to_client(SessionReady(session_id=sid, defaults=_defaults))
+        # 客户端要不要在 audio 消息里带 8 声道原始 PCM：
+        #   ① 人脸是 8PCM 门控（8768）—— 算法要；
+        #   ② 本次会话要录制 —— 转储要（存 -raw8.flac）。
+        # ``recording`` 在 build_session 里由 record_raw 决定，早于这里。
+        _want_pcm8 = bool(cfg.face_pcm8
+                          or (cfg.dump_pcm8 and sess.recording))
+        await send_to_client(SessionReady(session_id=sid, defaults=_defaults,
+                                          face_pcm8=bool(cfg.face_pcm8),
+                                          want_pcm8=_want_pcm8))
 
         # ---- 后台任务 ----
         # 注意：不用 create_task(name=...)，那是 Python 3.8+ 的 API
@@ -873,12 +902,16 @@ async def dispatch(sess: OrchestratorSession, msg: dict) -> None:
         # 不用服务端 TTS 参考轨，也不用测声学延迟。
         ref_b64 = msg.get("ref_base64") or ""
         ref = decode_audio_b64(ref_b64) if ref_b64 else None
+        # 可选 8 声道 PCM：给 8768 的 8PCM 门控用（16k / int16 LE / ch0..ch7
+        # 交错）。**原样字节**透传，不解交错 —— 多通道设备本来就有这 8 路，
+        # 以前只是没发。客户端不发时行为完全不变。
+        pcm8 = decode_pcm8_b64(msg.get("pcm8_base64") or "")
         # ctx_time/epoch 是浏览器 AudioContext 的锚点 —— 参考轨靠它做
         # 跨时钟域换算，缺了就只能退回预测落位（误差逐句变化）。
         await sess.on_audio(x, msg.get("t_ms", 0),
                             float(msg.get("ctx_time") or 0.0),
                             int(msg.get("epoch") or 0),
-                            ref=ref)
+                            ref=ref, pcm8=pcm8)
     elif t == "video_face":
         import base64
         raw = base64.b64decode(msg.get("frame_base64", ""))
