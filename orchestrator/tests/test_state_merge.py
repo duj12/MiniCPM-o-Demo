@@ -505,6 +505,13 @@ def t_desc_only_parse() -> None:
           "FEATURE: " + got["FEATURE"] + "\nENV: " + got["ENV"] +
           "\nPOSITION: " + got["POSITION"], "按 STATE_KEYS 顺序渲染三行")
 
+    # 2026-11-20 起默认提示词是**两行**（POSITION 砍掉压延迟）
+    two = ("FEATURE: 中年女性 浅色毛衣\n"
+           "ENV: 室内 蓝色屏幕 出口牌")
+    got4 = parse_state(two)
+    check(set(got4) == {"FEATURE", "ENV"}, f"两行 ⇒ 两个键：{sorted(got4)}")
+    check(render_state(got4) == two, "两行原样渲染，不补空 POSITION")
+
 
 def t_state_head_contract() -> None:
     print("\n[12] state_head 题集 / assemble：schema §3 对齐 + 动作单题")

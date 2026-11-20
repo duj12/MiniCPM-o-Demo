@@ -70,10 +70,10 @@ export ORCH_OMNI_DESCRIBE="${ORCH_OMNI_DESCRIBE:-1}"
 # state head（带置信度的 E2 状态）—— **旁挂容器** omnillm-state-head:22520。
 #   0（默认）= 完全不调，行为与今天逐字节一致（纯文本 E0）。
 #   1        = 调；schema §3 的枚举槽位全部由它答（独立 1s 节拍），
-#              文本只出三行描述。见下方 ORCH_TEXT_DESC_ONLY。
+#              文本只出两行描述。见下方 ORCH_TEXT_DESC_ONLY。
 # 打开前先确认那边确实活着：curl -s http://<host>:22520/health
 export ORCH_STATE_HEAD="${ORCH_STATE_HEAD:-0}"
-# desc-only 模式下文本只是"人 / 环境 / 位置"三行，10s 心跳足够；没开
+# desc-only 模式下文本只是"人 / 环境"两行，10s 心跳足够；没开
 # state head 时保持 1s（老行为：文本自己答全量 8 键）。
 if [ "$ORCH_STATE_HEAD" = "1" ]; then
   _DEF_DELTA_INTERVAL=10; _DEF_DELTA_ALWAYS=0
@@ -108,12 +108,12 @@ export ORCH_STATE_CONF_IN_TEXT="${ORCH_STATE_CONF_IN_TEXT:-1}"
 # **仅在 ORCH_STATE_HEAD=1 时生效** —— 没开 state head 还砍掉 5 个枚举键
 # 就什么都不剩了，所以代码里两个条件是"与"关系。
 export ORCH_TEXT_SHORT="${ORCH_TEXT_SHORT:-1}"
-# **文本只出三行描述**（FEATURE / ENV / POSITION，≤50 字）：schema §3 的
+# **文本只出两行描述**（FEATURE / ENV，每行 ≤10 字）：schema §3 的
 # 枚举槽位**全部**交给 state head。同样要求 ORCH_STATE_HEAD=1，且
 # ORCH_STATE_SLOTS 必须为空（代码里有护栏，配错会告警并按全量处理）。
 export ORCH_TEXT_DESC_ONLY="${ORCH_TEXT_DESC_ONLY:-1}"
-# desc-only 的硬截断（三行 ≤50 汉字约 60~80 token）。
-export ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS="${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS:-128}"
+# desc-only 的硬截断（两行关键词约 20~30 token）。
+export ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS="${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS:-32}"
 # 槽位白名单：**默认空 = 问全套 16 题**（schema 对齐后的形态）。
 # 空 / all / * = 全量；非空只作回滚用，例如
 #   ORCH_STATE_SLOTS=attn.gaze,beh.activity,rel.person_count,rel.interaction
@@ -151,7 +151,7 @@ echo "  描述定时触发    = 每 ${ORCH_OMNI_DELTA_INTERVAL_S}s（${_ALWAYS_T
 if [ "$ORCH_STATE_HEAD" = "1" ]; then
   echo "  state head      = $ORCH_STATE_URL（超时 ${ORCH_STATE_TIMEOUT_S}s，${ORCH_STATE_N_FRAMES} 帧，节拍 ${ORCH_STATE_INTERVAL_S}s，stage=$ORCH_STATE_STAGE）" >&2
   echo "  E2 槽位白名单   = ${ORCH_STATE_SLOTS:-（空 = 全量 16 题）}" >&2
-  echo "  文本侧          = desc-only=$ORCH_TEXT_DESC_ONLY（三行描述，上限 ${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS} token）" >&2
+  echo "  文本侧          = desc-only=$ORCH_TEXT_DESC_ONLY（两行描述，上限 ${ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS} token）" >&2
 else
   echo "  state head      = 关（纯文本 E0 状态）" >&2
 fi

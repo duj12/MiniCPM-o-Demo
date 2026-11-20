@@ -132,7 +132,7 @@ IC 始终在宿主进程内，每会话一份 Engine；`run_ic_105.sh/run_ic_106
 两条链**各自独立、互不等待**：
 
 * **Jev（state head）** —— 定时器触发，1Hz（帧率上限），每拍都是完整读数；
-* **Qwen3-Omni** —— 每话轮只出**三行描述**（`FEATURE` / `ENV` / `POSITION`，
+* **Qwen3-Omni** —— 每话轮只出**两行描述**（`FEATURE` / `ENV`，
   ≤50 字），枚举槽位一概不答（`ORCH_TEXT_DESC_ONLY=1`）。
 
 每次发布都把两边合成完整 8 键：E2 覆盖枚举槽位，文本补自由文本槽位
@@ -149,8 +149,8 @@ IC 始终在宿主进程内，每会话一份 Engine；`run_ic_105.sh/run_ic_106
 | `ORCH_STATE_MAX_PX` | `640` | 发前缩图长边（延迟/显存旋钮） |
 | `ORCH_STATE_CONF_IN_TEXT` | `1` | 渲染成 `label(0.82)` |
 | `ORCH_STATE_SLOTS` | 空 | **槽位白名单**：空/`all`/`*` = 问全套（16 题）。非空只作**回滚**用 |
-| `ORCH_TEXT_DESC_ONLY` | `1` | Omni 只出三行描述（要求 state head 开且白名单为空） |
-| `ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS` | `128` | 三行的硬截断 |
+| `ORCH_TEXT_DESC_ONLY` | `1` | Omni 只出两行描述（要求 state head 开且白名单为空） |
+| `ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS` | `32` | 两行的硬截断 |
 | `ORCH_OMNI_DELTA_INTERVAL_S` | `10` | 文本心跳间隔（主路径仍是 VAD 断句点触发） |
 | `ORCH_OMNI_DELTA_ALWAYS` | `0` | `0` = 心跳只在静默时补（文本不再负责动作） |
 

@@ -279,7 +279,7 @@ class Settings:
     omni_text_short: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_TEXT_SHORT", "1").strip().lower() not in
         ("0", "false", "off", "no"))
-    #: 文本侧**只出三行描述**（``FEATURE`` / ``ENV`` / ``POSITION``），schema
+    #: 文本侧**只出两行描述**（``FEATURE`` / ``ENV``），schema
     #: §3 的枚举槽位**全部**交给 state head（``ORCH_TEXT_DESC_ONLY``）。
     #:
     #: 与 `omni_text_short` 的区别：短文本仍是"8 键契约、值压短"，这里干脆
@@ -289,10 +289,11 @@ class Settings:
     omni_text_desc_only: bool = field(default_factory=lambda: os.environ.get(
         "ORCH_TEXT_DESC_ONLY", "1").strip().lower() not in
         ("0", "false", "off", "no", ""))
-    #: desc-only 的 token 上限（硬截断）。三行 ≤50 汉字约 60~80 token，
-    #: 128 留一倍余量；截断只可能砍到最后一行 POSITION。
+    #: desc-only 的 token 上限（硬截断）。两行关键词 ≈ 20~30 token，32 留余量；
+    #: 截断只可能砍到最后一行 ENV。注意服务端在某些路径上不一定执行这个值
+    #: （2026-11-20 实测 16 也没截断），所以提示词本身必须限定字数。
     omni_desc_only_max_new_tokens: int = field(default_factory=lambda: int(
-        os.environ.get("ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS", "128")))
+        os.environ.get("ORCH_OMNI_DESC_ONLY_MAX_NEW_TOKENS", "32")))
     #: state head 的**独立定时器**（秒，0 = 关）。开时 state head 不再等
     #: 文本轮结束，按固定节拍自己跑（帧历史本身就是 1Hz，1s 是上限）。
     #:

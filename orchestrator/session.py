@@ -218,14 +218,14 @@ class OrchestratorSession:
         self._state_enabled = bool(config.get("omni_state_head", False))
         self._state_client = None
         self._state_tasks: set = set()
-        #: 文本侧**只出三行描述**（FEATURE / ENV / POSITION），schema 的枚举
+        #: 文本侧**只出两行描述**（FEATURE / ENV），schema 的枚举
         #: 槽位全部交给 state head。没有 state head 时强制关闭 —— 否则枚举
         #: 槽位就没人答了（与 `_desc_text_short` 同一条护栏）。
         self._desc_only = (self._state_enabled
                            and bool(config.get("omni_text_desc_only", True)))
         #: desc-only 的硬截断（0 = 不限）。
         self._desc_only_max_new_tokens = int(
-            config.get("omni_desc_only_max_new_tokens", 128) or 0)
+            config.get("omni_desc_only_max_new_tokens", 32) or 0)
         #: state head 的**独立定时器**（秒；0 = 关，退回"跟随文本触发"）。
         self._state_interval = float(
             config.get("omni_state_interval_s", 1.0) or 0.0)
@@ -1870,7 +1870,7 @@ class OrchestratorSession:
         # 三个自由文本槽位 + 一行 DESCRIPTION。两个条件缺一不可 —— 没有
         # state head 还砍掉 5 个键，状态就直接丢了。
         if self._desc_only:
-            # 三行描述（FEATURE / ENV / POSITION）：枚举槽位全归 state head，
+            # 两行描述（FEATURE / ENV）：枚举槽位全归 state head，
             # 文本只说"人什么样、环境有什么、站在哪儿"。full / turn 同一套
             # —— 起点那份也不需要更长的版本。
             default_instruction = DESC_ONLY_INSTRUCTION
@@ -1893,8 +1893,8 @@ class OrchestratorSession:
         # 起点全量不设上限；每轮给上限（0 = 不限）。键值契约下截断只影响
         # 最后一行，不会污染合并后的快照。
         if self._desc_only:
-            # 三行 ≤50 汉字 ≈ 60~80 token；128 留一倍余量。截断只可能砍到
-            # 最后一行（POSITION），FEATURE 先出。
+            # 两行关键词 ≈ 20~30 token；32 留余量。截断只可能砍到最后一行
+            # （ENV），FEATURE 先出。
             max_new_tokens = self._desc_only_max_new_tokens or None
         elif stage == "full" or self._desc_delta_max_new_tokens <= 0:
             max_new_tokens = None

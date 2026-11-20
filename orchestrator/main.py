@@ -336,7 +336,7 @@ async def build_session(sid: str, cfg: Settings, send_to_client,
         if cfg.omni_describe and cfg.downstream_mode == "omni":
             from orchestrator.omni.describe import (
                 DESC_ONLY_DESCRIBE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT)
-            # 优先级：显式覆盖 > desc-only（文本只说三行）> 8 键契约。
+            # 优先级：显式覆盖 > desc-only（文本只说两行）> 8 键契约。
             # desc-only 要与 state head 同时开才成立（枚举槽位得有人答），
             # `session._desc_only` 里有同一条与门。
             if cfg.omni_describe_system_prompt:

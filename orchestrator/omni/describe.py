@@ -267,7 +267,9 @@ SHORT_TURN_INSTRUCTION = (
 #:   RELATION.person_count/interaction/target、ENV.scene/lighting、
 #:   POSITION.region；
 #: * Qwen3-Omni 只答**自由文本槽位**：FEATURE.appearance/accessories、
-#:   ENV.objects、POSITION.relative_positions —— 再加一句 description。
+#:   ENV.objects —— 再加一句 description。
+#:   （`POSITION.relative_positions` 原本也在文本侧，2026-11-20 为压延迟
+#:   砍掉了这一行；只剩 Jev 的 `POSITION.region`。）
 #:
 #: ⚠️ 为什么必须换 **system prompt** 而不是逐轮注入：2026-10-28 实测，
 #: 注入指令带不动"输出哪些类别"（151 字普通段落），也带不动详细程度
@@ -275,23 +277,32 @@ SHORT_TURN_INSTRUCTION = (
 #:
 #: ⚠️ `ENV` 行只说物品，**不说场景类型与光线** —— 那两个枚举由 state head
 #: 给，两边都写只会出现两份对不上的结论。
-DESC_ONLY_SYSTEM_PROMPT = """你是一个视频监控/行为分析助手。每轮只用三行描述当前画面：
-FEATURE: 画面中的用户 —— 性别、年龄段、穿着、配饰、正在做什么
-ENV: 环境 —— 画面里有哪些主要物品与环境要素（不写场景类型、不写光线）
-POSITION: 主要人物相对画面与其它物品的位置关系
-三行合计不超过 50 字，只写关键短语，不写完整句子；只描述实际可见的信息，
-不确定就省略该项；不要输出其它字段，不要与用户对话。
-不要写 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION —— 那几个字段由另一个模型判定。"""
+#:
+#: ## 为什么是**两行**（2026-11-20）
+#:
+#: 三行版每轮约 50 字、~1s；砍掉 POSITION 并压成关键词后实测 ~0.42~0.54s
+#: （640px 帧、1s 音频块），仍高于 Jev 的 ~0.2s，但少了近一半。再往下压
+#: 的瓶颈是固定开销（一帧视觉编码 + 一轮 decode），不是提示词。
+#:
+#: **代价**：`POSITION.relative_positions` 不再有文本来源（Jev 只给
+#: `POSITION.region`）。需要那半句时把 POSITION 行加回来，或用
+#: `ORCH_OMNI_DESCRIBE_SYSTEM_PROMPT` 显式覆盖。
+DESC_ONLY_SYSTEM_PROMPT = """你是视频监控/行为分析助手。每轮只用两行关键词描述当前画面：
+FEATURE: 人物 —— 性别、年龄段、穿着、配饰
+ENV: 环境 —— 场景类型与画面里的主要物品（不写光线）
+每行最多 10 个字，只写关键短语，不要标点、不要完整句子；只描述实际可见的
+信息，不确定就省略该项；不要输出其它字段，不要与用户对话。
+不要写 ATTENTION / ACTION / EMOTION / BEHAVIOR / RELATION / POSITION ——
+那几个字段由另一个模型判定。"""
 
 #: `main.py` 装配用（`ORCH_TEXT_DESC_ONLY=1` 且没有显式覆盖时选它）。
 DESC_ONLY_DESCRIBE_SYSTEM_PROMPT = DESC_ONLY_SYSTEM_PROMPT
 
 #: desc-only 的注入指令。**每轮与起点同一套** —— 起点那份也不需要更长。
 DESC_ONLY_INSTRUCTION = (
-    "本轮直接输出三行，格式照抄，合计不超过 50 字：\n"
-    "FEATURE: 用户（性别、年龄段、穿着、配饰、正在做什么）\n"
-    "ENV: 环境（画面里的主要物品与环境要素，不写场景类型与光线）\n"
-    "POSITION: 人物相对物品与画面的位置\n"
+    "本轮直接输出两行关键词，每行最多 10 个字，不要标点：\n"
+    "FEATURE: 人物（例：青年女性 浅色毛衣）\n"
+    "ENV: 环境（例：室内 蓝色屏幕 出口牌）\n"
     "不要确认、不要回应、不要以“好的/收到”开头，从 FEATURE: 开始。"
 )
 
