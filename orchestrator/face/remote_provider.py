@@ -37,7 +37,7 @@ import json
 import logging
 import socket
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .signals import FaceObservation, IdentityEvent
@@ -56,6 +56,27 @@ _NO_IDENT = (None, "NONE", None, None)
 
 #: 待发 8PCM 的块数上限（100ms/块 ⇒ 300 块 = 30s）。正常只有 1~2 块。
 _PCM8_MAX_PENDING = 300
+
+#: 客户端一块 mic 音频的字节数：1600 采样 × 8 声道 × int16。
+_MIC_BLOCK_BYTES = 1600 * 8 * 2
+
+#: **每次 detect 携带的 PCM 切片**（采样）。16k 下 40ms —— 与 25fps 的
+#: 帧间隔完全相同。这条就是「视频节拍 = 人脸节拍」的保证：
+#: 8768 要求每次 detect 都带 PCM 且相邻请求首尾相接，于是只有两种合法节奏
+#:   · 每来一块音频（100ms）才发一帧 ⇒ 人脸 10Hz（旧实现，见下）；
+#:   · 每帧切 40ms 音频发一次  ⇒ 25Hz，音频依然连续（现在）。
+#: 供给与需求在 16k 下精确相等：16000 采样/s ÷ 25fps = 640 采样/帧。
+#: 反例（s-56886bcbcf10）：视频 1191 帧 / 55s，真正进 8768 的只有 513 帧
+#: （≈9.3Hz）—— 没有新音频块的视频帧全被跳过，BlazeFace/Landmark/LipFsm
+#: 拿不到设计节拍。
+_PCM8_SLICE_SAMPLES = 640
+_PCM8_SLICE_BYTES = _PCM8_SLICE_SAMPLES * 8 * 2
+
+#: 积压到 **6 片**（240ms）才启动「一次多取」，排到只剩 1 片余量。
+#: 阈值不能太小：音频 100ms 一块、视频 40ms 一帧，块边界处缓冲本来就会
+#: 到 3 片（1920 采样），过早排水会让下一帧没音频可发 —— 实测 25fps 被
+#: 压到 20Hz。6 片只在视频真的慢于音频（实测 20fps 那档触发）时才排水。
+_PCM8_BACKLOG_SLICES = 6
 
 #: 服务端单请求 PCM8 上限 —— **实测 1 秒音频**（16k×1s×8ch×2B = 256000B）。
 #: 1000ms → 200，1008ms → `413 PCM8 exceeds service limit`。超过的部分
@@ -112,8 +133,9 @@ class RemoteFaceProvider:
         #: 8PCM 门控（8768）。开 ⇒ 每次 detect 都必须带 PCM，且时间戳
         #: 走**音频采样轴**而不是墙钟（见 ``set_pcm8`` / ``_send_pcm8``）。
         self.pcm8_enabled = bool(pcm8)
-        #: 待发的 8 声道交错 int16 块（原始字节，**不解交错**）
-        self._pcm8_pending: List[bytes] = []
+        #: 待发的 8 声道交错 int16 **字节缓冲**（不解交错）。按「每帧切
+        #: 40ms 一片」消费，见 ``_send_pcm8``；切成整采样（16 字节）边界。
+        self._pcm8_buf = bytearray()
         #: 已交给服务端的 PCM 累计采样数 —— 下一块的起点就是它，
         #: 「块间连续」由这个游标保证（不能拿墙钟/帧率去凑）。
         self._pcm8_cursor = 0
@@ -269,7 +291,8 @@ class RemoteFaceProvider:
             return None
 
         if self.pcm8_enabled:
-            # 8768 门控：时间戳走音频采样轴，且必须有新 PCM 才能发
+            # 8768 门控：时间戳走音频采样轴，**每帧切一片 40ms** 音频发送
+            # （不是「有新块才发」—— 那会把视频节拍压到 10Hz）
             return self._send_pcm8(jpeg, t)
 
         ts_us = self._next_timestamp_us()
@@ -314,29 +337,39 @@ class RemoteFaceProvider:
                 logger.warning("8PCM 块非法（%d 字节，需 8 声道 int16 对齐）"
                                "—— 已丢弃，后续同类不再提示", len(raw))
             return
-        self._pcm8_pending.append(raw)
+        self._pcm8_buf += raw
         # 兜底：视频停了但音频还在送（或人脸线程被拖住）时别无限攒。
-        # 丢掉最旧的块会破坏块间连续 —— 之后服务端会以 422 拒绝，
+        # 丢掉最旧的整块会破坏块间连续 —— 之后服务端会以 422 拒绝，
         # 由 ``_resync_pcm8`` 重建会话兜底。
-        if len(self._pcm8_pending) > _PCM8_MAX_PENDING:
-            self._pcm8_pending.pop(0)
+        cap = _PCM8_MAX_PENDING * _MIC_BLOCK_BYTES
+        if len(self._pcm8_buf) > cap:
+            del self._pcm8_buf[:len(self._pcm8_buf) - cap]
             self._warn_limited("8PCM 积压超过 %d 块（%.0fs）—— 丢弃最旧块",
                                _PCM8_MAX_PENDING, _PCM8_MAX_PENDING * 0.1)
 
     def _send_pcm8(self, jpeg: bytes, t: int) -> Optional[FaceObservation]:
-        """带 PCM 的 detect：把待发块拼成一整块连续 PCM。"""
-        if not self._pcm8_pending:
-            # **没有新 PCM 就不发** —— 8768 缺 PCM 回 422，重复上一块又
-            # 违反「块间连续」。跳过这帧，下一块音频到了再发。
+        """带 PCM 的 detect：**每帧切一片 40ms**（见 ``_PCM8_SLICE_BYTES``）。
+
+        旧实现「没有新 PCM 就不发」把视频节拍绑死到了 100ms 音频块上
+        （detect 只有 ~10Hz）。现在无论音频怎么成块到达，每帧都从缓冲里
+        抽 640 采样发一次 —— 视频 25fps ⇒ 人脸 25Hz，音频仍然首尾相接。
+        """
+        avail = len(self._pcm8_buf)
+        if avail < _PCM8_SLICE_BYTES:
+            # 还不够一帧的音频：这帧跳过。8768 缺 PCM 会 422，
+            # 也不能拿上一块充数（违反「块间连续、不得重复」）。
             return None
-        pending, self._pcm8_pending = self._pcm8_pending, []
-        buf = b"".join(pending)
-        if len(buf) > _PCM8_MAX_BYTES:
-            # 服务端单请求上限 1s（实测 1008ms 就 413）。超出部分留到下次，
-            # 切点是整帧边界（16 字节）⇒ 仍是首尾相接的连续块。
-            buf, rest = buf[:_PCM8_MAX_BYTES], buf[_PCM8_MAX_BYTES:]
-            self._pcm8_pending.insert(0, rest)
-        n = len(buf) // 16                       # 每声道采样数
+        # 正常**只取一片**（25fps 下供给与需求精确相等，多取反而会出现
+        # 空帧、把请求数拉到 20Hz）。只有积压 ≥3 片才一次多取 —— 比如
+        # 视频实际只跑到 21fps、或人脸线程被拖住，两条轴不能越拉越开。
+        take = _PCM8_SLICE_BYTES
+        if avail >= _PCM8_BACKLOG_SLICES * _PCM8_SLICE_BYTES:
+            take = min(avail - _PCM8_SLICE_BYTES, _PCM8_MAX_BYTES)
+        take = min(take, _PCM8_MAX_BYTES)        # 服务端单请求上限 1s
+        take -= take % 16                        # 切在整采样边界
+        buf = bytes(self._pcm8_buf[:take])
+        del self._pcm8_buf[:take]
+        n = take // 16                           # 每声道采样数
         start_us = _samples_to_us(self._pcm8_cursor)
         end_us = _samples_to_us(self._pcm8_cursor + n)
         payload = {
@@ -352,16 +385,16 @@ class RemoteFaceProvider:
             resp = self._post("/face/detect", payload)
         except (RemoteFaceError, socket.timeout, TimeoutError, OSError,
                 http.client.HTTPException) as exc:
-            # 失败：把**这一段**放回队首（不是原始块列表 —— 可能已按上限
-            # 切过），和后面的部分一起发，仍然是连续的。
-            self._pcm8_pending.insert(0, buf)
+            # 失败：把**这一段**放回缓冲头部（不是原始块列表 —— 可能已按
+            # 上限切过），和后面的部分一起发，仍然是连续的。
+            self._pcm8_buf[:0] = buf
             self._on_frame_error(exc)
             return None
 
         self._pcm8_cursor += n
         self._last_ts_us = end_us
         self.frames_sent += 1
-        self.pcm8_blocks += len(pending)
+        self.pcm8_blocks += 1
         self._healthy = True
         self._probe_frame_size(jpeg)
         return self._to_observation(resp, t)
@@ -374,7 +407,7 @@ class RemoteFaceProvider:
         让服务端回收该会话，下一次 detect 重新建一个，游标归零即可自愈。
         代价是 dwell 清零 —— 比「人脸永久失效」便宜得多。
         """
-        self._pcm8_pending.clear()
+        self._pcm8_buf.clear()
         self._pcm8_cursor = 0
         self._last_ts_us = 0
         try:

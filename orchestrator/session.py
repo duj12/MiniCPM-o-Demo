@@ -955,8 +955,9 @@ class OrchestratorSession:
     def _feed_face_pcm8(self, pcm8: bytes, mic_samples: int) -> None:
         """把 8 声道 PCM 登记给远端人脸（8768 门控）。
 
-        **同步、非阻塞**：只 append 到 provider 的待发列表，真正的拼块 +
-        HTTP 在 face 工作线程里。没开 8PCM（或人脸降级）时只告警一次。
+        **同步、非阻塞**：只 append 到 provider 的字节缓冲，真正的切片 +
+        HTTP 在 face 工作线程里（每帧切 40ms，视频拍 25fps ⇒ 人脸 25Hz）。
+        没开 8PCM（或人脸降级）时只告警一次。
 
         ``pcm8`` 与该 mic 块是同一时间窗切出来的，采样数理应相等；不等时
         只告警一次 —— 远端按**自己的**采样游标记账（不依赖 mic 时钟），
