@@ -57,8 +57,10 @@ export ORCH_TTS_RESUME_FADE_MS="${ORCH_TTS_RESUME_FADE_MS:-300}"
 export ORCH_ENABLE_FACE="${ORCH_ENABLE_FACE:-1}"
 export ORCH_FACE_SERVICE_URL="${ORCH_FACE_SERVICE_URL-http://192.168.89.106:8767}"
 export ORCH_FACE_SERVICE_TIMEOUT_S="${ORCH_FACE_SERVICE_TIMEOUT_S:-2.0}"
-# 8PCM 门控（8768 变体）：每次 detect 必须带客户端送来的 8 声道 PCM，
-# 没有新 PCM 的帧**不发**。开的时候 ORCH_FACE_SERVICE_URL 必须指 8768。
+# 8PCM 门控（8768 变体）：每次 detect 必须带客户端送来的 8 声道 PCM。
+# 客户端音频是 100ms 一块，但**不能**因此把 detect 也压到 10Hz —— 编排
+# 每帧从缓冲里切 40ms（640 采样）发一次，视频 25fps ⇒ 人脸 25Hz，
+# 同时保持「相邻 PCM 首尾相接」。开的时候 URL 必须指 8768。
 #   8767 = 只看图片帧（默认）；8768 = 图片 + 连续 8 声道 PCM 门控。
 export ORCH_FACE_PCM8="${ORCH_FACE_PCM8:-0}"
 export G1_FACE_DEBUG="${G1_FACE_DEBUG:-0}"
