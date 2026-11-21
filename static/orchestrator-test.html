@@ -118,6 +118,26 @@
         </select>
       </label>
       <label style="display:block;margin-bottom:8px">
+        采集画面比例：
+        <!-- ⚠️ 摄像头**原生不是 16:9** 的设备（AGV 上的 1:1 方形相机）必须
+             选「1:1」：默认请求 1280×720 时，驱动/HAL 会把方画面**非等比
+             重采样**成 16:9 —— 录下来纵向压扁，人脸检测也检不出来。
+             选「跟随设备」则不约束宽高，由浏览器挑最接近原生的模式。 -->
+        <select id="camAspect">
+          <option value="device">设备默认（请求 1280×720）</option>
+          <option value="square">1:1 方形（请求 1280×1280）</option>
+          <option value="native">跟随设备（不约束宽高）</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;margin:8px 0">
+        <!-- ⚠️ 默认**关**：检不到脸 ≠ 角度反了。AGV 实测过人就在镜头前
+             大特写，人脸检出率 0，这条启发式把本来就是正的画面翻 180°，
+             还写进 localStorage 让之后每场都倒着。只有**确认相机装反**的
+             设备才开（开了也只翻一次，且会记住）。 -->
+        <input type="checkbox" id="camAutoRot">
+        <span>自动纠偏（检不到脸时翻 180°，默认关）</span>
+      </label>
+      <label style="display:block;margin-bottom:8px">
         回声消除：
         <!-- 默认 **browser**（浏览器原生 AEC）：开箱即用、不依赖任何
              服务端配置与离线测出的 D，网络延迟也不影响它。
@@ -1049,19 +1069,157 @@ function selectedCamRotate() {
   return (v === 90 || v === 180 || v === 270) ? v : 0;
 }
 
+/** 标记「CAM_ROT_KEY 是自动纠偏写的」—— 迁移用，见 initCamRotate。 */
+const CAM_ROT_AUTO_KEY = 'orch_cam_rot_auto';
+/** 2026-11-21 那次迁移的一次性开关（每个浏览器 profile 只跑一遍）。 */
+const CAM_ROT_MIGR_KEY = 'orch_cam_rot_migr2';
+
 function initCamRotate() {
   const el = $('camRotate');
   if (!el) return;
+  // 一次性清理被误判的旧值：旧版自动纠偏把翻出来的 180° 写进了
+  // CAM_ROT_KEY，被误翻的设备之后**每一场都倒着**。
+  //   · 带 _auto 标记的（新版写的）→ 直接删；
+  //   · 老版本没打标记，无从区分「自动翻的 180°」和「用户手工选的」，
+  //     所以升级到这一版时**统一重置回 0° 一次**，并在日志里说明
+  //     —— 手工选过的用户重选一次即可，比每场都倒着好。
+  try {
+    if (localStorage.getItem(CAM_ROT_AUTO_KEY) === '1') {
+      localStorage.removeItem(CAM_ROT_KEY);
+      localStorage.removeItem(CAM_ROT_AUTO_KEY);
+      log('v', '清理了旧版自动纠偏留下的旋转值（之前那场被翻的 180°）');
+    }
+    if (localStorage.getItem(CAM_ROT_MIGR_KEY) !== '1') {
+      localStorage.setItem(CAM_ROT_MIGR_KEY, '1');
+      const old = parseInt(localStorage.getItem(CAM_ROT_KEY) || '0', 10);
+      if (old === 180 || old === 270) {
+        localStorage.removeItem(CAM_ROT_KEY);
+        log('v', `画面旋转残留 ${old}° 已重置为 0°（很可能是旧版自动纠偏误翻的；`
+               + '如果你确实要这个角度，请在下面重新选一次）');
+      }
+    }
+  } catch (e) { /* ignore */ }
   try {
     const saved = parseInt(localStorage.getItem(CAM_ROT_KEY) || '0', 10);
     if (saved === 90 || saved === 180 || saved === 270) el.value = String(saved);
   } catch (e) { /* ignore */ }
   el.addEventListener('change', () => {
-    try { localStorage.setItem(CAM_ROT_KEY, el.value); } catch (e) {}
+    try {
+      localStorage.setItem(CAM_ROT_KEY, el.value);
+      // 用户自己选的 = 不是猜的，撤掉自动纠偏的标记
+      localStorage.removeItem(CAM_ROT_AUTO_KEY);
+    } catch (e) {}
     if (running) log('e', '画面旋转已改 —— **下次开始会话才生效**（尺寸会话内锁死）');
   });
   // 0° 时沿用原来的 <video> 预览
   syncPreviewMode(selectedCamRotate());
+}
+
+/* ---------- 采集画面比例（getUserMedia 约束） ---------- */
+
+const CAM_ASPECT_KEY = 'orch_cam_aspect';
+
+function selectedCamAspect() {
+  const el = $('camAspect');
+  const v = el ? el.value : 'device';
+  return (v === 'square' || v === 'native') ? v : 'device';
+}
+
+/** 摄像头 getConstraints。
+ *
+ *  AGV 实测（2026-11-21，`s-909a075a7a2e`）：那台设备的传感器是 **1:1**，
+ *  我们请求 1280×720 后驱动直接**非等比重采样**（横向拉宽 = 纵向压扁），
+ *  于是①录下来人像变形、②人脸检测一次都没检出（脸被压短了）。
+ *  三种模式：
+ *    device —— 请求 1280×720（Windows 笔记本的 16:9 摄像头，默认）
+ *    square —— 请求 1280×1280 + aspectRatio 1（方形传感器）
+ *    native —— 一个宽高都不约束，由浏览器挑最接近原生的模式
+ */
+function camVideoConstraints() {
+  const base = { facingMode: 'user' };
+  const a = selectedCamAspect();
+  if (a === 'native') return base;
+  if (a === 'square') {
+    return Object.assign(base, {
+      width: { ideal: 1280 }, height: { ideal: 1280 },
+      aspectRatio: { ideal: 1 },
+    });
+  }
+  return Object.assign(base, {
+    width: { ideal: 1280 }, height: { ideal: 720 },
+  });
+}
+
+/** 把**实际生效**的摄像头参数打出来 —— 「录下来变形」只能靠这行定案：
+ *  请求值和 settings 不一致，说明被驱动改写了。 */
+function logVideoSettings() {
+  try {
+    const tr = videoStream && videoStream.getVideoTracks()[0];
+    if (!tr) return;
+    const s = (tr.getSettings && tr.getSettings()) || {};
+    const ratio = s.width && s.height
+      ? (s.aspectRatio || s.width / s.height) : 0;
+    log('k', `摄像头实际生效：${s.width || '?'}×${s.height || '?'}`
+             + `（比例 ${Number(ratio).toFixed(3)}）`
+             + (s.frameRate ? ` ${Math.round(s.frameRate)}fps` : '')
+             + (s.deviceId ? ` dev=${String(s.deviceId).slice(0, 8)}` : ''));
+    if (tr.getCapabilities) {
+      const c = tr.getCapabilities() || {};
+      const r = (x) => (x && x.min != null) ? `${x.min}~${x.max}` : '?';
+      log('k', `摄像头能力：宽 ${r(c.width)} 高 ${r(c.height)}`
+               + ` 比例 ${r(c.aspectRatio)}`
+               + (c.frameRate ? ` 帧率 ${r(c.frameRate)}` : '')
+               + (c.resizeMode ? ` resizeMode=${c.resizeMode.join('/')}` : ''));
+    }
+    if (selectedCamAspect() === 'square' && s.width && s.height
+        && Math.abs(s.width / s.height - 1) > 0.05) {
+      log('e', `⚠️ 选了「1:1 方形」，实际拿到 ${s.width}×${s.height} —— `
+               + '这台设备不支持方形模式（看上面「摄像头能力」那行，'
+               + '换成它支持的宽高比）');
+    }
+    // 请求 16:9 却拿到别的比例 ⇒ 驱动多半在**非等比重采样**，
+    // 画面会横向拉宽/纵向压扁（AGV 就是这样）。让你能一眼看出该改哪档。
+    if (selectedCamAspect() === 'device' && s.width && s.height
+        && Math.abs(s.width / s.height - 16 / 9) > 0.08) {
+      log('e', `⚠️ 请求的是 16:9（1280×720），实际是 ${s.width}×${s.height}`
+               + `（${(s.width / s.height).toFixed(2)}:1）—— 驱动可能在拉伸画面。`
+               + '若录下来人像变形，把「采集画面比例」改成「跟随设备」或「1:1 方形」');
+    }
+  } catch (e) { /* getCapabilities 不是所有浏览器都有 */ }
+}
+
+function initCamAspect() {
+  const el = $('camAspect');
+  if (!el) return;
+  try {
+    const saved = localStorage.getItem(CAM_ASPECT_KEY);
+    if (saved === 'square' || saved === 'native') el.value = saved;
+  } catch (e) { /* ignore */ }
+  el.addEventListener('change', () => {
+    try { localStorage.setItem(CAM_ASPECT_KEY, el.value); } catch (e) {}
+    if (running) log('e', '采集比例已改 —— **下次开始会话才生效**（尺寸会话内锁死）');
+  });
+}
+
+/* ---------- 自动纠偏（默认关） ---------- */
+
+const CAM_AUTOROT_KEY = 'orch_cam_autorot';
+
+function camAutoRotEnabled() {
+  const el = $('camAutoRot');
+  return !!(el && el.checked);
+}
+
+function initCamAutoRot() {
+  const el = $('camAutoRot');
+  if (!el) return;
+  try { el.checked = localStorage.getItem(CAM_AUTOROT_KEY) === '1'; } catch (e) {}
+  el.addEventListener('change', () => {
+    try {
+      localStorage.setItem(CAM_AUTOROT_KEY, el.checked ? '1' : '0');
+    } catch (e) {}
+    log('v', '自动纠偏 → ' + (el.checked ? '开' : '关'));
+  });
 }
 
 /** 0° → 用 <video>；非 0° → 用 <img> 显示"发出去的那张"。
@@ -1289,10 +1447,11 @@ async function startCapture() {
       videoStream = null;
     } else {
       videoStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: camVideoConstraints(),
       });
       $('cam').srcObject = videoStream;
       setCamState('ok', '');
+      logVideoSettings();
     }
   } catch (e) {
     // 设备存在但被占用 / 被拒绝（权限）—— 同样降级，别把会话带崩
@@ -1549,8 +1708,11 @@ async function startCapture() {
   const ON_ANDROID = isAndroid();
   // Android 用正方形上限（旋转后长边才是 640）；其它平台沿用原来的
   // 1280×720 包围盒 —— 输出尺寸与改动前**完全一致**。
+  // 例外：选了「1:1 方形」采集时上限也放成方的，否则 1280×1280 的源会被
+  // 720 的上限压成 720×720 —— 不变形，但白丢一半像素（人脸分依赖它）。
+  const _SQ = selectedCamAspect() === 'square';
   const VIDEO_BOX_W = ON_ANDROID ? 640 : 1280;
-  const VIDEO_BOX_H = ON_ANDROID ? 640 : 720;
+  const VIDEO_BOX_H = ON_ANDROID ? 640 : (_SQ ? 1280 : 720);
   const VIDEO_Q = ON_ANDROID ? 0.6 : 0.9;
   // ⚠️ **25fps 不能降**：人脸服务要 24fps 输入。主线程的负担改由
   //    「长边 640 + 编码移到浏览器后台线程」来消，而不是降帧率。
@@ -2252,10 +2414,17 @@ function drawFace(m) {
  *
  *  ⚠️ 只翻 180°：90↔270 / 0↔180 的**输出尺寸完全相同**，所以服务端那套
  *     "首帧定 src_w/src_h" 的坐标系不会失效（尺寸一变就再也没脸了）。
- *  误判的代价只是画面上下颠倒一次，用户手动改回即可，框依然对。
+ *
+ *  ⚠️ **默认关闭**（页面复选框 `camAutoRot`）。2026-11-21 AGV 事故：
+ *     人正对着镜头、脸占了大半个画面，检出率却是 0（另说：画面还被驱动
+ *     拉成了 16:9），于是这条启发式把本来就是正的画面翻了 180°，还写进
+ *     localStorage —— 之后每一场都倒着，用户看到的正是「前 2s 是正的，
+ *     然后自己翻过去」。**检不到脸 ≠ 角度反了**，只有确认相机装反的设备
+ *     才开；而且开着的时候也只翻一次、只改本次会话的锁定量。
  */
 function maybeAutoRotate(m) {
   if (_rotAutoDone || !_lockedFrame) return;
+  if (!camAutoRotEnabled()) { _rotAutoDone = true; return; }
   if (!_sessionStartedAt || Date.now() - _sessionStartedAt > 6000) {
     _rotAutoDone = true;
     return;
@@ -2272,12 +2441,17 @@ function maybeAutoRotate(m) {
   const L = _lockedFrame;
   const alt = (L.rot + 180) % 360;
   log('m', `角度自动纠偏：${L.rot}° → ${alt}°（图像尺寸不变 `
-         + `${L.outW}×${L.outH}，服务端坐标系不受影响）`);
+         + `${L.outW}×${L.outH}，服务端坐标系不受影响）—— `
+         + '若画面本来是正的，把「自动纠偏」关掉再重开一场');
   L.rot = alt;
   const sel = $('camRotate');
   if (sel) {
     sel.value = String(alt);
-    try { localStorage.setItem(CAM_ROT_KEY, sel.value); } catch (e) { /* ignore */ }
+    try {
+      localStorage.setItem(CAM_ROT_KEY, sel.value);
+      // 打标记：这条是**猜**出来的，下次加载页面时可以安全清掉
+      localStorage.setItem(CAM_ROT_AUTO_KEY, '1');
+    } catch (e) { /* ignore */ }
   }
   syncPreviewMode(alt);
 }
@@ -2543,6 +2717,8 @@ initAecMode();
 initAdvParams();
 initAudioSource();
 initCamRotate();
+initCamAspect();
+initCamAutoRot();
 window.addEventListener('resize', () => { applyStageAspect(); });
 log('k', `就绪。当前回声消除模式：${selectedAecMode()}`
        + `（选算法服务请外放，别戴耳机）`);
